@@ -4,7 +4,7 @@ use corro_client::CorrosionApiClient;
 use tracing::info;
 
 pub async fn run<P: AsRef<Path>>(api_addr: SocketAddr, schema_paths: &[P]) -> eyre::Result<()> {
-    let client = CorrosionApiClient::new(api_addr);
+    let client = CorrosionApiClient::new(api_addr)?;
 
     client.schema_from_paths(schema_paths).await?;
     info!("Successfully reloaded Corrosion's schema from paths!");

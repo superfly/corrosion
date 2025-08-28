@@ -3,12 +3,8 @@ use std::{
     collections::{BTreeMap, HashMap},
     fmt::Display,
     fs::OpenOptions,
-    io::BufReader,
 };
 
-use hyper::{client::HttpConnector, http::uri::InvalidUri};
-use hyper_rustls::HttpsConnector;
-use rustls::{Certificate, PrivateKey, RootCertStore};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_with::{serde_as, NoneAsEmptyString};
 
@@ -21,12 +17,14 @@ pub type ConsulResult<T> = std::result::Result<T, Error>;
 
 #[derive(Debug, Clone)]
 pub struct Client {
-    client: hyper::Client<HttpsConnector<HttpConnector>>,
+    client: reqwest::Client,
     addr: String,
 }
 
 impl Client {
     pub fn new(config: Config) -> ConsulResult<Self> {
+        use rustls::pki_types::pem::PemObject as _;
+
         let scheme = if config.tls.is_some() {
             "https"
         } else {
@@ -34,65 +32,48 @@ impl Client {
         };
         let ctor = if let Some(tls) = config.tls {
             // HTTPS path
-            let mut root_store = RootCertStore::empty();
-            let mut cacert_file = BufReader::new(
+            let mut root_store = rustls::RootCertStore::empty();
+            let cacert_iter = rustls::pki_types::CertificateDer::pem_reader_iter(
                 OpenOptions::new()
                     .read(true)
                     .open(&tls.ca_file)
                     .map_err(Error::TlsSetup)?,
             );
-            for cacert in rustls_pemfile::certs(&mut cacert_file).map_err(Error::TlsSetup)? {
-                root_store.add(&Certificate(cacert))?;
+            for cacert in cacert_iter {
+                let cert = cacert?;
+                root_store.add(cert)?;
             }
 
-            let mut cert_file = BufReader::new(
+            let cert_file = rustls::pki_types::CertificateDer::pem_reader_iter(
                 OpenOptions::new()
                     .read(true)
                     .open(&tls.cert_file)
                     .map_err(Error::TlsSetup)?,
             );
-            let certs = rustls_pemfile::certs(&mut cert_file)
-                .map_err(Error::TlsSetup)?
-                .into_iter()
-                .map(Certificate)
-                .collect();
+            let certs = cert_file.collect::<Result<Vec<_>, _>>()?;
 
-            let mut key_file = BufReader::new(
+            let key = rustls::pki_types::PrivateKeyDer::from_pem_reader(
                 OpenOptions::new()
                     .read(true)
                     .open(&tls.key_file)
                     .map_err(Error::TlsSetup)?,
-            );
-            let key = rustls_pemfile::pkcs8_private_keys(&mut key_file)
-                .map_err(Error::TlsSetup)?
-                .into_iter()
-                .map(PrivateKey)
-                .next()
-                .expect("could not find tls key");
+            )?;
 
             let tls_config = rustls::ClientConfig::builder()
-                .with_safe_defaults()
                 .with_root_certificates(root_store)
                 .with_client_auth_cert(certs, key)?;
 
-            hyper_rustls::HttpsConnectorBuilder::new()
-                .with_tls_config(tls_config)
-                .https_or_http()
-                .enable_http2()
+            reqwest::ClientBuilder::new()
+                .use_preconfigured_tls(tls_config)
+                .http2_prior_knowledge()
                 .build()
         } else {
-            // this is always gonna be HTTP, but we still need to build this, annoyingly.
-            // TODO: build custom connector so we don't have to do this
-            hyper_rustls::HttpsConnectorBuilder::new()
-                .with_native_roots()
-                .https_or_http()
-                .enable_http1()
-                .build()
+            reqwest::ClientBuilder::new().http1_only().build()
         };
 
         Ok(Self {
-            client: hyper::Client::builder().build(ctor),
-            addr: format!("{}://{}", scheme, config.address),
+            client: ctor?,
+            addr: format!("{scheme}://{}", config.address),
         })
     }
 
@@ -105,23 +86,18 @@ impl Client {
     }
 
     async fn request<P: Display, T: DeserializeOwned>(&self, path: P) -> ConsulResult<T> {
-        let res = match self
-            .client
-            .get(format!("{}{}", &self.addr, &path).parse()?)
-            .await
-        {
+        let res = match self.client.get(format!("{}{path}", self.addr)).send().await {
             Ok(res) => res,
             Err(e) => {
                 return Err(e.into());
             }
         };
 
-        if res.status() != hyper::StatusCode::OK {
+        if res.status() != http::StatusCode::OK {
             return Err(Error::BadStatusCode(res.status()));
         }
 
-        let bytes = hyper::body::to_bytes(res.into_body()).await?;
-
+        let bytes = res.bytes().await?;
         Ok(serde_json::from_slice(&bytes)?)
     }
 }
@@ -129,17 +105,19 @@ impl Client {
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error(transparent)]
-    Hyper(#[from] hyper::Error),
+    Reqwest(#[from] reqwest::Error),
     #[error("bad status code: {0}")]
-    BadStatusCode(hyper::StatusCode),
+    BadStatusCode(http::StatusCode),
     #[error(transparent)]
-    InvalidUri(#[from] InvalidUri),
+    InvalidUri(#[from] http::uri::InvalidUri),
     #[error(transparent)]
     Serde(#[from] serde_json::Error),
     #[error("tls setup: {0}")]
     TlsSetup(std::io::Error),
     #[error(transparent)]
     Rustls(#[from] rustls::Error),
+    #[error(transparent)]
+    Pem(#[from] rustls::pki_types::pem::Error),
     #[error(transparent)]
     Webpki(#[from] webpki::Error),
 }

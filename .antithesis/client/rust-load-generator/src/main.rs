@@ -276,7 +276,7 @@ async fn subscribe(addr: String, mut tripwire: Tripwire) -> eyre::Result<()> {
                     error!("could not subscribe: {e}");
                     if !matches!(
                         e,
-                        corro_client::Error::Hyper(_)
+                        corro_client::Error::Reqwest(_)
                             | corro_client::Error::Http(_)
                             | corro_client::Error::InvalidUri(_)
                     ) {
@@ -339,8 +339,7 @@ async fn create_client(addr: &str) -> Result<CorrosionClient> {
         Some(ip_addr) => {
             let addr =
                 SocketAddr::from((ip_addr, host_port.next().unwrap_or("8080").parse().unwrap()));
-            let corro_client = CorrosionClient::new(addr, "/var/lib/corrosion2/state.db");
-            Ok(corro_client)
+            Ok(CorrosionClient::new(addr, "/var/lib/corrosion2/state.db")?)
         }
         None => Err(eyre!("could not resolve ip address for {}", addr)),
     }

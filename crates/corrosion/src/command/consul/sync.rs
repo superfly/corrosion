@@ -42,7 +42,7 @@ pub async fn run<P: AsRef<Path>>(
             .into_boxed_str(),
     );
 
-    let corrosion = CorrosionClient::new(api_addr, db_path);
+    let corrosion = CorrosionClient::new(api_addr, db_path)?;
     let consul = consul_client::Client::new(config.client.clone())?;
 
     info!("Setting up corrosion for consul sync");

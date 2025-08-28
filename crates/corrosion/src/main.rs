@@ -632,7 +632,10 @@ struct Cli {
 impl Cli {
     fn api_client(&self) -> Result<CorrosionApiClient, ConfigError> {
         API_CLIENT
-            .get_or_try_init(|| Ok(CorrosionApiClient::new(self.api_addr()?)))
+            .get_or_try_init(|| {
+                CorrosionApiClient::new(self.api_addr()?)
+                    .map_err(|err| config::ConfigError::Foreign(Box::new(err)).into())
+            })
             .cloned()
     }
 

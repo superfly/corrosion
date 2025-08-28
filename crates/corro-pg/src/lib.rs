@@ -1,7 +1,9 @@
+mod codec;
 pub mod sql_state;
 pub mod utils;
 mod vtab;
 
+use eyre::WrapErr;
 use std::{
     collections::{BTreeSet, HashMap, VecDeque},
     fmt,
@@ -14,6 +16,7 @@ use std::{
 
 use bytes::Buf;
 use chrono::NaiveDateTime;
+use codec::PgWireMessageServerCodec;
 use compact_str::CompactString;
 use corro_types::{
     agent::{Agent, ChangeError},
@@ -30,21 +33,18 @@ use metrics::counter;
 use pgwire::{
     api::{
         results::{DataRowEncoder, FieldFormat, FieldInfo, Tag},
-        ClientInfo, ClientInfoHolder,
+        ClientInfo,
     },
     error::{ErrorInfo, PgWireError},
     messages::{
         data::{NoData, ParameterDescription, RowDescription},
         extendedquery::{BindComplete, CloseComplete, ParseComplete, PortalSuspended},
         response::{
-            CommandComplete, EmptyQueryResponse, ErrorResponse, ReadyForQuery,
-            READY_STATUS_FAILED_TRANSACTION_BLOCK, READY_STATUS_IDLE,
-            READY_STATUS_TRANSACTION_BLOCK,
+            CommandComplete, EmptyQueryResponse, ErrorResponse, ReadyForQuery, TransactionStatus,
         },
         startup::{ParameterStatus, SslRequest},
         PgWireBackendMessage, PgWireFrontendMessage,
     },
-    tokio::PgWireMessageServerCodec,
 };
 use postgres_types::{FromSql, Type};
 use rusqlite::{
@@ -153,26 +153,32 @@ impl StmtTag {
         matches!(self, StmtTag::Select | StmtTag::InsertAsSelect)
     }
     pub fn tag(&self, rows: Option<usize>) -> Tag {
-        match self {
-            StmtTag::Select => Tag::new_for_execution("SELECT", rows),
-            StmtTag::InsertAsSelect | StmtTag::Insert => Tag::new_for_execution("INSERT", rows),
-            StmtTag::Update => Tag::new_for_execution("UPDATE", rows),
-            StmtTag::Delete => Tag::new_for_execution("DELETE", rows),
-            StmtTag::Alter => Tag::new_for_execution("ALTER", rows),
-            StmtTag::Analyze => Tag::new_for_execution("ANALYZE", rows),
-            StmtTag::Attach => Tag::new_for_execution("ATTACH", rows),
-            StmtTag::Begin => Tag::new_for_execution("BEGIN", rows),
-            StmtTag::Commit => Tag::new_for_execution("COMMIT", rows),
-            StmtTag::Create => Tag::new_for_execution("CREATE", rows),
-            StmtTag::Detach => Tag::new_for_execution("DETACH", rows),
-            StmtTag::Drop => Tag::new_for_execution("DROP", rows),
-            StmtTag::Pragma => Tag::new_for_execution("PRAGMA", rows),
-            StmtTag::Reindex => Tag::new_for_execution("REINDEX", rows),
-            StmtTag::Release => Tag::new_for_execution("RELEASE", rows),
-            StmtTag::Rollback => Tag::new_for_execution("ROLLBACK", rows),
-            StmtTag::Savepoint => Tag::new_for_execution("SAVEPOINT", rows),
-            StmtTag::Vacuum => Tag::new_for_execution("VACUUM", rows),
-            StmtTag::Other => Tag::new_for_execution("OK", rows),
+        let tag = match self {
+            StmtTag::Select => Tag::new("SELECT"),
+            StmtTag::InsertAsSelect | StmtTag::Insert => Tag::new("INSERT"),
+            StmtTag::Update => Tag::new("UPDATE"),
+            StmtTag::Delete => Tag::new("DELETE"),
+            StmtTag::Alter => Tag::new("ALTER"),
+            StmtTag::Analyze => Tag::new("ANALYZE"),
+            StmtTag::Attach => Tag::new("ATTACH"),
+            StmtTag::Begin => Tag::new("BEGIN"),
+            StmtTag::Commit => Tag::new("COMMIT"),
+            StmtTag::Create => Tag::new("CREATE"),
+            StmtTag::Detach => Tag::new("DETACH"),
+            StmtTag::Drop => Tag::new("DROP"),
+            StmtTag::Pragma => Tag::new("PRAGMA"),
+            StmtTag::Reindex => Tag::new("REINDEX"),
+            StmtTag::Release => Tag::new("RELEASE"),
+            StmtTag::Rollback => Tag::new("ROLLBACK"),
+            StmtTag::Savepoint => Tag::new("SAVEPOINT"),
+            StmtTag::Vacuum => Tag::new("VACUUM"),
+            StmtTag::Other => Tag::new("OK"),
+        };
+
+        if let Some(r) = rows {
+            tag.with_rows(r)
+        } else {
+            tag
         }
     }
 }
@@ -243,7 +249,7 @@ impl ParsedCmd {
     }
 
     pub fn is_set(&self) -> bool {
-        matches!(self, ParsedCmd::Postgres(PgStatement::SetVariable { .. }))
+        matches!(self, ParsedCmd::Postgres(PgStatement::Set { .. }))
     }
 
     fn tag(&self) -> StmtTag {
@@ -470,6 +476,9 @@ pub enum PgStartError {
 }
 
 async fn setup_tls(pg: PgConfig) -> eyre::Result<(Option<TlsAcceptor>, bool)> {
+    use eyre::ContextCompat as _;
+    use rustls::pki_types::pem::PemObject as _;
+
     let tls = match pg.tls {
         Some(tls) => tls,
         None => {
@@ -479,66 +488,46 @@ async fn setup_tls(pg: PgConfig) -> eyre::Result<(Option<TlsAcceptor>, bool)> {
 
     let ssl_required = tls.verify_client;
 
-    let key = tokio::fs::read(&tls.key_file).await?;
+    let key_data = tokio::fs::read(&tls.key_file).await?;
     let key = if tls.key_file.extension() == Some("der") {
-        rustls::PrivateKey(key)
+        rustls::pki_types::PrivateKeyDer::try_from(key_data).map_err(|e| eyre::eyre!("{e}"))?
     } else {
-        let pkcs8 = rustls_pemfile::pkcs8_private_keys(&mut &*key)?;
-        match pkcs8.into_iter().next() {
-            Some(x) => rustls::PrivateKey(x),
-            None => {
-                let rsa = rustls_pemfile::rsa_private_keys(&mut &*key)?;
-                match rsa.into_iter().next() {
-                    Some(x) => rustls::PrivateKey(x),
-                    None => {
-                        eyre::bail!("no private keys found");
-                    }
-                }
-            }
-        }
+        rustls::pki_types::PrivateKeyDer::from_pem_slice(&key_data)?
     };
 
     let certs = tokio::fs::read(&tls.cert_file).await?;
     let certs = if tls.cert_file.extension() == Some("der") {
-        vec![rustls::Certificate(certs)]
+        vec![rustls::pki_types::CertificateDer::from(certs)]
     } else {
-        rustls_pemfile::certs(&mut &*certs)?
-            .into_iter()
-            .map(rustls::Certificate)
-            .collect()
+        rustls::pki_types::CertificateDer::pem_slice_iter(&certs)
+            .map(|res| res.wrap_err_with(|| format!("failed to read certs from {}", tls.key_file)))
+            .collect::<eyre::Result<Vec<_>>>()?
     };
 
-    let server_crypto = ServerConfig::builder().with_safe_defaults();
+    let server_crypto = ServerConfig::builder();
 
     let server_crypto = if ssl_required {
-        let ca_file = match &tls.ca_file {
-            None => {
-                eyre::bail!(
-                    "ca_file required in tls config for server client cert auth verification"
-                );
-            }
-            Some(ca_file) => ca_file,
-        };
+        let ca_file = tls
+            .ca_file
+            .as_ref()
+            .context("ca_file required in tls config for server client cert auth verification")?;
 
         let ca_certs = tokio::fs::read(&ca_file).await?;
-        let ca_certs = if ca_file.extension() == Some("der") {
-            vec![rustls::Certificate(ca_certs)]
-        } else {
-            rustls_pemfile::certs(&mut &*ca_certs)?
-                .into_iter()
-                .map(rustls::Certificate)
-                .collect()
-        };
 
         let mut root_store = rustls::RootCertStore::empty();
 
-        for cert in ca_certs {
-            root_store.add(&cert)?;
+        if ca_file.extension() == Some("der") {
+            root_store.add(rustls::pki_types::CertificateDer::from_slice(&ca_certs))?;
+        } else {
+            for cert in rustls::pki_types::CertificateDer::pem_slice_iter(&ca_certs) {
+                root_store
+                    .add(cert.wrap_err_with(|| format!("failed to read certs from {ca_file}"))?)?;
+            }
         }
 
-        server_crypto.with_client_cert_verifier(Arc::new(
-            rustls::server::AllowAnyAuthenticatedClient::new(root_store),
-        ))
+        server_crypto.with_client_cert_verifier(
+            rustls::server::WebPkiClientVerifier::builder(Arc::new(root_store)).build()?,
+        )
     } else {
         server_crypto.with_no_client_auth()
     };
@@ -593,37 +582,26 @@ pub async fn start(
                     return Ok(());
                 }
 
-                let (mut framed, secured) = match (tls_acceptor, is_sslrequest) {
+                let (which, secured) = match (tls_acceptor, is_sslrequest) {
                     (Some(tls_acceptor), true) => {
                         conn.stream.write_all(b"S").await?;
                         let tls_conn = tls_acceptor.accept(conn).await?;
-                        (
-                            Framed::new(
-                                Either::Left(tls_conn),
-                                PgWireMessageServerCodec::new(ClientInfoHolder::new(
-                                    local_addr, true,
-                                )),
-                            ),
-                            true,
-                        )
+                        (Either::Left(tls_conn), true)
                     }
                     (_, is_sslreq) => {
                         if is_sslreq {
                             conn.stream.write_all(b"N").await?;
                         }
-                        (
-                            Framed::new(
-                                Either::Right(conn),
-                                PgWireMessageServerCodec::new(ClientInfoHolder::new(
-                                    local_addr, false,
-                                )),
-                            ),
-                            false,
-                        )
+                        (Either::Right(conn), false)
                     }
                 };
 
                 trace!("SSL ? {secured}");
+
+                let mut framed = Framed::new(
+                    which,
+                    PgWireMessageServerCodec::new(codec::Client::new(local_addr, secured)),
+                );
 
                 let msg = match framed.next().await {
                     Some(msg) => msg?,
@@ -651,7 +629,10 @@ pub async fn start(
                     }
                 }
 
-                framed.set_state(pgwire::api::PgWireConnectionState::ReadyForQuery);
+                framed
+                    .codec_mut()
+                    .client_info
+                    .set_state(pgwire::api::PgWireConnectionState::ReadyForQuery);
 
                 framed
                     .feed(PgWireBackendMessage::Authentication(
@@ -668,7 +649,7 @@ pub async fn start(
 
                 framed
                     .feed(PgWireBackendMessage::ReadyForQuery(ReadyForQuery::new(
-                        READY_STATUS_IDLE,
+                        TransactionStatus::Idle,
                     )))
                     .await?;
 
@@ -896,8 +877,8 @@ pub async fn start(
                                     continue;
                                 }
                                 PgWireFrontendMessage::Parse(parse) => {
-                                    let name: &str = parse.name().as_deref().unwrap_or("");
-                                    let mut cmds = match parse_query(parse.query()) {
+                                    let name: &str = parse.name.as_deref().unwrap_or_default();
+                                    let mut cmds = match parse_query(&parse.query) {
                                         Ok(cmds) => cmds,
                                         Err(e) => {
                                             back_tx.blocking_send(
@@ -948,7 +929,7 @@ pub async fn start(
 
                                             trace!("parsed cmd: {parsed_cmd:#?}");
 
-                                            let prepped = match session.conn.prepare(parse.query()) {
+                                            let prepped = match session.conn.prepare(&parse.query) {
                                                 Ok(prepped) => prepped,
                                                 Err(e) => {
                                                     back_tx.blocking_send(
@@ -971,7 +952,7 @@ pub async fn start(
                                             };
 
                                             let mut param_types: Vec<Type> = parse
-                                                .type_oids()
+                                                .type_oids
                                                 .iter()
                                                 .filter_map(|oid| Type::from_oid(*oid))
                                                 .collect();
@@ -1034,7 +1015,7 @@ pub async fn start(
                                             prepared.insert(
                                                 name.into(),
                                                 Prepared::NonEmpty {
-                                                    sql: parse.query().clone(),
+                                                    sql: parse.query.clone(),
                                                     param_types,
                                                     fields,
                                                     cmd: Box::new(parsed_cmd),
@@ -1054,8 +1035,8 @@ pub async fn start(
                                     )?;
                                 }
                                 PgWireFrontendMessage::Describe(desc) => {
-                                    let name = desc.name().as_deref().unwrap_or("");
-                                    match desc.target_type() {
+                                    let name = desc.name.as_deref().unwrap_or_default();
+                                    match desc.target_type {
                                         // statement
                                         b'S' => match prepared.get(name) {
                                             None => {
@@ -1214,12 +1195,12 @@ pub async fn start(
                                 }
                                 PgWireFrontendMessage::Bind(bind) => {
                                     let portal_name = bind
-                                        .portal_name()
+                                        .portal_name
                                         .as_deref()
                                         .map(CompactString::from)
                                         .unwrap_or_default();
 
-                                    let stmt_name = bind.statement_name().as_deref().unwrap_or("");
+                                    let stmt_name = bind.statement_name.as_deref().unwrap_or_default();
 
                                     match prepared.get(stmt_name) {
                                         None => {
@@ -1278,14 +1259,14 @@ pub async fn start(
 
                                             trace!(
                                                 "bind params count: {}, statement params count: {}",
-                                                bind.parameters().len(),
+                                                bind.parameters.len(),
                                                 prepped.parameter_count()
                                             );
 
                                             debug!("bind param types: {param_types:?}");
 
                                             let mut format_codes = match bind
-                                            .parameter_format_codes()
+                                            .parameter_format_codes
                                             .iter()
                                             .map(|code| {
                                                 Ok(match *code {
@@ -1319,14 +1300,14 @@ pub async fn start(
                                             if format_codes.is_empty() {
                                                 // no format codes? default to text
                                                 format_codes =
-                                                    vec![FormatCode::Text; bind.parameters().len()];
+                                                    vec![FormatCode::Text; bind.parameters.len()];
                                             } else if format_codes.len() == 1 {
                                                 // single code means we should use it for all others
                                                 format_codes =
-                                                    vec![format_codes[0]; bind.parameters().len()];
+                                                    vec![format_codes[0]; bind.parameters.len()];
                                             }
 
-                                            for (i, param) in bind.parameters().iter().enumerate() {
+                                            for (i, param) in bind.parameters.iter().enumerate() {
                                                 let idx = i + 1;
                                                 let b = match param {
                                                     None => {
@@ -1545,7 +1526,7 @@ pub async fn start(
                                                     stmt_name: stmt_name.into(),
                                                     stmt: prepped,
                                                     result_formats: bind
-                                                        .result_column_format_codes()
+                                                        .result_column_format_codes
                                                         .iter()
                                                         .copied()
                                                         .map(FieldFormat::from)
@@ -1571,7 +1552,7 @@ pub async fn start(
                                     discard_until_sync = false;
                                 }
                                 PgWireFrontendMessage::Execute(execute) => {
-                                    let name = execute.name().as_deref().unwrap_or("");
+                                    let name = execute.name.as_deref().unwrap_or_default();
                                     let (prepped, result_formats, cmd) = match portals.get_mut(name)
                                     {
                                         Some(Portal::Empty { .. }) => {
@@ -1615,11 +1596,10 @@ pub async fn start(
 
                                     trace!("non-empty portal!");
 
-                                    let max_rows = *execute.max_rows();
-                                    let max_rows = if max_rows == 0 {
+                                    let max_rows = if execute.max_rows <= 0 {
                                         usize::MAX
                                     } else {
-                                        max_rows as usize
+                                        execute.max_rows as usize
                                     };
 
                                     if let Err(e) = session.handle_execute(
@@ -1647,7 +1627,7 @@ pub async fn start(
                                     }
                                 }
                                 PgWireFrontendMessage::Query(query) => {
-                                    let parsed_query = match parse_query(query.query()) {
+                                    let parsed_query = match parse_query(&query.query) {
                                         Ok(q) => q,
                                         Err(e) => {
                                             back_tx.blocking_send(
@@ -1763,8 +1743,8 @@ pub async fn start(
                                     continue;
                                 }
                                 PgWireFrontendMessage::Close(close) => {
-                                    let name = close.name().as_deref().unwrap_or("");
-                                    match close.target_type() {
+                                    let name = close.name.as_deref().unwrap_or_default();
+                                    match close.target_type {
                                         // statement
                                         b'S' => {
                                             if prepared.remove(name).is_some() {
@@ -1862,6 +1842,48 @@ pub async fn start(
                                                     "ERROR".into(),
                                                     "XX000".to_owned(),
                                                     "CopyDone is not implemented".into(),
+                                                )
+                                                .into(),
+                                            ),
+                                            true,
+                                        )
+                                            .into(),
+                                    )?;
+                                    continue;
+                                }
+                                PgWireFrontendMessage::CancelRequest(_) => {
+                                    // cancel.cancel(); ?
+                                    back_tx.blocking_send(
+                                        (
+                                            PgWireBackendMessage::ErrorResponse(
+                                                ErrorInfo::new(
+                                                    "ERROR".into(),
+                                                    "XX000".to_owned(),
+                                                    "Cancel is not implemented".into(),
+                                                )
+                                                .into(),
+                                            ),
+                                            true,
+                                        )
+                                            .into(),
+                                    )?;
+                                    continue;
+                                }
+                                PgWireFrontendMessage::GssEncRequest(_) => {
+                                    back_tx.blocking_send(
+                                        (
+                                            PgWireBackendMessage::GssEncResponse(pgwire::messages::response::GssEncResponse::Refuse), false
+                                        ).into())?;
+                                    continue;
+                                }
+                                PgWireFrontendMessage::SslRequest(_) => {
+                                    back_tx.blocking_send(
+                                        (
+                                            PgWireBackendMessage::ErrorResponse(
+                                                ErrorInfo::new(
+                                                    "ERROR".into(),
+                                                    "XX000".to_owned(),
+                                                    "SslRequest is not implemented".into(),
                                                 )
                                                 .into(),
                                             ),
@@ -2209,7 +2231,7 @@ impl<'conn> Session<'conn> {
                 let mut encoder = DataRowEncoder::new(schema.clone());
                 for (idx, field) in schema.iter().enumerate() {
                     trace!("processing field: {field:?}");
-                    let format = *field.format();
+                    let format = field.format();
                     match field.datatype() {
                         &Type::ANY => {
                             let data = row.get_ref_unwrap(idx);
@@ -2297,7 +2319,9 @@ impl<'conn> Session<'conn> {
                                 .unwrap();
                         }
                         _ => {
-                            return Err(UnsupportedSqliteToPostgresType(field.name().clone()).into())
+                            return Err(
+                                UnsupportedSqliteToPostgresType(field.name().to_owned()).into()
+                            )
                         }
                     }
                 }
@@ -2416,15 +2440,15 @@ fn send_ready(
             session.handle_commit()?;
         }
 
-        READY_STATUS_IDLE
+        TransactionStatus::Idle
     } else if session.tx_state.is_explicit() {
         if discard_until_sync {
-            READY_STATUS_FAILED_TRANSACTION_BLOCK
+            TransactionStatus::Error
         } else {
-            READY_STATUS_TRANSACTION_BLOCK
+            TransactionStatus::Transaction
         }
     } else {
-        READY_STATUS_IDLE
+        TransactionStatus::Idle
     };
 
     back_tx.blocking_send(
@@ -2656,37 +2680,6 @@ fn expr_to_name(expr: &Expr) -> Option<SqliteNameRef<'_>> {
         _ => None,
     }
 }
-
-// determines the type of a literal type if any
-// fn literal_type(expr: &Expr) -> Option<SqliteType> {
-//     match expr {
-//         Expr::Literal(lit) => match lit {
-//             Literal::Numeric(num) => {
-//                 if num.parse::<i64>().is_ok() {
-//                     Some(SqliteType::Integer)
-//                 } else if num.parse::<f64>().is_ok() {
-//                     Some(SqliteType::Real)
-//                 } else {
-//                     // this should be unreachable...
-//                     None
-//                 }
-//             }
-//             Literal::String(_) => Some(SqliteType::Text),
-//             Literal::Blob(_) => Some(SqliteType::Blob),
-//             Literal::Keyword(keyword) => {
-//                 // TODO: figure out what this is...
-//                 warn!("got a keyword: {keyword}");
-//                 None
-//             }
-//             Literal::Null => Some(SqliteType::Null),
-//             Literal::CurrentDate | Literal::CurrentTime | Literal::CurrentTimestamp => {
-//                 // TODO: make this configurable at connection time or something
-//                 Some(SqliteType::Text)
-//             }
-//         },
-//         _ => None,
-//     }
-// }
 
 fn handle_lhs_rhs<'stmt>(
     lhs: &'stmt Expr,
@@ -3433,10 +3426,7 @@ fn field_types(
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        io::BufReader,
-        time::{Duration, Instant},
-    };
+    use std::time::{Duration, Instant};
 
     use camino::Utf8PathBuf;
     use chrono::{DateTime, Utc};
@@ -3446,6 +3436,7 @@ mod tests {
         tls::{generate_ca, generate_client_cert, generate_server_cert},
     };
     use rcgen::Certificate;
+    use rustls::pki_types::pem::PemObject;
     use spawn::wait_for_all_pending_handles;
     use tempfile::TempDir;
     use tokio_postgres::NoTls;
@@ -3821,9 +3812,10 @@ mod tests {
 
         {
             let mut root_cert_store = tokio_rustls::rustls::RootCertStore::empty();
-            root_cert_store.add(&rustls::Certificate(certs.ca_cert.serialize_der()?))?;
+            root_cert_store.add(rustls::pki_types::CertificateDer::from_slice(
+                &certs.ca_cert.serialize_der()?,
+            ))?;
             let config = rustls::ClientConfig::builder()
-                .with_safe_defaults()
                 .with_root_certificates(root_cert_store)
                 .with_no_client_auth();
 
@@ -3878,21 +3870,20 @@ mod tests {
 
         {
             let mut root_cert_store = tokio_rustls::rustls::RootCertStore::empty();
-            root_cert_store.add(&rustls::Certificate(certs.ca_cert.serialize_der()?))?;
+            root_cert_store.add(rustls::pki_types::CertificateDer::from_slice(
+                &certs.ca_cert.serialize_der()?,
+            ))?;
 
-            let client_cert =
-                rustls_pemfile::certs(&mut BufReader::new(certs.client_cert_signed.as_bytes()))
-                    .map_err(|e| format!("failed to read client cert: {e}"))?;
+            let client_cert = rustls::pki_types::CertificateDer::pem_slice_iter(
+                certs.client_cert_signed.as_bytes(),
+            )
+            .collect::<Result<Vec<_>, _>>()?;
 
-            let client_cert: Vec<rustls::Certificate> = client_cert
-                .iter()
-                .map(|cert| rustls::Certificate(cert.clone()))
-                .collect();
-
+            let key = rustls::pki_types::PrivateKeyDer::try_from(certs.client_key.as_slice())?
+                .clone_key();
             let config = rustls::ClientConfig::builder()
-                .with_safe_defaults()
                 .with_root_certificates(root_cert_store.clone())
-                .with_client_auth_cert(client_cert, rustls::PrivateKey(certs.client_key))?;
+                .with_client_auth_cert(client_cert, key)?;
 
             let connector = MakeRustlsConnect::new(config);
 
@@ -3908,7 +3899,6 @@ mod tests {
             client.simple_query("SELECT 1").await?;
 
             let config = rustls::ClientConfig::builder()
-                .with_safe_defaults()
                 .with_root_certificates(root_cert_store)
                 .with_no_client_auth();
 
