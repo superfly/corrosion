@@ -50,7 +50,7 @@ async fn run(
         gossip_server_endpoint,
         transport,
         api_listeners,
-        tripwire,
+        mut tripwire,
         lock_registry,
         rx_bcast,
         rx_apply,
@@ -116,7 +116,7 @@ async fn run(
     // Setup client http API
     let mut http_handles = util::setup_http_api_handler(
         &agent,
-        &tripwire,
+        &mut tripwire,
         subs_bcast_cache,
         updates_bcast_cache,
         &subs_manager,

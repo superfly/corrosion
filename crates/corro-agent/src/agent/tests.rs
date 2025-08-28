@@ -60,10 +60,10 @@ async fn insert_rows_and_gossip() -> eyre::Result<()> {
     )
     .await?;
 
-    let client = hyper::Client::builder()
+    let client = reqwest::Client::builder()
         .pool_max_idle_per_host(5)
         .pool_idle_timeout(Duration::from_secs(300))
-        .build_http::<hyper::Body>();
+        .build()?;
 
     let req_body: Vec<Statement> = serde_json::from_value(json!([[
         "INSERT INTO tests (id,text) VALUES (?,?)",
@@ -72,18 +72,15 @@ async fn insert_rows_and_gossip() -> eyre::Result<()> {
 
     let res = timeout(
         Duration::from_secs(5),
-        client.request(
-            hyper::Request::builder()
-                .method(hyper::Method::POST)
-                .uri(format!("http://{}/v1/transactions", ta1.agent.api_addr()))
-                .header(hyper::header::CONTENT_TYPE, "application/json")
-                .body(serde_json::to_vec(&req_body)?.into())?,
-        ),
+        client
+            .post(format!("http://{}/v1/transactions", ta1.agent.api_addr()))
+            .header(hyper::header::CONTENT_TYPE, "application/json")
+            .body(serde_json::to_vec(&req_body)?)
+            .send(),
     )
     .await??;
 
-    let body: ExecResponse =
-        serde_json::from_slice(&hyper::body::to_bytes(res.into_body()).await?)?;
+    let body: ExecResponse = serde_json::from_slice(&res.bytes().await?)?;
 
     let db_version: CrsqlDbVersion =
         ta1.agent
@@ -131,17 +128,13 @@ async fn insert_rows_and_gossip() -> eyre::Result<()> {
     ]]))?;
 
     let res = client
-        .request(
-            hyper::Request::builder()
-                .method(hyper::Method::POST)
-                .uri(format!("http://{}/v1/transactions", ta1.agent.api_addr()))
-                .header(hyper::header::CONTENT_TYPE, "application/json")
-                .body(serde_json::to_vec(&req_body)?.into())?,
-        )
+        .post(format!("http://{}/v1/transactions", ta1.agent.api_addr()))
+        .header(hyper::header::CONTENT_TYPE, "application/json")
+        .body(serde_json::to_vec(&req_body)?)
+        .send()
         .await?;
 
-    let body: ExecResponse =
-        serde_json::from_slice(&hyper::body::to_bytes(res.into_body()).await?)?;
+    let body: ExecResponse = serde_json::from_slice(&res.bytes().await?)?;
 
     println!("body: {body:?}");
 
@@ -214,13 +207,11 @@ async fn insert_rows_and_gossip() -> eyre::Result<()> {
 
     timeout(
         Duration::from_secs(5),
-        client.request(
-            hyper::Request::builder()
-                .method(hyper::Method::POST)
-                .uri(format!("http://{}/v1/transactions", ta1.agent.api_addr()))
-                .header(hyper::header::CONTENT_TYPE, "application/json")
-                .body(serde_json::to_vec(&req_body)?.into())?,
-        ),
+        client
+            .post(format!("http://{}/v1/transactions", ta1.agent.api_addr()))
+            .header(hyper::header::CONTENT_TYPE, "application/json")
+            .body(serde_json::to_vec(&req_body)?)
+            .send(),
     )
     .await??;
 
@@ -330,7 +321,7 @@ pub async fn configurable_stress_test(
     })
     .await?;
 
-    let client: hyper::Client<_, hyper::Body> = hyper::Client::builder().build_http();
+    let client = reqwest::Client::new();
 
     let addrs: Vec<(ActorId, SocketAddr)> = agents
         .iter()
@@ -360,7 +351,7 @@ pub async fn configurable_stress_test(
     });
 
     let actor_versions = {
-        let client: hyper::Client<_, hyper::Body> = hyper::Client::builder().build_http();
+        let client = reqwest::Client::new();
 
         tokio_stream::StreamExt::map(futures::stream::iter(iter).chunks(20), {
             let addrs = addrs.clone();
@@ -373,21 +364,17 @@ pub async fn configurable_stress_test(
                     let (actor_id, chosen) = addrs.iter().choose(&mut rng).unwrap();
 
                     let res = client
-                        .request(
-                            hyper::Request::builder()
-                                .method(hyper::Method::POST)
-                                .uri(format!("http://{chosen}/v1/transactions"))
-                                .header(hyper::header::CONTENT_TYPE, "application/json")
-                                .body(serde_json::to_vec(&statements)?.into())?,
-                        )
+                        .post(format!("http://{chosen}/v1/transactions"))
+                        .header(hyper::header::CONTENT_TYPE, "application/json")
+                        .body(serde_json::to_vec(&statements)?)
+                        .send()
                         .await?;
 
                     if res.status() != StatusCode::OK {
                         eyre::bail!("unexpected status code: {}", res.status());
                     }
 
-                    let body: ExecResponse =
-                        serde_json::from_slice(&hyper::body::to_bytes(res.into_body()).await?)?;
+                    let body: ExecResponse = serde_json::from_slice(&res.bytes().await?)?;
 
                     for (i, statement) in statements.iter().enumerate() {
                         if !matches!(
@@ -602,10 +589,10 @@ async fn large_tx_sync() -> eyre::Result<()> {
     let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
     let ta1 = launch_test_agent(|conf| conf.build(), tripwire.clone()).await?;
 
-    let client = hyper::Client::builder()
+    let client = reqwest::ClientBuilder::new()
         .pool_max_idle_per_host(5)
         .pool_idle_timeout(Duration::from_secs(300))
-        .build_http::<hyper::Body>();
+        .build()?;
 
     let counts = [
         10000, 1000, 900, 800, 700, 600, 500, 400, 300, 200, 100, 1000, 900, 800, 700, 600, 500,
@@ -621,18 +608,15 @@ async fn large_tx_sync() -> eyre::Result<()> {
 
         let res = timeout(
             Duration::from_secs(5),
-            client.request(
-                hyper::Request::builder()
-                    .method(hyper::Method::POST)
-                    .uri(format!("http://{}/v1/transactions", ta1.agent.api_addr()))
-                    .header(hyper::header::CONTENT_TYPE, "application/json")
-                    .body(serde_json::to_vec(&req_body)?.into())?,
-            ),
+            client
+                .post(format!("http://{}/v1/transactions", ta1.agent.api_addr()))
+                .header(hyper::header::CONTENT_TYPE, "application/json")
+                .body(serde_json::to_vec(&req_body)?)
+                .send(),
         )
         .await??;
 
-        let body: ExecResponse =
-            serde_json::from_slice(&hyper::body::to_bytes(res.into_body()).await?)?;
+        let body: ExecResponse = serde_json::from_slice(&res.bytes().await?)?;
 
         println!("body: {body:?}");
     }
@@ -1339,7 +1323,7 @@ async fn many_small_changes() -> eyre::Result<()> {
         start_id += 100000;
         async move {
             tokio::spawn(async move {
-                let client: hyper::Client<_, hyper::Body> = hyper::Client::builder().build_http();
+                let client = reqwest::Client::new();
 
                 let durs = {
                     let between = rand::distr::Uniform::try_from(100..=1000).unwrap();
@@ -1364,21 +1348,17 @@ async fn many_small_changes() -> eyre::Result<()> {
                         ],]))?;
 
                         let res = client
-                            .request(
-                                hyper::Request::builder()
-                                    .method(hyper::Method::POST)
-                                    .uri(format!("http://{api_addr}/v1/transactions"))
-                                    .header(hyper::header::CONTENT_TYPE, "application/json")
-                                    .body(serde_json::to_vec(&req_body)?.into())?,
-                            )
+                            .post(format!("http://{api_addr}/v1/transactions"))
+                            .header(hyper::header::CONTENT_TYPE, "application/json")
+                            .body(serde_json::to_vec(&req_body)?)
+                            .send()
                             .await?;
 
                         if res.status() != StatusCode::OK {
                             eyre::bail!("bad status code: {}", res.status());
                         }
 
-                        let body: ExecResponse =
-                            serde_json::from_slice(&hyper::body::to_bytes(res.into_body()).await?)?;
+                        let body: ExecResponse = serde_json::from_slice(&res.bytes().await?)?;
 
                         match &body.results[0] {
                             ExecResult::Execute { .. } => {}
