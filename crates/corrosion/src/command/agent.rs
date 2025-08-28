@@ -76,7 +76,7 @@ pub async fn run(
     )?;
 
     if !config.db.schema_paths.is_empty() {
-        let client = corro_client::CorrosionApiClient::new(*config.api.bind_addr.first().unwrap());
+        let client = corro_client::CorrosionApiClient::new(*config.api.bind_addr.first().unwrap())?;
         match client
             .schema_from_paths(config.db.schema_paths.as_slice())
             .await

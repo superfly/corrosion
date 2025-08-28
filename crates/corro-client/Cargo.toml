@@ -15,15 +15,18 @@ corro-utils = { path = "../corro-utils" }
 futures = { workspace = true }
 hickory-resolver = { workspace = true }
 http = { workspace = true }
-hyper = { workspace = true }
+http-body.workspace = true
 pin-project-lite = { workspace = true }
+reqwest.workspace = true
+serde = { workspace = true }
 serde_json = { workspace = true }
+sqlite-pool = { path = "../sqlite-pool" }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
-sqlite-pool = { path = "../sqlite-pool" }
-serde = { workspace = true }
 
-[features]
+[dev-dependencies]
+hyper.workspace = true
+hyper-util.workspace = true

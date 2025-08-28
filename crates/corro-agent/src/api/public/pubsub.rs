@@ -12,7 +12,6 @@ use corro_types::{
     pubsub::{MatcherCreated, MatcherError, MatcherHandle, NormalizeStatementError, SubsManager},
     sqlite::SqlitePoolError,
 };
-use futures::future::poll_fn;
 use rusqlite::Connection;
 use serde::Deserialize;
 use tokio::{
@@ -28,6 +27,8 @@ use tracing::{debug, error, info, warn};
 use tripwire::Tripwire;
 use uuid::Uuid;
 
+type BodySender = crate::streaming_body::Sender<Bytes>;
+
 #[derive(Clone, Copy, Debug, Default, Deserialize)]
 pub struct SubParams {
     #[serde(default)]
@@ -36,6 +37,7 @@ pub struct SubParams {
     skip_rows: bool,
 }
 
+#[axum_macros::debug_handler]
 pub async fn api_v1_sub_by_id(
     Extension(agent): Extension<Agent>,
     Extension(bcast_cache): Extension<SharedMatcherBroadcastCache>,
@@ -84,13 +86,13 @@ async fn sub_by_id(
 
                 return hyper::Response::builder()
                     .status(StatusCode::NOT_FOUND)
-                    .body(
+                    .header(http::header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(
                         serde_json::to_vec(&QueryEvent::Error(format_compact!(
                             "could not find subscription with id {id}"
                         )))
-                        .expect("could not serialize queries stream error")
-                        .into(),
-                    )
+                        .expect("could not serialize queries stream error"),
+                    ))
                     .expect("could not build error response");
             }
         }
@@ -111,7 +113,7 @@ async fn sub_by_id(
         .status(StatusCode::OK)
         .header("corro-query-id", id.to_string())
         .header("corro-query-hash", query_hash)
-        .body(body)
+        .body(axum::body::Body::new(body))
         .expect("could not build query response body")
 }
 
@@ -306,7 +308,7 @@ impl MatcherUpsertError {
     }
 }
 
-impl From<MatcherUpsertError> for hyper::Response<CountedBody<hyper::Body>> {
+impl From<MatcherUpsertError> for http::Response<axum::body::Body> {
     fn from(value: MatcherUpsertError) -> Self {
         hyper::Response::builder()
             .status(value.status_code())
@@ -680,7 +682,7 @@ pub async fn api_v1_subs(
 ) -> impl IntoResponse {
     let stmt = match expand_sql(&agent, &stmt).await {
         Ok(stmt) => stmt,
-        Err(e) => return hyper::Response::<CountedBody<hyper::Body>>::from(e),
+        Err(e) => return hyper::Response::from(e),
     };
 
     info!("Received subscription request for query: {stmt}");
@@ -699,9 +701,7 @@ pub async fn api_v1_subs(
 
     let (handle, maybe_created) = match upsert_res {
         Ok(res) => res,
-        Err(e) => {
-            return hyper::Response::<CountedBody<hyper::Body>>::from(MatcherUpsertError::from(e))
-        }
+        Err(e) => return hyper::Response::from(MatcherUpsertError::from(e)),
     };
 
     let (tx, body) = CountedBody::channel(
@@ -728,14 +728,14 @@ pub async fn api_v1_subs(
     .await
     {
         Ok(id) => id,
-        Err(e) => return hyper::Response::<CountedBody<hyper::Body>>::from(e),
+        Err(e) => return e.into(),
     };
 
     hyper::Response::builder()
         .status(StatusCode::OK)
         .header("corro-query-id", matcher_id.to_string())
         .header("corro-query-hash", query_hash)
-        .body(body)
+        .body(axum::body::Body::new(body))
         .expect("could not generate ok http response for query request")
 }
 
@@ -790,9 +790,9 @@ async fn handle_sub_event(
     buf: &mut BytesMut,
     event_buf: Bytes,
     meta: QueryEventMeta,
-    tx: &mut hyper::body::Sender,
+    tx: &mut BodySender,
     last_change_id: &mut ChangeId,
-) -> hyper::Result<()> {
+) -> Result<(), crate::streaming_body::SendError> {
     match meta {
         QueryEventMeta::EndOfQuery(Some(change_id)) | QueryEventMeta::Change(change_id) => {
             if !last_change_id.is_zero() && change_id > *last_change_id + 1 {
@@ -821,7 +821,7 @@ async fn handle_sub_event(
 async fn forward_bytes_to_body_sender(
     sub_id: Uuid,
     mut rx: mpsc::Receiver<(Bytes, QueryEventMeta)>,
-    mut tx: hyper::body::Sender,
+    mut tx: BodySender,
     mut tripwire: Tripwire,
 ) {
     let mut buf = BytesMut::new();
@@ -852,8 +852,8 @@ async fn forward_bytes_to_body_sender(
                         return;
                     }
                 } else {
-                    if let Err(e) = poll_fn(|cx| tx.poll_ready(cx)).await {
-                        warn!(%sub_id, error = %e, "body sender was closed or errored, stopping event broadcast sends");
+                    if tx.is_closed() {
+                        warn!(%sub_id, "body sender was closed, stopping event broadcast sends");
                         return;
                     }
                     send_deadline.as_mut().reset(tokio::time::Instant::now() + Duration::from_millis(10));
@@ -903,7 +903,6 @@ mod tests {
         config::Config,
         pubsub::ChangeType,
     };
-    use http_body::Body;
     use serde::de::DeserializeOwned;
     use spawn::wait_for_all_pending_handles;
     use std::time::Instant;
@@ -922,6 +921,24 @@ mod tests {
     use corro_tests::launch_test_agent;
     use corro_tests::tempdir::TempDir;
     use corro_types::api::SqliteValue::Integer;
+
+    async fn assert_ok(res: http::Response<axum::body::Body>) -> axum::body::BodyDataStream {
+        let status = res.status();
+        if status != StatusCode::OK {
+            match axum::body::to_bytes(res.into_body(), usize::MAX).await {
+                Ok(body) => {
+                    println!("body: {}", String::from_utf8_lossy(&body));
+                }
+                Err(err) => {
+                    println!("unable to read body: {err}");
+                }
+            }
+
+            panic!("{status} != OK");
+        } else {
+            res.into_body().into_data_stream()
+        }
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn test_api_v1_subs() -> eyre::Result<()> {
@@ -973,7 +990,7 @@ mod tests {
         let update_bcast_cache: SharedUpdateBroadcastCache = Default::default();
 
         {
-            let mut res = api_v1_subs(
+            let res = api_v1_subs(
                 Extension(agent.clone()),
                 Extension(bcast_cache.clone()),
                 Extension(tripwire.clone()),
@@ -983,19 +1000,14 @@ mod tests {
             .await
             .into_response();
 
-            if !res.status().is_success() {
-                let b = res.body_mut().data().await.unwrap().unwrap();
-                println!("body: {}", String::from_utf8_lossy(&b));
-            }
-
-            assert_eq!(res.status(), StatusCode::OK);
+            let body = assert_ok(res).await;
 
             // only want notifications
             // small sleep here to make sure `broadcast_changes` has already run
             // for earlier transactions
             tokio::time::sleep(Duration::from_secs(1)).await;
 
-            let mut notify_res = api_v1_updates(
+            let notify_res = api_v1_updates(
                 Extension(agent.clone()),
                 Extension(update_bcast_cache.clone()),
                 Extension(tripwire.clone()),
@@ -1004,12 +1016,7 @@ mod tests {
             .await
             .into_response();
 
-            if !notify_res.status().is_success() {
-                let b = notify_res.body_mut().data().await.unwrap().unwrap();
-                println!("body: {}", String::from_utf8_lossy(&b));
-            }
-
-            assert_eq!(notify_res.status(), StatusCode::OK);
+            let notify_body = assert_ok(notify_res).await;
 
             let (status_code, _) = api_v1_transactions(
                 Extension(agent.clone()),
@@ -1023,19 +1030,8 @@ mod tests {
 
             assert_eq!(status_code, StatusCode::OK);
 
-            let mut rows = RowsIter {
-                body: res.into_body(),
-                codec: LinesCodec::new(),
-                buf: BytesMut::new(),
-                done: false,
-            };
-
-            let mut notify_rows = RowsIter {
-                body: notify_res.into_body(),
-                codec: LinesCodec::new(),
-                buf: BytesMut::new(),
-                done: false,
-            };
+            let mut rows = RowsIter::new(body);
+            let mut notify_rows = RowsIter::new(notify_body);
 
             assert_eq!(
                 rows.recv::<QueryEvent>().await.unwrap().unwrap(),
@@ -1100,7 +1096,7 @@ mod tests {
                 NotifyEvent::Notify(ChangeType::Update, vec!["service-id-4".into()],)
             );
 
-            let mut res = api_v1_subs(
+            let res = api_v1_subs(
                 Extension(agent.clone()),
                 Extension(bcast_cache.clone()),
                 Extension(tripwire.clone()),
@@ -1113,19 +1109,7 @@ mod tests {
             .await
             .into_response();
 
-            if !res.status().is_success() {
-                let b = res.body_mut().data().await.unwrap().unwrap();
-                println!("body: {}", String::from_utf8_lossy(&b));
-            }
-
-            assert_eq!(res.status(), StatusCode::OK);
-
-            let mut rows_from = RowsIter {
-                body: res.into_body(),
-                codec: LinesCodec::new(),
-                buf: BytesMut::new(),
-                done: false,
-            };
+            let mut rows_from = RowsIter::new(assert_ok(res).await);
 
             assert_eq!(
                 rows_from.recv::<QueryEvent>().await.unwrap().unwrap(),
@@ -1138,7 +1122,7 @@ mod tests {
             );
 
             // new subscriber for updates
-            let mut notify_res2 = api_v1_updates(
+            let notify_res2 = api_v1_updates(
                 Extension(agent.clone()),
                 Extension(update_bcast_cache.clone()),
                 Extension(tripwire.clone()),
@@ -1147,19 +1131,7 @@ mod tests {
             .await
             .into_response();
 
-            if !notify_res2.status().is_success() {
-                let b = notify_res2.body_mut().data().await.unwrap().unwrap();
-                println!("body: {}", String::from_utf8_lossy(&b));
-            }
-
-            assert_eq!(notify_res2.status(), StatusCode::OK);
-
-            let mut notify_rows2 = RowsIter {
-                body: notify_res2.into_body(),
-                codec: LinesCodec::new(),
-                buf: BytesMut::new(),
-                done: false,
-            };
+            let mut notify_rows2 = RowsIter::new(assert_ok(notify_res2).await);
 
             let (status_code, _) = api_v1_transactions(
                 Extension(agent.clone()),
@@ -1201,7 +1173,7 @@ mod tests {
 
             // subscriber who arrives later!
 
-            let mut res = api_v1_subs(
+            let res = api_v1_subs(
                 Extension(agent.clone()),
                 Extension(bcast_cache.clone()),
                 Extension(tripwire.clone()),
@@ -1211,19 +1183,7 @@ mod tests {
             .await
             .into_response();
 
-            if !res.status().is_success() {
-                let b = res.body_mut().data().await.unwrap().unwrap();
-                println!("body: {}", String::from_utf8_lossy(&b));
-            }
-
-            assert_eq!(res.status(), StatusCode::OK);
-
-            let mut rows = RowsIter {
-                body: res.into_body(),
-                codec: LinesCodec::new(),
-                buf: BytesMut::new(),
-                done: false,
-            };
+            let mut rows = RowsIter::new(assert_ok(res).await);
 
             assert_eq!(
                 rows.recv::<QueryEvent>().await.unwrap().unwrap(),
@@ -1317,7 +1277,7 @@ mod tests {
 
         // previous subs have been dropped.
 
-        let mut res = api_v1_subs(
+        let res = api_v1_subs(
             Extension(agent.clone()),
             Extension(bcast_cache.clone()),
             Extension(tripwire.clone()),
@@ -1330,19 +1290,7 @@ mod tests {
         .await
         .into_response();
 
-        if !res.status().is_success() {
-            let b = res.body_mut().data().await.unwrap().unwrap();
-            println!("body: {}", String::from_utf8_lossy(&b));
-        }
-
-        assert_eq!(res.status(), StatusCode::OK);
-
-        let mut rows_from = RowsIter {
-            body: res.into_body(),
-            codec: LinesCodec::new(),
-            buf: BytesMut::new(),
-            done: false,
-        };
+        let mut rows_from = RowsIter::new(assert_ok(res).await);
 
         assert_eq!(
             rows_from.recv::<QueryEvent>().await.unwrap().unwrap(),
@@ -1365,7 +1313,7 @@ mod tests {
         );
 
         // change id 0 should start subs afresh
-        let mut res = api_v1_subs(
+        let res = api_v1_subs(
             Extension(agent.clone()),
             Extension(bcast_cache.clone()),
             Extension(tripwire.clone()),
@@ -1378,19 +1326,7 @@ mod tests {
         .await
         .into_response();
 
-        if !res.status().is_success() {
-            let b = res.body_mut().data().await.unwrap().unwrap();
-            println!("body: {}", String::from_utf8_lossy(&b));
-        }
-
-        assert_eq!(res.status(), StatusCode::OK);
-
-        let mut rows_zero = RowsIter {
-            body: res.into_body(),
-            codec: LinesCodec::new(),
-            buf: BytesMut::new(),
-            done: false,
-        };
+        let mut rows_zero = RowsIter::new(assert_ok(res).await);
 
         assert_eq!(
             rows_zero.recv::<QueryEvent>().await.unwrap().unwrap(),
@@ -1458,19 +1394,7 @@ mod tests {
         .await
         .into_response();
 
-        if !res.status().is_success() {
-            let b = res.body_mut().data().await.unwrap().unwrap();
-            println!("body: {}", String::from_utf8_lossy(&b));
-        }
-
-        assert_eq!(res.status(), StatusCode::OK);
-
-        let mut rows_from = RowsIter {
-            body: res.into_body(),
-            codec: LinesCodec::new(),
-            buf: BytesMut::new(),
-            done: false,
-        };
+        let mut rows_from = RowsIter::new(assert_ok(res).await);
 
         let (status_code, _) = api_v1_transactions(
             Extension(agent.clone()),
@@ -1496,7 +1420,7 @@ mod tests {
 
         // skip rows AND from
 
-        let mut res = api_v1_subs(
+        let res = api_v1_subs(
             Extension(agent.clone()),
             Extension(bcast_cache.clone()),
             Extension(tripwire.clone()),
@@ -1509,19 +1433,7 @@ mod tests {
         .await
         .into_response();
 
-        if !res.status().is_success() {
-            let b = res.body_mut().data().await.unwrap().unwrap();
-            println!("body: {}", String::from_utf8_lossy(&b));
-        }
-
-        assert_eq!(res.status(), StatusCode::OK);
-
-        let mut rows_from = RowsIter {
-            body: res.into_body(),
-            codec: LinesCodec::new(),
-            buf: BytesMut::new(),
-            done: false,
-        };
+        let mut rows_from = RowsIter::new(assert_ok(res).await);
 
         assert_eq!(
             tokio::time::timeout(Duration::from_secs(5), rows_from.recv::<QueryEvent>())
@@ -1609,7 +1521,7 @@ mod tests {
 
         let bcast_cache: SharedMatcherBroadcastCache = Default::default();
         let update_bcast_cache: SharedUpdateBroadcastCache = Default::default();
-        let mut res = api_v1_subs(
+        let res = api_v1_subs(
             Extension(ta1.agent.clone()),
             Extension(bcast_cache.clone()),
             Extension(tripwire.clone()),
@@ -1619,15 +1531,10 @@ mod tests {
         .await
         .into_response();
 
-        if !res.status().is_success() {
-            let b = res.body_mut().data().await.unwrap().unwrap();
-            println!("body: {}", String::from_utf8_lossy(&b));
-        }
-
-        assert_eq!(res.status(), StatusCode::OK);
+        let body = assert_ok(res).await;
 
         // only notifications
-        let mut notify_res = api_v1_updates(
+        let notify_res = api_v1_updates(
             Extension(ta1.agent.clone()),
             Extension(update_bcast_cache.clone()),
             Extension(tripwire.clone()),
@@ -1636,26 +1543,8 @@ mod tests {
         .await
         .into_response();
 
-        if !notify_res.status().is_success() {
-            let b = notify_res.body_mut().data().await.unwrap().unwrap();
-            println!("body: {}", String::from_utf8_lossy(&b));
-        }
-
-        assert_eq!(notify_res.status(), StatusCode::OK);
-
-        let mut notify_rows = RowsIter {
-            body: notify_res.into_body(),
-            codec: LinesCodec::new(),
-            buf: BytesMut::new(),
-            done: false,
-        };
-
-        let mut rows = RowsIter {
-            body: res.into_body(),
-            codec: LinesCodec::new(),
-            buf: BytesMut::new(),
-            done: false,
-        };
+        let mut notify_rows = RowsIter::new(assert_ok(notify_res).await);
+        let mut rows = RowsIter::new(body);
 
         assert_eq!(
             rows.recv::<QueryEvent>().await.unwrap().unwrap(),
@@ -1773,13 +1662,22 @@ mod tests {
     }
 
     struct RowsIter {
-        body: axum::body::BoxBody,
+        body: axum::body::BodyDataStream,
         codec: LinesCodec,
         buf: BytesMut,
         done: bool,
     }
 
     impl RowsIter {
+        fn new(body: axum::body::BodyDataStream) -> Self {
+            Self {
+                body,
+                codec: LinesCodec::new(),
+                buf: BytesMut::new(),
+                done: false,
+            }
+        }
+
         async fn recv<T: DeserializeOwned>(&mut self) -> Option<eyre::Result<T>> {
             if self.done {
                 return None;
@@ -1802,7 +1700,8 @@ mod tests {
                     }
                 }
 
-                let bytes_res = self.body.data().await;
+                use futures::StreamExt;
+                let bytes_res = self.body.next().await;
                 match bytes_res {
                     Some(Ok(b)) => {
                         // debug!("read {} bytes", b.len());

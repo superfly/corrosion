@@ -4,7 +4,7 @@ use corro_client::CorrosionApiClient;
 use tracing::info;
 
 pub async fn run<P: AsRef<Path>>(api_addr: SocketAddr, schema_paths: &[P]) -> eyre::Result<()> {
-    let client = CorrosionApiClient::new(api_addr);
+    let client = CorrosionApiClient::new(api_addr)?;
 
     client.schema_from_paths(schema_paths).await?;
     info!("Successfully reloaded Corrosion's schema from paths!");
@@ -25,7 +25,7 @@ mod tests {
         let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
         let ta = launch_test_agent(|conf| conf.build(), tripwire.clone()).await?;
 
-        let client = corro_client::CorrosionApiClient::new(ta.agent.api_addr());
+        let client = corro_client::CorrosionApiClient::new(ta.agent.api_addr())?;
         client
             .schema_from_paths(&ta.agent.config().db.schema_paths)
             .await?;

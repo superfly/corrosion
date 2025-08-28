@@ -10,6 +10,8 @@ workspace = true
 antithesis_sdk = { workspace = true }
 arc-swap = { workspace = true }
 axum = { workspace = true }
+axum-extra = { version = "0.10", features = ["typed-header"] }
+axum-macros = "0.5"
 backoff = { path = "../backoff" }
 bincode = { workspace = true }
 bytes = { workspace = true }
@@ -23,11 +25,16 @@ foca = { workspace = true }
 futures = { workspace = true }
 hex = { workspace = true }
 hickory-resolver = { workspace = true }
+http.workspace = true
+http-body.workspace = true
+http-body-util = { version = "0.1", features = ["channel"] }
 hyper = { workspace = true }
+hyper-util.workspace = true
 itertools = { workspace = true }
 metrics = { workspace = true }
 opentelemetry = { workspace = true }
 parking_lot = { workspace = true }
+pin-project-lite.workspace = true
 quinn = { workspace = true }
 quinn-proto = { workspace = true }
 quinn-plaintext = { workspace = true }
@@ -36,7 +43,6 @@ rand = { workspace = true }
 rangemap = { workspace = true }
 rusqlite = { workspace = true }
 rustls = { workspace = true }
-rustls-pemfile.workspace = true
 seahash = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -61,9 +67,8 @@ uhlc = { workspace = true }
 uuid = { workspace = true }
 corro-pg = { path = "../corro-pg" }
 indexmap = { workspace = true }
-pin-project-lite = { workspace = true }
 governor.workspace = true
 
 [dev-dependencies]
 corro-tests = { path = "../corro-tests" }
-http-body = { workspace = true }
+reqwest.workspace = true
