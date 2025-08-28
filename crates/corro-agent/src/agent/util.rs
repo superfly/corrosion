@@ -672,7 +672,6 @@ pub async fn process_fully_buffered_changes(
 
     if rows_impacted {
         let conn = agent.pool().read().await?;
-        info!(%actor_id, %version, "matching changes for subs from db version {version} actor {actor_id}");
         block_in_place(|| {
             if let Err(e) =
                 match_changes_from_db_version(agent.subs_manager(), &conn, version, actor_id)
@@ -1029,9 +1028,8 @@ pub async fn process_multiple_changes(
 
     let mut change_chunk_size = 0;
 
-    for (actor_id, changeset, db_version, _src) in changesets {
+    for (_actor_id, changeset, db_version, _src) in changesets {
         change_chunk_size += changeset.changes().len();
-        info!(%actor_id, %db_version, "(process_multiple_changes) matching changes for subs from db version {db_version} actor {actor_id}");
         match_changes(agent.subs_manager(), changeset.changes(), db_version);
         match_changes(agent.updates_manager(), changeset.changes(), db_version);
     }

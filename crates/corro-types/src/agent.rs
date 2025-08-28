@@ -855,7 +855,7 @@ pub struct LockRegistry {
 
 impl LockRegistry {
     fn remove(&self, id: &LockId) {
-        self.map.write().remove(id);
+        self.map.write().shift_remove(id);
     }
 
     async fn acquire_write<'a, T, C: fmt::Display, E: Into<Option<C>>>(
