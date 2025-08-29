@@ -296,14 +296,15 @@ pub async fn setup_http_api_handler(
                 .layer(Extension(tripwire.clone())),
         )
         .layer(DefaultBodyLimit::disable())
-        .layer(TraceLayer::new_for_http());
+        .layer(TraceLayer::new_for_http())
+        .into_make_service_with_connect_info::<std::net::SocketAddr>();
 
     let mut handles: Vec<JoinHandle<()>> = vec![];
     for api_listener in api_listeners {
         let api_addr = api_listener.local_addr()?;
         info!("Starting API listener on tcp/{api_addr}");
 
-        let svc = api.clone();
+        let mut svc = api.clone();
         let mut tw = tripwire.clone();
         let handle = spawn_counted(async move {
             loop {
@@ -327,14 +328,14 @@ pub async fn setup_http_api_handler(
                     continue;
                 }
 
-                let svc = svc.clone();
+                use tower::Service;
+                let Ok(svc) = svc.call(addr).await;
                 let mut tw = tw.clone();
                 tokio::spawn(async move {
                     let stream = hyper_util::rt::TokioIo::new(stream);
 
                     let hyper_service = hyper::service::service_fn(
                         move |request: hyper::Request<hyper::body::Incoming>| {
-                            use tower::Service;
                             svc.clone().call(request)
                         },
                     );
