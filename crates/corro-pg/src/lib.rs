@@ -205,6 +205,7 @@ impl<'a> Portal<'a> {
 }
 
 #[derive(Clone, Debug)]
+#[allow(clippy::large_enum_variant)]
 enum ParsedCmd {
     Sqlite(Cmd),
     Postgres(PgStatement),
