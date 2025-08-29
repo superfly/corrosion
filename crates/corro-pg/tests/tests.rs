@@ -351,14 +351,14 @@ async fn generate_and_write_certs(tmpdir: &TempDir) -> TestCertificates {
     let ca_cert = generate_ca().expect("failed to generate CA");
     let ca_pem = &ca_cert.serialize_pem().expect("failed to serialize CA");
     let (server_cert, server_cert_signed) = generate_server_cert(
-        &ca_pem,
+        ca_pem,
         &ca_cert.serialize_private_key_pem(),
         std::net::Ipv4Addr::LOCALHOST.into(),
     )
     .expect("failed to generate server cert");
 
     let (client_cert, client_cert_signed) =
-        generate_client_cert(&ca_pem, &ca_cert.serialize_private_key_pem())
+        generate_client_cert(ca_pem, &ca_cert.serialize_private_key_pem())
             .expect("failed to generate client cert");
 
     let base_path = Utf8PathBuf::from(tmpdir.path().display().to_string());
