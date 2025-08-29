@@ -734,7 +734,10 @@ mod tests {
 
                         let mut drop_conn_rx = drop_conn_rx.resubscribe();
                         tokio::spawn(async move {
-                            let conn = hyper::server::conn::http1::Builder::new().serve_connection(
+                            let conn = hyper::server::conn::http2::Builder::new(
+                                hyper_util::rt::TokioExecutor::new(),
+                            )
+                            .serve_connection(
                                 io,
                                 service_fn(move |_: Request<hyper::body::Incoming>| async move {
                                     let mut res = Response::new(Empty::new());
