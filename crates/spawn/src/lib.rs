@@ -9,7 +9,7 @@ use futures::Future;
 use pin_project_lite::pin_project;
 use tracing::{info, trace};
 
-/// Global counter for [spawn_counted] and [spawn_counted_w_handle]
+/// Global counter for [spawn_counted]
 pub static PENDING_HANDLES: AtomicUsize = AtomicUsize::new(0);
 
 #[cfg(all(unix, debug_assertions))]
@@ -24,37 +24,6 @@ where
     F::Output: Send,
 {
     tokio::spawn(CountedFut::new(fut, &PENDING_HANDLES))
-}
-
-/// Spawn `fut` as a [CountedFut] (increments/decrements an [AtomicUsize])
-/// on the given [tokio::runtime::Handle].
-#[track_caller]
-pub fn spawn_counted_w_handle<F>(
-    fut: F,
-    h: &tokio::runtime::Handle,
-) -> tokio::task::JoinHandle<F::Output>
-where
-    F: Future + Send + 'static,
-    F::Output: Send,
-{
-    h.spawn(CountedFut::new(fut, &PENDING_HANDLES))
-}
-
-/// Spawn blocking `fut` as a [CountedFut] (increments/decrements an [AtomicUsize])
-/// on the given [tokio::runtime::Handle].
-#[track_caller]
-pub fn spawn_blocking_counted_w_handle<F, R>(
-    func: F,
-    h: &tokio::runtime::Handle,
-) -> tokio::task::JoinHandle<R>
-where
-    F: FnOnce() -> R + Send + 'static,
-    R: Send + 'static,
-{
-    h.spawn_blocking(move || {
-        let _guard = CountedGuard::new(&PENDING_HANDLES);
-        func()
-    })
 }
 
 pub struct CountedGuard {
