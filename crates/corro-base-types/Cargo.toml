@@ -6,7 +6,6 @@ description = "common API types for corrosion"
 license = "MIT"
 
 [dependencies]
-async-trait = { workspace = true }
 deadpool = { workspace = true }
 camino = { workspace = true }
 compact_str = { workspace = true }
