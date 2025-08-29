@@ -1,4 +1,7 @@
 steps:
+  - block: "Approve to run CI"
+    if: build.pull_request.id != null && build.env("BUILDKITE_PULL_REQUEST_REPO") != build.env("BUILDKITE_REPO")
+
   - label: "🔍 Lint"
     priority: 80
     key: lint
