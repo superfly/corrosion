@@ -7,7 +7,6 @@ edition = "2021"
 workspace = true
 
 [dependencies]
-async-trait.workspace = true
 bytes = { workspace = true }
 compact_str = { workspace = true }
 corro-types = { path = "../corro-types" }
