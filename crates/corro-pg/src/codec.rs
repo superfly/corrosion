@@ -109,7 +109,7 @@ impl PgWireMessageServerCodec {
     pub fn new(client: Client) -> Self {
         Self {
             client_info: client,
-            decode_context: Default::default(),
+            decode_context: msg::DecodeContext::new(msg::ProtocolVersion::PROTOCOL3_0),
         }
     }
 }
@@ -126,7 +126,6 @@ impl codec::Decoder for PgWireMessageServerCodec {
             api::PgWireConnectionState::AwaitingStartup => {
                 self.decode_context.awaiting_ssl = false;
             }
-
             _ => {
                 self.decode_context.awaiting_startup = false;
             }
@@ -148,67 +147,25 @@ impl codec::Encoder<msg::PgWireBackendMessage> for PgWireMessageServerCodec {
     }
 }
 
-// impl<T: 'static, S> ClientInfo for codec::Framed<T, PgWireMessageServerCodec<S>> {
-//     fn socket_addr(&self) -> std::net::SocketAddr {
-//         self.codec().client_info.socket_addr
-//     }
+pub(super) trait SetState {
+    fn set_state(&mut self, state: pgwire::api::PgWireConnectionState);
+}
 
-//     fn is_secure(&self) -> bool {
-//         self.codec().client_info.is_secure
-//     }
+impl<T: 'static> SetState for codec::Framed<T, PgWireMessageServerCodec> {
+    fn set_state(&mut self, state: pgwire::api::PgWireConnectionState) {
+        self.codec_mut().client_info.set_state(state);
+    }
+}
 
-//     fn pid_and_secret_key(&self) -> (i32, SecretKey) {
-//         self.codec().client_info.pid_and_secret_key()
-//     }
-
-//     fn set_pid_and_secret_key(&mut self, pid: i32, secret_key: SecretKey) {
-//         self.codec_mut()
-//             .client_info
-//             .set_pid_and_secret_key(pid, secret_key);
-//     }
-
-//     fn protocol_version(&self) -> msg::ProtocolVersion {
-//         self.codec().client_info.protocol_version()
-//     }
-
-//     fn set_protocol_version(&mut self, version: msg::ProtocolVersion) {
-//         self.codec_mut().client_info.set_protocol_version(version);
-//     }
-
-//     fn state(&self) -> PgWireConnectionState {
-//         self.codec().client_info.state
-//     }
-
-//     fn set_state(&mut self, new_state: PgWireConnectionState) {
-//         self.codec_mut().client_info.set_state(new_state);
-//     }
-
-//     fn metadata(&self) -> &std::collections::HashMap<String, String> {
-//         self.codec().client_info.metadata()
-//     }
-
-//     fn metadata_mut(&mut self) -> &mut std::collections::HashMap<String, String> {
-//         self.codec_mut().client_info.metadata_mut()
-//     }
-
-//     fn transaction_status(&self) -> TransactionStatus {
-//         self.codec().client_info.transaction_status()
-//     }
-
-//     fn set_transaction_status(&mut self, new_status: TransactionStatus) {
-//         self.codec_mut()
-//             .client_info
-//             .set_transaction_status(new_status);
-//     }
-
-//     fn client_certificates<'a>(&self) -> Option<&[CertificateDer<'a>]> {
-//         if !self.is_secure() {
-//             None
-//         } else {
-//             let socket =
-//                 <dyn std::any::Any>::downcast_ref::<TlsStream<TcpStream>>(self.get_ref()).unwrap();
-//             let (_, tls_session) = socket.get_ref();
-//             tls_session.peer_certificates()
-//         }
-//     }
-// }
+impl<L, R> SetState for tokio_util::either::Either<L, R>
+where
+    L: SetState,
+    R: SetState,
+{
+    fn set_state(&mut self, state: pgwire::api::PgWireConnectionState) {
+        match self {
+            Self::Left(l) => l.set_state(state),
+            Self::Right(r) => r.set_state(state),
+        }
+    }
+}
