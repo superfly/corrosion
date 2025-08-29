@@ -43,7 +43,6 @@ use axum_extra::{
 };
 use corro_types::broadcast::Timestamp;
 use foca::Member;
-use futures::FutureExt;
 use http::StatusCode;
 use metrics::{counter, histogram};
 use rangemap::{RangeInclusiveMap, RangeInclusiveSet};
@@ -303,14 +302,30 @@ pub async fn setup_http_api_handler(
     for api_listener in api_listeners {
         let api_addr = api_listener.local_addr()?;
         info!("Starting API listener on tcp/{api_addr}");
+
         let svc = api.clone();
-        let tw = tripwire.clone();
-        spawn_counted(async move {
+        let mut tw = tripwire.clone();
+        let handle = spawn_counted(async move {
             loop {
-                let Ok((stream, _addr)) = api_listener.accept().await else {
-                    info!("API listener closed");
-                    break;
+                let (stream, addr) = tokio::select! {
+                    res = api_listener.accept() => {
+                        match res {
+                            Ok(s) => s,
+                            Err(error) => {
+                                debug!(%api_addr, %error, "API listener closed");
+                                break;
+                            }
+                        }
+                    }
+                    _ = &mut tw => {
+                        break;
+                    }
                 };
+
+                if let Err(error) = stream.set_nodelay(true) {
+                    error!(%addr, %error, "failed to set nodelay");
+                    continue;
+                }
 
                 let svc = svc.clone();
                 let mut tw = tw.clone();
@@ -324,12 +339,13 @@ pub async fn setup_http_api_handler(
                         },
                     );
 
-                    let builder = hyper_util::server::conn::auto::Builder::new(CountedExecutor);
+                    let builder =
+                        hyper_util::server::conn::auto::Builder::new(CountedExecutor).http1_only();
                     let conn = builder.serve_connection_with_upgrades(stream, hyper_service);
                     tokio::pin!(conn);
 
                     tokio::select! {
-                        res = conn.as_mut() => {
+                        _res = conn.as_mut() => {
                             info!("corrosion api is done");
                         }
                         _ = &mut tw => {
@@ -340,6 +356,8 @@ pub async fn setup_http_api_handler(
                 });
             }
         });
+
+        handles.push(handle);
     }
 
     Ok(handles)

@@ -30,3 +30,4 @@ uuid = { workspace = true }
 [dev-dependencies]
 hyper.workspace = true
 hyper-util.workspace = true
+tracing-test.workspace = true
