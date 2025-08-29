@@ -355,17 +355,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "axum-macros"
-version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "604fde5e028fea851ce1d8570bbdc034bec850d157f7569d10f347d06808c05c"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.106",
-]
-
-[[package]]
 name = "backoff"
 version = "0.1.0"
 dependencies = [
@@ -903,7 +892,6 @@ dependencies = [
  "arc-swap",
  "axum",
  "axum-extra",
- "axum-macros",
  "backoff",
  "bincode 2.0.1",
  "bytes",
@@ -968,7 +956,6 @@ dependencies = [
 name = "corro-api-types"
 version = "0.1.0-alpha.1"
 dependencies = [
- "async-trait",
  "camino",
  "compact_str 0.7.1",
  "deadpool",
@@ -987,7 +974,6 @@ dependencies = [
 name = "corro-base-types"
 version = "0.1.0-alpha.1"
 dependencies = [
- "async-trait",
  "camino",
  "compact_str 0.7.1",
  "deadpool",
@@ -1045,7 +1031,6 @@ dependencies = [
 name = "corro-pg"
 version = "0.1.0"
 dependencies = [
- "async-trait",
  "bytes",
  "camino",
  "chrono",
