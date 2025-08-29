@@ -1,5 +1,6 @@
 mod codec;
 pub mod sql_state;
+mod ssl;
 pub mod utils;
 mod vtab;
 
@@ -7,14 +8,12 @@ use eyre::WrapErr;
 use std::{
     collections::{BTreeSet, HashMap, VecDeque},
     fmt,
-    future::poll_fn,
     net::SocketAddr,
     str::{FromStr, Utf8Error},
     sync::Arc,
     time::Duration,
 };
 
-use bytes::Buf;
 use chrono::NaiveDateTime;
 use codec::PgWireMessageServerCodec;
 use compact_str::CompactString;
@@ -31,10 +30,7 @@ use fallible_iterator::FallibleIterator;
 use futures::{SinkExt, StreamExt};
 use metrics::counter;
 use pgwire::{
-    api::{
-        results::{DataRowEncoder, FieldFormat, FieldInfo, Tag},
-        ClientInfo,
-    },
+    api::results::{DataRowEncoder, FieldFormat, FieldInfo, Tag},
     error::{ErrorInfo, PgWireError},
     messages::{
         data::{NoData, ParameterDescription, RowDescription},
@@ -42,7 +38,7 @@ use pgwire::{
         response::{
             CommandComplete, EmptyQueryResponse, ErrorResponse, ReadyForQuery, TransactionStatus,
         },
-        startup::{ParameterStatus, SslRequest},
+        startup::ParameterStatus,
         PgWireBackendMessage, PgWireFrontendMessage,
     },
 };
@@ -60,8 +56,7 @@ use sqlite3_parser::ast::{
 };
 use sqlparser::ast::Statement as PgStatement;
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt, ReadBuf},
-    net::{TcpListener, TcpStream},
+    net::TcpListener,
     sync::{
         mpsc::{channel, Sender},
         AcquireError, OwnedSemaphorePermit,
@@ -436,35 +431,6 @@ enum OpenTxKind {
     Explicit,
 }
 
-async fn peek_for_sslrequest(tcp_socket: &mut TcpStream) -> std::io::Result<bool> {
-    let mut want_ssl = false;
-    let mut buf = [0u8; SslRequest::BODY_SIZE];
-    let mut buf = ReadBuf::new(&mut buf);
-    loop {
-        let size = poll_fn(|cx| tcp_socket.poll_peek(cx, &mut buf)).await?;
-        if size == 0 {
-            // the tcp_stream has ended
-            return Ok(false);
-        }
-        if size == SslRequest::BODY_SIZE {
-            let mut buf_ref = buf.filled();
-            // skip first 4 bytes
-            buf_ref.get_i32();
-            if buf_ref.get_i32() == SslRequest::BODY_MAGIC_NUMBER {
-                // the socket is sending sslrequest, read the first 8 bytes
-                // skip first 8 bytes
-                tcp_socket
-                    .read_exact(&mut [0u8; SslRequest::BODY_SIZE])
-                    .await?;
-                // ssl configured
-                want_ssl = true;
-            }
-
-            return Ok(want_ssl);
-        }
-    }
-}
-
 #[derive(Debug, thiserror::Error)]
 pub enum PgStartError {
     #[error(transparent)]
@@ -574,34 +540,45 @@ pub async fn start(
                         .with_retries(4);
                     sock.set_tcp_keepalive(&ka)?;
                 }
-                let is_sslrequest = peek_for_sslrequest(&mut conn.stream).await?;
 
-                // reject non-ssl connections if ssl is required (client cert auth)
-                if ssl_required && !is_sslrequest {
-                    debug!("rejecting non-ssl connection");
+                let mut tcp_socket = Framed::new(
+                    tokio::io::BufStream::new(conn),
+                    PgWireMessageServerCodec::new(codec::Client::new(local_addr, false)),
+                );
+
+                let negotiation =
+                    ssl::negotiate_ssl(&mut tcp_socket, tls_acceptor.is_some()).await?;
+
+                let (mut framed, secured) = if matches!(negotiation, ssl::SslNegotiationType::None)
+                {
+                    if ssl_required {
+                        debug!("rejecting non-ssl connection");
+                        return Ok(());
+                    }
+
+                    (Either::Left(tcp_socket), false)
+                } else if let Some(tls) = tls_acceptor {
+                    let tls_socket = tls.accept(tcp_socket.into_inner()).await?;
+
+                    if matches!(negotiation, ssl::SslNegotiationType::Direct) {
+                        ssl::check_alpn_for_direct_ssl(&tls_socket)?;
+                    }
+
+                    let framed = Framed::new(
+                        tokio::io::BufStream::new(tls_socket),
+                        PgWireMessageServerCodec::new(codec::Client::new(local_addr, true)),
+                    );
+
+                    (Either::Right(framed), true)
+                } else {
+                    trace!("received SSL connection attempt without a TLS acceptor configured");
                     return Ok(());
-                }
-
-                let (which, secured) = match (tls_acceptor, is_sslrequest) {
-                    (Some(tls_acceptor), true) => {
-                        conn.stream.write_all(b"S").await?;
-                        let tls_conn = tls_acceptor.accept(conn).await?;
-                        (Either::Left(tls_conn), true)
-                    }
-                    (_, is_sslreq) => {
-                        if is_sslreq {
-                            conn.stream.write_all(b"N").await?;
-                        }
-                        (Either::Right(conn), false)
-                    }
                 };
 
                 trace!("SSL ? {secured}");
 
-                let mut framed = Framed::new(
-                    which,
-                    PgWireMessageServerCodec::new(codec::Client::new(local_addr, secured)),
-                );
+                use crate::codec::SetState;
+                framed.set_state(pgwire::api::PgWireConnectionState::AwaitingStartup);
 
                 let msg = match framed.next().await {
                     Some(msg) => msg?,
@@ -629,10 +606,7 @@ pub async fn start(
                     }
                 }
 
-                framed
-                    .codec_mut()
-                    .client_info
-                    .set_state(pgwire::api::PgWireConnectionState::ReadyForQuery);
+                framed.set_state(pgwire::api::PgWireConnectionState::ReadyForQuery);
 
                 framed
                     .feed(PgWireBackendMessage::Authentication(
@@ -3422,596 +3396,4 @@ fn field_types(
     }
 
     Ok(fields)
-}
-
-#[cfg(test)]
-mod tests {
-    use std::time::{Duration, Instant};
-
-    use camino::Utf8PathBuf;
-    use chrono::{DateTime, Utc};
-    use corro_tests::{launch_test_agent, TestAgent};
-    use corro_types::{
-        config::PgTlsConfig,
-        tls::{generate_ca, generate_client_cert, generate_server_cert},
-    };
-    use rcgen::Certificate;
-    use rustls::pki_types::pem::PemObject;
-    use spawn::wait_for_all_pending_handles;
-    use tempfile::TempDir;
-    use tokio_postgres::NoTls;
-    use tokio_postgres_rustls::MakeRustlsConnect;
-    use tripwire::Tripwire;
-
-    use super::*;
-
-    async fn setup_pg_test_server(
-        tripwire: Tripwire,
-        tls_config: Option<PgTlsConfig>,
-    ) -> Result<(TestAgent, PgServer), BoxError> {
-        _ = tracing_subscriber::fmt::try_init();
-
-        let tmpdir = tempfile::tempdir()?;
-
-        tokio::fs::write(
-            tmpdir.path().join("kitchensink.sql"),
-            "
-            CREATE TABLE kitchensink (
-                id BIGINT PRIMARY KEY NOT NULL,
-                other_ts DATETIME,
-                updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
-            );
-        ",
-        )
-        .await?;
-
-        let ta = launch_test_agent(
-            |builder| {
-                builder
-                    .add_schema_path(tmpdir.path().display().to_string())
-                    .build()
-            },
-            tripwire.clone(),
-        )
-        .await?;
-
-        let server = start(
-            ta.agent.clone(),
-            PgConfig {
-                bind_addr: "127.0.0.1:0".parse()?,
-                tls: tls_config,
-                readonly: false,
-            },
-            tripwire,
-        )
-        .await?;
-
-        Ok((ta, server))
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_pg() -> Result<(), BoxError> {
-        let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
-
-        let (ta, server) = setup_pg_test_server(tripwire, None).await?;
-
-        let sema = ta.agent.write_sema().clone();
-
-        let conn_str = format!(
-            "host={} port={} user=testuser",
-            server.local_addr.ip(),
-            server.local_addr.port()
-        );
-
-        {
-            let (mut client, client_conn) = tokio_postgres::connect(&conn_str, NoTls).await?;
-            // let (mut client, client_conn) =
-            // tokio_postgres::connect("host=localhost port=5432 user=jerome", NoTls).await?;
-            println!("client is ready!");
-            tokio::spawn(client_conn);
-
-            let _permit = sema.acquire().await;
-
-            println!("before prepare");
-            let stmt = client.prepare("SELECT 1").await?;
-            println!(
-                "after prepare: params: {:?}, columns: {:?}",
-                stmt.params(),
-                stmt.columns()
-            );
-
-            println!("before query");
-            // add a timeout because the semaphore shouldn't block anything here
-            // it will fail if the semaphore prevents this query.
-            let rows = tokio::time::timeout(Duration::from_millis(100), client.query(&stmt, &[]))
-                .await??;
-
-            println!("rows count: {}", rows.len());
-            for row in rows {
-                println!("ROW!!! {row:?}");
-            }
-
-            println!("before execute");
-            let start = Instant::now();
-            let (affected_res, sema_elapsed) = tokio::join!(
-                async {
-                    let affected = client
-                        .execute("INSERT INTO tests VALUES (1,2)", &[])
-                        .await?;
-                    Ok::<_, tokio_postgres::Error>((affected, start.elapsed()))
-                },
-                async move {
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                    drop(_permit);
-                    start.elapsed()
-                }
-            );
-
-            let (affected, exec_elapsed) = affected_res?;
-
-            println!("after execute, affected: {affected}, sema elapsed: {sema_elapsed:?}, exec elapsed: {exec_elapsed:?}");
-
-            assert_eq!(affected, 1);
-
-            assert!(exec_elapsed > sema_elapsed);
-
-            let row = client.query_one("SELECT * FROM crsql_changes", &[]).await?;
-            println!("CHANGE ROW: {row:?}");
-
-            client
-                .batch_execute("SELECT 1; SELECT 2; SELECT 3;")
-                .await?;
-            println!("after batch exec");
-
-            client.batch_execute("SELECT 1; BEGIN; SELECT 3;").await?;
-            println!("after batch exec 2");
-
-            client.batch_execute("SELECT 3; COMMIT; SELECT 3;").await?;
-            println!("after batch exec 3");
-
-            let tx = client.transaction().await?;
-            println!("after begin I assume");
-            let res = tx
-                .execute(
-                    "INSERT INTO tests VALUES ($1, $2)",
-                    &[&2i64, &"hello world"],
-                )
-                .await?;
-            println!("res (rows affected): {res}");
-            let res = tx
-                .execute(
-                    "INSERT INTO tests2 VALUES ($1, $2)",
-                    &[&2i64, &"hello world 2"],
-                )
-                .await?;
-            println!("res (rows affected): {res}");
-            tx.commit().await?;
-            println!("after commit");
-
-            let row = client
-                .query_one("SELECT * FROM tests t WHERE t.id = ?", &[&2i64])
-                .await?;
-            println!("ROW: {row:?}");
-
-            let row = client
-                .query_one("SELECT * FROM tests t WHERE t.id = ?", &[&2i64])
-                .await?;
-            println!("ROW: {row:?}");
-
-            let row = client
-                .query_one("SELECT * FROM tests t WHERE t.id IN (?)", &[&2i64])
-                .await?;
-            println!("ROW: {row:?}");
-
-            let row = client
-        .query_one("SELECT t.id, t.text, t2.text as t2text FROM tests t LEFT JOIN tests2 t2 WHERE t.id = ? LIMIT ?", &[&2i64, &1i64])
-        .await?;
-            println!("ROW: {row:?}");
-
-            println!("t.id: {:?}", row.try_get::<_, i64>(0));
-            println!("t.text: {:?}", row.try_get::<_, String>(1));
-            println!("t2text: {:?}", row.try_get::<_, String>(2));
-
-            let now: DateTime<Utc> = Utc::now();
-            println!("NOW: {now:?}");
-
-            let row = client
-                .query_one(
-                    "INSERT INTO kitchensink (other_ts, id, updated_at) VALUES (?1, ?2, ?1) RETURNING updated_at",
-                    &[&now.naive_utc(), &1i64],
-                )
-                .await?;
-
-            println!("ROW: {row:?}");
-            let updated_at = row.try_get::<_, NaiveDateTime>(0)?;
-            println!("updated_at: {updated_at:?}");
-
-            assert_eq!(
-                now.timestamp_micros(),
-                updated_at.and_utc().timestamp_micros()
-            );
-
-            let future: DateTime<Utc> = Utc::now() + Duration::from_secs(1);
-            println!("NOW: {future:?}");
-
-            let row = client
-                .query_one(
-                    "UPDATE kitchensink SET other_ts = $ts, updated_at = $ts WHERE id = $id AND updated_at > ? RETURNING updated_at",
-                    &[&future.naive_utc(), &1i64, &(now - Duration::from_secs(1)).naive_utc()],
-                )
-                .await?;
-
-            println!("ROW: {row:?}");
-            let updated_at = row.try_get::<_, NaiveDateTime>(0)?;
-            println!("updated_at: {updated_at:?}");
-
-            assert_eq!(
-                future.timestamp_micros(),
-                updated_at.and_utc().timestamp_micros()
-            );
-
-            let row = client
-                .query_one(
-                    "SELECT COUNT(*) AS yep, COUNT(id) yeppers FROM kitchensink",
-                    &[],
-                )
-                .await?;
-            println!("COUNT ROW: {row:?}");
-        }
-
-        tripwire_tx.send(()).await.ok();
-        tripwire_worker.await;
-        wait_for_all_pending_handles().await;
-
-        Ok(())
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_pg_readonly() -> Result<(), BoxError> {
-        let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
-
-        let (ta, server) = setup_pg_test_server(tripwire.clone(), None).await?;
-
-        let readonly_server = start(
-            ta.agent.clone(),
-            PgConfig {
-                bind_addr: "127.0.0.1:0".parse()?,
-                tls: None,
-                readonly: true,
-            },
-            tripwire,
-        )
-        .await?;
-
-        // Do some writes first
-        {
-            let conn_str = format!(
-                "host={} port={} user=testuser",
-                server.local_addr.ip(),
-                server.local_addr.port()
-            );
-
-            let (client, client_conn) = tokio_postgres::connect(&conn_str, NoTls).await?;
-            println!("client is ready!");
-            tokio::spawn(client_conn);
-            client
-                .execute("INSERT INTO tests VALUES (1,2)", &[])
-                .await?;
-        }
-
-        // Then use the readonly conn
-        {
-            let conn_str = format!(
-                "host={} port={} user=testuser",
-                readonly_server.local_addr.ip(),
-                readonly_server.local_addr.port()
-            );
-
-            let (client, client_conn) = tokio_postgres::connect(&conn_str, NoTls).await?;
-            println!("readonly client is ready!");
-            tokio::spawn(client_conn);
-            assert_eq!(
-                client
-                    .query_one("SELECT * FROM tests", &[])
-                    .await
-                    .unwrap()
-                    .get::<_, String>(1),
-                "2"
-            );
-            assert!(client
-                .execute("INSERT INTO tests VALUES (3,4)", &[])
-                .await
-                .unwrap_err()
-                .as_db_error()
-                .unwrap()
-                .message()
-                .contains("readonly database"));
-        }
-
-        tripwire_tx.send(()).await.ok();
-        tripwire_worker.await;
-        wait_for_all_pending_handles().await;
-
-        Ok(())
-    }
-
-    struct TestCertificates {
-        ca_cert: Certificate,
-        client_cert_signed: String,
-        client_key: Vec<u8>,
-        ca_file: Utf8PathBuf,
-        server_cert_file: Utf8PathBuf,
-        server_key_file: Utf8PathBuf,
-    }
-
-    async fn generate_and_write_certs(tmpdir: &TempDir) -> Result<TestCertificates, BoxError> {
-        let ca_cert = generate_ca()?;
-        let (server_cert, server_cert_signed) = generate_server_cert(
-            &ca_cert.serialize_pem()?,
-            &ca_cert.serialize_private_key_pem(),
-            "127.0.0.1".parse()?,
-        )?;
-
-        let (client_cert, client_cert_signed) = generate_client_cert(
-            &ca_cert.serialize_pem()?,
-            &ca_cert.serialize_private_key_pem(),
-        )?;
-
-        let base_path = Utf8PathBuf::from(tmpdir.path().display().to_string());
-
-        let cert_file = base_path.join("cert.pem");
-        let key_file = base_path.join("cert.key");
-        let ca_file = base_path.join("ca.pem");
-
-        let client_cert_file = base_path.join("client-cert.pem");
-        let client_key_file = base_path.join("client-cert.key");
-
-        tokio::fs::write(&cert_file, &server_cert_signed).await?;
-        tokio::fs::write(&key_file, server_cert.serialize_private_key_pem()).await?;
-
-        tokio::fs::write(&ca_file, ca_cert.serialize_pem()?).await?;
-
-        tokio::fs::write(&client_cert_file, &client_cert_signed).await?;
-        tokio::fs::write(&client_key_file, client_cert.serialize_private_key_pem()).await?;
-
-        Ok(TestCertificates {
-            server_cert_file: cert_file,
-            server_key_file: key_file,
-            ca_cert,
-            client_cert_signed,
-            client_key: client_cert.serialize_private_key_der(),
-            ca_file,
-        })
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_pg_ssl() -> Result<(), BoxError> {
-        let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
-
-        let tmpdir = TempDir::new()?;
-        let certs = generate_and_write_certs(&tmpdir).await?;
-
-        let (ta, server) = setup_pg_test_server(
-            tripwire,
-            Some(PgTlsConfig {
-                cert_file: certs.server_cert_file,
-                key_file: certs.server_key_file,
-                ca_file: None,
-                verify_client: false,
-            }),
-        )
-        .await?;
-
-        let sema = ta.agent.write_sema().clone();
-
-        let conn_str = format!(
-            "host={} port={} user=testuser",
-            server.local_addr.ip(),
-            server.local_addr.port()
-        );
-
-        {
-            let mut root_cert_store = tokio_rustls::rustls::RootCertStore::empty();
-            root_cert_store.add(rustls::pki_types::CertificateDer::from_slice(
-                &certs.ca_cert.serialize_der()?,
-            ))?;
-            let config = rustls::ClientConfig::builder()
-                .with_root_certificates(root_cert_store)
-                .with_no_client_auth();
-
-            let connector = MakeRustlsConnect::new(config);
-
-            println!("connecting to: {conn_str}");
-
-            let (client, client_conn) = tokio_postgres::connect(&conn_str, connector).await?;
-
-            tokio::spawn(client_conn);
-
-            let _permit = sema.acquire().await;
-
-            println!("before query");
-
-            client.simple_query("SELECT 1").await?;
-        }
-
-        tripwire_tx.send(()).await.ok();
-        tripwire_worker.await;
-        wait_for_all_pending_handles().await;
-
-        Ok(())
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_pg_mtls() -> Result<(), BoxError> {
-        let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
-
-        let tmpdir = TempDir::new()?;
-
-        let certs = generate_and_write_certs(&tmpdir).await?;
-
-        let (ta, server) = setup_pg_test_server(
-            tripwire,
-            Some(PgTlsConfig {
-                cert_file: certs.server_cert_file,
-                key_file: certs.server_key_file,
-                ca_file: Some(certs.ca_file),
-                verify_client: true,
-            }),
-        )
-        .await?;
-
-        let sema = ta.agent.write_sema().clone();
-
-        let conn_str = format!(
-            "host={} port={} user=testuser",
-            server.local_addr.ip(),
-            server.local_addr.port()
-        );
-
-        {
-            let mut root_cert_store = tokio_rustls::rustls::RootCertStore::empty();
-            root_cert_store.add(rustls::pki_types::CertificateDer::from_slice(
-                &certs.ca_cert.serialize_der()?,
-            ))?;
-
-            let client_cert = rustls::pki_types::CertificateDer::pem_slice_iter(
-                certs.client_cert_signed.as_bytes(),
-            )
-            .collect::<Result<Vec<_>, _>>()?;
-
-            let key = rustls::pki_types::PrivateKeyDer::try_from(certs.client_key.as_slice())?
-                .clone_key();
-            let config = rustls::ClientConfig::builder()
-                .with_root_certificates(root_cert_store.clone())
-                .with_client_auth_cert(client_cert, key)?;
-
-            let connector = MakeRustlsConnect::new(config);
-
-            println!("connecting to: {conn_str} with client auth cert");
-            let (client, client_conn) = tokio_postgres::connect(&conn_str, connector).await?;
-
-            tokio::spawn(client_conn);
-
-            println!("successfully connected!");
-
-            let _permit = sema.acquire().await;
-
-            client.simple_query("SELECT 1").await?;
-
-            let config = rustls::ClientConfig::builder()
-                .with_root_certificates(root_cert_store)
-                .with_no_client_auth();
-
-            let connector = MakeRustlsConnect::new(config);
-
-            println!("connecting to: {conn_str} without client auth cert");
-            let result = tokio_postgres::connect(&conn_str, connector).await;
-            assert!(
-                result.is_err(),
-                "expected connect to fail without client auth cert"
-            );
-
-            println!("successfully failed to connect without client auth cert");
-        }
-
-        tripwire_tx.send(()).await.ok();
-        tripwire_worker.await;
-        wait_for_all_pending_handles().await;
-
-        Ok(())
-    }
-
-    // #[tokio::test(flavor = "multi_thread")]
-    // async fn test_write_permit_released_on_error() -> Result<(), BoxError> {
-    //     _ = tracing_subscriber::fmt::try_init();
-    //     let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
-    //     let tmpdir = tempfile::tempdir()?;
-
-    //     // Create a test table that will help us verify transaction state
-    //     tokio::fs::write(
-    //         tmpdir.path().join("test.sql"),
-    //         "CREATE TABLE test (id INTEGER PRIMARY KEY NOT NULL, value TEXT);",
-    //     )
-    //     .await?;
-
-    //     let ta = launch_test_agent(
-    //         |builder| {
-    //             builder
-    //                 .add_schema_path(tmpdir.path().display().to_string())
-    //                 .build()
-    //         },
-    //         tripwire.clone(),
-    //     )
-    //     .await?;
-
-    //     let server = start(
-    //         ta.agent.clone(),
-    //         PgConfig {
-    //             bind_addr: "127.0.0.1:0".parse()?,
-    //         },
-    //         tripwire,
-    //     )
-    //     .await?;
-
-    //     let conn_str = format!(
-    //         "host={} port={} user=testuser",
-    //         server.local_addr.ip(),
-    //         server.local_addr.port()
-    //     );
-
-    //     let (client, connection) = tokio_postgres::connect(&conn_str, NoTls).await?;
-    //     tokio::spawn(connection);
-
-    //     println!("before begin");
-
-    //     // Start transaction
-    //     client.execute("BEGIN", &[]).await?;
-
-    //     println!("after begin");
-
-    //     // Insert valid data to acquire write permit
-    //     client
-    //         .execute("INSERT INTO test (id, value) VALUES (1, 'test')", &[])
-    //         .await?;
-
-    //     // Attempt an invalid insert that will error
-    //     let err = client
-    //         .execute("INSERT INTO test (id, value) VALUES (1, 'duplicate')", &[])
-    //         .await
-    //         .unwrap_err();
-    //     assert!(err.to_string().contains("UNIQUE constraint failed"));
-    //     println!("after error");
-
-    //     // Verify we can still query in failed transaction
-    //     let rows = client.query("SELECT 1", &[]).await.unwrap();
-    //     assert_eq!(
-    //         rows.len(),
-    //         1,
-    //         "Query should succeed but transaction should be marked as failed"
-    //     );
-
-    //     // Try another write - should fail since we're in failed transaction
-    //     let err = client
-    //         .execute("INSERT INTO test (id, value) VALUES (2, 'test2')", &[])
-    //         .await
-    //         .unwrap_err();
-    //     assert!(err.to_string().contains("current transaction is aborted"));
-
-    //     // Verify ROLLBACK works and clears the failed state
-    //     client.execute("ROLLBACK", &[]).await?;
-
-    //     // Verify we can start a new transaction
-    //     client.execute("BEGIN", &[]).await?;
-    //     client
-    //         .execute("INSERT INTO test (id, value) VALUES (2, 'test2')", &[])
-    //         .await?;
-    //     client.execute("COMMIT", &[]).await?;
-
-    //     // Cleanup
-    //     tripwire_tx.send(()).await.ok();
-    //     tripwire_worker.await;
-    //     wait_for_all_pending_handles().await;
-
-    //     Ok(())
-    // }
 }
