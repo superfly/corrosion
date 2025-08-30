@@ -167,7 +167,7 @@ impl SyncStateV1 {
                         let start = cmp::max(range.start(), overlap.start());
                         let end = cmp::min(range.end(), overlap.end());
                         needs.entry(*actor_id).or_default().push(SyncNeedV1::Full {
-                            versions: (*start..=*end).into(),
+                            versions: CrsqlDbVersionRange::new(*start, *end),
                         })
                     }
                 }
