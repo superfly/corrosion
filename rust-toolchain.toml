@@ -1,6 +1,2 @@
 [toolchain]
-channel = "nightly-2024-09-05"
-targets = [
-    "x86_64-apple-darwin",
-    "x86_64-unknown-linux-gnu"
-]
+channel = "stable"

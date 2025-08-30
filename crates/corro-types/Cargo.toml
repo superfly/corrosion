@@ -5,6 +5,9 @@ edition = "2021"
 description = "common types for corrosion"
 license = "MIT"
 
+[lints]
+workspace = true
+
 [dependencies]
 arc-swap = { workspace = true }
 async-trait = { workspace = true }
