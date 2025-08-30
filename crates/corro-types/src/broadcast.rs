@@ -170,7 +170,7 @@ impl Changeset {
             // todo: this returns dummy version because empty set has an array of versions.
             // probably shouldn't be doing this
             Changeset::EmptySet { .. } => CrsqlDbVersionRange::empty(),
-            Changeset::Full { version, .. } => (*version..=*version).into(),
+            Changeset::Full { version, .. } => CrsqlDbVersionRange::single(*version),
         }
     }
 
@@ -549,7 +549,7 @@ pub async fn broadcast_changes(
                                     changeset: Changeset::Full {
                                         version: db_version,
                                         changes,
-                                        seqs: seqs.into(),
+                                        seqs,
                                         last_seq,
                                         ts,
                                     },

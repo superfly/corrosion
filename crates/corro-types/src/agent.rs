@@ -1140,7 +1140,7 @@ impl VersionsSnapshot {
             }
             let details = json!({"count": count, "range": range});
             assert_always!(count == 1, "ineffective deletion of gaps in-db", &details);
-            for version in CrsqlDbVersionRange::from(range.clone()) {
+            for version in CrsqlDbVersionRange::from(&range) {
                 self.partials.remove(&version);
             }
             self.needed.remove(range);

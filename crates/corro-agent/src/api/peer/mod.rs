@@ -751,7 +751,7 @@ fn send_change_chunks<I: Iterator<Item = rusqlite::Result<Change>>>(
             Some(Ok((changes, seqs))) => {
                 let start = Instant::now();
 
-                if changes.is_empty() && *seqs.start() == CrsqlSeq(0) && *seqs.end() == last_seq {
+                if changes.is_empty() && seqs.start() == CrsqlSeq(0) && seqs.end() == last_seq {
                     warn!(%actor_id, %version, "got an empty changes we should've had");
                     return Ok(());
                 } else {
@@ -760,7 +760,7 @@ fn send_change_chunks<I: Iterator<Item = rusqlite::Result<Change>>>(
                         changeset: Changeset::Full {
                             version,
                             changes,
-                            seqs: seqs.into(),
+                            seqs,
                             last_seq,
                             ts,
                         },
