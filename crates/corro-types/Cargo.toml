@@ -52,6 +52,7 @@ uhlc = { workspace = true }
 uuid = { workspace = true }
 strum = { workspace = true }
 antithesis_sdk = { workspace = true }
+
 [dev-dependencies]
-tracing-subscriber = { workspace = true }
 corro-tests = { path = "../corro-tests" }
+tracing-subscriber = { workspace = true }

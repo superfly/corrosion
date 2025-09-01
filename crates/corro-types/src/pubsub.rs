@@ -2425,17 +2425,20 @@ mod tests {
             tx.commit()?;
         }
 
-        let (handle, maybe_created) = subs.get_or_insert(
-            sql,
-            subscriptions_path.as_path(),
-            &schema,
-            &pool,
-            tripwire.clone(),
-        )?;
+        {
+            let (handle, maybe_created) = subs.get_or_insert(
+                sql,
+                subscriptions_path.as_path(),
+                &schema,
+                &pool,
+                tripwire.clone(),
+            )?;
 
-        assert!(maybe_created.is_some());
+            assert!(maybe_created.is_some());
 
-        handle.cleanup().await;
+            handle.cleanup().await;
+            subs.remove(&handle.id());
+        }
 
         tripwire_tx.send(()).await.ok();
         tripwire_worker.await;
