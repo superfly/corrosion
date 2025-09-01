@@ -17,7 +17,8 @@ const fn default_apply_queue() -> usize {
 }
 
 const fn default_wal_threshold() -> usize {
-    5
+    // Default of 5GB
+    5 * 1024
 }
 
 const fn default_processing_queue() -> usize {
@@ -221,7 +222,7 @@ pub struct PerfConfig {
     #[serde(default = "default_apply_queue")]
     pub apply_queue_len: usize,
     #[serde(default = "default_wal_threshold")]
-    pub wal_threshold_gb: usize,
+    pub wal_threshold_mb: usize,
     #[serde(default = "default_processing_queue")]
     pub processing_queue_len: usize,
     #[serde(default = "default_sql_tx_timeout")]
@@ -246,7 +247,7 @@ impl Default for PerfConfig {
             foca_channel_len: default_small_channel(),
             apply_queue_timeout: default_apply_timeout(),
             apply_queue_len: default_apply_queue(),
-            wal_threshold_gb: default_wal_threshold(),
+            wal_threshold_mb: default_wal_threshold(),
             processing_queue_len: default_processing_queue(),
             sql_tx_timeout: default_sql_tx_timeout(),
             min_sync_backoff: default_min_sync_backoff(),
