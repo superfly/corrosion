@@ -1678,6 +1678,7 @@ mod tests {
 
         tripwire_tx.send(()).await.ok();
         tripwire_worker.await;
+        ta1.agent.subs_manager().drop_handles().await;
         wait_for_all_pending_handles().await;
 
         Ok(())
