@@ -1,7 +1,7 @@
 //! Setup main agent state
 
 // External crates
-use antithesis_sdk::assert_always;
+use antithesis_sdk::assert_always_or_unreachable;
 use arc_swap::ArcSwap;
 use camino::Utf8PathBuf;
 use indexmap::IndexMap;
@@ -223,7 +223,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
                                 "kind": lock.kind,
                                 "state": lock.state,
                             });
-                            assert_always!(
+                            assert_always_or_unreachable!(
                                 duration < Duration::from_secs(60),
                                 "bookie lock held for too long",
                                 &details
