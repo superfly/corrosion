@@ -841,7 +841,7 @@ async fn process_sync(
                 let agg = reqs
                     .into_iter()
                     .flatten()
-                    .group_by(|req| req.0)
+                    .chunk_by(|req| req.0)
                     .into_iter()
                     .map(|(actor_id, reqs)| (actor_id, reqs.flat_map(|(_, reqs)| reqs).collect()))
                     .collect::<Vec<(ActorId, Vec<SyncNeedV1>)>>();

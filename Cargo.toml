@@ -36,7 +36,7 @@ http-body = "0.4.5"
 hyper = { version = "0.14.26", features = ["h2", "http1", "http2", "server", "tcp", "stream", "client", "runtime"] }
 hyper-rustls = { version = "0.24.0", features = ["http2"] }
 indexmap = { version = "2.1.0", features = ["serde"] }
-itertools = { version = "0.10.5" }
+itertools = { version = "0.14" }
 metrics = "0.24.2"
 metrics-exporter-prometheus = { version = "0.17.2", default-features = false, features = ["http-listener"] }
 metrics-util = { version = "0.20.0" }
