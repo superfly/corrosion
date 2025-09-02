@@ -1017,7 +1017,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn ensure_vacuum_works() -> eyre::Result<()> {
         let tmpdir = tempfile::tempdir()?;
-        let db_path = tmpdir.into_path().join("db.sqlite");
+        let db_path = tmpdir.keep().join("db.sqlite");
 
         {
             let db_conn = Connection::open(db_path.clone())?;
