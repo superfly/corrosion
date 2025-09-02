@@ -28,3 +28,6 @@ colors = false
 
 [consul.client]
 address = "localhost:8500"
+
+[perf]
+wal_threshold_mb = 5

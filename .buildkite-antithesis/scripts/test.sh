@@ -15,7 +15,7 @@ response=$(curl --fail -u "flyio:${ANTITHESIS_PASSWORD}" -X POST https://flyio.a
     \"antithesis.duration\":\"${CUSTOM_DURATION}\",
     \"antithesis.config_image\":\"antithesis-config:${COMMIT_HASH}\",
     \"antithesis.images\":\"corrosion:${COMMIT_HASH},corro-client:${COMMIT_HASH},consul:1.15.4\",
-    \"antithesis.report.recipients\":\"${EMAIL}\",
+    \"antithesis.report.recipients\":\"networking@fly.io\",
     \"antithesis.source\":\"${BUILDKITE_BRANCH}\"
 }}")
 
