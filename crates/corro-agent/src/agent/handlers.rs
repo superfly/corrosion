@@ -668,8 +668,8 @@ pub async fn handle_changes(
             continue;
         }
 
-        if let Some(mut seqs) = change.seqs().cloned() {
-            let v = *change.versions().start();
+        if let Some(mut seqs) = change.seqs() {
+            let v = change.versions().start();
             if let Some(seen_seqs) = seen.get(&(change.actor_id, v)) {
                 if seqs.all(|seq| seen_seqs.contains(&seq)) {
                     continue;
@@ -729,8 +729,8 @@ pub async fn handle_changes(
             if let Some((dropped_change, _, _)) = queue.pop_front() {
                 for v in dropped_change.versions() {
                     if let Entry::Occupied(mut entry) = seen.entry((change.actor_id, v)) {
-                        if let Some(seqs) = dropped_change.seqs().cloned() {
-                            entry.get_mut().remove(seqs);
+                        if let Some(seqs) = dropped_change.seqs() {
+                            entry.get_mut().remove(seqs.into());
                         } else {
                             entry.swap_remove_entry();
                         }
@@ -753,8 +753,8 @@ pub async fn handle_changes(
         // this will only run once for a non-empty changeset
         for v in change.versions() {
             let entry = seen.entry((change.actor_id, v)).or_default();
-            if let Some(seqs) = change.seqs().cloned() {
-                entry.extend([seqs]);
+            if let Some(seqs) = change.seqs() {
+                entry.extend([seqs.into()]);
             }
         }
 
@@ -900,7 +900,10 @@ mod tests {
     use corro_tests::TEST_SCHEMA;
     use corro_types::api::{ColumnName, TableName};
     use corro_types::{
-        base::CrsqlDbVersion, broadcast::Changeset, change::Change, config::Config,
+        base::{dbsr, dbvr, CrsqlDbVersion},
+        broadcast::Changeset,
+        change::Change,
+        config::Config,
         pubsub::pack_columns,
     };
     use rusqlite::Connection;
@@ -983,7 +986,7 @@ mod tests {
                         changeset: Changeset::Full {
                             version: CrsqlDbVersion(i as u64),
                             changes: vec![crsql_row.clone()],
-                            seqs: CrsqlSeq(0)..=CrsqlSeq(0),
+                            seqs: dbsr!(0, 0),
                             last_seq: CrsqlSeq(0),
                             ts: agent.clock().new_timestamp().into(),
                         },
@@ -1003,8 +1006,8 @@ mod tests {
             .unwrap()
             .read::<&str, _>("test", None)
             .await;
-        assert!(booked.contains_all(CrsqlDbVersion(6)..=CrsqlDbVersion(10), None));
-        assert!(booked.contains_all(CrsqlDbVersion(1)..=CrsqlDbVersion(3), None));
+        assert!(booked.contains_all(dbvr!(6, 10), None));
+        assert!(booked.contains_all(dbvr!(1, 3), None));
         assert!(!booked.contains_version(&CrsqlDbVersion(5)));
         assert!(!booked.contains_version(&CrsqlDbVersion(4)));
 
@@ -1021,7 +1024,7 @@ mod tests {
             db_conn.execute_batch("PRAGMA auto_vacuum = INCREMENTAL")?;
         }
 
-        println!("temp db: {:?}", db_path);
+        println!("temp db: {db_path:?}");
         let write_sema = Arc::new(Semaphore::new(1));
         let pool = SplitPool::create(db_path, write_sema.clone()).await?;
 

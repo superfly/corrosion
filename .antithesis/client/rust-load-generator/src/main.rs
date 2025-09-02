@@ -198,7 +198,7 @@ async fn query(addr: String, tripwire: Tripwire) -> eyre::Result<()> {
                         .query_typed::<TeamStats>(
                             &Statement::WithParams(
                                 TEAM_QUERY.into(),
-                                vec![format!("%{}%", letter).into()],
+                                vec![format!("%{letter}%").into()],
                             ),
                             None,
                         )

@@ -157,7 +157,10 @@ where
         res
     }
 
-    pub fn prepare(&self, sql: &str) -> Result<InterruptibleStatement<Statement>, rusqlite::Error> {
+    pub fn prepare(
+        &self,
+        sql: &str,
+    ) -> Result<InterruptibleStatement<Statement<'_>>, rusqlite::Error> {
         let stmt = self.conn.prepare(sql)?;
         self.current_sql.store(Arc::new(Some(sql.to_string())));
         Ok(InterruptibleStatement::new(
@@ -171,7 +174,7 @@ where
     pub fn prepare_cached(
         &self,
         sql: &str,
-    ) -> Result<InterruptibleStatement<CachedStatement>, rusqlite::Error> {
+    ) -> Result<InterruptibleStatement<CachedStatement<'_>>, rusqlite::Error> {
         let stmt = self.conn.prepare_cached(sql)?;
         self.current_sql.store(Arc::new(Some(sql.to_string())));
         Ok(InterruptibleStatement::new(

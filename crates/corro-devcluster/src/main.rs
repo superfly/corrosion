@@ -104,7 +104,7 @@ fn main() {
 }
 
 fn run_simple_topology(topo: Simple, bin_path: String, state_dir: PathBuf, schema_dir: PathBuf) {
-    println!("//// Creating topology: \n{:#?}", topo);
+    println!("//// Creating topology: \n{topo:#?}");
     let nodes = topo.get_all_nodes();
 
     let mut port_map = BTreeMap::default();
@@ -140,10 +140,7 @@ fn run_simple_topology(topo: Simple, bin_path: String, state_dir: PathBuf, schem
             bootstrap_set,
         );
 
-        println!(
-            "Generated config for node '{}': \n{}",
-            node_name, node_config
-        );
+        println!("Generated config for node '{node_name}': \n{node_config}",);
 
         let mut config_file = File::create(node_state.join("config.toml"))
             .expect("failed to create node config file");

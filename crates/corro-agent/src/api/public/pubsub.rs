@@ -884,7 +884,7 @@ mod tests {
     use corro_types::actor::ActorId;
     use corro_types::api::NotifyEvent;
     use corro_types::api::{ColumnName, TableName};
-    use corro_types::base::{CrsqlDbVersion, CrsqlSeq};
+    use corro_types::base::{dbsr, CrsqlDbVersion, CrsqlSeq};
     use corro_types::broadcast::{ChangeSource, ChangeV1, Changeset};
     use corro_types::change::Change;
     use corro_types::pubsub::pack_columns;
@@ -896,7 +896,6 @@ mod tests {
     use http_body::Body;
     use serde::de::DeserializeOwned;
     use spawn::wait_for_all_pending_handles;
-    use std::ops::RangeInclusive;
     use std::time::Instant;
     use tokio::time::timeout;
     use tokio_util::codec::{Decoder, LinesCodec};
@@ -1505,7 +1504,7 @@ mod tests {
             changeset: Changeset::Full {
                 version: CrsqlDbVersion(1),
                 changes: vec![change1, change2],
-                seqs: RangeInclusive::new(CrsqlSeq(0), CrsqlSeq(1)),
+                seqs: dbsr!(0, 1),
                 last_seq: CrsqlSeq(1),
                 ts: Default::default(),
             },
@@ -1602,7 +1601,7 @@ mod tests {
             changeset: Changeset::Full {
                 version: CrsqlDbVersion(2),
                 changes: vec![change3],
-                seqs: RangeInclusive::new(CrsqlSeq(0), CrsqlSeq(0)),
+                seqs: dbsr!(0, 0),
                 last_seq: CrsqlSeq(1),
                 ts: Default::default(),
             },
@@ -1644,7 +1643,7 @@ mod tests {
             changeset: Changeset::Full {
                 version: CrsqlDbVersion(2),
                 changes: vec![change4],
-                seqs: RangeInclusive::new(CrsqlSeq(1), CrsqlSeq(1)),
+                seqs: dbsr!(1, 1),
                 last_seq: CrsqlSeq(1),
                 ts: Default::default(),
             },
