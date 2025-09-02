@@ -1024,7 +1024,7 @@ mod tests {
             db_conn.execute_batch("PRAGMA auto_vacuum = INCREMENTAL")?;
         }
 
-        println!("temp db: {:?}", db_path);
+        println!("temp db: {db_path:?}");
         let write_sema = Arc::new(Semaphore::new(1));
         let pool = SplitPool::create(db_path, write_sema.clone()).await?;
 

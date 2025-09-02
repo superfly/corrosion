@@ -500,7 +500,7 @@ pub fn apply_schema(
                         }
                         .into());
                     }
-                    tx.execute_batch(&format!("ALTER TABLE {name} ADD COLUMN {}", col))?;
+                    tx.execute_batch(&format!("ALTER TABLE {name} ADD COLUMN {col}"))?;
                 }
 
                 if require_migration {

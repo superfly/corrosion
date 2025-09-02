@@ -53,9 +53,7 @@ impl CorrosionApiClient {
         statement: &Statement,
         timeout: Option<u64>,
     ) -> Result<QueryStream<T>, Error> {
-        let params = timeout
-            .map(|t| format!("?timeout={}", t))
-            .unwrap_or_default();
+        let params = timeout.map(|t| format!("?timeout={t}")).unwrap_or_default();
         let req = hyper::Request::builder()
             .method(hyper::Method::POST)
             .uri(format!("http://{}/v1/queries{}", self.api_addr, params))
@@ -115,7 +113,7 @@ impl CorrosionApiClient {
             )
             .try_into()?
         } else {
-            format!("/v1/subscriptions?skip_rows={}", skip_rows).try_into()?
+            format!("/v1/subscriptions?skip_rows={skip_rows}").try_into()?
         };
         let url = hyper::Uri::builder()
             .scheme("http")
@@ -179,7 +177,7 @@ impl CorrosionApiClient {
             )
             .try_into()?
         } else {
-            format!("/v1/subscriptions/{id}?skip_rows={}", skip_rows).try_into()?
+            format!("/v1/subscriptions/{id}?skip_rows={skip_rows}").try_into()?
         };
         let url = hyper::Uri::builder()
             .scheme("http")
@@ -227,7 +225,7 @@ impl CorrosionApiClient {
         &self,
         table: &str,
     ) -> Result<UpdatesStream<T>, Error> {
-        let p_and_q: PathAndQuery = format!("/v1/updates/{}", table).try_into()?;
+        let p_and_q: PathAndQuery = format!("/v1/updates/{table}").try_into()?;
 
         let url = hyper::Uri::builder()
             .scheme("http")

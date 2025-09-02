@@ -2845,7 +2845,7 @@ mod tests {
             let mut rx = created.evt_rx;
 
             let matcher_id = matcher.id().as_simple().to_string();
-            println!("matcher restored w/ id: {}", matcher_id);
+            println!("matcher restored w/ id: {matcher_id}");
 
             let (catch_up_tx, mut catch_up_rx) = mpsc::channel(1);
 
