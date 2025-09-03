@@ -1,6 +1,6 @@
 use corro_types::{
     actor::ClusterId,
-    broadcast::{BroadcastV1, ChangeSource, ChangeV1, UniPayload, UniPayloadV1},
+    broadcast::{BroadcastV1, BroadcastV2, ChangeSource, ChangeV1, UniPayload, UniPayloadV1},
     channel::CorroSender,
 };
 use metrics::counter;
@@ -66,16 +66,38 @@ pub fn spawn_unipayload_handler(
 
                                             match payload {
                                                 UniPayload::V1 {
-                                                    data:
-                                                        UniPayloadV1::Broadcast(BroadcastV1::Change(
-                                                            change,
-                                                        )),
+                                                    data: payload_data,
                                                     cluster_id: payload_cluster_id,
                                                 } => {
                                                     if cluster_id != payload_cluster_id {
                                                         continue;
                                                     }
-                                                    changes.push((change, ChangeSource::Broadcast));
+
+                                                    match payload_data {
+                                                        UniPayloadV1::Broadcast(
+                                                            BroadcastV1::Change(change),
+                                                        ) => {
+                                                            changes.push((
+                                                                change,
+                                                                ChangeSource::Broadcast,
+                                                            ));
+                                                        }
+                                                        UniPayloadV1::BroadcastV2(
+                                                            BroadcastV2 {
+                                                                change: BroadcastV1::Change(change),
+                                                                set,
+                                                                num_broadcasts,
+                                                            },
+                                                        ) => {
+                                                            changes.push((
+                                                                change,
+                                                                ChangeSource::BroadcastV2(
+                                                                    set,
+                                                                    num_broadcasts,
+                                                                ),
+                                                            ));
+                                                        }
+                                                    }
                                                 }
                                             }
                                         }

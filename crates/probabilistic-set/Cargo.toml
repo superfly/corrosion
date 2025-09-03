@@ -1,0 +1,12 @@
+[package]
+name = "probabilistic-set"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+rand = { workspace = true }
+serde = { workspace = true }
+speedy = { workspace = true }
+
+[lints]
+workspace = true

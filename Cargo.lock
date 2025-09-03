@@ -1016,6 +1016,7 @@ dependencies = [
  "once_cell",
  "opentelemetry",
  "parking_lot",
+ "probabilistic-set",
  "rand 0.9.2",
  "rangemap",
  "rcgen",
@@ -3366,6 +3367,15 @@ checksum = "3ae130e2f271fbc2ac3a40fb1d07180839cdbbe443c7a27e1e3c13c5cac0116d"
 dependencies = [
  "diff",
  "yansi",
+]
+
+[[package]]
+name = "probabilistic-set"
+version = "0.1.0"
+dependencies = [
+ "corro-speedy",
+ "rand 0.8.5",
+ "serde",
 ]
 
 [[package]]

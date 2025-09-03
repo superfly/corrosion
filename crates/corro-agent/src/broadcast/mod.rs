@@ -38,7 +38,10 @@ use tripwire::Tripwire;
 use corro_types::{
     actor::{Actor, ActorId},
     agent::Agent,
-    broadcast::{BroadcastInput, DispatchRuntime, FocaCmd, FocaInput, UniPayload, UniPayloadV1},
+    broadcast::{
+        BroadcastChangeV1, BroadcastInput, BroadcastV1, BroadcastV2, DispatchRuntime, FocaCmd,
+        FocaInput, UniPayload, UniPayloadV1,
+    },
     channel::{bounded, CorroReceiver, CorroSender},
 };
 
@@ -523,6 +526,10 @@ async fn handle_broadcasts(
                 let (bcast, is_local) = match input {
                     BroadcastInput::Rebroadcast(bcast) => (bcast, false),
                     BroadcastInput::AddBroadcast(bcast) => (bcast, true),
+                    BroadcastInput::RebroadcastV2(bcast) => {
+                        let BroadcastV2::Change(BroadcastChangeV1 { change, .. }) = bcast;
+                        (BroadcastV1::Change(change), false)
+                    }
                 };
                 trace!("adding broadcast: {bcast:?}, local? {is_local}");
 
