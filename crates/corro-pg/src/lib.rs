@@ -787,6 +787,9 @@ pub async fn start(
                                     }
                                     _ = check_internal.tick() => {
                                         let discard_until_sync_time = discard_until_sync.load(std::sync::atomic::Ordering::Relaxed);
+                                        if discard_until_sync_time == 0 {
+                                            continue;
+                                        }
                                         if Instant::now() - start - Duration::from_secs(discard_until_sync_time) >= Duration::from_secs(60) {
                                             warn!("Connection stuck in discard_until_sync for more than 1 minute! this is a bug.");
                                         }
