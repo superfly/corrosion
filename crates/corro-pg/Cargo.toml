@@ -20,7 +20,7 @@ pgwire = { version = "0.16.1" }
 postgres-types = { version = "0.2", features = ["with-time-0_3"] }
 rusqlite = { workspace = true }
 rustls = { workspace = true }
-rustls-pemfile = "*"
+rustls-pemfile.workspace = true
 spawn = { path = "../spawn" }
 sqlite3-parser = { workspace = true }
 tempfile = { workspace = true }

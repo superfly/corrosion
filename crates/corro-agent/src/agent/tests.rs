@@ -8,9 +8,7 @@ use std::{
 use axum::Extension;
 use futures::{future, stream::FuturesUnordered, StreamExt, TryStreamExt};
 use hyper::StatusCode;
-use rand::{
-    distributions::Uniform, prelude::Distribution, rngs::StdRng, seq::IteratorRandom, SeedableRng,
-};
+use rand::{prelude::Distribution, rngs::StdRng, seq::IteratorRandom, SeedableRng};
 use rangemap::RangeInclusiveSet;
 use serde::Deserialize;
 use serde_json::json;
@@ -302,7 +300,7 @@ pub async fn configurable_stress_test(
             async move {
                 for (n, gossip_addr) in to_launch {
                     println!("LAUNCHING AGENT #{n}");
-                    let mut rng = StdRng::from_entropy();
+                    let mut rng = StdRng::from_os_rng();
                     let bootstrap = agents
                         .iter()
                         .map(|ta| ta.agent.gossip_addr())
@@ -371,7 +369,7 @@ pub async fn configurable_stress_test(
                 let addrs = addrs.clone();
                 let client = client.clone();
                 Ok(async move {
-                    let mut rng = StdRng::from_entropy();
+                    let mut rng = StdRng::from_os_rng();
                     let (actor_id, chosen) = addrs.iter().choose(&mut rng).unwrap();
 
                     let res = client
@@ -1304,7 +1302,7 @@ async fn many_small_changes() -> eyre::Result<()> {
             async move {
                 for n in to_launch {
                     println!("LAUNCHING AGENT #{n}");
-                    let mut rng = StdRng::from_entropy();
+                    let mut rng = StdRng::from_os_rng();
                     let bootstrap = agents
                         .iter()
                         .map(|ta| ta.agent.gossip_addr())
@@ -1344,8 +1342,8 @@ async fn many_small_changes() -> eyre::Result<()> {
                 let client: hyper::Client<_, hyper::Body> = hyper::Client::builder().build_http();
 
                 let durs = {
-                    let between = Uniform::from(100..=1000);
-                    let mut rng = rand::thread_rng();
+                    let between = rand::distr::Uniform::try_from(100..=1000).unwrap();
+                    let mut rng = rand::rng();
                     (0..100)
                         .map(|_| between.sample(&mut rng))
                         .collect::<Vec<_>>()
