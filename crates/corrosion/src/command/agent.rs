@@ -176,8 +176,7 @@ fn start_tokio_runtime_reporter() {
                     .set(metrics.total_busy_duration.as_secs_f64());
                 gauge!("corro.tokio.max_busy_seconds").set(metrics.max_busy_duration.as_secs_f64());
                 gauge!("corro.tokio.min_busy_seconds").set(metrics.min_busy_duration.as_secs_f64());
-                gauge!("corro.tokio.injection_queue_depth")
-                    .set(metrics.injection_queue_depth as f64);
+                gauge!("corro.tokio.injection_queue_depth").set(metrics.global_queue_depth as f64);
                 gauge!("corro.tokio.total_local_queue_depth")
                     .set(metrics.total_local_queue_depth as f64);
                 gauge!("corro.tokio.max_local_queue_depth")
@@ -188,6 +187,8 @@ fn start_tokio_runtime_reporter() {
                     .set(metrics.budget_forced_yield_count as f64);
                 gauge!("corro.tokio.io_driver_ready_count")
                     .set(metrics.io_driver_ready_count as f64);
+                gauge!("corro.tokio.blocking_queue_depth").set(metrics.blocking_queue_depth as f64);
+                gauge!("corro.tokio.idle_blocking_threads_count").set(metrics.idle_blocking_threads_count as f64);
 
                 // wait 2s
                 tokio::time::sleep(Duration::from_secs(2)).await;
