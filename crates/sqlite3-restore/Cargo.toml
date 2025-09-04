@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-nix = "*"
+nix = { version = "0.30", features = ["fs"] }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 
