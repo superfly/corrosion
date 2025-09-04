@@ -7,8 +7,8 @@ use std::{
     future::poll_fn,
     net::SocketAddr,
     str::{FromStr, Utf8Error},
-    sync::Arc,
-    time::Duration,
+    sync::{atomic::AtomicU64, Arc},
+    time::{Duration, Instant},
 };
 
 use bytes::Buf;
@@ -742,6 +742,7 @@ pub async fn start(
                 });
 
                 let res = tokio::task::spawn_blocking({
+                    let start = Instant::now();
                     let back_tx = back_tx.clone();
                     move || {
                         let conn = if readonly {
@@ -751,10 +752,46 @@ pub async fn start(
                         };
                         trace!("opened connection");
 
+                        let discard_until_sync = Arc::new(AtomicU64::new(0));
+                        let set_discard_until_sync = {
+                            let discard_until_sync = discard_until_sync.clone();
+
+                            move || {
+                                discard_until_sync.store(Instant::now().duration_since(start).as_secs(), std::sync::atomic::Ordering::Relaxed);
+                            }
+                        };
+                        let unset_discard_until_sync = {
+                            let discard_until_sync = discard_until_sync.clone();
+
+                            move || {
+                                discard_until_sync.store(0, std::sync::atomic::Ordering::Relaxed);
+                            }
+                        };
+                        let is_discard_until_sync = {
+                            let discard_until_sync = discard_until_sync.clone();
+
+                            move || {
+                                discard_until_sync.load(std::sync::atomic::Ordering::Relaxed) != 0
+                            }
+                        };
+
                         let int_handle = conn.get_interrupt_handle();
                         tokio::spawn(async move {
-                            cancel.cancelled().await;
-                            int_handle.interrupt();
+                            let mut check_internal = tokio::time::interval(Duration::from_secs(10));
+
+                            loop {
+                                tokio::select! {
+                                    _ = cancel.cancelled() => {
+                                        int_handle.interrupt()
+                                    }
+                                    _ = check_internal.tick() => {
+                                        let discard_until_sync_time = discard_until_sync.load(std::sync::atomic::Ordering::Relaxed);
+                                        if Instant::now() - start - Duration::from_secs(discard_until_sync_time) >= Duration::from_secs(60) {
+                                            warn!("Connection stuck in discard_until_sync for more than 1 minute! this is a bug.");
+                                        }
+                                    }
+                                }
+                            }
                         });
 
                         conn.execute_batch("ATTACH ':memory:' AS pg_catalog;")?;
@@ -840,12 +877,10 @@ pub async fn start(
 
                         let mut portals: HashMap<CompactString, Portal> = HashMap::new();
 
-                        let mut discard_until_sync = false;
-
                         'outer: while let Some(msg) = front_rx.blocking_recv() {
                             debug!("msg: {msg:?}");
 
-                            if discard_until_sync
+                            if is_discard_until_sync()
                                 && !matches!(
                                     msg,
                                     PgWireFrontendMessage::Sync(_)
@@ -893,7 +928,7 @@ pub async fn start(
                                                 )
                                                     .into(),
                                             )?;
-                                            discard_until_sync = true;
+                                            set_discard_until_sync();
                                             continue;
                                         }
                                     };
@@ -921,7 +956,7 @@ pub async fn start(
                                                 )
                                                     .into(),
                                             )?;
-                                                discard_until_sync = true;
+                                                set_discard_until_sync();
                                                 continue;
                                             }
 
@@ -944,7 +979,7 @@ pub async fn start(
                                                         )
                                                             .into(),
                                                     )?;
-                                                    discard_until_sync = true;
+                                                    set_discard_until_sync();
                                                     continue;
                                                 }
                                             };
@@ -1005,7 +1040,7 @@ pub async fn start(
                                                 Err(e) => {
                                                     back_tx
                                                         .blocking_send((e.into(), true).into())?;
-                                                    discard_until_sync = true;
+                                                    set_discard_until_sync();
                                                     continue 'outer;
                                                 }
                                             };
@@ -1052,7 +1087,7 @@ pub async fn start(
                                                     )
                                                         .into(),
                                                 )?;
-                                                discard_until_sync = true;
+                                                set_discard_until_sync();
                                             }
                                             Some(Prepared::Empty) => {
                                                 back_tx.blocking_send(
@@ -1116,7 +1151,7 @@ pub async fn start(
                                                     )
                                                         .into(),
                                                 )?;
-                                                discard_until_sync = true;
+                                                set_discard_until_sync();
                                             }
                                             Some(Portal::Empty { .. }) => {
                                                 back_tx.blocking_send(
@@ -1186,7 +1221,7 @@ pub async fn start(
                                                 )
                                                     .into(),
                                             )?;
-                                            discard_until_sync = true;
+                                            set_discard_until_sync();
                                             continue;
                                         }
                                     }
@@ -1216,7 +1251,7 @@ pub async fn start(
                                                 )
                                                     .into(),
                                             )?;
-                                            discard_until_sync = true;
+                                            set_discard_until_sync();
                                             continue;
                                         }
                                         Some(Prepared::Empty) => {
@@ -1250,7 +1285,7 @@ pub async fn start(
                                                         )
                                                             .into(),
                                                     )?;
-                                                    discard_until_sync = true;
+                                                    set_discard_until_sync();
                                                     continue;
                                                 }
                                             };
@@ -1291,7 +1326,7 @@ pub async fn start(
                                                     )
                                                         .into(),
                                                 )?;
-                                                discard_until_sync = true;
+                                                set_discard_until_sync();
                                                 continue;
                                             }
                                         };
@@ -1328,7 +1363,7 @@ pub async fn start(
                                                             )
                                                                 .into(),
                                                         )?;
-                                                            discard_until_sync = true;
+                                                            set_discard_until_sync();
                                                             continue 'outer;
                                                         }
                                                         continue;
@@ -1356,7 +1391,7 @@ pub async fn start(
                                                             )
                                                                 .into(),
                                                         )?;
-                                                        discard_until_sync = true;
+                                                        set_discard_until_sync();
                                                         continue 'outer;
                                                     }
                                                     Some(param_type) => {
@@ -1508,7 +1543,7 @@ pub async fn start(
                                                                     true,
                                                                 ).into(),
                                                             )?;
-                                                                discard_until_sync = true;
+                                                                set_discard_until_sync();
                                                                 continue 'outer;
                                                             }
                                                         }
@@ -1544,10 +1579,10 @@ pub async fn start(
                                     )?;
                                 }
                                 PgWireFrontendMessage::Sync(_) => {
-                                    send_ready(&mut session, discard_until_sync, &back_tx)?;
+                                    send_ready(&mut session, is_discard_until_sync(), &back_tx)?;
 
                                     // reset this
-                                    discard_until_sync = false;
+                                    unset_discard_until_sync();
                                 }
                                 PgWireFrontendMessage::Execute(execute) => {
                                     let name = execute.name().as_deref().unwrap_or("");
@@ -1587,7 +1622,7 @@ pub async fn start(
                                                 )
                                                     .into(),
                                             )?;
-                                            discard_until_sync = true;
+                                            set_discard_until_sync();
                                             continue;
                                         }
                                     };
@@ -1615,11 +1650,11 @@ pub async fn start(
                                             flush: true,
                                         })?;
 
-                                        discard_until_sync = true;
+                                        set_discard_until_sync();
 
                                         send_ready(
                                             &mut session,
-                                            discard_until_sync,
+                                            is_discard_until_sync(),
                                             &back_tx,
                                         )?;
                                         continue;
@@ -1645,7 +1680,7 @@ pub async fn start(
                                             )?;
                                             send_ready(
                                                 &mut session,
-                                                discard_until_sync,
+                                                is_discard_until_sync(),
                                                 &back_tx,
                                             )?;
                                             continue;
@@ -1665,7 +1700,7 @@ pub async fn start(
 
                                         send_ready(
                                             &mut session,
-                                            discard_until_sync,
+                                            is_discard_until_sync(),
                                             &back_tx,
                                         )?;
                                         continue;
@@ -1681,7 +1716,7 @@ pub async fn start(
                                             })?;
                                             send_ready(
                                                 &mut session,
-                                                discard_until_sync,
+                                                is_discard_until_sync(),
                                                 &back_tx,
                                             )?;
                                             continue 'outer;
@@ -1710,7 +1745,7 @@ pub async fn start(
                                             )?;
                                             send_ready(
                                                 &mut session,
-                                                discard_until_sync,
+                                                is_discard_until_sync(),
                                                 &back_tx,
                                             )?;
                                             continue;
@@ -1718,7 +1753,7 @@ pub async fn start(
                                         trace!("committed IMPLICIT tx");
                                     }
 
-                                    send_ready(&mut session, discard_until_sync, &back_tx)?;
+                                    send_ready(&mut session, is_discard_until_sync(), &back_tx)?;
                                 }
                                 PgWireFrontendMessage::Terminate(_) => {
                                     break;
@@ -1791,7 +1826,7 @@ pub async fn start(
                                                 )
                                                     .into(),
                                             )?;
-                                            discard_until_sync = true;
+                                            set_discard_until_sync();
                                             continue;
                                         }
                                     }
