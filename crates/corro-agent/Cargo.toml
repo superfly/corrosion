@@ -28,6 +28,7 @@ itertools = { workspace = true }
 metrics = { workspace = true }
 opentelemetry = { workspace = true }
 parking_lot = { workspace = true }
+probabilistic-set = { path = "../probabilistic-set" }
 quinn = { workspace = true }
 quinn-proto = { workspace = true }
 quinn-plaintext = { workspace = true }
