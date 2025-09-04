@@ -188,7 +188,8 @@ fn start_tokio_runtime_reporter() {
                 gauge!("corro.tokio.io_driver_ready_count")
                     .set(metrics.io_driver_ready_count as f64);
                 gauge!("corro.tokio.blocking_queue_depth").set(metrics.blocking_queue_depth as f64);
-                gauge!("corro.tokio.idle_blocking_threads_count").set(metrics.idle_blocking_threads_count as f64);
+                gauge!("corro.tokio.idle_blocking_threads_count")
+                    .set(metrics.idle_blocking_threads_count as f64);
 
                 // wait 2s
                 tokio::time::sleep(Duration::from_secs(2)).await;
