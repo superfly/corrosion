@@ -803,6 +803,7 @@ dependencies = [
  "metrics",
  "opentelemetry",
  "parking_lot",
+ "probabilistic-set",
  "quinn",
  "quinn-plaintext",
  "quinn-proto",
@@ -3376,6 +3377,7 @@ dependencies = [
  "corro-speedy",
  "rand 0.8.5",
  "serde",
+ "uuid",
 ]
 
 [[package]]

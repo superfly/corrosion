@@ -10,7 +10,7 @@ use corro_base_types::{CrsqlDbVersionRange, CrsqlSeqRange};
 use foca::{Identity, Member, Notification, Runtime, Timer};
 use indexmap::{map::Entry, IndexMap};
 use metrics::counter;
-use probabilistic_set::ProbabilisticSet;
+use probabilistic_set::ProbSet;
 use rusqlite::{
     types::{FromSql, FromSqlError},
     ToSql,
@@ -117,7 +117,7 @@ pub struct ColumnChange {
 pub enum ChangeSource {
     Broadcast,
     Sync,
-    BroadcastV2(ProbabilisticSet, u64),
+    BroadcastV2(ProbSet, u8),
 }
 
 #[derive(Debug, Clone, PartialEq, Readable, Writable)]
@@ -596,6 +596,7 @@ pub enum BroadcastDecodeError {
 pub enum BroadcastInput {
     Rebroadcast(BroadcastV1),
     AddBroadcast(BroadcastV1),
+    AddBroadcastV2(BroadcastV2),
     RebroadcastV2(BroadcastV2),
 }
 

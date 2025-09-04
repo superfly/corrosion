@@ -37,6 +37,10 @@ impl ActorId {
     pub fn from_bytes(bytes: [u8; 16]) -> Self {
         Self(Uuid::from_bytes(bytes))
     }
+
+    pub fn to_u128(&self) -> u128 {
+        self.0.as_u128()
+    }
 }
 
 impl TryFrom<ActorId> for uhlc::ID {
