@@ -42,7 +42,7 @@ impl Stream for IoBodyStream {
                     .and_then(|source| source.downcast_ref::<io::Error>())
                 {
                     Some(io_err) => io::Error::from(io_err.kind()),
-                    None => io::Error::new(io::ErrorKind::Other, e),
+                    None => io::Error::other(e),
                 };
                 Poll::Ready(Some(Err(io_err)))
             }
@@ -236,7 +236,7 @@ where
                             .and_then(|source| source.downcast_ref::<io::Error>())
                         {
                             Some(io_err) => io::Error::from(io_err.kind()),
-                            None => io::Error::new(io::ErrorKind::Other, e),
+                            None => io::Error::other(e),
                         };
                         Poll::Ready(Err(io_err.into()))
                     }
