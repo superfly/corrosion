@@ -782,7 +782,8 @@ pub async fn start(
                             loop {
                                 tokio::select! {
                                     _ = cancel.cancelled() => {
-                                        int_handle.interrupt()
+                                        int_handle.interrupt();
+                                        break;
                                     }
                                     _ = check_internal.tick() => {
                                         let discard_until_sync_time = discard_until_sync.load(std::sync::atomic::Ordering::Relaxed);
