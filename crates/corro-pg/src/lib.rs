@@ -67,7 +67,7 @@ use tokio::{
 use tokio_rustls::TlsAcceptor;
 use tokio_util::{codec::Framed, either::Either, sync::CancellationToken};
 use tracing::{debug, error, info, trace, warn};
-use tripwire::{Outcome, PreemptibleFutureExt, Tripwire};
+use tripwire::{Outcome, PreemptibleFutureExt, TimeoutFutureExt, Tripwire};
 
 use crate::{
     sql_state::SqlState,
@@ -671,8 +671,9 @@ pub async fn start(
 
                 let cancel = CancellationToken::new();
 
-                tokio::spawn({
-                    let back_tx = back_tx.clone();
+                let mut frontend_task = tokio::spawn({
+                    // Use a weak sender here; it should NOT hold the backend channel (and half-connection) open
+                    let back_tx = back_tx.clone().downgrade();
                     let cancel = cancel.clone();
                     async move {
                         // cancel stuff if this loop breaks
@@ -688,20 +689,22 @@ pub async fn start(
                                 Err(e) => {
                                     warn!("could not receive pg frontend message: {e}");
                                     // attempt to send this...
-                                    _ = back_tx.try_send(
-                                        (
-                                            PgWireBackendMessage::ErrorResponse(
-                                                ErrorInfo::new(
-                                                    "FATAL".to_owned(),
-                                                    "XX000".to_owned(),
-                                                    e.to_string(),
-                                                )
+                                    if let Some(back_tx) = back_tx.upgrade() {
+                                        _ = back_tx.try_send(
+                                            (
+                                                PgWireBackendMessage::ErrorResponse(
+                                                    ErrorInfo::new(
+                                                        "FATAL".to_owned(),
+                                                        "XX000".to_owned(),
+                                                        e.to_string(),
+                                                    )
+                                                    .into(),
+                                                ),
+                                                true,
+                                            )
                                                 .into(),
-                                            ),
-                                            true,
-                                        )
-                                            .into(),
-                                    );
+                                        );
+                                    }
                                     break;
                                 }
                             };
@@ -714,7 +717,7 @@ pub async fn start(
                     }
                 });
 
-                tokio::spawn({
+                let mut backend_task = tokio::spawn({
                     let cancel = cancel.clone();
                     async move {
                         let _drop_guard = cancel.drop_guard();
@@ -737,6 +740,12 @@ pub async fn start(
                             }
                         }
                         debug!("backend stream is done");
+                        // If we get here, we know that `back_rx` has been fully drained.
+                        // Close the sink, this calls shutdown() on the underlying TCP socket
+                        // If the other side behaves correctly, the frontend task will eventually receive an EOF
+                        // and will also complete; by that point we know all messages have been sent successfully over TCP.
+                        // However, if this is not handled correctly we time out later.
+                        sink.close().await?;
                         Ok::<_, std::io::Error>(())
                     }
                 });
@@ -1897,6 +1906,31 @@ pub async fn start(
                             )
                             .await;
                     }
+                }
+
+                // The message-handling loop has completed, make sure we also abort the tasks
+                // handling the TCP connection
+                // Firstly we attempt a graceful shutdown -- dropping back_tx will cause
+                // backend_task to complete once it writes all content to the TCP socket
+                // Then, frontend_task will eventually receive an EOF if clients behave properly
+                // Note that this should be the only reference of back_tx at this point:
+                // the one in frontend_task is weak, and the one cloned into the message-handling
+                // thread should have been dropped.
+                assert_eq!(back_tx.strong_count(), 1);
+                drop(back_tx);
+
+                // Now we wait for both front and back to complete; if however frontend_task never
+                // receives an EOF, instead of relying on half-open timeout we just abort both tasks
+                // after 1 minute.
+                match async { tokio::join!(&mut frontend_task, &mut backend_task) }
+                    .with_timeout(Duration::from_secs(60))
+                    .await
+                {
+                    Outcome::Preempted(_) => {
+                        frontend_task.abort();
+                        backend_task.abort();
+                    }
+                    Outcome::Completed(_) => {}
                 }
 
                 Ok::<_, BoxError>(())
