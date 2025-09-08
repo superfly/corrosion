@@ -671,7 +671,7 @@ pub async fn start(
 
                 let cancel = CancellationToken::new();
 
-                tokio::spawn({
+                let frontend_task = tokio::spawn({
                     let back_tx = back_tx.clone();
                     let cancel = cancel.clone();
                     async move {
@@ -714,7 +714,7 @@ pub async fn start(
                     }
                 });
 
-                tokio::spawn({
+                let backend_task = tokio::spawn({
                     let cancel = cancel.clone();
                     async move {
                         let _drop_guard = cancel.drop_guard();
@@ -1856,6 +1856,11 @@ pub async fn start(
                         Ok::<_, BoxError>(())
                     }
                 }).await;
+
+                // The message-handling loop has completed, make sure we also abort the tasks
+                // handling the TCP connection
+                frontend_task.abort();
+                backend_task.abort();
 
                 match res {
                     Ok(Ok(_)) => {}
