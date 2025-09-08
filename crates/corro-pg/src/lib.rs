@@ -671,50 +671,64 @@ pub async fn start(
 
                 let cancel = CancellationToken::new();
 
-                tokio::spawn({
+                let frontend_future = tokio::spawn({
                     let back_tx = back_tx.clone();
                     let cancel = cancel.clone();
                     async move {
                         // cancel stuff if this loop breaks
                         let _drop_guard = cancel.drop_guard();
 
-                        while let Some(decode_res) = stream.next().await {
-                            let msg = match decode_res {
-                                Ok(msg) => msg,
-                                Err(PgWireError::IoError(io_error)) => {
-                                    debug!("postgres io error: {io_error}");
-                                    break;
-                                }
-                                Err(e) => {
-                                    warn!("could not receive pg frontend message: {e}");
-                                    // attempt to send this...
-                                    _ = back_tx.try_send(
-                                        (
-                                            PgWireBackendMessage::ErrorResponse(
-                                                ErrorInfo::new(
-                                                    "FATAL".to_owned(),
-                                                    "XX000".to_owned(),
-                                                    e.to_string(),
-                                                )
-                                                .into(),
-                                            ),
-                                            true,
-                                        )
-                                            .into(),
-                                    );
-                                    break;
-                                }
-                            };
+                        loop {
+                            tokio::select! {
+                                decode_res = stream.next() => {
+                                    let Some(decode_res) = decode_res else {
+                                        debug!("frontend stream is done");
+                                        break;
+                                    };
 
-                            front_tx.send(msg).await?;
+                                    let msg = match decode_res {
+                                        Ok(msg) => msg,
+                                        Err(PgWireError::IoError(io_error)) => {
+                                            debug!("postgres io error: {io_error}");
+                                            break;
+                                        }
+                                        Err(e) => {
+                                            warn!("could not receive pg frontend message: {e}");
+                                            // attempt to send this...
+                                            _ = back_tx.try_send(
+                                                (
+                                                    PgWireBackendMessage::ErrorResponse(
+                                                        ErrorInfo::new(
+                                                            "FATAL".to_owned(),
+                                                            "XX000".to_owned(),
+                                                            e.to_string(),
+                                                        )
+                                                        .into(),
+                                                    ),
+                                                    true,
+                                                )
+                                                    .into(),
+                                            );
+                                            break;
+                                        }
+                                    };
+
+                                    if front_tx.send(msg).await.is_err() {
+                                        break;
+                                    }
+                                }
+                                _ = front_tx.closed() => {
+                                    debug!("front_tx closed, exiting frontend loop");
+                                    break;
+                                }
+                            }
                         }
-                        debug!("frontend stream is done");
 
                         Ok::<_, BoxError>(())
                     }
                 });
 
-                tokio::spawn({
+                let backend_future = tokio::spawn({
                     let cancel = cancel.clone();
                     async move {
                         let _drop_guard = cancel.drop_guard();
@@ -1898,6 +1912,12 @@ pub async fn start(
                             .await;
                     }
                 }
+
+                // Close the backend channel once all messages have been sent
+                drop(back_tx);
+
+                let _ = backend_future.await;
+                let _ = frontend_future.await;
 
                 Ok::<_, BoxError>(())
             });
