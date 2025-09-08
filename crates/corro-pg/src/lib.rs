@@ -672,7 +672,8 @@ pub async fn start(
                 let cancel = CancellationToken::new();
 
                 let mut frontend_task = tokio::spawn({
-                    let back_tx = back_tx.clone();
+                    // Use a weak sender here; it should NOT hold the backend channel (and half-connection) open
+                    let back_tx = back_tx.clone().downgrade();
                     let cancel = cancel.clone();
                     async move {
                         // cancel stuff if this loop breaks
@@ -688,20 +689,22 @@ pub async fn start(
                                 Err(e) => {
                                     warn!("could not receive pg frontend message: {e}");
                                     // attempt to send this...
-                                    _ = back_tx.try_send(
-                                        (
-                                            PgWireBackendMessage::ErrorResponse(
-                                                ErrorInfo::new(
-                                                    "FATAL".to_owned(),
-                                                    "XX000".to_owned(),
-                                                    e.to_string(),
-                                                )
+                                    if let Some(back_tx) = back_tx.upgrade() {
+                                        _ = back_tx.try_send(
+                                            (
+                                                PgWireBackendMessage::ErrorResponse(
+                                                    ErrorInfo::new(
+                                                        "FATAL".to_owned(),
+                                                        "XX000".to_owned(),
+                                                        e.to_string(),
+                                                    )
+                                                    .into(),
+                                                ),
+                                                true,
+                                            )
                                                 .into(),
-                                            ),
-                                            true,
-                                        )
-                                            .into(),
-                                    );
+                                        );
+                                    }
                                     break;
                                 }
                             };
@@ -1910,6 +1913,10 @@ pub async fn start(
                 // Firstly we attempt a graceful shutdown -- dropping back_tx will cause
                 // backend_task to complete once it writes all content to the TCP socket
                 // Then, frontend_task will eventually receive an EOF if clients behave properly
+                // Note that this should be the only reference of back_tx at this point:
+                // the one in frontend_task is weak, and the one cloned into the message-handling
+                // thread should have been dropped.
+                assert_eq!(back_tx.strong_count(), 1);
                 drop(back_tx);
 
                 // Now we wait for both front and back to complete; if however frontend_task never
