@@ -1857,11 +1857,6 @@ pub async fn start(
                     }
                 }).await;
 
-                // The message-handling loop has completed, make sure we also abort the tasks
-                // handling the TCP connection
-                frontend_task.abort();
-                backend_task.abort();
-
                 match res {
                     Ok(Ok(_)) => {}
                     Ok(Err(e)) => {
@@ -1903,6 +1898,11 @@ pub async fn start(
                             .await;
                     }
                 }
+
+                // The message-handling loop has completed, make sure we also abort the tasks
+                // handling the TCP connection
+                frontend_task.abort();
+                backend_task.abort();
 
                 Ok::<_, BoxError>(())
             });
