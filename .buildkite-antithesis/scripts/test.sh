@@ -10,7 +10,7 @@ COMMIT_HASH=${BUILDKITE_COMMIT:0:8}
 
 echo "Launching Antithesis test ${BUILDKITE_BRANCH} ${COMMIT_HASH}"
 
-response=$(curl --fail -u "flyio:${ANTITHESIS_PASSWORD}" -X POST https://flyio.antithesis.com/api/v1/launch/flyio -d "{\"params\": {
+response=$(curl --fail -u "flyio:${ANTITHESIS_PASSWORD}" -X POST https://flyio.antithesis.com/api/v1/launch/corrosion -d "{\"params\": {
     \"antithesis.description\":\"Run tests on ${BUILDKITE_BRANCH} for ${CUSTOM_DURATION}h\",
     \"antithesis.duration\":\"${CUSTOM_DURATION}\",
     \"antithesis.config_image\":\"antithesis-config:${COMMIT_HASH}\",
