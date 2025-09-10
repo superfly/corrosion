@@ -675,14 +675,14 @@ pub async fn handle_changes(
                     continue;
                 }
             }
-        } else {
-            // empty versions
-            if change
-                .versions()
-                .all(|v| seen.contains_key(&(change.actor_id, v)))
-            {
-                continue;
+        } else if change
+            .versions()
+            .all(|v| seen.contains_key(&(change.actor_id, v)))
+        {
+            if matches!(src, ChangeSource::Broadcast) {
+                counter!("corro.broadcast.duplicate.count", "from" => "cache").increment(1);
             }
+            continue;
         }
 
         let src_str: &'static str = src.into();
@@ -719,6 +719,9 @@ pub async fn handle_changes(
                 .contains_all(change.versions(), change.seqs())
             {
                 trace!("already seen, stop disseminating");
+                if matches!(src, ChangeSource::Broadcast) {
+                    counter!("corro.broadcast.duplicate.count", "from" => "bookie").increment(1);
+                }
                 continue;
             }
         }
