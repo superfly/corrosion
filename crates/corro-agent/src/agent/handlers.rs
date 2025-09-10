@@ -680,7 +680,7 @@ pub async fn handle_changes(
             .all(|v| seen.contains_key(&(change.actor_id, v)))
         {
             if matches!(src, ChangeSource::Broadcast) {
-                counter!("corro.broadcast.duplicate.count", "kind" => "change").increment(1);
+                counter!("corro.broadcast.duplicate.count", "from" => "cache").increment(1);
             }
             continue;
         }
@@ -719,7 +719,9 @@ pub async fn handle_changes(
                 .contains_all(change.versions(), change.seqs())
             {
                 trace!("already seen, stop disseminating");
-                counter!("corro.broadcast.duplicate.count", "kind" => "change").increment(1);
+                if matches!(src, ChangeSource::Broadcast) {
+                    counter!("corro.broadcast.duplicate.count", "from" => "bookie").increment(1);
+                }
                 continue;
             }
         }
