@@ -633,7 +633,7 @@ async fn handle_broadcasts(
                 match encode_framed(&mut bcast_codec, &mut ser_buf, &mut bcast_buf, &uni_payload) {
                     Ok(payload) => payload,
                     Err(e) => {
-                    error!("could not encode UniPayload::V1 BroadcastV2: {e}");
+                        error!("could not encode UniPayload::V1 BroadcastV2: {e}");
                         continue;
                     }
                 }
