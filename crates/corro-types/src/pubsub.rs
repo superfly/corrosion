@@ -415,7 +415,8 @@ impl MatcherHandle {
         let mut prepped = conn.prepare_cached("SELECT MIN(id) FROM changes")?;
         let min_change_id: u64 = prepped.query_row([], |row| row.get(0))?;
 
-        if since.0 < min_change_id {
+        // return error if we've cleared changes after the received change id
+        if since.0 + 1 < min_change_id {
             return Err(rusqlite::Error::ModuleError(format!(
                 "subscription already deleted older changes, min change id: {min_change_id}",
             )));
