@@ -226,7 +226,7 @@ fn lock(f: &File, l_type: LockType, l_start: i64, timeout: Duration) -> Result<(
             l_type: l_type as i16,
             l_whence: SEEK_SET as i16,
         };
-        match fcntl(f, FcntlArg::F_SETLK(&flock)) {
+        match fcntl(f.as_raw_fd(), FcntlArg::F_SETLK(&flock)) {
             Ok(_) => {
                 info!("lock acquired");
                 return Ok(());
