@@ -411,17 +411,6 @@ impl MatcherHandle {
         tx: mpsc::Sender<QueryEvent>,
     ) -> rusqlite::Result<ChangeId> {
         self.wait_for_running_state();
-
-        let mut prepped = conn.prepare_cached("SELECT MIN(id) FROM changes")?;
-        let min_change_id: u64 = prepped.query_row([], |row| row.get(0))?;
-
-        // return error if we've cleared changes after the received change id
-        if since.0 + 1 < min_change_id {
-            return Err(rusqlite::Error::ModuleError(format!(
-                "subscription already deleted older changes, min change id: {min_change_id}",
-            )));
-        }
-
         let mut query_cols = vec![];
         for i in 0..(self.parsed_columns().len()) {
             query_cols.push(format!("col_{i}"));
