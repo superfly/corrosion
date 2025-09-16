@@ -2335,7 +2335,7 @@ pub fn unpack_columns(mut buf: &[u8]) -> Result<Vec<SqliteValueRef<'_>>, UnpackE
                 if buf.remaining() < intlen {
                     return Err(UnpackError::Abort);
                 }
-                let len = buf.get_int(intlen) as usize;
+                let len = buf.get_uint(intlen) as usize;
                 if buf.remaining() < len {
                     return Err(UnpackError::Abort);
                 }
@@ -2362,7 +2362,7 @@ pub fn unpack_columns(mut buf: &[u8]) -> Result<Vec<SqliteValueRef<'_>>, UnpackE
                 if buf.remaining() < intlen {
                     return Err(UnpackError::Abort);
                 }
-                let len = buf.get_int(intlen) as usize;
+                let len = buf.get_uint(intlen) as usize;
                 if buf.remaining() < len {
                     return Err(UnpackError::Abort);
                 }
@@ -2401,6 +2401,8 @@ mod tests {
     fn test_pack_unpack() {
         let neg_one: i64 = -1;
         let big_neg: i64 = -2500000;
+        let i8_max: i64 = i8::MAX as i64;
+        let i16_max: i64 = i16::MAX as i64;
         let columns = vec![
             vec![1_i64.into(), SqliteValue::Null],
             vec![
@@ -2411,7 +2413,9 @@ mod tests {
             vec![i64::MAX.into(), vec![1, 2, 3].into()],
             vec![big_neg.into(), f64::MAX.into()],
             vec![10156800_i64.into(), f64::MIN.into()],
-            vec![10000000_i64.into(), "a".into()],
+            vec![10000000_i64.into(), "".into()],
+            vec![i8_max.into(), "a".into()],
+            vec![i16_max.into(), vec![0].into()],
         ];
         for cols in columns.clone() {
             let packed = pack_columns(&cols).unwrap();
