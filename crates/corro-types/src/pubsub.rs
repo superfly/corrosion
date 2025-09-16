@@ -2352,7 +2352,8 @@ pub fn unpack_columns(mut buf: &[u8]) -> Result<Vec<SqliteValueRef<'_>>, UnpackE
                 if buf.remaining() < intlen {
                     return Err(UnpackError::Abort);
                 }
-                ret.push(SqliteValueRef(ValueRef::Integer(buf.get_int(intlen))));
+                let unsigned = buf.get_uint(intlen);
+                ret.push(SqliteValueRef(ValueRef::Integer(unsigned as i64)));
             }
             Some(ColumnType::Null) => {
                 ret.push(SqliteValueRef(ValueRef::Null));
@@ -2380,7 +2381,7 @@ mod tests {
     use std::net::Ipv4Addr;
 
     use camino::Utf8PathBuf;
-    use rusqlite::params;
+    use rusqlite::{params, Connection};
     use spawn::wait_for_all_pending_handles;
     use tokio::sync::Semaphore;
 
@@ -2390,11 +2391,66 @@ mod tests {
         base::CrsqlDbVersion,
         change::row_to_change,
         schema::{apply_schema, parse_sql},
-        sqlite::{setup_conn, CrConn},
+        sqlite::{rusqlite_to_crsqlite, setup_conn, CrConn},
     };
     use corro_tests::tempdir::TempDir;
 
     use super::*;
+
+    #[test]
+    fn test_pack_unpack() {
+        let neg_one: i64 = -1;
+        let big_neg: i64 = -2500000;
+        let columns = vec![
+            vec![1_i64.into(), SqliteValue::Null],
+            vec![
+                neg_one.into(),
+                "abcdefghijklmnopqrstuvwxyz1234567890?".into(),
+            ],
+            vec![i64::MIN.into(), 1.0.into()],
+            vec![i64::MAX.into(), vec![1, 2, 3].into()],
+            vec![big_neg.into(), f64::MAX.into()],
+            vec![10156800_i64.into(), f64::MIN.into()],
+            vec![10000000_i64.into(), "a".into()],
+        ];
+        for cols in columns.clone() {
+            let packed = pack_columns(&cols).unwrap();
+            let unpacked: Vec<_> = unpack_columns(&packed)
+                .unwrap()
+                .into_iter()
+                .map(|v| v.to_owned())
+                .collect();
+            assert_eq!(cols, unpacked);
+        }
+
+        let conn = Connection::open_in_memory().unwrap();
+        let cr_conn = rusqlite_to_crsqlite(conn).unwrap();
+        cr_conn
+            .execute_batch("CREATE TABLE foo (pk INTEGER NOT NULL PRIMARY KEY, col_1);")
+            .unwrap();
+
+        for cols in columns {
+            cr_conn
+                .execute(
+                    "INSERT INTO foo (pk, col_1) VALUES (?, ?);",
+                    params![cols[0], cols[1]],
+                )
+                .unwrap();
+            let packed = cr_conn
+                .query_row(
+                    "SELECT crsql_pack_columns(pk, col_1) FROM foo where pk = ?",
+                    params![cols[0]],
+                    |row| row.get::<_, Vec<u8>>(0),
+                )
+                .unwrap();
+            let unpacked: Vec<_> = unpack_columns(&packed)
+                .unwrap()
+                .into_iter()
+                .map(|v| v.to_owned())
+                .collect();
+            assert_eq!(cols, unpacked);
+        }
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn test_matcher() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
