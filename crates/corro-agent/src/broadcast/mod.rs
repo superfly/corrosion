@@ -463,7 +463,9 @@ async fn handle_broadcasts(
     let mut to_local_broadcast = VecDeque::new();
     let mut log_count = 0;
 
+    let cfg_max_transmissions = agent.config().perf.max_broadcast_transmissions;
     let mut limited_log_count = 0;
+    let mut prev_set_size = 0;
 
     let bytes_per_sec: BroadcastRateLimiter = RateLimiter::direct(Quota::per_second(unsafe {
         NonZeroU32::new_unchecked(10 * 1024 * 1024)
@@ -591,25 +593,60 @@ async fn handle_broadcasts(
                 gauge!("corro.broadcast.buffer.capacity").set(bcast_buf.capacity() as f64);
                 gauge!("corro.broadcast.serialization.buffer.capacity")
                     .set(ser_buf.capacity() as f64);
+                gauge!("corro.broadcast.prob_set.size").set(prev_set_size as f64);
             }
         }
 
         let prev_rate_limited = rate_limited;
 
+        let (members_count, ring0_count) = {
+            let members = agent.members().read();
+            let members_count = members.states.len();
+            let ring0_count = members.ring0(agent.cluster_id()).count();
+            (members_count, ring0_count)
+        };
+
+        let (choose_count, dynamic_count, max_transmissions) = {
+            let config = config.read();
+            let gossip_max_txns = config.max_transmissions.get();
+            let max_transmissions = cmp::min(
+                gossip_max_txns,
+                cfg_max_transmissions.unwrap_or(gossip_max_txns),
+            );
+            let dynamic_count = (members_count - ring0_count) / (max_transmissions as usize * 10);
+            let count = cmp::max(config.num_indirect_probes.get(), dynamic_count);
+
+            if prev_rate_limited {
+                // we've been rate limited on the last loop, try sending to less nodes...
+                (
+                    cmp::min(count, dynamic_count / 2),
+                    dynamic_count / 2,
+                    max_transmissions / 2,
+                )
+            } else {
+                (count, dynamic_count, max_transmissions)
+            }
+        };
+
         // start with local broadcasts, they're higher priority
         let mut ring0: HashSet<SocketAddr> = HashSet::new();
 
-        let members_len = agent.members().read().states.len();
-        let count = cmp::max(members_len / 2, 2);
-        let mut set = ProbSet::new(count, 4);
+        let prob_set = {
+            // setting the size of the set to the number of times it'll broadcasted + number of members
+            // it will be broadcasted to with some padding
+            let dynamic_size = (dynamic_count + 1) * (max_transmissions + 1) as usize;
+            // clamp size to 500
+            let size = cmp::min(500, dynamic_size);
 
-        {
+            prev_set_size = size;
+            let mut set = ProbSet::new(size, 4);
             let members = agent.members().read();
             let members_ring0 = members.ring0(agent.cluster_id());
             for (actor_id, addr) in members_ring0 {
                 set.insert(actor_id.to_u128());
                 ring0.insert(addr);
             }
+            set
         };
 
         debug!("sending local broadcasts to ring0 nodes: {:?}", ring0);
@@ -619,7 +656,7 @@ async fn handle_broadcasts(
 
             let bcast_change = BroadcastV2 {
                 change: BroadcastV1::Change(change.clone()),
-                set: set.clone(),
+                set: prob_set.clone(),
                 num_broadcasts: 1,
             };
 
@@ -681,31 +718,11 @@ async fn handle_broadcasts(
                 to_local_broadcast.push_front(change);
                 break;
             } else {
+                // TODO: test whether we still want to re-queue
                 to_broadcast_v2.push_front(bcast_change);
             }
             counter!("corro.broadcast.spawn", "type" => "local").increment(spawn_count);
         }
-
-        let (members_count, ring0_count) = {
-            let members = agent.members().read();
-            let members_count = members.states.len();
-            let ring0_count = members.ring0(agent.cluster_id()).count();
-            (members_count, ring0_count)
-        };
-
-        let (choose_count, max_transmissions) = {
-            let config = config.read();
-            let max_transmissions = config.max_transmissions.get();
-            let dynamic_count = (members_count - ring0_count) / (max_transmissions as usize * 10);
-            let count = cmp::max(config.num_indirect_probes.get(), dynamic_count);
-
-            if prev_rate_limited {
-                // we've been rate limited on the last loop, try sending to less nodes...
-                (cmp::min(count, dynamic_count / 2), max_transmissions / 2)
-            } else {
-                (count, max_transmissions)
-            }
-        };
 
         if !rate_limited {
             debug!(
@@ -847,24 +864,24 @@ async fn handle_broadcasts(
                 for (member_id, _) in broadcast_to.clone() {
                     bcast_v2.set.insert(member_id.to_u128());
                 }
+
                 let uni_payload = UniPayload::V1 {
                     data: UniPayloadV1::BroadcastV2(bcast_v2.clone()),
                     cluster_id: agent.cluster_id(),
                 };
 
-                if let Err(e) = uni_payload.write_to_stream((&mut ser_buf).writer()) {
-                    error!("could not encode UniPayload::V1 BroadcastV2: {e}");
-                    ser_buf.clear();
-                    continue;
-                }
-
-                if let Err(e) = bcast_codec.encode(ser_buf.split().freeze(), &mut bcast_buf) {
-                    error!("could not encode broadcast: {e}");
-                    bcast_buf.clear();
-                    continue;
-                }
-
-                let payload = bcast_buf.split().freeze();
+                let payload = match encode_framed(
+                    &mut bcast_codec,
+                    &mut ser_buf,
+                    &mut bcast_buf,
+                    &uni_payload,
+                ) {
+                    Ok(payload) => payload,
+                    Err(e) => {
+                        error!("could not encode UniPayload::V1 BroadcastV2: {e}");
+                        continue;
+                    }
+                };
 
                 let mut spawn_count = 0;
                 for (_, addr) in broadcast_to {
