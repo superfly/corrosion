@@ -1103,7 +1103,11 @@ impl Matcher {
                     if let Err(e) = self.set_status("cancelled") {
                         error!(sub_id = %self.id, "could not set status during cancellation: {e}");
                     }
-                    break;
+                    info!(sub_id = %self.id, "attempting to cleanup");
+                    if let Err(e) = Self::cleanup(self.id, self.base_path.clone()) {
+                        error!("could not handle cleanup: {e}");
+                    }
+                    return;
                 }
                 Some(candidates) = self.changes_rx.recv() => {
                     for (table, pks) in  candidates {
@@ -2510,9 +2514,6 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn test_diff() {
         _ = tracing_subscriber::fmt::try_init();
-
-        let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
-
         let sql = "SELECT json_object(
             'targets', json_array(cs.address||':'||cs.port),
             'labels',  json_object(
@@ -2697,7 +2698,7 @@ mod tests {
         let mut last_change_id = None;
 
         let id = {
-            // let (db_v_tx, db_v_rx) = watch::channel(0);
+            let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
 
             let (matcher, maybe_created) = subs
                 .get_or_insert(
@@ -2889,14 +2890,18 @@ mod tests {
                     println!("{}", s.join(", "));
                 }
             }
-            if let Some(handle) = subs.remove(&matcher.id()) {
-                handle.cleanup().await;
-            }
+
+            subs.remove(&matcher.id());
+
+            // trip the wire so subs loop exits cleanly
+            tripwire_tx.send(()).await.ok();
+            tripwire_worker.await;
             matcher.id()
         };
 
         tokio::time::sleep(Duration::from_secs(1)).await;
 
+        let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
         // restore subscription
         let matcher_id = {
             let (matcher, created) = subs
