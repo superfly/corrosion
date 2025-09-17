@@ -48,7 +48,7 @@ impl<T> TypedQueryEvent<T> {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum QueryEventMeta {
     Columns,
     Row(RowId),

@@ -458,8 +458,7 @@ pub async fn catch_up_sub(
 
     let mut last_change_id = {
         let res = match params.from {
-            Some(from) => catch_up_sub_from(&matcher, from, &evt_tx).await,
-            None => {
+            Some(ChangeId(0)) | None => {
                 if params.skip_rows {
                     let conn = match matcher.pool().get().await {
                         Ok(conn) => conn,
@@ -475,6 +474,7 @@ pub async fn catch_up_sub(
                     catch_up_sub_anew(&matcher, &evt_tx).await
                 }
             }
+            Some(from) => catch_up_sub_from(&matcher, from, &evt_tx).await,
         };
 
         match res {
@@ -1354,8 +1354,87 @@ mod tests {
             )
         );
 
-        // skip rows!
+        // change id 0 should start subs afresh
+        let mut res = api_v1_subs(
+            Extension(agent.clone()),
+            Extension(bcast_cache.clone()),
+            Extension(tripwire.clone()),
+            axum::extract::Query(SubParams {
+                from: Some(0.into()),
+                ..Default::default()
+            }),
+            axum::Json(Statement::Simple("select * from tests".into())),
+        )
+        .await
+        .into_response();
 
+        if !res.status().is_success() {
+            let b = res.body_mut().data().await.unwrap().unwrap();
+            println!("body: {}", String::from_utf8_lossy(&b));
+        }
+
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let mut rows_zero = RowsIter {
+            body: res.into_body(),
+            codec: LinesCodec::new(),
+            buf: BytesMut::new(),
+            done: false,
+        };
+
+        assert_eq!(
+            rows_zero.recv::<QueryEvent>().await.unwrap().unwrap(),
+            QueryEvent::Columns(vec!["id".into(), "text".into()])
+        );
+
+        assert_eq!(
+            rows_zero.recv::<QueryEvent>().await.unwrap().unwrap(),
+            QueryEvent::Row(RowId(1), vec!["service-id".into(), "service-name".into()])
+        );
+
+        assert_eq!(
+            rows_zero.recv::<QueryEvent>().await.unwrap().unwrap(),
+            QueryEvent::Row(
+                RowId(2),
+                vec!["service-id-2".into(), "service-name-2".into()]
+            )
+        );
+
+        assert_eq!(
+            rows_zero.recv::<QueryEvent>().await.unwrap().unwrap(),
+            QueryEvent::Row(
+                RowId(3),
+                vec!["service-id-3".into(), "service-name-3".into()],
+            )
+        );
+
+        assert_eq!(
+            rows_zero.recv::<QueryEvent>().await.unwrap().unwrap(),
+            QueryEvent::Row(
+                RowId(4),
+                vec!["service-id-4".into(), "service-name-4".into()]
+            )
+        );
+
+        assert_eq!(
+            rows_zero.recv::<QueryEvent>().await.unwrap().unwrap(),
+            QueryEvent::Row(
+                RowId(5),
+                vec!["service-id-5".into(), "service-name-5".into()]
+            )
+        );
+
+        assert_eq!(
+            rows_zero
+                .recv::<QueryEvent>()
+                .await
+                .unwrap()
+                .unwrap()
+                .meta(),
+            QueryEventMeta::EndOfQuery(Some(ChangeId(3)))
+        );
+
+        // skip rows!
         let mut res = api_v1_subs(
             Extension(agent.clone()),
             Extension(bcast_cache.clone()),
