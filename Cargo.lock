@@ -3374,9 +3374,9 @@ dependencies = [
 name = "probabilistic-set"
 version = "0.1.0"
 dependencies = [
- "corro-speedy",
- "rand 0.8.5",
+ "rand 0.9.2",
  "serde",
+ "speedy",
  "uuid",
 ]
 

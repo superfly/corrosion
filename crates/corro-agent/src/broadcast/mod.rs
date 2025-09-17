@@ -40,8 +40,8 @@ use corro_types::{
     actor::{Actor, ActorId},
     agent::Agent,
     broadcast::{
-        BroadcastInput, BroadcastV1, BroadcastV2, ChangeV1, DispatchRuntime,
-        FocaCmd, FocaInput, UniPayload, UniPayloadV1,
+        BroadcastInput, BroadcastV1, BroadcastV2, ChangeV1, DispatchRuntime, FocaCmd, FocaInput,
+        UniPayload, UniPayloadV1,
     },
     channel::{bounded, CorroReceiver, CorroSender},
 };
@@ -437,9 +437,8 @@ async fn handle_broadcasts(
     let mut idle_pendings =
         FuturesUnordered::<Pin<Box<dyn Future<Output = PendingBroadcast> + Send + 'static>>>::new();
 
-    let mut broadcast_v2_pendings = FuturesUnordered::<
-        Pin<Box<dyn Future<Output = BroadcastV2> + Send + 'static>>,
-    >::new();
+    let mut broadcast_v2_pendings =
+        FuturesUnordered::<Pin<Box<dyn Future<Output = BroadcastV2> + Send + 'static>>>::new();
 
     let mut bcast_interval = interval(opts.interval);
 
@@ -544,7 +543,10 @@ async fn handle_broadcasts(
                     }
                     BroadcastInput::AddBroadcastV2(bcast) => {
                         // todo: rebroadcast immediates too??
-                        let BroadcastV2 { change: BroadcastV1::Change(change), .. } = bcast;
+                        let BroadcastV2 {
+                            change: BroadcastV1::Change(change),
+                            ..
+                        } = bcast;
                         to_local_broadcast.push_front(change);
                     }
                     // for old rebroadcast, treat as normal
@@ -847,7 +849,7 @@ async fn handle_broadcasts(
                 // let prev_set = bcast_change.set.clone();
                 let broadcast_to = member_states
                     .iter()
-                    .filter_map(|(member_id, state)| {  
+                    .filter_map(|(member_id, state)| {
                         // don't broadcast to ourselves... or a member that's already in the set
                         if *member_id == actor_id
                             || state.cluster_id != agent.cluster_id()
