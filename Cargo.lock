@@ -787,7 +787,6 @@ dependencies = [
  "compact_str 0.7.1",
  "config",
  "corro-pg",
- "corro-speedy",
  "corro-tests",
  "corro-types",
  "corro-utils",
@@ -817,6 +816,7 @@ dependencies = [
  "serde",
  "serde_json",
  "spawn",
+ "speedy",
  "sqlite-pool",
  "sqlite3-parser",
  "strum",
@@ -843,13 +843,13 @@ dependencies = [
  "async-trait",
  "camino",
  "compact_str 0.7.1",
- "corro-speedy",
  "deadpool",
  "hex",
  "rusqlite",
  "serde",
  "serde_json",
  "smallvec",
+ "speedy",
  "strum",
  "thiserror 1.0.69",
  "tokio",
@@ -862,7 +862,6 @@ dependencies = [
  "async-trait",
  "camino",
  "compact_str 0.7.1",
- "corro-speedy",
  "deadpool",
  "hex",
  "rangemap",
@@ -870,6 +869,7 @@ dependencies = [
  "serde",
  "serde_json",
  "smallvec",
+ "speedy",
  "strum",
  "thiserror 1.0.69",
  "tokio",
@@ -948,19 +948,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "corro-speedy"
-version = "0.8.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dcbc8dd22992b785a0375e7065168b3a3b95599d3ffe2cf3d5d4a752278fdaba"
-dependencies = [
- "indexmap 1.9.3",
- "memoffset",
- "smallvec",
- "speedy-derive",
- "uuid",
-]
-
-[[package]]
 name = "corro-tests"
 version = "0.1.0"
 dependencies = [
@@ -1016,7 +1003,6 @@ dependencies = [
  "consul-client",
  "corro-api-types",
  "corro-base-types",
- "corro-speedy",
  "corro-tests",
  "deadpool",
  "enquote",
@@ -1039,6 +1025,7 @@ dependencies = [
  "serde_json",
  "serde_with",
  "spawn",
+ "speedy",
  "sqlite-functions",
  "sqlite-pool",
  "sqlite3-parser",
@@ -2708,9 +2695,9 @@ checksum = "32a282da65faaf38286cf3be983213fcf1d2e2a58700e808f83f4ea9a4804bc0"
 
 [[package]]
 name = "memoffset"
-version = "0.8.0"
+version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d61c719bcfbcf5d62b3a09efa6088de8c54bc0bfcd3ea7ae39fcc186108b8de1"
+checksum = "488016bfae457b036d996092f6cb448677611ce4449e970ceaf42695203f218a"
 dependencies = [
  "autocfg",
 ]
@@ -4304,10 +4291,24 @@ dependencies = [
 ]
 
 [[package]]
-name = "speedy-derive"
-version = "0.8.6"
+name = "speedy"
+version = "0.8.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7d395866cb6778625150f77a430cc0af764ce0300f6a3d3413477785fa34b6c7"
+checksum = "da1992073f0e55aab599f4483c460598219b4f9ff0affa124b33580ab511e25a"
+dependencies = [
+ "indexmap 1.9.3",
+ "indexmap 2.11.0",
+ "memoffset",
+ "smallvec",
+ "speedy-derive",
+ "uuid",
+]
+
+[[package]]
+name = "speedy-derive"
+version = "0.8.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "658f2ca5276b92c3dfd65fa88316b4e032ace68f88d7570b43967784c0bac5ac"
 dependencies = [
  "proc-macro2",
  "quote",
