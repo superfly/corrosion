@@ -1,6 +1,6 @@
 use crate::actor::ActorId;
 use crate::agent::SplitPool;
-use crate::change::Change;
+use crate::broadcast::Changeset;
 use crate::pubsub::{unpack_columns, MatchCandidates, MatchableChange, MatcherError};
 use crate::schema::Schema;
 use antithesis_sdk::assert_sometimes;
@@ -417,7 +417,7 @@ async fn batch_candidates(
     debug!(id = %id, "update loop is done");
 }
 
-pub fn match_changes<H>(manager: &impl Manager<H>, changes: &[Change], db_version: CrsqlDbVersion)
+pub fn match_changes<H>(manager: &impl Manager<H>, changes: &Changeset, db_version: CrsqlDbVersion)
 where
     H: Handle + Send + 'static,
 {
@@ -441,7 +441,7 @@ where
         trace!(sub_id = %id, %db_version, "attempting to match changes to a subscription");
         let mut candidates = MatchCandidates::new();
         let mut match_count = 0;
-        for change in changes.iter().map(MatchableChange::from) {
+        for change in changes.matchable_changes() {
             if handle.filter_matchable_change(&mut candidates, change) {
                 match_count += 1;
             }
