@@ -174,7 +174,7 @@ pub async fn process_sub_channel(
             },
             _ = subs_check.tick() => {
                 let rcv = tx.receiver_count();
-                info!(sub_id = %id, "receiver count: {rcv}");
+                debug!(sub_id = %id, "receiver count: {rcv}");
                 if rcv == 0 {
                     if deadline.is_none() {
                         deadline = Some(Box::pin(tokio::time::sleep(MAX_UNSUB_TIME)));
