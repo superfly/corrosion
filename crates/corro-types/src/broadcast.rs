@@ -2,9 +2,10 @@ use std::{cmp, fmt, io, num::NonZeroU32, num::ParseIntError, ops::Deref, time::D
 
 use antithesis_sdk::assert_sometimes;
 use bytes::{Bytes, BytesMut};
-use corro_api_types::{ColumnName, SqliteValue};
+use corro_api_types::{ColumnName, SqliteValue, TableName};
 use corro_base_types::{CrsqlDbVersionRange, CrsqlSeqRange};
 use foca::{Identity, Member, Notification, Runtime, Timer};
+use indexmap::IndexMap;
 use itertools::Itertools;
 use metrics::counter;
 use rusqlite::{
@@ -112,6 +113,12 @@ pub struct ChangeV1 {
     pub changeset: Changeset,
 }
 
+#[derive(Debug, Clone, PartialEq, Readable, Writable)]
+pub struct ChangesetPerTable(IndexMap<TableName, ChangesetPerTablePk>);
+
+#[derive(Debug, Clone, PartialEq, Readable, Writable)]
+pub struct ChangesetPerTablePk(IndexMap<Vec<u8>, Vec<ColumnChange>>);
+
 impl Deref for ChangeV1 {
     type Target = Changeset;
 
@@ -138,6 +145,14 @@ pub enum Changeset {
     },
     EmptySet {
         versions: Vec<CrsqlDbVersionRange>,
+        ts: Timestamp,
+    },
+    FullV2 {
+        site_id: ActorId,
+        version: CrsqlDbVersion,
+        changes: ChangesetPerTable,
+        last_seq: CrsqlSeq,
+        seqs: CrsqlSeqRange,
         ts: Timestamp,
     },
 }
@@ -171,6 +186,7 @@ impl Changeset {
             // probably shouldn't be doing this
             Changeset::EmptySet { .. } => CrsqlDbVersionRange::empty(),
             Changeset::Full { version, .. } => CrsqlDbVersionRange::single(*version),
+            Changeset::FullV2 { version, .. } => CrsqlDbVersionRange::single(*version),
         }
     }
 
@@ -183,11 +199,17 @@ impl Changeset {
                 .map(|versions| cmp::min(versions.len(), 20))
                 .sum::<usize>(),
             Changeset::Full { changes, .. } => changes.len(),
+            Changeset::FullV2 { .. } => self.len(),
         }
     }
 
     pub fn max_db_version(&self) -> Option<CrsqlDbVersion> {
-        self.changes().iter().map(|c| c.db_version).max()
+        match self {
+            Changeset::Empty { .. } => None,
+            Changeset::EmptySet { .. } => None,
+            Changeset::Full { version, .. } => Some(*version),
+            Changeset::FullV2 { version, .. } => Some(*version),
+        }
     }
 
     #[inline]
@@ -196,6 +218,7 @@ impl Changeset {
             Changeset::Empty { .. } => None,
             Changeset::EmptySet { .. } => None,
             Changeset::Full { seqs, .. } => Some(*seqs),
+            Changeset::FullV2 { seqs, .. } => Some(*seqs),
         }
     }
 
@@ -204,6 +227,7 @@ impl Changeset {
             Changeset::Empty { .. } => None,
             Changeset::EmptySet { .. } => None,
             Changeset::Full { last_seq, .. } => Some(*last_seq),
+            Changeset::FullV2 { last_seq, .. } => Some(*last_seq),
         }
     }
 
@@ -214,6 +238,9 @@ impl Changeset {
             Changeset::Full { seqs, last_seq, .. } => {
                 seqs.start_int() == 0 && seqs.end_int() == last_seq.0
             }
+            Changeset::FullV2 { seqs, last_seq, .. } => {
+                seqs.start_int() == 0 && seqs.end_int() == last_seq.0
+            }
         }
     }
 
@@ -222,6 +249,17 @@ impl Changeset {
             Changeset::Empty { .. } => 0,
             Changeset::EmptySet { versions, .. } => versions.len(),
             Changeset::Full { changes, .. } => changes.len(),
+            Changeset::FullV2 { changes, .. } => changes
+                .0
+                .iter()
+                .map(|(_, pk_changes)| {
+                    pk_changes
+                        .0
+                        .iter()
+                        .map(|(_, changes)| changes.len())
+                        .sum::<usize>()
+                })
+                .sum::<usize>(),
         }
     }
 
@@ -230,6 +268,7 @@ impl Changeset {
             Changeset::Empty { .. } => true,
             Changeset::EmptySet { .. } => true,
             Changeset::Full { changes, .. } => changes.is_empty(),
+            Changeset::FullV2 { changes, .. } => changes.0.is_empty(),
         }
     }
 
@@ -238,6 +277,7 @@ impl Changeset {
             Changeset::Empty { .. } => false,
             Changeset::EmptySet { .. } => true,
             Changeset::Full { .. } => false,
+            Changeset::FullV2 { .. } => false,
         }
     }
 
@@ -246,6 +286,7 @@ impl Changeset {
             Changeset::Empty { ts, .. } => *ts,
             Changeset::EmptySet { ts, .. } => Some(*ts),
             Changeset::Full { ts, .. } => Some(*ts),
+            Changeset::FullV2 { ts, .. } => Some(*ts),
         }
     }
 
@@ -254,6 +295,8 @@ impl Changeset {
             Changeset::Empty { .. } => &[],
             Changeset::EmptySet { .. } => &[],
             Changeset::Full { changes, .. } => changes,
+            // TODO: Fix this
+            Changeset::FullV2 { .. } => &[],
         }
     }
 
@@ -274,6 +317,43 @@ impl Changeset {
                 last_seq,
                 ts,
             }),
+            Changeset::FullV2 {
+                site_id,
+                version,
+                changes,
+                seqs,
+                last_seq,
+                ts,
+            } => {
+                let changes = changes
+                    .0
+                    .into_iter()
+                    .flat_map(|(table, pk_changes)| {
+                        pk_changes.0.into_iter().flat_map(move |(pk, row)| {
+                            let table = table.clone();
+                            row.into_iter().map(move |col_change| Change {
+                                table: table.clone(),
+                                pk: pk.clone(),
+                                cid: col_change.cid,
+                                val: col_change.val,
+                                col_version: col_change.col_version,
+                                db_version: version,
+                                seq: col_change.seq,
+                                site_id: site_id.to_bytes(),
+                                cl: col_change.cl,
+                            })
+                        })
+                    })
+                    .collect::<Vec<_>>();
+
+                Some(ChangesetParts {
+                    version,
+                    changes,
+                    seqs,
+                    last_seq,
+                    ts,
+                })
+            }
         }
     }
 }
