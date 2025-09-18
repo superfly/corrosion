@@ -1,12 +1,14 @@
-use std::{cmp, fmt, io, num::NonZeroU32, num::ParseIntError, ops::Deref, time::Duration};
+use std::{
+    cmp, collections::HashMap, fmt, io, num::NonZeroU32, num::ParseIntError, ops::Deref,
+    time::Duration,
+};
 
 use antithesis_sdk::assert_sometimes;
 use bytes::{Bytes, BytesMut};
 use corro_api_types::{ColumnName, SqliteValue, TableName};
 use corro_base_types::{CrsqlDbVersionRange, CrsqlSeqRange};
 use foca::{Identity, Member, Notification, Runtime, Timer};
-use indexmap::IndexMap;
-use itertools::Itertools;
+use indexmap::{map::Entry, IndexMap};
 use metrics::counter;
 use rusqlite::{
     types::{FromSql, FromSqlError},
@@ -28,6 +30,7 @@ use crate::{
     base::{CrsqlDbVersion, CrsqlSeq},
     change::{row_to_change, Change, ChunkedChanges, MAX_CHANGES_BYTE_SIZE},
     channel::CorroSender,
+    pubsub::MatchableChange,
     sqlite::SqlitePoolError,
     sync::SyncTraceContextV1,
     updates::match_changes,
@@ -113,12 +116,6 @@ pub struct ChangeV1 {
     pub changeset: Changeset,
 }
 
-#[derive(Debug, Clone, PartialEq, Readable, Writable)]
-pub struct ChangesetPerTable(IndexMap<TableName, ChangesetPerTablePk>);
-
-#[derive(Debug, Clone, PartialEq, Readable, Writable)]
-pub struct ChangesetPerTablePk(IndexMap<Vec<u8>, Vec<ColumnChange>>);
-
 impl Deref for ChangeV1 {
     type Target = Changeset;
 
@@ -148,7 +145,8 @@ pub enum Changeset {
         ts: Timestamp,
     },
     FullV2 {
-        site_id: ActorId,
+        // TODO: actor_id is duplicated here
+        actor_id: ActorId,
         version: CrsqlDbVersion,
         changes: ChangesetPerTable,
         last_seq: CrsqlSeq,
@@ -168,6 +166,86 @@ impl From<ChangesetParts> for Changeset {
         }
     }
 }
+
+#[derive(Debug, Default, Clone, PartialEq, Readable, Writable)]
+pub struct ChangesetPerTable(IndexMap<TableName, ChangesetPerTablePk>);
+
+impl ChangesetPerTable {
+    pub fn new(map: IndexMap<TableName, ChangesetPerTablePk>) -> Self {
+        Self(map)
+    }
+
+    pub fn count(&self) -> HashMap<String, usize> {
+        self.iter()
+            .map(|(table, rows)| {
+                (
+                    table.to_string(),
+                    rows.0.iter().map(|(_, cols)| cols.len()).sum(),
+                )
+            })
+            .collect()
+    }
+
+    pub fn matchable_changes(&self) -> Box<dyn Iterator<Item = MatchableChange<'_>> + '_> {
+        Box::new(self.iter().flat_map(|(table, row)| {
+            row.0.iter().flat_map(|(pk, cols)| {
+                cols.iter().map(|col| MatchableChange {
+                    table,
+                    pk,
+                    column: &col.cid,
+                    cl: col.cl,
+                })
+            })
+        }))
+    }
+
+    pub fn insert(&mut self, change: Change) -> usize {
+        let mut cost = change.estimated_column_byte_size();
+        let table_len = change.table.len();
+        let pk_len = change.pk.len();
+
+        let per_table = match self.0.entry(change.table) {
+            Entry::Occupied(e) => e.into_mut(),
+            Entry::Vacant(v) => {
+                cost += table_len;
+                v.insert(ChangesetPerTablePk::default())
+            }
+        };
+
+        let col_changes = match per_table.0.entry(change.pk) {
+            Entry::Occupied(e) => e.into_mut(),
+            Entry::Vacant(v) => {
+                cost += pk_len;
+                v.insert(Default::default())
+            }
+        };
+
+        col_changes.push(ColumnChange {
+            cid: change.cid,
+            val: change.val,
+            col_version: change.col_version,
+            seq: change.seq,
+            cl: change.cl,
+        });
+
+        cost
+    }
+
+    pub fn drain(&mut self) -> Self {
+        Self(self.0.drain(..).collect())
+    }
+}
+
+impl Deref for ChangesetPerTable {
+    type Target = IndexMap<TableName, ChangesetPerTablePk>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Readable, Writable)]
+pub struct ChangesetPerTablePk(IndexMap<Vec<u8>, Vec<ColumnChange>>);
 
 pub struct ChangesetParts {
     pub version: CrsqlDbVersion,
@@ -290,16 +368,6 @@ impl Changeset {
         }
     }
 
-    pub fn changes(&self) -> &[Change] {
-        match self {
-            Changeset::Empty { .. } => &[],
-            Changeset::EmptySet { .. } => &[],
-            Changeset::Full { changes, .. } => changes,
-            // TODO: Fix this
-            Changeset::FullV2 { .. } => &[],
-        }
-    }
-
     pub fn into_parts(self) -> Option<ChangesetParts> {
         match self {
             Changeset::Empty { .. } => None,
@@ -318,7 +386,7 @@ impl Changeset {
                 ts,
             }),
             Changeset::FullV2 {
-                site_id,
+                actor_id,
                 version,
                 changes,
                 seqs,
@@ -339,7 +407,7 @@ impl Changeset {
                                 col_version: col_change.col_version,
                                 db_version: version,
                                 seq: col_change.seq,
-                                site_id: site_id.to_bytes(),
+                                site_id: actor_id.to_bytes(),
                                 cl: col_change.cl,
                             })
                         })
@@ -354,6 +422,14 @@ impl Changeset {
                     ts,
                 })
             }
+        }
+    }
+
+    pub fn matchable_changes(&self) -> Box<dyn Iterator<Item = MatchableChange<'_>> + '_> {
+        match self {
+            Changeset::Full { changes, .. } => Box::new(changes.iter().map(MatchableChange::from)),
+            Changeset::FullV2 { changes, .. } => Box::new(changes.matchable_changes()),
+            Changeset::Empty { .. } | Changeset::EmptySet { .. } => Box::new(std::iter::empty()),
         }
     }
 }
@@ -609,15 +685,23 @@ pub async fn broadcast_changes(
         for changes_seqs in chunked {
             match changes_seqs {
                 Ok((changes, seqs)) => {
-                    for (table_name, count) in changes.iter().counts_by(|change| &change.table) {
-                        counter!("corro.changes.committed", "table" => table_name.to_string(), "source" => "local").increment(count as u64);
+                    for (table_name, count) in changes.count() {
+                        counter!("corro.changes.committed", "table" => table_name, "source" => "local").increment(count as u64);
                     }
 
                     trace!("broadcasting changes: {changes:?} for seq: {seqs:?}");
 
                     debug!("match_changes db_version: {db_version}");
-                    match_changes(agent.subs_manager(), &changes, db_version);
-                    match_changes(agent.updates_manager(), &changes, db_version);
+                    let changeset = Changeset::FullV2 {
+                        actor_id,
+                        version: db_version,
+                        changes,
+                        seqs,
+                        last_seq,
+                        ts,
+                    };
+                    match_changes(agent.subs_manager(), &changeset, db_version);
+                    match_changes(agent.updates_manager(), &changeset, db_version);
 
                     let tx_bcast = agent.tx_bcast().clone();
                     assert_sometimes!(true, "Corrosion broadcasts changes");
@@ -626,13 +710,7 @@ pub async fn broadcast_changes(
                             .send(BroadcastInput::AddBroadcast(BroadcastV1::Change(
                                 ChangeV1 {
                                     actor_id,
-                                    changeset: Changeset::Full {
-                                        version: db_version,
-                                        changes,
-                                        seqs,
-                                        last_seq,
-                                        ts,
-                                    },
+                                    changeset,
                                 },
                             )))
                             .await

@@ -772,7 +772,7 @@ mod tests {
         assert!(matches!(
             msg,
             BroadcastInput::AddBroadcast(BroadcastV1::Change(ChangeV1 {
-                changeset: Changeset::Full {
+                changeset: Changeset::FullV2 {
                     version: CrsqlDbVersion(1),
                     ..
                 },
