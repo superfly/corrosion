@@ -19,6 +19,7 @@ config = { workspace = true }
 consul-client = { version = "0.1.0-alpha.0", path = "../consul-client" }
 corro-api-types = { version = "0.1.0-alpha.1", path = "../corro-api-types" }
 corro-base-types = { version = "0.1.0-alpha.1", path = "../corro-base-types" }
+probabilistic-set = { version = "0.1.0-alpha.1", path = "../probabilistic-set" }
 deadpool = { workspace = true }
 enquote = { workspace = true }
 fallible-iterator = { workspace = true }
