@@ -13,7 +13,7 @@ use tracing::{debug, trace, warn};
 use crate::{
     agent::{Agent, BookedVersions, ChangeError, VersionsSnapshot},
     base::CrsqlSeq,
-    broadcast::Timestamp,
+    broadcast::{ChangesetPerTable, Timestamp},
 };
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize, Readable, Writable, PartialEq)]
@@ -34,17 +34,20 @@ impl Change {
     // be required on the wire
     pub fn estimated_byte_size(&self) -> usize {
         self.table.len() + self.pk.len() + self.cid.len() + self.val.estimated_byte_size() +
-        // col_version
-        8 +
         // db_version
+        8 +
+        self.estimated_column_byte_size() +
+        // site_id
+        16
+    }
+
+    pub fn estimated_column_byte_size(&self) -> usize {
+        self.cid.len() + self.val.estimated_byte_size() +
+        // col_version
         8 +
         // seq
         8 +
-        // site_id
-        16 +
         // cl
-        8 +
-        // site_version
         8
     }
 }
@@ -65,7 +68,7 @@ pub fn row_to_change(row: &Row) -> Result<Change, rusqlite::Error> {
 
 pub struct ChunkedChanges<I: Iterator> {
     iter: Peekable<I>,
-    changes: Vec<Change>,
+    changes: ChangesetPerTable,
     last_pushed_seq: CrsqlSeq,
     last_start_seq: CrsqlSeq,
     last_seq: CrsqlSeq,
@@ -81,7 +84,7 @@ where
     pub fn new(iter: I, start_seq: CrsqlSeq, last_seq: CrsqlSeq, max_buf_size: usize) -> Self {
         Self {
             iter: iter.peekable(),
-            changes: vec![],
+            changes: Default::default(),
             last_pushed_seq: CrsqlSeq(0),
             last_start_seq: start_seq,
             last_seq,
@@ -104,7 +107,7 @@ impl<I> Iterator for ChunkedChanges<I>
 where
     I: Iterator<Item = rusqlite::Result<Change>>,
 {
-    type Item = Result<(Vec<Change>, CrsqlSeqRange), rusqlite::Error>;
+    type Item = Result<(ChangesetPerTable, CrsqlSeqRange), rusqlite::Error>;
 
     fn next(&mut self) -> Option<Self::Item> {
         // previously marked as done because the Rows iterator returned None
@@ -130,9 +133,8 @@ where
 
                     self.last_pushed_seq = change.seq;
 
-                    self.buffered_size += change.estimated_byte_size();
-
-                    self.changes.push(change);
+                    let size = self.changes.insert(change);
+                    self.buffered_size += size;
 
                     if self.last_pushed_seq == self.last_seq {
                         // this was the last seq! break early
@@ -152,7 +154,7 @@ where
                         self.last_start_seq = self.last_pushed_seq + 1;
 
                         return Some(Ok((
-                            self.changes.drain(..).collect(),
+                            self.changes.drain(),
                             CrsqlSeqRange::new(start_seq, self.last_pushed_seq),
                         )));
                     }
@@ -269,7 +271,10 @@ mod tests {
         // empty interator
         let mut chunker = ChunkedChanges::new(vec![].into_iter(), CrsqlSeq(0), CrsqlSeq(100), 50);
 
-        assert_eq!(chunker.next(), Some(Ok((vec![], dbsr!(0, 100)))));
+        assert_eq!(
+            chunker.next(),
+            Some(Ok((ChangesetPerTable::default(), dbsr!(0, 100))))
+        );
         assert_eq!(chunker.next(), None);
 
         let changes: Vec<Change> = (0..100)
@@ -279,6 +284,8 @@ mod tests {
             })
             .collect();
 
+        let (changeset, size) =
+            mapped_changeset_from_changes(vec![changes[0].clone(), changes[1].clone()]);
         // 2 iterations
         let mut chunker = ChunkedChanges::new(
             vec![
@@ -289,54 +296,47 @@ mod tests {
             .into_iter(),
             CrsqlSeq(0),
             CrsqlSeq(100),
-            changes[0].estimated_byte_size() + changes[1].estimated_byte_size(),
+            size,
         );
 
-        assert_eq!(
-            chunker.next(),
-            Some(Ok((
-                vec![changes[0].clone(), changes[1].clone()],
-                dbsr!(0, 1)
-            )))
-        );
-        assert_eq!(
-            chunker.next(),
-            Some(Ok((vec![changes[2].clone()], dbsr!(2, 100))))
-        );
+        assert_eq!(chunker.next(), Some(Ok((changeset, dbsr!(0, 1)))));
+
+        let (changeset, _) = mapped_changeset_from_changes(vec![changes[2].clone()]);
+        assert_eq!(chunker.next(), Some(Ok((changeset, dbsr!(2, 100)))));
         assert_eq!(chunker.next(), None);
 
+        let (changeset, size) = mapped_changeset_from_changes(vec![changes[0].clone()]);
         let mut chunker = ChunkedChanges::new(
             vec![Ok(changes[0].clone()), Ok(changes[1].clone())].into_iter(),
             CrsqlSeq(0),
             CrsqlSeq(0),
-            changes[0].estimated_byte_size(),
+            size,
         );
 
-        assert_eq!(
-            chunker.next(),
-            Some(Ok((vec![changes[0].clone()], dbsr!(0, 0))))
-        );
+        assert_eq!(chunker.next(), Some(Ok((changeset, dbsr!(0, 0)))));
         assert_eq!(chunker.next(), None);
 
+        let (changeset, size) =
+            mapped_changeset_from_changes(vec![changes[0].clone(), changes[2].clone()]);
         // gaps
         let mut chunker = ChunkedChanges::new(
             vec![Ok(changes[0].clone()), Ok(changes[2].clone())].into_iter(),
             CrsqlSeq(0),
             CrsqlSeq(100),
-            changes[0].estimated_byte_size() + changes[2].estimated_byte_size(),
+            size,
         );
 
-        assert_eq!(
-            chunker.next(),
-            Some(Ok((
-                vec![changes[0].clone(), changes[2].clone()],
-                dbsr!(0, 100)
-            )))
-        );
+        assert_eq!(chunker.next(), Some(Ok((changeset, dbsr!(0, 100)))));
 
         assert_eq!(chunker.next(), None);
 
         // gaps
+        let (changeset, _) = mapped_changeset_from_changes(vec![
+            changes[2].clone(),
+            changes[4].clone(),
+            changes[7].clone(),
+            changes[8].clone(),
+        ]);
         let mut chunker = ChunkedChanges::new(
             vec![
                 Ok(changes[2].clone()),
@@ -350,22 +350,13 @@ mod tests {
             100000, // just send them all!
         );
 
-        assert_eq!(
-            chunker.next(),
-            Some(Ok((
-                vec![
-                    changes[2].clone(),
-                    changes[4].clone(),
-                    changes[7].clone(),
-                    changes[8].clone()
-                ],
-                dbsr!(0, 100)
-            )))
-        );
+        assert_eq!(chunker.next(), Some(Ok((changeset, dbsr!(0, 100)))));
 
         assert_eq!(chunker.next(), None);
 
         // gaps
+        let (changeset, size) =
+            mapped_changeset_from_changes(vec![changes[2].clone(), changes[4].clone()]);
         let mut chunker = ChunkedChanges::new(
             vec![
                 Ok(changes[2].clone()),
@@ -376,25 +367,24 @@ mod tests {
             .into_iter(),
             CrsqlSeq(0),
             CrsqlSeq(10),
-            changes[2].estimated_byte_size() + changes[4].estimated_byte_size(),
+            size,
         );
 
-        assert_eq!(
-            chunker.next(),
-            Some(Ok((
-                vec![changes[2].clone(), changes[4].clone(),],
-                dbsr!(0, 4)
-            )))
-        );
+        assert_eq!(chunker.next(), Some(Ok((changeset, dbsr!(0, 4)))));
 
-        assert_eq!(
-            chunker.next(),
-            Some(Ok((
-                vec![changes[7].clone(), changes[8].clone(),],
-                dbsr!(5, 10)
-            )))
-        );
+        let (changeset, _) =
+            mapped_changeset_from_changes(vec![changes[7].clone(), changes[8].clone()]);
+        assert_eq!(chunker.next(), Some(Ok((changeset, dbsr!(5, 10)))));
 
         assert_eq!(chunker.next(), None);
+    }
+
+    fn mapped_changeset_from_changes(changes: Vec<Change>) -> (ChangesetPerTable, usize) {
+        let mut changeset = ChangesetPerTable::default();
+        let mut size = 0;
+        for change in changes {
+            size += changeset.insert(change);
+        }
+        (changeset, size)
     }
 }
