@@ -1306,7 +1306,7 @@ mod tests {
         );
 
         // change id 0 should start subs afresh
-        let mut res = api_v1_subs(
+        let res = api_v1_subs(
             Extension(agent.clone()),
             Extension(bcast_cache.clone()),
             Extension(tripwire.clone()),
@@ -1319,19 +1319,7 @@ mod tests {
         .await
         .into_response();
 
-        if !res.status().is_success() {
-            let b = res.body_mut().data().await.unwrap().unwrap();
-            println!("body: {}", String::from_utf8_lossy(&b));
-        }
-
-        assert_eq!(res.status(), StatusCode::OK);
-
-        let mut rows_zero = RowsIter {
-            body: res.into_body(),
-            codec: LinesCodec::new(),
-            buf: BytesMut::new(),
-            done: false,
-        };
+        let mut rows_zero = RowsIter::new(assert_ok(res).await);
 
         assert_eq!(
             rows_zero.recv::<QueryEvent>().await.unwrap().unwrap(),
@@ -1386,7 +1374,7 @@ mod tests {
         );
 
         // skip rows!
-        let mut res = api_v1_subs(
+        let res = api_v1_subs(
             Extension(agent.clone()),
             Extension(bcast_cache.clone()),
             Extension(tripwire.clone()),
