@@ -1380,7 +1380,7 @@ mod tests {
         );
 
         // skip rows!
-        let mut res = api_v1_subs(
+        let res = api_v1_subs(
             Extension(agent.clone()),
             Extension(bcast_cache.clone()),
             Extension(tripwire.clone()),
