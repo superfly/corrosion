@@ -181,18 +181,34 @@ impl From<SocketAddr> for Actor {
     }
 }
 
+pub struct ActorAddr {
+    id: ActorId,
+    addr: SocketAddr,
+}
+
+impl PartialEq for ActorAddr {
+    fn eq(&self, other: &Self) -> bool {
+        // this happens if we're announcing ourselves to another node
+        // we don't yet have any info about them, except their gossip addr
+        if self.id.is_nil() || other.id.is_nil() {
+            self.addr.eq(&other.addr)
+        } else {
+            self.id.eq(&other.id)
+        }
+    }
+}
+
 impl Identity for Actor {
+    type Addr = ActorAddr;
+
     // Since a client outside the cluster will not be aware of our
     // `bump` field, we implement the optional trait method
     // `has_same_prefix` to allow anyone that knows our `addr`
     // to join our cluster.
-    fn has_same_prefix(&self, other: &Self) -> bool {
-        // this happens if we're announcing ourselves to another node
-        // we don't yet have any info about them, except their gossip addr
-        if other.id.is_nil() || self.id.is_nil() {
-            self.addr.eq(&other.addr)
-        } else {
-            self.id.eq(&other.id)
+    fn addr(&self) -> Self::Addr {
+        ActorAddr {
+            id: self.id,
+            addr: self.addr,
         }
     }
 
@@ -206,6 +222,10 @@ impl Identity for Actor {
             ts: NTP64::from(duration_since_epoch()).into(),
             cluster_id: self.cluster_id,
         })
+    }
+
+    fn win_addr_conflict(&self, adversary: &Self) -> bool {
+        self.ts > adversary.ts
     }
 }
 

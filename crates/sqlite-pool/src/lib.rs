@@ -11,10 +11,7 @@ use std::{
 };
 use tracing::warn;
 
-use deadpool::{
-    async_trait,
-    managed::{self, Object},
-};
+use deadpool::managed::{self, Object};
 use metrics::counter;
 use rusqlite::{CachedStatement, InterruptHandle, Params, Transaction};
 use tokio::time::{sleep, Duration};
@@ -88,7 +85,6 @@ impl SqliteConn for rusqlite::Connection {
     }
 }
 
-#[async_trait]
 impl<T> managed::Manager for Manager<T>
 where
     T: SqliteConn,
