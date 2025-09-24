@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
 use corro_agent::agent::start_with_config;
+// Reexport CorrosionClient and CorrosionApiClient
+pub use corro_client::{CorrosionApiClient, CorrosionClient};
 use corro_types::{
     agent::{Agent, Bookie},
     config::{Config, ConfigBuilder, ConfigBuilderError},
@@ -85,6 +87,16 @@ pub async fn launch_test_agent<F: FnOnce(ConfigBuilder) -> Result<Config, Config
         tmpdir: Arc::new(tmpdir),
         config: conf,
     })
+}
+
+impl TestAgent {
+    pub fn client(&self) -> CorrosionClient {
+        CorrosionClient::new(self.agent.api_addr(), self.agent.db_path())
+    }
+
+    pub fn api_client(&self) -> CorrosionApiClient {
+        CorrosionApiClient::new(self.agent.api_addr())
+    }
 }
 
 impl Drop for TestAgent {

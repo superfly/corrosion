@@ -899,7 +899,7 @@ mod tests {
     use std::time::Instant;
     use tokio::time::timeout;
     use tokio_util::codec::{Decoder, LinesCodec};
-    use tripwire::Tripwire;
+    use tripwire::{Tripwire, TripwireWorker};
 
     use super::*;
     use crate::agent::process_multiple_changes;
@@ -912,6 +912,92 @@ mod tests {
     use corro_tests::launch_test_agent;
     use corro_tests::tempdir::TempDir;
     use corro_types::api::SqliteValue::Integer;
+
+    struct PubSubAgent {
+        ta: corro_tests::TestAgent,
+        ta_client: corro_tests::CorrosionClient,
+        subs_bcast_cache: SharedMatcherBroadcastCache,
+        updates_bcast_cache: SharedUpdateBroadcastCache,
+    }
+    struct PubSubTest {
+        agents: Vec<PubSubAgent>,
+        tripwire_worker: TripwireWorker<tokio_stream::wrappers::ReceiverStream<()>>,
+    }
+
+    impl PubSubTest {
+        // Creates an cluster with N agents
+        async fn with_n_agents(n: usize) -> eyre::Result<Self> {
+            let (tripwire, tripwire_worker, _) = Tripwire::new_simple();
+            let mut agents = Vec::with_capacity(n);
+            for _ in 0..n {
+                let prev_gossip = agents
+                    .last()
+                    .map(|a: &PubSubAgent| a.ta.agent.gossip_addr().to_string());
+                dbg!(&prev_gossip);
+                let ta = launch_test_agent(
+                    |conf| {
+                        if let Some(gossip) = prev_gossip {
+                            conf.bootstrap(vec![gossip]).build()
+                        } else {
+                            conf.build()
+                        }
+                    },
+                    tripwire.clone(),
+                )
+                .await?;
+                let ta_client = ta.client();
+                agents.push(PubSubAgent {
+                    ta,
+                    ta_client,
+                    subs_bcast_cache: Default::default(),
+                    updates_bcast_cache: Default::default(),
+                });
+            }
+            Ok(Self { agents, tripwire_worker })
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn tets_on_2_nodes() -> eyre::Result<()> {
+        _ = tracing_subscriber::fmt::try_init();
+        let test = PubSubTest::with_n_agents(2).await?;
+
+        let ta1 = &test.agents[0].ta;
+        let ta2 = &test.agents[1].ta;
+
+        let (status_code, body) = api_v1_transactions(
+            Extension(ta1.agent.clone()),
+            axum::extract::Query(TimeoutParams { timeout: None }),
+            axum::Json(vec![
+                Statement::WithParams(
+                    "insert into tests (id, text) values (?,?)".into(),
+                    vec!["service-id".into(), "service-name".into()],
+                ),
+                Statement::WithParams(
+                    "insert into tests (id, text) values (?,?)".into(),
+                    vec!["service-id-2".into(), "service-name-2".into()],
+                ),
+            ]),
+        )
+        .await;
+
+        assert_eq!(status_code, StatusCode::OK);
+        assert!(body.0.results.len() == 2);
+        let ta1_client = ta1.client();
+        let ta2_client = ta2.client();
+
+        let conn = ta1_client.pool().get().await?;
+        let count: u64 = conn.query_row("SELECT count(*) FROM tests", (), |row| row.get(0))?;
+        assert_eq!(count, 2);
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        let conn = ta2_client.pool().get().await?;
+        let count: u64 = conn.query_row("SELECT count(*) FROM tests", (), |row| row.get(0))?;
+        assert_eq!(count, 2);
+
+        Ok(())
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn test_api_v1_subs() -> eyre::Result<()> {
@@ -1769,6 +1855,7 @@ mod tests {
         done: bool,
     }
 
+    const RECV_TIMEOUT: Duration = Duration::from_secs(2);
     impl RowsIter {
         async fn recv<T: DeserializeOwned>(&mut self) -> Option<eyre::Result<T>> {
             if self.done {
@@ -1792,19 +1879,23 @@ mod tests {
                     }
                 }
 
-                let bytes_res = self.body.data().await;
+                let bytes_res = timeout(RECV_TIMEOUT, self.body.data()).await;
                 match bytes_res {
-                    Some(Ok(b)) => {
+                    Ok(Some(Ok(b))) => {
                         // debug!("read {} bytes", b.len());
                         self.buf.extend_from_slice(&b)
                     }
-                    Some(Err(e)) => {
+                    Ok(Some(Err(e))) => {
                         self.done = true;
                         return Some(Err(e.into()));
                     }
-                    None => {
+                    Ok(None) => {
                         self.done = true;
                         return None;
+                    }
+                    Err(e) => {
+                        self.done = true;
+                        return Some(Err(e.into()));
                     }
                 }
             }
