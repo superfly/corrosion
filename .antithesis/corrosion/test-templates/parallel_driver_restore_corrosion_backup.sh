@@ -3,12 +3,19 @@
 set -e
 
 function start_corrosion {
-  echo "Restarting corrosion"
-  supervisorctl start corrosion
-  supervisorctl start corro-consul
+  STATUS=$(supervisorctl status corrosion | awk '{print $2}')
+
+  if [ "$STATUS" != "RUNNING" ]; then
+      echo "Restarting corrosion"
+      supervisorctl start corrosion
+      supervisorctl start corro-consul
+  fi
 }
 
 if [ -f "/var/lib/corrosion/backups/state.db" ]; then
+    exec {lockfd}<>"/var/lib/corrosion/backups/backup.lock"
+    flock "$lockfd"
+
     echo "Restoring backup for corrosion"
 
     echo "Stopping corrosion first"
@@ -17,7 +24,7 @@ if [ -f "/var/lib/corrosion/backups/state.db" ]; then
 
     corrosion restore /var/lib/corrosion${ID}/backups/state.db
     supervisorctl start corrosion
-    supervisorctl restart corro-consul
+    supervisorctl start corro-consul
     exit 0
 fi
 
