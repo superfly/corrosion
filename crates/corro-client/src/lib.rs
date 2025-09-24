@@ -24,7 +24,7 @@ use uuid::Uuid;
 
 const HTTP2_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const HTTP2_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(10);
-const DNS_RESOLVE_TIMEOUT: Duration = Duration::from_secs(3);
+reconst DNS_RESOLVE_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Clone)]
 pub struct CorrosionApiClient {

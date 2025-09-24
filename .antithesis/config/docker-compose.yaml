@@ -2,41 +2,45 @@ services:
   load-generator:
     container_name: load-generator
     hostname: load-generator
-    image: corrosion
+    image: corrosion:${SHORT_COMMIT}
     command: ["rust-load-generator", "corrosion1:8080", "corrosion2:8080", "corrosion3:8080"]
     environment:
     - RUST_LOG=info
     - RUST_BACKTRACE=full
+    annotations:
+      com.antithesis.exclude.faults: "all"
 
   corrosion1:
     container_name: corrosion1
     hostname: corrosion1
-    image: corrosion
+    image: corrosion:${SHORT_COMMIT}
     volumes:
       - ./volumes/corrosion1:/var/lib/corrosion
 
   corrosion2:
     container_name: corrosion2
     hostname: corrosion2
-    image: corrosion
+    image: corrosion:${SHORT_COMMIT}
     volumes:
       - ./volumes/corrosion2:/var/lib/corrosion
 
   corrosion3:
     container_name: corrosion3
     hostname: corrosion3
-    image: corrosion
+    image: corrosion:${SHORT_COMMIT}
     volumes:
-      - ./volumes/corrosion3:/var/lib/corrosion
+      - ./volumes/corrosion3:/var/lib/corrosion 
 
   corro-client:
     container_name: corro-client
     hostname: corro-client
-    image: corro-client
+    image: corro-client:${SHORT_COMMIT}
     volumes:
       - ./volumes/corrosion1:/var/lib/corrosion1
       - ./volumes/corrosion2:/var/lib/corrosion2
       - ./volumes/corrosion3:/var/lib/corrosion3
+    annotations:
+      com.antithesis.exclude.faults: "all"
 
   consul:
     container_name: consul

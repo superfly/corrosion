@@ -1,3 +1,4 @@
+import json
 import pg8000.dbapi
 import requests
 import string
@@ -28,17 +29,13 @@ def get_db_connection(host, port):
 
 
 def execute_psql(conn, sql_command, params=None):
-    try:
-        cursor = conn.cursor()
-        if params:
-            cursor.execute(sql_command, params)
-        else:
-            cursor.execute(sql_command)
-        conn.commit()
-        cursor.close()
-        return True, None
-    except Exception as e:
-        return False, str(e)
+    cursor = conn.cursor()
+    if params:
+        cursor.execute(sql_command, params)
+    else:
+        cursor.execute(sql_command)
+    conn.commit()
+    cursor.close()
 
 def execute_sql(address, sql_command):
     headers = {'Content-Type': 'application/json'}
@@ -54,15 +51,18 @@ def execute_sql(address, sql_command):
 
 def query_sql(address, port, sql_command):
     headers = {'Content-Type': 'application/json'}
-    try:
-        result = requests.post(f"http://{address}:{port}/v1/queries", headers=headers, json=f"{sql_command}")
-        sometimes(result.status_code == 200, "Clients can make successful queries to corrosion", {"status_code": result.status_code})
-        if result.status_code != 200:
-            return False, f"Unexpected status code: {result.status_code} - {result.text}"
-        else:
-            return result.text, None
-    except requests.exceptions.ConnectionError as e:
-        return False, e
+    result = requests.post(f"http://{address}:{port}/v1/queries", headers=headers, json=f"{sql_command}")
+    sometimes(result.status_code == 200, "Clients can make successful queries to corrosion", {"status_code": result.status_code})
+    if result.status_code != 200:
+        raise Exception(f"Unexpected status code: {result.status_code} - {result.text} {result.request.body}")
+    else:
+        res = []
+        lines = result.text.splitlines()
+        for line in lines:
+            parsed = json.loads(line)
+            if 'row' in parsed:
+                res.append(parsed["row"][1])
+        return res
 
 def random_name(length=6):
     return ''.join(random.choices(string.ascii_letters, k=length))
@@ -115,9 +115,11 @@ def random_data(table):
     elif table == "deployments":
         return random_deploy()
 
-        
-# def main():
-#     print(random_name())
-
-# if __name__ == "__main__":
-#     main()    
+def get_random_cols(address, table, cols=["id"]):
+    host, port = address.split(':')
+    sql_command = f"SELECT {', '.join(cols)} FROM {table} ORDER BY RANDOM() LIMIT 1"
+    res = query_sql(host, port, sql_command)
+    if len(res) == 0:
+        return None
+    else:
+        return res[0]
