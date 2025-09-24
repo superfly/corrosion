@@ -957,6 +957,7 @@ dependencies = [
  "corro-client",
  "corro-types",
  "eyre",
+ "sqlite-pool",
  "tempfile",
  "tokio",
  "tripwire",
