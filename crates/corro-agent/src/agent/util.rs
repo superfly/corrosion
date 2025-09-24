@@ -270,7 +270,7 @@ pub async fn setup_http_api_handler(
             ),
         )
         .route(
-            "/v1/table_stats",  
+            "/v1/table_stats",
             post(api_v1_table_stats).route_layer(
                 tower::ServiceBuilder::new()
                     .layer(HandleErrorLayer::new(|_error: BoxError| async {

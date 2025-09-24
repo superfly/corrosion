@@ -3,8 +3,6 @@ FROM rust:bookworm AS builder
 
 ARG TARGETARCH
 
-RUN echo me ${TARGETARCH}
-
 RUN apt update && apt install -y build-essential gcc-x86-64-linux-gnu clang llvm unzip
 
 # Install mold

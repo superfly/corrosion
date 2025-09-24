@@ -24,7 +24,7 @@ if [ -f "/var/lib/corrosion/backups/state.db" ]; then
 
     corrosion restore /var/lib/corrosion${ID}/backups/state.db
     supervisorctl start corrosion
-    supervisorctl start corro-consul
+    supervisorctl restart corro-consul
     exit 0
 fi
 
