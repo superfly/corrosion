@@ -882,8 +882,8 @@ async fn forward_bytes_to_body_sender(
 #[cfg(test)]
 mod tests {
     use corro_types::actor::ActorId;
-    use corro_types::api::NotifyEvent;
     use corro_types::api::{ColumnName, TableName};
+    use corro_types::api::{NotifyEvent, SqliteValue};
     use corro_types::base::{dbsr, CrsqlDbVersion, CrsqlSeq};
     use corro_types::broadcast::{ChangeSource, ChangeV1, Changeset};
     use corro_types::change::Change;
@@ -918,9 +918,195 @@ mod tests {
         ta_client: corro_tests::CorrosionClient,
         subs_bcast_cache: SharedMatcherBroadcastCache,
         updates_bcast_cache: SharedUpdateBroadcastCache,
+        tripwire: Tripwire,
     }
+
+    struct SubscriptionStream {
+        iter: RowsIter,
+        sub_id: Uuid,
+    }
+
+    impl SubscriptionStream {
+        // If skip_rows is false and we're starting the subscription from the beginning, we should see
+        // the initial query results before getting any updates.
+        // We expect Columns, Rows x N, and then EndOfQuery.
+        async fn assert_initial_query_results(
+            &mut self,
+            expected_column_names: Vec<ColumnName>,
+            expected_rows: Vec<(RowId, Vec<SqliteValue>)>,
+            expected_change_id: ChangeId,
+        ) -> () {
+            assert_eq!(
+                self.iter.recv::<QueryEvent>().await.unwrap().unwrap(),
+                QueryEvent::Columns(expected_column_names)
+            );
+
+            for (row_id, row) in expected_rows {
+                assert_eq!(
+                    self.iter.recv::<QueryEvent>().await.unwrap().unwrap(),
+                    QueryEvent::Row(row_id, row.to_vec())
+                );
+            }
+
+            assert_eq!(
+                self.iter
+                    .recv::<QueryEvent>()
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .meta(),
+                QueryEventMeta::EndOfQuery(Some(expected_change_id))
+            );
+        }
+
+        async fn assert_updates(&mut self, expected_updates: Vec<(ChangeType, RowId, ChangeId, Vec<SqliteValue>)>) {
+            for (change_type, row_id, change_id, row) in expected_updates {
+                assert_eq!(
+                    self.iter.recv::<QueryEvent>().await.unwrap().unwrap(),
+                    QueryEvent::Change(change_type, row_id, row, change_id)
+                );
+            }
+        }
+
+        async fn assert_no_more_events(&mut self) {
+            // Assume no more events within 100ms. There is also a 2s timeout in recv.
+            assert!(timeout(Duration::from_millis(100), self.iter.recv::<QueryEvent>()).await.is_err());
+        }
+    }
+
+    const TEST_QUERY1: &str = "select * from tests";
+    const TEST_QUERY2: &str = "select * from tests where id = ?";
+    impl PubSubAgent {
+        async fn subscribe_to_test_table(
+            &self,
+            sub_params: SubParams,
+            sub_id: Option<Uuid>,
+        ) -> eyre::Result<SubscriptionStream> {
+            let mut res = if sub_id.is_some() {
+                api_v1_sub_by_id(
+                    Extension(self.ta.agent.clone()),
+                    Extension(self.subs_bcast_cache.clone()),
+                    Extension(self.tripwire.clone()),
+                    axum::extract::Path(sub_id.unwrap()),
+                    axum::extract::Query(sub_params),
+                )
+                .await
+                .into_response()
+            } else {
+                api_v1_subs(
+                    Extension(self.ta.agent.clone()),
+                    Extension(self.subs_bcast_cache.clone()),
+                    Extension(self.tripwire.clone()),
+                    axum::extract::Query(sub_params),
+                    axum::Json(Statement::Simple("select * from tests".into())),
+                )
+                .await
+                .into_response()
+            };
+
+            if !res.status().is_success() {
+                let b = res.body_mut().data().await.unwrap().unwrap();
+                println!("body: {}", String::from_utf8_lossy(&b));
+            }
+
+            assert_eq!(res.status(), StatusCode::OK);
+
+            // The api should always return a corro-query-id header
+            let query_id_header = res
+                .headers()
+                .get("corro-query-id")
+                .ok_or(eyre::eyre!("missing corro-query-id header"))?;
+            let res_sub_id = Uuid::parse_str(query_id_header.to_str().unwrap())?;
+
+            // If a sub_id was provided, it should match the response sub_id
+            if sub_id.is_some() {
+                assert_eq!(sub_id.unwrap(), res_sub_id);
+            }
+
+            Ok(SubscriptionStream {
+                iter: RowsIter {
+                    body: res.into_body(),
+                    codec: LinesCodec::new(),
+                    buf: BytesMut::new(),
+                    done: false,
+                },
+                sub_id: res_sub_id,
+            })
+        }
+
+        async fn insert_test_data(&self, rows: Vec<(String, String)>) -> eyre::Result<()> {
+            let rows_len = rows.len();
+            let (status_code, body) = api_v1_transactions(
+                Extension(self.ta.agent.clone()),
+                axum::extract::Query(TimeoutParams { timeout: None }),
+                axum::Json(
+                    rows.into_iter()
+                        .map(|(id, name)| {
+                            Statement::WithParams(
+                                "insert into tests (id, text) values (?,?)".into(),
+                                vec![id.into(), name.into()],
+                            )
+                        })
+                        .collect(),
+                ),
+            )
+            .await;
+
+            assert_eq!(status_code, StatusCode::OK);
+            assert!(body.0.results.len() == rows_len);
+            Ok(())
+        }
+
+        async fn update_test_data(&self, rows: Vec<(String, String)>) -> eyre::Result<()> {
+            let rows_len = rows.len();
+            let (status_code, body) = api_v1_transactions(
+                Extension(self.ta.agent.clone()),
+                axum::extract::Query(TimeoutParams { timeout: None }),
+                axum::Json(
+                    rows.into_iter()
+                        .map(|(id, name)| {
+                            Statement::WithParams(
+                                "update tests set text = ?2 where id = ?1".into(),
+                                vec![id.into(), name.into()],
+                            )
+                        })
+                        .collect(),
+                ),
+            )
+            .await;
+
+            assert_eq!(status_code, StatusCode::OK);
+            assert!(body.0.results.len() == rows_len);
+            Ok(())
+        }
+
+        async fn delete_test_data(&self, rows: Vec<String>) -> eyre::Result<()> {
+            let rows_len = rows.len();
+            let (status_code, body) = api_v1_transactions(
+                Extension(self.ta.agent.clone()),
+                axum::extract::Query(TimeoutParams { timeout: None }),
+                axum::Json(
+                    rows.into_iter()
+                        .map(|id| {
+                            Statement::WithParams(
+                                "delete from tests where id = ?1".into(),
+                                vec![id.into()],
+                            )
+                        })
+                        .collect(),
+                ),
+            )
+            .await;
+
+            assert_eq!(status_code, StatusCode::OK);
+            assert!(body.0.results.len() == rows_len);
+            Ok(())
+        }
+    }
+
     struct PubSubTest {
         agents: Vec<PubSubAgent>,
+        #[allow(dead_code)]
         tripwire_worker: TripwireWorker<tokio_stream::wrappers::ReceiverStream<()>>,
     }
 
@@ -933,7 +1119,6 @@ mod tests {
                 let prev_gossip = agents
                     .last()
                     .map(|a: &PubSubAgent| a.ta.agent.gossip_addr().to_string());
-                dbg!(&prev_gossip);
                 let ta = launch_test_agent(
                     |conf| {
                         if let Some(gossip) = prev_gossip {
@@ -951,50 +1136,99 @@ mod tests {
                     ta_client,
                     subs_bcast_cache: Default::default(),
                     updates_bcast_cache: Default::default(),
+                    tripwire: tripwire.clone(),
                 });
             }
-            Ok(Self { agents, tripwire_worker })
+            Ok(Self {
+                agents,
+                tripwire_worker,
+            })
+        }
+
+        const CHECK_RETRIES: usize = 10;
+        const SLEEP_START_DELAY: Duration = Duration::from_millis(10);
+        const SLEEP_MAX_DELAY: Duration = Duration::from_millis(1000);
+        // Checks if the row count in the tests table is the same on all nodes
+        async fn wait_for_nodes_to_sync(&self) -> eyre::Result<()> {
+            if self.agents.len() < 2 {
+                return Ok(());
+            }
+
+            let now = Instant::now();
+            let mut delay = Self::SLEEP_START_DELAY;
+            for _ in 0..Self::CHECK_RETRIES {
+                let are_nodes_consistent =
+                    futures::future::join_all(self.agents.iter().map(|a| async move {
+                        let conn = a.ta_client.pool().get().await?;
+                        let count: u64 =
+                            conn.query_row("SELECT count(*) FROM tests", (), |row| row.get(0))?;
+                        Ok(count) as eyre::Result<u64>
+                    }))
+                    .await
+                    .into_iter()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap()
+                    .windows(2)
+                    .all(|window| window[0] == window[1]);
+
+                if are_nodes_consistent {
+                    return Ok(());
+                }
+
+                if delay < Self::SLEEP_MAX_DELAY {
+                    delay *= 2;
+                    if delay > Self::SLEEP_MAX_DELAY {
+                        delay = Self::SLEEP_MAX_DELAY;
+                    }
+                }
+                tokio::time::sleep(delay).await;
+            }
+            eyre::bail!(
+                "nodes did not reach consistent state within {} ms",
+                now.elapsed().as_millis()
+            );
         }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-    async fn tets_on_2_nodes() -> eyre::Result<()> {
+    async fn test_on_2_nodes() -> eyre::Result<()> {
         _ = tracing_subscriber::fmt::try_init();
         let test = PubSubTest::with_n_agents(2).await?;
 
-        let ta1 = &test.agents[0].ta;
-        let ta2 = &test.agents[1].ta;
+        test.agents[0]
+            .insert_test_data(vec![
+                ("service-id".into(), "service-name".into()),
+                ("service-id-2".into(), "service-name-2".into()),
+            ])
+            .await?;
 
-        let (status_code, body) = api_v1_transactions(
-            Extension(ta1.agent.clone()),
-            axum::extract::Query(TimeoutParams { timeout: None }),
-            axum::Json(vec![
-                Statement::WithParams(
-                    "insert into tests (id, text) values (?,?)".into(),
-                    vec!["service-id".into(), "service-name".into()],
-                ),
-                Statement::WithParams(
-                    "insert into tests (id, text) values (?,?)".into(),
-                    vec!["service-id-2".into(), "service-name-2".into()],
-                ),
-            ]),
-        )
-        .await;
+        test.wait_for_nodes_to_sync().await?;
 
-        assert_eq!(status_code, StatusCode::OK);
-        assert!(body.0.results.len() == 2);
-        let ta1_client = ta1.client();
-        let ta2_client = ta2.client();
+        let mut rows_iter = test.agents[1]
+            .subscribe_to_test_table(
+                SubParams {
+                    from: None,
+                    skip_rows: true,
+                },
+                None,
+            )
+            .await?;
 
-        let conn = ta1_client.pool().get().await?;
-        let count: u64 = conn.query_row("SELECT count(*) FROM tests", (), |row| row.get(0))?;
-        assert_eq!(count, 2);
+        test.agents[0]
+            .insert_test_data(vec![
+                ("service-id-3".into(), "service-name-3".into()),
+                ("service-id-4".into(), "service-name-4".into()),
+            ])
+            .await?;
 
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        dbg!(rows_iter.iter.recv::<QueryEvent>().await);
+        dbg!(rows_iter.iter.recv::<QueryEvent>().await);
+        dbg!(rows_iter.iter.recv::<QueryEvent>().await);
+        dbg!(rows_iter.iter.recv::<QueryEvent>().await);
+        dbg!(rows_iter.iter.recv::<QueryEvent>().await);
+        dbg!(rows_iter.iter.recv::<QueryEvent>().await);
 
-        let conn = ta2_client.pool().get().await?;
-        let count: u64 = conn.query_row("SELECT count(*) FROM tests", (), |row| row.get(0))?;
-        assert_eq!(count, 2);
+        assert!(false);
 
         Ok(())
     }
@@ -1392,7 +1626,6 @@ mod tests {
         }
 
         // previous subs have been dropped.
-
         let mut res = api_v1_subs(
             Extension(agent.clone()),
             Extension(bcast_cache.clone()),
