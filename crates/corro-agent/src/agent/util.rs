@@ -1036,8 +1036,8 @@ pub async fn process_multiple_changes(
 
     for (_actor_id, changeset, db_version, _src) in changesets {
         change_chunk_size += changeset.len();
-        match_changes(agent.subs_manager(), changeset.changes(), db_version);
-        match_changes(agent.updates_manager(), changeset.changes(), db_version);
+        match_changes(agent.subs_manager(), &changeset, db_version);
+        match_changes(agent.updates_manager(), &changeset, db_version);
     }
 
     histogram!("corro.agent.changes.processing.time.seconds", "source" => "remote")
