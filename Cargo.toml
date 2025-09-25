@@ -64,7 +64,7 @@ serde = "1.0.159"
 serde_json = { version = "1.0.95", features = ["raw_value"] }
 serde_with = "2.3.2"
 smallvec = { version = "1.11.0", features = ["serde", "write", "union"] }
-speedy = { version = "0.8.7", features = ["uuid", "smallvec", "indexmap"], package = "corro-speedy" }
+speedy = { version = "0.8.7", features = ["uuid", "smallvec", "indexmap", "indexmap_v2" ], package = "speedy" }
 sqlite3-parser = "0.12.0"
 strum = { version = "0.24.1", features = ["derive"] }
 tempfile = "3.5.0"
