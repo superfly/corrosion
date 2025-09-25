@@ -224,11 +224,14 @@ pub struct ExecResponse {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(untagged)]
+#[serde(tag = "ty")]
 pub enum ExecResult {
+    #[serde(rename = "x")]
     Execute { rows_affected: usize, time: f64 },
+    #[serde(rename = "e")]
     Error { error: String },
 }
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct TableStatRequest {
     pub tables: Vec<String>,
