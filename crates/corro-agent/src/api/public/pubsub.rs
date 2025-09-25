@@ -899,6 +899,7 @@ mod tests {
     use std::time::Instant;
     use tokio::time::timeout;
     use tokio_util::codec::{Decoder, LinesCodec};
+    use tokio_util::either::Either;
     use tripwire::{Tripwire, TripwireWorker};
 
     use super::*;
@@ -959,7 +960,10 @@ mod tests {
             );
         }
 
-        async fn assert_updates(&mut self, expected_updates: Vec<(ChangeType, RowId, ChangeId, Vec<SqliteValue>)>) {
+        async fn assert_updates(
+            &mut self,
+            expected_updates: Vec<(ChangeType, RowId, ChangeId, Vec<SqliteValue>)>,
+        ) {
             for (change_type, row_id, change_id, row) in expected_updates {
                 assert_eq!(
                     self.iter.recv::<QueryEvent>().await.unwrap().unwrap(),
@@ -970,38 +974,44 @@ mod tests {
 
         async fn assert_no_more_events(&mut self) {
             // Assume no more events within 100ms. There is also a 2s timeout in recv.
-            assert!(timeout(Duration::from_millis(100), self.iter.recv::<QueryEvent>()).await.is_err());
+            assert!(
+                timeout(Duration::from_millis(100), self.iter.recv::<QueryEvent>())
+                    .await
+                    .is_err()
+            );
         }
     }
 
     const TEST_QUERY1: &str = "select * from tests";
-    const TEST_QUERY2: &str = "select * from tests where id = ?";
+    const TEST_QUERY1_WITH_SPACES: &str = "select           *             from tests";
+    const TEST_QUERY1_EXPLICIT: &str = "select id, text from tests";
+    const TEST_QUERY2: &str =
+        "select * from tests where substr(id, -1) IN ('0', '2', '4', '6', '8')";
     impl PubSubAgent {
         async fn subscribe_to_test_table(
             &self,
             sub_params: SubParams,
-            sub_id: Option<Uuid>,
+            query_or_sub_id: Either<corro_types::api::Statement, Uuid>,
         ) -> eyre::Result<SubscriptionStream> {
-            let mut res = if sub_id.is_some() {
-                api_v1_sub_by_id(
+            let mut res = match &query_or_sub_id {
+                Either::Right(sub_id) => api_v1_sub_by_id(
                     Extension(self.ta.agent.clone()),
                     Extension(self.subs_bcast_cache.clone()),
                     Extension(self.tripwire.clone()),
-                    axum::extract::Path(sub_id.unwrap()),
+                    axum::extract::Path(*sub_id),
                     axum::extract::Query(sub_params),
                 )
                 .await
-                .into_response()
-            } else {
-                api_v1_subs(
+                .into_response(),
+                Either::Left(statement) => api_v1_subs(
                     Extension(self.ta.agent.clone()),
                     Extension(self.subs_bcast_cache.clone()),
                     Extension(self.tripwire.clone()),
                     axum::extract::Query(sub_params),
-                    axum::Json(Statement::Simple("select * from tests".into())),
+                    axum::Json(statement.clone()),
                 )
                 .await
-                .into_response()
+                .into_response(),
             };
 
             if !res.status().is_success() {
@@ -1019,8 +1029,8 @@ mod tests {
             let res_sub_id = Uuid::parse_str(query_id_header.to_str().unwrap())?;
 
             // If a sub_id was provided, it should match the response sub_id
-            if sub_id.is_some() {
-                assert_eq!(sub_id.unwrap(), res_sub_id);
+            if let Either::Right(sub_id) = query_or_sub_id {
+                assert_eq!(sub_id, res_sub_id);
             }
 
             Ok(SubscriptionStream {
@@ -1191,6 +1201,42 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn test_same_sub_id_for_same_query() -> eyre::Result<()> {
+        _ = tracing_subscriber::fmt::try_init();
+        let test = PubSubTest::with_n_agents(1).await?;
+        let mut s = Vec::new();
+        for q in [
+            TEST_QUERY1,
+            TEST_QUERY1,
+            TEST_QUERY1_WITH_SPACES,
+            TEST_QUERY1_EXPLICIT,
+            TEST_QUERY2,
+        ]
+        .into_iter()
+        {
+            s.push(
+                test.agents[0]
+                    .subscribe_to_test_table(
+                        SubParams {
+                            from: None,
+                            skip_rows: true,
+                        },
+                        Either::Left(q.into()),
+                    )
+                    .await?,
+            );
+        }
+        assert_eq!(s[0].sub_id, s[1].sub_id);
+        assert_ne!(s[0].sub_id, s[2].sub_id);
+        assert_ne!(s[0].sub_id, s[3].sub_id);
+        assert_ne!(s[0].sub_id, s[4].sub_id);
+        assert_ne!(s[2].sub_id, s[3].sub_id);
+        assert_ne!(s[2].sub_id, s[4].sub_id);
+        assert_ne!(s[3].sub_id, s[4].sub_id);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn test_on_2_nodes() -> eyre::Result<()> {
         _ = tracing_subscriber::fmt::try_init();
         let test = PubSubTest::with_n_agents(2).await?;
@@ -1210,7 +1256,7 @@ mod tests {
                     from: None,
                     skip_rows: true,
                 },
-                None,
+                Either::Left(TEST_QUERY2.into()),
             )
             .await?;
 
@@ -1236,69 +1282,26 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn test_api_v1_subs() -> eyre::Result<()> {
         _ = tracing_subscriber::fmt::try_init();
+        let test = PubSubTest::with_n_agents(1).await?;
+        let agent = &test.agents[0];
 
-        let (tripwire, _tripwire_worker, _tripwire_tx) = Tripwire::new_simple();
-
-        let dir = TempDir::new(tempfile::tempdir()?);
-
-        let (agent, _agent_options) = setup(
-            Config::builder()
-                .db_path(dir.path().join("corrosion.db").display().to_string())
-                .gossip_addr("127.0.0.1:0".parse()?)
-                .api_addr("127.0.0.1:0".parse()?)
-                .build()?,
-            tripwire.clone(),
-        )
-        .await?;
-
-        let (status_code, _body) = api_v1_db_schema(
-            Extension(agent.clone()),
-            axum::Json(vec![corro_tests::TEST_SCHEMA.into()]),
-        )
-        .await;
-
-        assert_eq!(status_code, StatusCode::OK);
-
-        let (status_code, body) = api_v1_transactions(
-            Extension(agent.clone()),
-            axum::extract::Query(TimeoutParams { timeout: None }),
-            axum::Json(vec![
-                Statement::WithParams(
-                    "insert into tests (id, text) values (?,?)".into(),
-                    vec!["service-id".into(), "service-name".into()],
-                ),
-                Statement::WithParams(
-                    "insert into tests (id, text) values (?,?)".into(),
-                    vec!["service-id-2".into(), "service-name-2".into()],
-                ),
-            ]),
-        )
-        .await;
-
-        assert_eq!(status_code, StatusCode::OK);
-
-        assert!(body.0.results.len() == 2);
-
-        let bcast_cache: SharedMatcherBroadcastCache = Default::default();
-        let update_bcast_cache: SharedUpdateBroadcastCache = Default::default();
+        agent
+            .insert_test_data(vec![
+                ("service-id".into(), "service-name".into()),
+                ("service-id-2".into(), "service-name-2".into()),
+            ])
+            .await?;
 
         {
-            let mut res = api_v1_subs(
-                Extension(agent.clone()),
-                Extension(bcast_cache.clone()),
-                Extension(tripwire.clone()),
-                axum::extract::Query(SubParams::default()),
-                axum::Json(Statement::Simple("select * from tests".into())),
-            )
-            .await
-            .into_response();
-
-            if !res.status().is_success() {
-                let b = res.body_mut().data().await.unwrap().unwrap();
-                println!("body: {}", String::from_utf8_lossy(&b));
-            }
-
-            assert_eq!(res.status(), StatusCode::OK);
+            let mut s1 = agent
+                .subscribe_to_test_table(
+                    SubParams {
+                        from: None,
+                        skip_rows: false,
+                    },
+                    Either::Left(TEST_QUERY1.into()),
+                )
+                .await?;
 
             // only want notifications
             // small sleep here to make sure `broadcast_changes` has already run
@@ -1306,9 +1309,9 @@ mod tests {
             tokio::time::sleep(Duration::from_secs(1)).await;
 
             let mut notify_res = api_v1_updates(
-                Extension(agent.clone()),
-                Extension(update_bcast_cache.clone()),
-                Extension(tripwire.clone()),
+                Extension(agent.ta.agent.clone()),
+                Extension(agent.updates_bcast_cache.clone()),
+                Extension(agent.tripwire.clone()),
                 axum::extract::Path("tests".to_string()),
             )
             .await
@@ -1321,24 +1324,9 @@ mod tests {
 
             assert_eq!(notify_res.status(), StatusCode::OK);
 
-            let (status_code, _) = api_v1_transactions(
-                Extension(agent.clone()),
-                axum::extract::Query(TimeoutParams { timeout: None }),
-                axum::Json(vec![Statement::WithParams(
-                    "insert into tests (id, text) values (?,?)".into(),
-                    vec!["service-id-3".into(), "service-name-3".into()],
-                )]),
-            )
-            .await;
-
-            assert_eq!(status_code, StatusCode::OK);
-
-            let mut rows = RowsIter {
-                body: res.into_body(),
-                codec: LinesCodec::new(),
-                buf: BytesMut::new(),
-                done: false,
-            };
+            agent
+                .insert_test_data(vec![("service-id-3".into(), "service-name-3".into())])
+                .await?;
 
             let mut notify_rows = RowsIter {
                 body: notify_res.into_body(),
@@ -1347,58 +1335,35 @@ mod tests {
                 done: false,
             };
 
-            assert_eq!(
-                rows.recv::<QueryEvent>().await.unwrap().unwrap(),
-                QueryEvent::Columns(vec!["id".into(), "text".into()])
-            );
+            s1.assert_initial_query_results(
+                vec!["id".into(), "text".into()],
+                vec![
+                    (RowId(1), vec!["service-id".into(), "service-name".into()]),
+                    (
+                        RowId(2),
+                        vec!["service-id-2".into(), "service-name-2".into()],
+                    ),
+                ],
+                0.into(),
+            ).await;
 
-            assert_eq!(
-                rows.recv::<QueryEvent>().await.unwrap().unwrap(),
-                QueryEvent::Row(RowId(1), vec!["service-id".into(), "service-name".into()])
-            );
+            s1.assert_updates(vec![(
+                ChangeType::Insert,
+                RowId(3),
+                ChangeId(1),
+                vec!["service-id-3".into(), "service-name-3".into()],
+            )]);
 
-            assert_eq!(
-                rows.recv::<QueryEvent>().await.unwrap().unwrap(),
-                QueryEvent::Row(
-                    RowId(2),
-                    vec!["service-id-2".into(), "service-name-2".into()]
-                )
-            );
+            agent
+                .insert_test_data(vec![("service-id-4".into(), "service-name-4".into())])
+                .await?;
 
-            let evt = rows.recv::<QueryEvent>().await.unwrap().unwrap();
-            assert!(matches!(evt, QueryEvent::EndOfQuery { .. }));
-
-            assert_eq!(
-                rows.recv::<QueryEvent>().await.unwrap().unwrap(),
-                QueryEvent::Change(
-                    ChangeType::Insert,
-                    RowId(3),
-                    vec!["service-id-3".into(), "service-name-3".into()],
-                    ChangeId(1)
-                )
-            );
-
-            let (status_code, _) = api_v1_transactions(
-                Extension(agent.clone()),
-                axum::extract::Query(TimeoutParams { timeout: None }),
-                axum::Json(vec![Statement::WithParams(
-                    "insert into tests (id, text) values (?,?)".into(),
-                    vec!["service-id-4".into(), "service-name-4".into()],
-                )]),
-            )
-            .await;
-
-            assert_eq!(status_code, StatusCode::OK);
-
-            assert_eq!(
-                rows.recv::<QueryEvent>().await.unwrap().unwrap(),
-                QueryEvent::Change(
-                    ChangeType::Insert,
-                    RowId(4),
-                    vec!["service-id-4".into(), "service-name-4".into()],
-                    ChangeId(2)
-                )
-            );
+            s1.assert_updates(vec![(
+                ChangeType::Insert,
+                RowId(4),
+                ChangeId(2),
+                vec!["service-id-4".into(), "service-name-4".into()],
+            )]).await?;
 
             assert_eq!(
                 notify_rows.recv::<NotifyEvent>().await.unwrap().unwrap(),
@@ -1410,48 +1375,29 @@ mod tests {
                 NotifyEvent::Notify(ChangeType::Update, vec!["service-id-4".into()],)
             );
 
-            let mut res = api_v1_subs(
-                Extension(agent.clone()),
-                Extension(bcast_cache.clone()),
-                Extension(tripwire.clone()),
-                axum::extract::Query(SubParams {
-                    from: Some(1.into()),
-                    ..Default::default()
-                }),
-                axum::Json(Statement::Simple("select * from tests".into())),
-            )
-            .await
-            .into_response();
-
-            if !res.status().is_success() {
-                let b = res.body_mut().data().await.unwrap().unwrap();
-                println!("body: {}", String::from_utf8_lossy(&b));
-            }
-
-            assert_eq!(res.status(), StatusCode::OK);
-
-            let mut rows_from = RowsIter {
-                body: res.into_body(),
-                codec: LinesCodec::new(),
-                buf: BytesMut::new(),
-                done: false,
-            };
-
-            assert_eq!(
-                rows_from.recv::<QueryEvent>().await.unwrap().unwrap(),
-                QueryEvent::Change(
-                    ChangeType::Insert,
-                    RowId(4),
-                    vec!["service-id-4".into(), "service-name-4".into()],
-                    ChangeId(2)
+            // s2 subscribes from change id 1
+            let mut s2 = agent
+                .subscribe_to_test_table(
+                    SubParams {
+                        from: Some(1.into()),
+                        skip_rows: false,
+                    },
+                    Either::Left(TEST_QUERY1.into()),
                 )
-            );
+                .await?;
+
+            s2.assert_updates(vec![(
+                ChangeType::Insert,
+                RowId(4),
+                ChangeId(2),
+                vec!["service-id-4".into(), "service-name-4".into()],
+            )]).await;
 
             // new subscriber for updates
             let mut notify_res2 = api_v1_updates(
-                Extension(agent.clone()),
-                Extension(update_bcast_cache.clone()),
-                Extension(tripwire.clone()),
+                Extension(agent.ta.agent.clone()),
+                Extension(agent.updates_bcast_cache.clone()),
+                Extension(agent.tripwire.clone()),
                 axum::extract::Path("tests".to_string()),
             )
             .await
@@ -1471,34 +1417,22 @@ mod tests {
                 done: false,
             };
 
-            let (status_code, _) = api_v1_transactions(
-                Extension(agent.clone()),
-                axum::extract::Query(TimeoutParams { timeout: None }),
-                axum::Json(vec![Statement::WithParams(
-                    "insert into tests (id, text) values (?,?)".into(),
-                    vec!["service-id-5".into(), "service-name-5".into()],
-                )]),
-            )
-            .await;
+            agent
+                .insert_test_data(vec![("service-id-5".into(), "service-name-5".into())])
+                .await?;
 
-            assert_eq!(status_code, StatusCode::OK);
-
-            let query_evt = QueryEvent::Change(
+            // Both s1 and s2 should receive the insert
+            let query_evt = (
                 ChangeType::Insert,
                 RowId(5),
-                vec!["service-id-5".into(), "service-name-5".into()],
                 ChangeId(3),
+                vec!["service-id-5".into(), "service-name-5".into()],
             );
+            s1.assert_updates(vec![query_evt.clone()]);
+            s2.assert_updates(vec![query_evt]);
 
-            assert_eq!(rows.recv::<QueryEvent>().await.unwrap().unwrap(), query_evt);
-
-            assert_eq!(
-                rows_from.recv::<QueryEvent>().await.unwrap().unwrap(),
-                query_evt
-            );
-
+            // And both notifications should be received
             let notify_evt = NotifyEvent::Notify(ChangeType::Update, vec!["service-id-5".into()]);
-
             assert_eq!(
                 notify_rows.recv::<NotifyEvent>().await.unwrap().unwrap(),
                 notify_evt
@@ -1509,97 +1443,43 @@ mod tests {
                 notify_evt
             );
 
-            // subscriber who arrives later!
-
-            let mut res = api_v1_subs(
-                Extension(agent.clone()),
-                Extension(bcast_cache.clone()),
-                Extension(tripwire.clone()),
-                axum::extract::Query(SubParams::default()),
-                axum::Json(Statement::Simple("select * from tests".into())),
-            )
-            .await
-            .into_response();
-
-            if !res.status().is_success() {
-                let b = res.body_mut().data().await.unwrap().unwrap();
-                println!("body: {}", String::from_utf8_lossy(&b));
-            }
-
-            assert_eq!(res.status(), StatusCode::OK);
-
-            let mut rows = RowsIter {
-                body: res.into_body(),
-                codec: LinesCodec::new(),
-                buf: BytesMut::new(),
-                done: false,
-            };
-
-            assert_eq!(
-                rows.recv::<QueryEvent>().await.unwrap().unwrap(),
-                QueryEvent::Columns(vec!["id".into(), "text".into()])
-            );
-
-            assert_eq!(
-                rows.recv::<QueryEvent>().await.unwrap().unwrap(),
-                QueryEvent::Row(RowId(1), vec!["service-id".into(), "service-name".into()])
-            );
-
-            assert_eq!(
-                rows.recv::<QueryEvent>().await.unwrap().unwrap(),
-                QueryEvent::Row(
-                    RowId(2),
-                    vec!["service-id-2".into(), "service-name-2".into()]
+            // s3 arrives late and subscribes from scratch
+            let mut s3 = agent
+                .subscribe_to_test_table(
+                    SubParams {
+                        from: None,
+                        skip_rows: false,
+                    },
+                    Either::Left(TEST_QUERY1.into()),
                 )
-            );
+                .await?;
 
-            assert_eq!(
-                rows.recv::<QueryEvent>().await.unwrap().unwrap(),
-                QueryEvent::Row(
-                    RowId(3),
-                    vec!["service-id-3".into(), "service-name-3".into()],
-                )
-            );
-
-            assert_eq!(
-                rows.recv::<QueryEvent>().await.unwrap().unwrap(),
-                QueryEvent::Row(
-                    RowId(4),
-                    vec!["service-id-4".into(), "service-name-4".into()],
-                )
-            );
-
-            assert_eq!(
-                rows.recv::<QueryEvent>().await.unwrap().unwrap(),
-                QueryEvent::Row(
-                    RowId(5),
-                    vec!["service-id-5".into(), "service-name-5".into()]
-                )
-            );
-
-            let (status_code, _) = api_v1_transactions(
-                Extension(agent.clone()),
-                axum::extract::Query(TimeoutParams { timeout: None }),
-                axum::Json(vec![Statement::WithParams(
-                    "insert into tests (id, text) values (?,?)".into(),
-                    vec!["service-id-6".into(), "service-name-6".into()],
-                )]),
-            )
-            .await;
-
-            assert_eq!(status_code, StatusCode::OK);
-
-            let (status_code, _) = api_v1_transactions(
-                Extension(agent.clone()),
-                axum::extract::Query(TimeoutParams { timeout: None }),
-                axum::Json(vec![Statement::WithParams(
-                    "delete from  tests where id = ?".into(),
-                    vec!["service-id-6".into()],
-                )]),
-            )
-            .await;
-
-            assert_eq!(status_code, StatusCode::OK);
+            s3.assert_initial_query_results(
+                vec!["id".into(), "text".into()],
+                vec![
+                    (RowId(1), vec!["service-id".into(), "service-name".into()]),
+                    (
+                        RowId(2),
+                        vec!["service-id-2".into(), "service-name-2".into()],
+                    ),
+                    (
+                        RowId(3),
+                        vec!["service-id-3".into(), "service-name-3".into()],
+                    ),
+                    (
+                        RowId(4),
+                        vec!["service-id-4".into(), "service-name-4".into()],
+                    ),
+                    (
+                        RowId(5),
+                        vec!["service-id-5".into(), "service-name-5".into()],
+                    ),
+                ],
+                ChangeId(3),
+            ).await;
+            
+            agent.insert_test_data(vec![("service-id-6".into(), "service-name-6".into())]).await?;
+            agent.delete_test_data(vec!["service-id-6".into()]).await?;
 
             // when we make changes to the same primary key in quick succession,
             // the newer event might get sent first (but in that case, the older one should be dropped)
@@ -1626,225 +1506,63 @@ mod tests {
         }
 
         // previous subs have been dropped.
-        let mut res = api_v1_subs(
-            Extension(agent.clone()),
-            Extension(bcast_cache.clone()),
-            Extension(tripwire.clone()),
-            axum::extract::Query(SubParams {
+        let mut s1 = agent.subscribe_to_test_table(
+            SubParams {
                 from: Some(1.into()),
                 ..Default::default()
-            }),
-            axum::Json(Statement::Simple("select * from tests".into())),
-        )
-        .await
-        .into_response();
+            },
+            Either::Left(TEST_QUERY1.into()),
+        ).await?;
 
-        if !res.status().is_success() {
-            let b = res.body_mut().data().await.unwrap().unwrap();
-            println!("body: {}", String::from_utf8_lossy(&b));
-        }
-
-        assert_eq!(res.status(), StatusCode::OK);
-
-        let mut rows_from = RowsIter {
-            body: res.into_body(),
-            codec: LinesCodec::new(),
-            buf: BytesMut::new(),
-            done: false,
-        };
-
-        assert_eq!(
-            rows_from.recv::<QueryEvent>().await.unwrap().unwrap(),
-            QueryEvent::Change(
-                ChangeType::Insert,
-                RowId(4),
-                vec!["service-id-4".into(), "service-name-4".into()],
-                ChangeId(2)
-            )
-        );
-
-        assert_eq!(
-            rows_from.recv::<QueryEvent>().await.unwrap().unwrap(),
-            QueryEvent::Change(
-                ChangeType::Insert,
-                RowId(5),
-                vec!["service-id-5".into(), "service-name-5".into()],
-                ChangeId(3),
-            )
-        );
+        s1.assert_updates(vec![
+            (ChangeType::Insert, RowId(4), ChangeId(2), vec!["service-id-4".into(), "service-name-4".into()]),
+            (ChangeType::Insert, RowId(5), ChangeId(3), vec!["service-id-5".into(), "service-name-5".into()]),
+        ]);
 
         // change id 0 should start subs afresh
-        let mut res = api_v1_subs(
-            Extension(agent.clone()),
-            Extension(bcast_cache.clone()),
-            Extension(tripwire.clone()),
-            axum::extract::Query(SubParams {
+        let mut s_zero = agent.subscribe_to_test_table(
+            SubParams {
                 from: Some(0.into()),
                 ..Default::default()
-            }),
-            axum::Json(Statement::Simple("select * from tests".into())),
-        )
-        .await
-        .into_response();
+            },
+            Either::Left(TEST_QUERY1.into()),
+        ).await?;
 
-        if !res.status().is_success() {
-            let b = res.body_mut().data().await.unwrap().unwrap();
-            println!("body: {}", String::from_utf8_lossy(&b));
-        }
-
-        assert_eq!(res.status(), StatusCode::OK);
-
-        let mut rows_zero = RowsIter {
-            body: res.into_body(),
-            codec: LinesCodec::new(),
-            buf: BytesMut::new(),
-            done: false,
-        };
-
-        assert_eq!(
-            rows_zero.recv::<QueryEvent>().await.unwrap().unwrap(),
-            QueryEvent::Columns(vec!["id".into(), "text".into()])
-        );
-
-        assert_eq!(
-            rows_zero.recv::<QueryEvent>().await.unwrap().unwrap(),
-            QueryEvent::Row(RowId(1), vec!["service-id".into(), "service-name".into()])
-        );
-
-        assert_eq!(
-            rows_zero.recv::<QueryEvent>().await.unwrap().unwrap(),
-            QueryEvent::Row(
-                RowId(2),
-                vec!["service-id-2".into(), "service-name-2".into()]
-            )
-        );
-
-        assert_eq!(
-            rows_zero.recv::<QueryEvent>().await.unwrap().unwrap(),
-            QueryEvent::Row(
-                RowId(3),
-                vec!["service-id-3".into(), "service-name-3".into()],
-            )
-        );
-
-        assert_eq!(
-            rows_zero.recv::<QueryEvent>().await.unwrap().unwrap(),
-            QueryEvent::Row(
-                RowId(4),
-                vec!["service-id-4".into(), "service-name-4".into()]
-            )
-        );
-
-        assert_eq!(
-            rows_zero.recv::<QueryEvent>().await.unwrap().unwrap(),
-            QueryEvent::Row(
-                RowId(5),
-                vec!["service-id-5".into(), "service-name-5".into()]
-            )
-        );
-
-        assert_eq!(
-            rows_zero
-                .recv::<QueryEvent>()
-                .await
-                .unwrap()
-                .unwrap()
-                .meta(),
-            QueryEventMeta::EndOfQuery(Some(ChangeId(3)))
-        );
+        s_zero.assert_initial_query_results(vec!["id".into(), "text".into()], vec![
+            (RowId(1), vec!["service-id".into(), "service-name".into()]),
+            (RowId(2), vec!["service-id-2".into(), "service-name-2".into()]),
+            (RowId(3), vec!["service-id-3".into(), "service-name-3".into()]),
+            (RowId(4), vec!["service-id-4".into(), "service-name-4".into()]),
+            (RowId(5), vec!["service-id-5".into(), "service-name-5".into()]),
+        ], ChangeId(3));
 
         // skip rows!
-        let mut res = api_v1_subs(
-            Extension(agent.clone()),
-            Extension(bcast_cache.clone()),
-            Extension(tripwire.clone()),
-            axum::extract::Query(SubParams {
+        let mut s_skip = agent.subscribe_to_test_table(
+            SubParams {
                 skip_rows: true,
                 ..Default::default()
-            }),
-            axum::Json(Statement::Simple("select * from tests".into())),
-        )
-        .await
-        .into_response();
+            },
+            Either::Left(TEST_QUERY1.into()),
+        ).await?;
 
-        if !res.status().is_success() {
-            let b = res.body_mut().data().await.unwrap().unwrap();
-            println!("body: {}", String::from_utf8_lossy(&b));
-        }
+        agent.insert_test_data(vec![("service-id-6".into(), "service-name-6".into())]).await?;
 
-        assert_eq!(res.status(), StatusCode::OK);
+        let upd = (ChangeType::Insert, RowId(6), ChangeId(4), vec!["service-id-6".into(), "service-name-6".into()]);
+        s_skip.assert_updates(vec![upd.clone()]);
+        s_zero.assert_updates(vec![upd.clone()]);
 
-        let mut rows_from = RowsIter {
-            body: res.into_body(),
-            codec: LinesCodec::new(),
-            buf: BytesMut::new(),
-            done: false,
-        };
-
-        let (status_code, _) = api_v1_transactions(
-            Extension(agent.clone()),
-            axum::extract::Query(TimeoutParams { timeout: None }),
-            axum::Json(vec![Statement::WithParams(
-                "insert into tests (id, text) values (?,?)".into(),
-                vec!["service-id-6".into(), "service-name-6".into()],
-            )]),
-        )
-        .await;
-
-        assert_eq!(status_code, StatusCode::OK);
-
-        assert_eq!(
-            rows_from.recv::<QueryEvent>().await.unwrap().unwrap(),
-            QueryEvent::Change(
-                ChangeType::Insert,
-                RowId(6),
-                vec!["service-id-6".into(), "service-name-6".into()],
-                ChangeId(4),
-            )
-        );
 
         // skip rows AND from
-
-        let mut res = api_v1_subs(
-            Extension(agent.clone()),
-            Extension(bcast_cache.clone()),
-            Extension(tripwire.clone()),
-            axum::extract::Query(SubParams {
+        let mut s_skip_from = agent.subscribe_to_test_table(
+            SubParams {
                 skip_rows: true,
                 from: Some(ChangeId(3)),
-            }),
-            axum::Json(Statement::Simple("select * from tests".into())),
-        )
-        .await
-        .into_response();
+            },
+            Either::Left(TEST_QUERY1.into()),
+        ).await?;
 
-        if !res.status().is_success() {
-            let b = res.body_mut().data().await.unwrap().unwrap();
-            println!("body: {}", String::from_utf8_lossy(&b));
-        }
-
-        assert_eq!(res.status(), StatusCode::OK);
-
-        let mut rows_from = RowsIter {
-            body: res.into_body(),
-            codec: LinesCodec::new(),
-            buf: BytesMut::new(),
-            done: false,
-        };
-
-        assert_eq!(
-            tokio::time::timeout(Duration::from_secs(5), rows_from.recv::<QueryEvent>())
-                .await
-                .unwrap()
-                .unwrap()
-                .unwrap(),
-            QueryEvent::Change(
-                ChangeType::Insert,
-                RowId(6),
-                vec!["service-id-6".into(), "service-name-6".into()],
-                ChangeId(4),
-            )
-        );
+        s_skip_from.assert_updates(vec![upd.clone()]);
+        s_skip_from.assert_no_more_events();
 
         Ok(())
     }
