@@ -712,7 +712,7 @@ mod tests {
             .await
             .unwrap();
 
-        let client = corro_client::CorrosionApiClient::new(ta.agent.api_addr());
+        let client = ta.api_client();
 
         client
             .schema(&[Statement::Simple(corro_tests::TEST_SCHEMA.into())])

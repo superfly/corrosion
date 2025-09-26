@@ -390,6 +390,18 @@ impl From<i64> for SqliteParam {
     }
 }
 
+impl From<SqliteValue> for SqliteParam {
+    fn from(value: SqliteValue) -> Self {
+        match value {
+            SqliteValue::Null => Self::Null,
+            SqliteValue::Integer(i) => Self::Integer(i),
+            SqliteValue::Real(f) => Self::Real(*f),
+            SqliteValue::Text(t) => Self::Text(t),
+            SqliteValue::Blob(b) => Self::Blob(b),
+        }
+    }
+}
+
 impl ToSql for SqliteParam {
     fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
         Ok(match self {
