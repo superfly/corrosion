@@ -182,26 +182,47 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
 
                 let conn = Connection::open(&path)?;
 
-                let site_id: [u8; 16] = conn.query_row(
-                    "DELETE FROM crsql_site_id WHERE ordinal = 0 RETURNING site_id;",
-                    [],
-                    |row| row.get(0),
-                )?;
-
-                let new_ordinal: i64 = conn.query_row(
-                    "INSERT INTO crsql_site_id (site_id) VALUES (?) RETURNING ordinal;",
-                    [&site_id],
-                    |row| row.get(0),
-                )?;
-
                 let tables: Vec<String> = conn.prepare("SELECT name FROM sqlite_schema WHERE type = 'table' AND name LIKE '%__crsql_clock'")?.query_map([], |row| row.get(0))?.collect::<Result<Vec<_>, _>>()?;
 
-                for table in tables {
-                    let n = conn.execute(
-                        &format!("UPDATE \"{table}\" SET site_id = ? WHERE site_id = 0"),
-                        [new_ordinal],
-                    )?;
-                    debug!("updated {n} rows in {table}");
+                let site_id: Option<[u8; 16]> = conn
+                    .query_row(
+                        "DELETE FROM crsql_site_id WHERE ordinal = 0 RETURNING site_id;",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+
+                match site_id {
+                    Some(site_id) => {
+                        let new_ordinal: i64 = conn.query_row(
+                            "INSERT INTO crsql_site_id (site_id) VALUES (?) RETURNING ordinal;",
+                            [&site_id],
+                            |row| row.get(0),
+                        )?;
+
+                        for table in tables {
+                            let n = conn.execute(
+                                &format!("UPDATE \"{table}\" SET site_id = ? WHERE site_id = 0"),
+                                [new_ordinal],
+                            )?;
+                            debug!("updated {n} rows in {table}");
+                        }
+                    }
+                    None => {
+                        // check if any tables have rows with site_id = 0 and return an error
+                        for table in tables {
+                            let exists = conn.query_row(
+                                &format!(
+                                    "SELECT EXISTS (SELECT 1 FROM \"{table}\" WHERE site_id = 0)"
+                                ),
+                                [],
+                                |row| row.get::<_, bool>(0),
+                            )?;
+                            if exists {
+                                eyre::bail!("Site id missing");
+                            }
+                        }
+                    }
                 }
 
                 // clear __corro_members, this state is per actor

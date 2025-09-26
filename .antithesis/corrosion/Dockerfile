@@ -1,12 +1,19 @@
 # build image
 FROM rust:bookworm AS builder
 
+ARG TARGETARCH
+
 RUN apt update && apt install -y build-essential gcc-x86-64-linux-gnu clang llvm unzip
 
 # Install mold
 ENV MOLD_VERSION=1.11.0
-RUN set -eux; \
-    curl --fail --location "https://github.com/rui314/mold/releases/download/v${MOLD_VERSION}/mold-${MOLD_VERSION}-x86_64-linux.tar.gz" --output /tmp/mold.tar.gz; \
+RUN case "${TARGETARCH}" in \
+      amd64) MOLD_ARCH="x86_64" ;; \
+      arm64) MOLD_ARCH="aarch64" ;; \
+      *) echo "Unsupported architecture: ${TARGETARCH}" && exit 1 ;; \
+    esac; \
+    set -eux; \
+    curl --fail --location "https://github.com/rui314/mold/releases/download/v${MOLD_VERSION}/mold-${MOLD_VERSION}-${MOLD_ARCH}-linux.tar.gz" --output /tmp/mold.tar.gz; \
     tar --directory "/usr/local" -xzvf "/tmp/mold.tar.gz" --strip-components 1; \
     rm /tmp/mold.tar.gz; \
     mold --version;
@@ -20,10 +27,10 @@ RUN set -eux; \
 ENV CONSUL_VERSION="1.14.3"
 
 RUN set -eux; \
-    curl --silent --remote-name https://releases.hashicorp.com/consul/${CONSUL_VERSION}/consul_${CONSUL_VERSION}_linux_amd64.zip; \
-    unzip consul_${CONSUL_VERSION}_linux_amd64.zip; \
+    curl --silent --remote-name https://releases.hashicorp.com/consul/${CONSUL_VERSION}/consul_${CONSUL_VERSION}_linux_${TARGETARCH}.zip; \
+    unzip consul_${CONSUL_VERSION}_linux_${TARGETARCH}.zip; \
     mv consul /usr/local/bin/consul; \
-    rm consul_${CONSUL_VERSION}_linux_amd64.zip; \
+    rm consul_${CONSUL_VERSION}_linux_${TARGETARCH}.zip; \
     consul --version;
 
 WORKDIR /usr/src/app
@@ -43,7 +50,7 @@ RUN --mount=type=cache,target=/usr/local/cargo,from=rust:bookworm,source=/usr/lo
 FROM debian:bookworm-slim
 
 RUN apt update && apt install -y sqlite3 sqlite3-tools watch socat iproute2 gettext-base ca-certificates supervisor && rm -rf /var/lib/apt/lists/*
-COPY --from=builder /usr/local/bin/nperf /usr/local/bin/consul /usr/src/app/corrosion /usr/src/app/rust-load-generator /usr/local/bin/
+COPY --from=builder /usr/local/bin/consul /usr/src/app/corrosion /usr/src/app/rust-load-generator /usr/local/bin/
 
 # Create "corrosion" user
 RUN useradd -ms /bin/bash corrosion
@@ -60,7 +67,7 @@ COPY .antithesis/corrosion/config.toml.tpl /etc/corrosion/config.toml.tpl
 COPY .antithesis/corrosion/schemas /etc/corrosion/schemas
 COPY .antithesis/corrosion/templates /etc/corrosion/templates
 
-# COPY .antithesis/corrosion/test-templates/* /opt/antithesis/test/v1/basic_test/
+COPY .antithesis/corrosion/test-templates/* /opt/antithesis/test/v1/basic_test/
 
 # Create supervisor configuration directory
 RUN mkdir -p /etc/supervisor/conf.d
