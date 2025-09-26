@@ -934,7 +934,7 @@ mod tests {
         async fn assert_initial_query_results(
             &mut self,
             expected_column_names: Vec<ColumnName>,
-            expected_rows: Vec<(RowId, Vec<SqliteValue>)>,
+            expected_rows: Vec<(RowId, &Vec<SqliteValue>)>,
             expected_change_id: ChangeId,
         ) -> () {
             assert_eq!(
@@ -962,12 +962,12 @@ mod tests {
 
         async fn assert_updates(
             &mut self,
-            expected_updates: Vec<(ChangeType, RowId, ChangeId, Vec<SqliteValue>)>,
+            expected_updates: Vec<(ChangeType, RowId, ChangeId, &Vec<SqliteValue>)>,
         ) {
             for (change_type, row_id, change_id, row) in expected_updates {
                 assert_eq!(
                     self.iter.recv::<QueryEvent>().await.unwrap().unwrap(),
-                    QueryEvent::Change(change_type, row_id, row, change_id)
+                    QueryEvent::Change(change_type, row_id, row.to_vec(), change_id)
                 );
             }
         }
@@ -987,6 +987,8 @@ mod tests {
     const TEST_QUERY1_EXPLICIT: &str = "select id, text from tests";
     const TEST_QUERY2: &str =
         "select * from tests where substr(id, -1) IN ('0', '2', '4', '6', '8')";
+    const TEST_QUERY3: &str =
+        "select * from tests where substr(id, -1) IN ('1', '3', '5', '7', '9')";
     impl PubSubAgent {
         async fn subscribe_to_test_table(
             &self,
@@ -1044,17 +1046,16 @@ mod tests {
             })
         }
 
-        async fn insert_test_data(&self, rows: Vec<(String, String)>) -> eyre::Result<()> {
-            let rows_len = rows.len();
+        async fn insert_test_data(&self, rows: &[Vec<SqliteValue>]) -> eyre::Result<()> {
             let (status_code, body) = api_v1_transactions(
                 Extension(self.ta.agent.clone()),
                 axum::extract::Query(TimeoutParams { timeout: None }),
                 axum::Json(
                     rows.into_iter()
-                        .map(|(id, name)| {
+                        .map(|row| {
                             Statement::WithParams(
                                 "insert into tests (id, text) values (?,?)".into(),
-                                vec![id.into(), name.into()],
+                                row.iter().map(|v| v.clone().into()).collect(),
                             )
                         })
                         .collect(),
@@ -1063,21 +1064,21 @@ mod tests {
             .await;
 
             assert_eq!(status_code, StatusCode::OK);
-            assert!(body.0.results.len() == rows_len);
+            assert!(body.0.results.len() == rows.len());
             Ok(())
         }
 
-        async fn update_test_data(&self, rows: Vec<(String, String)>) -> eyre::Result<()> {
+        async fn update_test_data(&self, rows: Vec<&Vec<SqliteValue>>) -> eyre::Result<()> {
             let rows_len = rows.len();
             let (status_code, body) = api_v1_transactions(
                 Extension(self.ta.agent.clone()),
                 axum::extract::Query(TimeoutParams { timeout: None }),
                 axum::Json(
-                    rows.into_iter()
-                        .map(|(id, name)| {
+                    rows.iter()
+                        .map(|row| {
                             Statement::WithParams(
                                 "update tests set text = ?2 where id = ?1".into(),
-                                vec![id.into(), name.into()],
+                                row.iter().map(|v| v.clone().into()).collect(),
                             )
                         })
                         .collect(),
@@ -1090,17 +1091,17 @@ mod tests {
             Ok(())
         }
 
-        async fn delete_test_data(&self, rows: Vec<String>) -> eyre::Result<()> {
+        async fn delete_test_data(&self, rows: Vec<&SqliteValue>) -> eyre::Result<()> {
             let rows_len = rows.len();
             let (status_code, body) = api_v1_transactions(
                 Extension(self.ta.agent.clone()),
                 axum::extract::Query(TimeoutParams { timeout: None }),
                 axum::Json(
-                    rows.into_iter()
+                    rows.iter()
                         .map(|id| {
                             Statement::WithParams(
                                 "delete from tests where id = ?1".into(),
-                                vec![id.into()],
+                                vec![(*id).clone().into()],
                             )
                         })
                         .collect(),
@@ -1200,39 +1201,158 @@ mod tests {
         }
     }
 
+    // Check subscription deduplication
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn test_same_sub_id_for_same_query() -> eyre::Result<()> {
         _ = tracing_subscriber::fmt::try_init();
         let test = PubSubTest::with_n_agents(1).await?;
+        let make_sub_fn = async |q: &str, sub_params: SubParams| {
+            test.agents[0]
+                .subscribe_to_test_table(
+                    sub_params,
+                    Either::Left(q.into()),
+                )
+                .await
+        };
         let mut s = Vec::new();
         for q in [
-            TEST_QUERY1,
             TEST_QUERY1,
             TEST_QUERY1_WITH_SPACES,
             TEST_QUERY1_EXPLICIT,
             TEST_QUERY2,
+            TEST_QUERY3,
         ]
         .into_iter()
         {
-            s.push(
-                test.agents[0]
-                    .subscribe_to_test_table(
-                        SubParams {
-                            from: None,
-                            skip_rows: true,
-                        },
-                        Either::Left(q.into()),
-                    )
-                    .await?,
-            );
+            // skip_rows should not affect the sub_id
+            // resubscribing should not affect the sub_id
+            let s0 = make_sub_fn(q, SubParams { from: None, skip_rows: false }).await?;
+            let s1 = make_sub_fn(q, SubParams { from: None, skip_rows: false }).await?;
+            let s2 = make_sub_fn(q, SubParams { from: None, skip_rows: true }).await?;
+            let s3 = make_sub_fn(q, SubParams { from: Some(0.into()), skip_rows: false }).await?;
+            let s4 = make_sub_fn(q, SubParams { from: Some(0.into()), skip_rows: true }).await?;
+            assert_eq!(s0.sub_id, s1.sub_id);
+            assert_eq!(s0.sub_id, s2.sub_id);
+            assert_eq!(s0.sub_id, s3.sub_id);
+            assert_eq!(s0.sub_id, s4.sub_id);
+            s.push(s0);
         }
-        assert_eq!(s[0].sub_id, s[1].sub_id);
-        assert_ne!(s[0].sub_id, s[2].sub_id);
-        assert_ne!(s[0].sub_id, s[3].sub_id);
-        assert_ne!(s[0].sub_id, s[4].sub_id);
-        assert_ne!(s[2].sub_id, s[3].sub_id);
-        assert_ne!(s[2].sub_id, s[4].sub_id);
-        assert_ne!(s[3].sub_id, s[4].sub_id);
+        
+        // TODO: Semantically equivalent queries should get the same sub_id
+        //       for now only byte-identical queries get the same sub_id
+        for i in 1..s.len() {
+            for j in i + 1..s.len() {
+                assert_ne!(s[i].sub_id, s[j].sub_id);
+            }
+        }
+        Ok(())
+    }
+
+    // Checks that rowIDs are different across different subscriptions
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn test_row_ids_are_unique_per_query() -> eyre::Result<()> {
+        _ = tracing_subscriber::fmt::try_init();
+        let test = PubSubTest::with_n_agents(1).await?;
+        let make_sub_fn = async |q: &str| {
+            test.agents[0]
+                .subscribe_to_test_table(
+                    SubParams {
+                        from: None,
+                        skip_rows: false,
+                    },
+                    Either::Left(q.into()),
+                )
+                .await
+        };
+
+        // First insert some data to test rowIds for the initial query results
+        let data = [
+            vec!["service-id-0".into(), "service-name-0".into()],
+            vec!["service-id-1".into(), "service-name-1".into()],
+            vec!["service-id-2".into(), "service-name-2".into()],
+            vec!["service-id-3".into(), "service-name-3".into()],
+            vec!["service-id-4".into(), "service-name-4".into()],
+            vec!["service-id-5".into(), "service-name-5".into()],
+        ];
+        test.agents[0].insert_test_data(&data).await?;
+
+        let mut s_all = make_sub_fn(TEST_QUERY1).await?;
+        let mut s_even = make_sub_fn(TEST_QUERY2).await?;
+        let mut s_odd = make_sub_fn(TEST_QUERY3).await?;
+
+        s_all.assert_initial_query_results(vec!["id".into(), "text".into()], vec![
+            (RowId(1), &data[0]),
+            (RowId(2), &data[1]),
+            (RowId(3), &data[2]),
+            (RowId(4), &data[3]),
+            (RowId(5), &data[4]),
+            (RowId(6), &data[5]),
+        ], 0.into()).await;
+
+        s_even.assert_initial_query_results(vec!["id".into(), "text".into()], vec![
+            (RowId(1), &data[0]),
+            (RowId(2), &data[2]),
+            (RowId(3), &data[4]),
+        ], 0.into()).await;
+
+        s_odd.assert_initial_query_results(vec!["id".into(), "text".into()], vec![
+            (RowId(1), &data[1]),
+            (RowId(2), &data[3]),
+            (RowId(3), &data[5]),
+        ], 0.into()).await;
+
+        // Now check updates
+        let data = [
+            vec!["service-id-6".into(), "service-name-6".into()],
+            vec!["service-id-7".into(), "service-name-7".into()],
+            vec!["service-id-8".into(), "service-name-8".into()],
+            vec!["service-id-9".into(), "service-name-9".into()],
+            vec!["service-id-10".into(), "service-name-10".into()],
+            vec!["service-id-11".into(), "service-name-11".into()],
+        ];
+        test.agents[0].insert_test_data(&data).await?;
+
+        s_all.assert_updates(vec![
+            (ChangeType::Insert, RowId(7), ChangeId(1), &data[4]),
+        ]).await;
+        s_all.assert_updates(vec![
+            (ChangeType::Insert, RowId(8), ChangeId(2), &data[5]),
+        ]).await;
+        s_all.assert_updates(vec![
+            (ChangeType::Insert, RowId(9), ChangeId(3), &data[0]),
+        ]).await;
+        s_all.assert_updates(vec![
+            (ChangeType::Insert, RowId(10), ChangeId(4), &data[1]),
+        ]).await;
+        s_all.assert_updates(vec![
+            (ChangeType::Insert, RowId(11), ChangeId(5), &data[2]),
+        ]).await;
+        s_all.assert_updates(vec![
+            (ChangeType::Insert, RowId(12), ChangeId(6), &data[3]),
+        ]).await;
+
+        dbg!("dupa");
+        s_all.assert_updates(vec![
+            (ChangeType::Insert, RowId(7), ChangeId(1), &data[0]),
+            (ChangeType::Insert, RowId(8), ChangeId(1), &data[1]),
+            (ChangeType::Insert, RowId(9), ChangeId(1), &data[2]),
+            (ChangeType::Insert, RowId(10), ChangeId(1), &data[3]),
+            (ChangeType::Insert, RowId(11), ChangeId(1), &data[4]),
+            (ChangeType::Insert, RowId(12), ChangeId(1), &data[5]),
+        ]).await;
+
+        s_even.assert_updates(vec![
+            (ChangeType::Insert, RowId(4), ChangeId(1), &data[0]),
+            (ChangeType::Insert, RowId(5), ChangeId(1), &data[2]),
+            (ChangeType::Insert, RowId(6), ChangeId(1), &data[4]),
+        ]).await;
+
+        s_odd.assert_updates(vec![
+            (ChangeType::Insert, RowId(4), ChangeId(1), &data[1]),
+            (ChangeType::Insert, RowId(5), ChangeId(1), &data[3]),
+            (ChangeType::Insert, RowId(6), ChangeId(1), &data[5]),
+        ]).await;
+
         Ok(())
     }
 
@@ -1240,13 +1360,14 @@ mod tests {
     async fn test_on_2_nodes() -> eyre::Result<()> {
         _ = tracing_subscriber::fmt::try_init();
         let test = PubSubTest::with_n_agents(2).await?;
+        let data = [
+            vec!["service-id-0".into(), "service-name-0".into()],
+            vec!["service-id-1".into(), "service-name-1".into()],
+            vec!["service-id-2".into(), "service-name-2".into()],
+            vec!["service-id-3".into(), "service-name-3".into()],
+        ];
 
-        test.agents[0]
-            .insert_test_data(vec![
-                ("service-id".into(), "service-name".into()),
-                ("service-id-2".into(), "service-name-2".into()),
-            ])
-            .await?;
+        test.agents[0].insert_test_data(&data[0..2]).await?;
 
         test.wait_for_nodes_to_sync().await?;
 
@@ -1260,12 +1381,7 @@ mod tests {
             )
             .await?;
 
-        test.agents[0]
-            .insert_test_data(vec![
-                ("service-id-3".into(), "service-name-3".into()),
-                ("service-id-4".into(), "service-name-4".into()),
-            ])
-            .await?;
+        test.agents[0].insert_test_data(&data[2..4]).await?;
 
         dbg!(rows_iter.iter.recv::<QueryEvent>().await);
         dbg!(rows_iter.iter.recv::<QueryEvent>().await);
@@ -1284,14 +1400,16 @@ mod tests {
         _ = tracing_subscriber::fmt::try_init();
         let test = PubSubTest::with_n_agents(1).await?;
         let agent = &test.agents[0];
+        let data = [
+            vec!["service-id-0".into(), "service-name-0".into()],
+            vec!["service-id-1".into(), "service-name-1".into()],
+            vec!["service-id-2".into(), "service-name-2".into()],
+            vec!["service-id-3".into(), "service-name-3".into()],
+            vec!["service-id-4".into(), "service-name-4".into()],
+            vec!["service-id-5".into(), "service-name-5".into()],
+        ];
 
-        agent
-            .insert_test_data(vec![
-                ("service-id".into(), "service-name".into()),
-                ("service-id-2".into(), "service-name-2".into()),
-            ])
-            .await?;
-
+        agent.insert_test_data(&data[0..2]).await?;
         {
             let mut s1 = agent
                 .subscribe_to_test_table(
@@ -1324,9 +1442,7 @@ mod tests {
 
             assert_eq!(notify_res.status(), StatusCode::OK);
 
-            agent
-                .insert_test_data(vec![("service-id-3".into(), "service-name-3".into())])
-                .await?;
+            agent.insert_test_data(&data[2..3]).await?;
 
             let mut notify_rows = RowsIter {
                 body: notify_res.into_body(),
@@ -1337,42 +1453,27 @@ mod tests {
 
             s1.assert_initial_query_results(
                 vec!["id".into(), "text".into()],
-                vec![
-                    (RowId(1), vec!["service-id".into(), "service-name".into()]),
-                    (
-                        RowId(2),
-                        vec!["service-id-2".into(), "service-name-2".into()],
-                    ),
-                ],
+                vec![(RowId(1), &data[0]), (RowId(2), &data[1])],
                 0.into(),
-            ).await;
+            )
+            .await;
 
-            s1.assert_updates(vec![(
-                ChangeType::Insert,
-                RowId(3),
-                ChangeId(1),
-                vec!["service-id-3".into(), "service-name-3".into()],
-            )]);
+            s1.assert_updates(vec![(ChangeType::Insert, RowId(3), ChangeId(1), &data[2])])
+                .await;
 
-            agent
-                .insert_test_data(vec![("service-id-4".into(), "service-name-4".into())])
-                .await?;
+            agent.insert_test_data(&data[3..4]).await?;
 
-            s1.assert_updates(vec![(
-                ChangeType::Insert,
-                RowId(4),
-                ChangeId(2),
-                vec!["service-id-4".into(), "service-name-4".into()],
-            )]).await?;
+            s1.assert_updates(vec![(ChangeType::Insert, RowId(4), ChangeId(2), &data[3])])
+                .await;
 
             assert_eq!(
                 notify_rows.recv::<NotifyEvent>().await.unwrap().unwrap(),
-                NotifyEvent::Notify(ChangeType::Update, vec!["service-id-3".into()],)
+                NotifyEvent::Notify(ChangeType::Update, vec!["service-id-2".into()],)
             );
 
             assert_eq!(
                 notify_rows.recv::<NotifyEvent>().await.unwrap().unwrap(),
-                NotifyEvent::Notify(ChangeType::Update, vec!["service-id-4".into()],)
+                NotifyEvent::Notify(ChangeType::Update, vec!["service-id-3".into()],)
             );
 
             // s2 subscribes from change id 1
@@ -1386,12 +1487,8 @@ mod tests {
                 )
                 .await?;
 
-            s2.assert_updates(vec![(
-                ChangeType::Insert,
-                RowId(4),
-                ChangeId(2),
-                vec!["service-id-4".into(), "service-name-4".into()],
-            )]).await;
+            s2.assert_updates(vec![(ChangeType::Insert, RowId(4), ChangeId(2), &data[3])])
+                .await;
 
             // new subscriber for updates
             let mut notify_res2 = api_v1_updates(
@@ -1417,22 +1514,15 @@ mod tests {
                 done: false,
             };
 
-            agent
-                .insert_test_data(vec![("service-id-5".into(), "service-name-5".into())])
-                .await?;
+            agent.insert_test_data(&data[4..5]).await?;
 
             // Both s1 and s2 should receive the insert
-            let query_evt = (
-                ChangeType::Insert,
-                RowId(5),
-                ChangeId(3),
-                vec!["service-id-5".into(), "service-name-5".into()],
-            );
-            s1.assert_updates(vec![query_evt.clone()]);
-            s2.assert_updates(vec![query_evt]);
+            let query_evt = (ChangeType::Insert, RowId(5), ChangeId(3), &data[4]);
+            s1.assert_updates(vec![query_evt.clone()]).await;
+            s2.assert_updates(vec![query_evt]).await;
 
             // And both notifications should be received
-            let notify_evt = NotifyEvent::Notify(ChangeType::Update, vec!["service-id-5".into()]);
+            let notify_evt = NotifyEvent::Notify(ChangeType::Update, vec!["service-id-4".into()]);
             assert_eq!(
                 notify_rows.recv::<NotifyEvent>().await.unwrap().unwrap(),
                 notify_evt
@@ -1457,42 +1547,31 @@ mod tests {
             s3.assert_initial_query_results(
                 vec!["id".into(), "text".into()],
                 vec![
-                    (RowId(1), vec!["service-id".into(), "service-name".into()]),
-                    (
-                        RowId(2),
-                        vec!["service-id-2".into(), "service-name-2".into()],
-                    ),
-                    (
-                        RowId(3),
-                        vec!["service-id-3".into(), "service-name-3".into()],
-                    ),
-                    (
-                        RowId(4),
-                        vec!["service-id-4".into(), "service-name-4".into()],
-                    ),
-                    (
-                        RowId(5),
-                        vec!["service-id-5".into(), "service-name-5".into()],
-                    ),
+                    (RowId(1), &data[0]),
+                    (RowId(2), &data[1]),
+                    (RowId(3), &data[2]),
+                    (RowId(4), &data[3]),
+                    (RowId(5), &data[4]),
                 ],
                 ChangeId(3),
-            ).await;
-            
-            agent.insert_test_data(vec![("service-id-6".into(), "service-name-6".into())]).await?;
-            agent.delete_test_data(vec!["service-id-6".into()]).await?;
+            )
+            .await;
+
+            agent.insert_test_data(&data[5..6]).await?;
+            agent.delete_test_data(vec![&data[5][0]]).await?;
 
             // when we make changes to the same primary key in quick succession,
             // the newer event might get sent first (but in that case, the older one should be dropped)
             match notify_rows.recv::<NotifyEvent>().await.unwrap().unwrap() {
                 NotifyEvent::Notify(ChangeType::Update, pk) => {
-                    assert_eq!(pk, vec!["service-id-6".into()]);
+                    assert_eq!(pk, vec!["service-id-5".into()]);
                     assert_eq!(
                         notify_rows.recv::<NotifyEvent>().await.unwrap().unwrap(),
-                        NotifyEvent::Notify(ChangeType::Delete, vec!["service-id-6".into()],)
+                        NotifyEvent::Notify(ChangeType::Delete, vec!["service-id-5".into()],)
                     );
                 }
                 NotifyEvent::Notify(ChangeType::Delete, pk) => {
-                    assert_eq!(pk, vec!["service-id-6".into()]);
+                    assert_eq!(pk, vec!["service-id-5".into()]);
                     // check that we dont get an update after
                     assert!(tokio::time::timeout(
                         Duration::from_secs(2),
@@ -1506,63 +1585,77 @@ mod tests {
         }
 
         // previous subs have been dropped.
-        let mut s1 = agent.subscribe_to_test_table(
-            SubParams {
-                from: Some(1.into()),
-                ..Default::default()
-            },
-            Either::Left(TEST_QUERY1.into()),
-        ).await?;
+        let mut s1 = agent
+            .subscribe_to_test_table(
+                SubParams {
+                    from: Some(1.into()),
+                    ..Default::default()
+                },
+                Either::Left(TEST_QUERY1.into()),
+            )
+            .await?;
 
         s1.assert_updates(vec![
-            (ChangeType::Insert, RowId(4), ChangeId(2), vec!["service-id-4".into(), "service-name-4".into()]),
-            (ChangeType::Insert, RowId(5), ChangeId(3), vec!["service-id-5".into(), "service-name-5".into()]),
-        ]);
+            (ChangeType::Insert, RowId(4), ChangeId(2), &data[3]),
+            (ChangeType::Insert, RowId(5), ChangeId(3), &data[4]),
+        ])
+        .await;
 
         // change id 0 should start subs afresh
-        let mut s_zero = agent.subscribe_to_test_table(
-            SubParams {
-                from: Some(0.into()),
-                ..Default::default()
-            },
-            Either::Left(TEST_QUERY1.into()),
-        ).await?;
+        let mut s_zero = agent
+            .subscribe_to_test_table(
+                SubParams {
+                    from: Some(0.into()),
+                    ..Default::default()
+                },
+                Either::Left(TEST_QUERY1.into()),
+            )
+            .await?;
 
-        s_zero.assert_initial_query_results(vec!["id".into(), "text".into()], vec![
-            (RowId(1), vec!["service-id".into(), "service-name".into()]),
-            (RowId(2), vec!["service-id-2".into(), "service-name-2".into()]),
-            (RowId(3), vec!["service-id-3".into(), "service-name-3".into()]),
-            (RowId(4), vec!["service-id-4".into(), "service-name-4".into()]),
-            (RowId(5), vec!["service-id-5".into(), "service-name-5".into()]),
-        ], ChangeId(3));
+        s_zero
+            .assert_initial_query_results(
+                vec!["id".into(), "text".into()],
+                vec![
+                    (RowId(1), &data[0]),
+                    (RowId(2), &data[1]),
+                    (RowId(3), &data[2]),
+                    (RowId(4), &data[3]),
+                    (RowId(5), &data[4]),
+                ],
+                ChangeId(3),
+            )
+            .await;
 
         // skip rows!
-        let mut s_skip = agent.subscribe_to_test_table(
-            SubParams {
-                skip_rows: true,
-                ..Default::default()
-            },
-            Either::Left(TEST_QUERY1.into()),
-        ).await?;
+        let mut s_skip = agent
+            .subscribe_to_test_table(
+                SubParams {
+                    skip_rows: true,
+                    ..Default::default()
+                },
+                Either::Left(TEST_QUERY1.into()),
+            )
+            .await?;
 
-        agent.insert_test_data(vec![("service-id-6".into(), "service-name-6".into())]).await?;
+        agent.insert_test_data(&data[5..6]).await?;
 
-        let upd = (ChangeType::Insert, RowId(6), ChangeId(4), vec!["service-id-6".into(), "service-name-6".into()]);
-        s_skip.assert_updates(vec![upd.clone()]);
-        s_zero.assert_updates(vec![upd.clone()]);
-
+        let upd = (ChangeType::Insert, RowId(6), ChangeId(4), &data[5]);
+        s_skip.assert_updates(vec![upd.clone()]).await;
+        s_zero.assert_updates(vec![upd.clone()]).await;
 
         // skip rows AND from
-        let mut s_skip_from = agent.subscribe_to_test_table(
-            SubParams {
-                skip_rows: true,
-                from: Some(ChangeId(3)),
-            },
-            Either::Left(TEST_QUERY1.into()),
-        ).await?;
+        let mut s_skip_from = agent
+            .subscribe_to_test_table(
+                SubParams {
+                    skip_rows: true,
+                    from: Some(ChangeId(3)),
+                },
+                Either::Left(TEST_QUERY1.into()),
+            )
+            .await?;
 
-        s_skip_from.assert_updates(vec![upd.clone()]);
-        s_skip_from.assert_no_more_events();
+        s_skip_from.assert_updates(vec![upd.clone()]).await;
+        s_skip_from.assert_no_more_events().await;
 
         Ok(())
     }
