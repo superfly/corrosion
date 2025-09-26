@@ -893,6 +893,7 @@ mod tests {
         config::Config,
         pubsub::ChangeType,
     };
+    use eyre::{Result, WrapErr};
     use http_body::Body;
     use serde::de::DeserializeOwned;
     use spawn::wait_for_all_pending_handles;
@@ -906,12 +907,8 @@ mod tests {
     use crate::agent::process_multiple_changes;
     use crate::api::public::update::{api_v1_updates, SharedUpdateBroadcastCache};
     use crate::api::public::TimeoutParams;
-    use crate::{
-        agent::setup,
-        api::public::{api_v1_db_schema, api_v1_transactions},
-    };
+    use crate::api::public::{api_v1_db_schema, api_v1_transactions};
     use corro_tests::launch_test_agent;
-    use corro_tests::tempdir::TempDir;
     use corro_types::api::SqliteValue::Integer;
 
     struct PubSubAgent {
@@ -922,6 +919,7 @@ mod tests {
         tripwire: Tripwire,
     }
 
+    #[derive(Debug)]
     struct SubscriptionStream {
         iter: RowsIter,
         sub_id: Uuid,
@@ -1016,12 +1014,10 @@ mod tests {
                 .into_response(),
             };
 
-            if !res.status().is_success() {
+            if res.status() != StatusCode::OK {
                 let b = res.body_mut().data().await.unwrap().unwrap();
-                println!("body: {}", String::from_utf8_lossy(&b));
+                return Err(eyre::eyre!(String::from_utf8_lossy(&b).to_string()));
             }
-
-            assert_eq!(res.status(), StatusCode::OK);
 
             // The api should always return a corro-query-id header
             let query_id_header = res
@@ -1208,10 +1204,7 @@ mod tests {
         let test = PubSubTest::with_n_agents(1).await?;
         let make_sub_fn = async |q: &str, sub_params: SubParams| {
             test.agents[0]
-                .subscribe_to_test_table(
-                    sub_params,
-                    Either::Left(q.into()),
-                )
+                .subscribe_to_test_table(sub_params, Either::Left(q.into()))
                 .await
         };
         let mut s = Vec::new();
@@ -1226,18 +1219,53 @@ mod tests {
         {
             // skip_rows should not affect the sub_id
             // resubscribing should not affect the sub_id
-            let s0 = make_sub_fn(q, SubParams { from: None, skip_rows: false }).await?;
-            let s1 = make_sub_fn(q, SubParams { from: None, skip_rows: false }).await?;
-            let s2 = make_sub_fn(q, SubParams { from: None, skip_rows: true }).await?;
-            let s3 = make_sub_fn(q, SubParams { from: Some(0.into()), skip_rows: false }).await?;
-            let s4 = make_sub_fn(q, SubParams { from: Some(0.into()), skip_rows: true }).await?;
+            let s0 = make_sub_fn(
+                q,
+                SubParams {
+                    from: None,
+                    skip_rows: false,
+                },
+            )
+            .await?;
+            let s1 = make_sub_fn(
+                q,
+                SubParams {
+                    from: None,
+                    skip_rows: false,
+                },
+            )
+            .await?;
+            let s2 = make_sub_fn(
+                q,
+                SubParams {
+                    from: None,
+                    skip_rows: true,
+                },
+            )
+            .await?;
+            let s3 = make_sub_fn(
+                q,
+                SubParams {
+                    from: Some(0.into()),
+                    skip_rows: false,
+                },
+            )
+            .await?;
+            let s4 = make_sub_fn(
+                q,
+                SubParams {
+                    from: Some(0.into()),
+                    skip_rows: true,
+                },
+            )
+            .await?;
             assert_eq!(s0.sub_id, s1.sub_id);
             assert_eq!(s0.sub_id, s2.sub_id);
             assert_eq!(s0.sub_id, s3.sub_id);
             assert_eq!(s0.sub_id, s4.sub_id);
             s.push(s0);
         }
-        
+
         // TODO: Semantically equivalent queries should get the same sub_id
         //       for now only byte-identical queries get the same sub_id
         for i in 1..s.len() {
@@ -1280,28 +1308,46 @@ mod tests {
         let mut s_even = make_sub_fn(TEST_QUERY2).await?;
         let mut s_odd = make_sub_fn(TEST_QUERY3).await?;
 
-        s_all.assert_initial_query_results(vec!["id".into(), "text".into()], vec![
-            (RowId(1), &data[0]),
-            (RowId(2), &data[1]),
-            (RowId(3), &data[2]),
-            (RowId(4), &data[3]),
-            (RowId(5), &data[4]),
-            (RowId(6), &data[5]),
-        ], 0.into()).await;
+        s_all
+            .assert_initial_query_results(
+                vec!["id".into(), "text".into()],
+                vec![
+                    (RowId(1), &data[0]),
+                    (RowId(2), &data[1]),
+                    (RowId(3), &data[2]),
+                    (RowId(4), &data[3]),
+                    (RowId(5), &data[4]),
+                    (RowId(6), &data[5]),
+                ],
+                0.into(),
+            )
+            .await;
 
-        s_even.assert_initial_query_results(vec!["id".into(), "text".into()], vec![
-            (RowId(1), &data[0]),
-            (RowId(2), &data[2]),
-            (RowId(3), &data[4]),
-        ], 0.into()).await;
+        s_even
+            .assert_initial_query_results(
+                vec!["id".into(), "text".into()],
+                vec![
+                    (RowId(1), &data[0]),
+                    (RowId(2), &data[2]),
+                    (RowId(3), &data[4]),
+                ],
+                0.into(),
+            )
+            .await;
 
-        s_odd.assert_initial_query_results(vec!["id".into(), "text".into()], vec![
-            (RowId(1), &data[1]),
-            (RowId(2), &data[3]),
-            (RowId(3), &data[5]),
-        ], 0.into()).await;
+        s_odd
+            .assert_initial_query_results(
+                vec!["id".into(), "text".into()],
+                vec![
+                    (RowId(1), &data[1]),
+                    (RowId(2), &data[3]),
+                    (RowId(3), &data[5]),
+                ],
+                0.into(),
+            )
+            .await;
 
-        // Now check updates
+        // Now check if updates work
         let data = [
             vec!["service-id-6".into(), "service-name-6".into()],
             vec!["service-id-7".into(), "service-name-7".into()],
@@ -1310,48 +1356,105 @@ mod tests {
             vec!["service-id-10".into(), "service-name-10".into()],
             vec!["service-id-11".into(), "service-name-11".into()],
         ];
-        test.agents[0].insert_test_data(&data).await?;
 
-        s_all.assert_updates(vec![
-            (ChangeType::Insert, RowId(7), ChangeId(1), &data[4]),
-        ]).await;
-        s_all.assert_updates(vec![
-            (ChangeType::Insert, RowId(8), ChangeId(2), &data[5]),
-        ]).await;
-        s_all.assert_updates(vec![
-            (ChangeType::Insert, RowId(9), ChangeId(3), &data[0]),
-        ]).await;
-        s_all.assert_updates(vec![
-            (ChangeType::Insert, RowId(10), ChangeId(4), &data[1]),
-        ]).await;
-        s_all.assert_updates(vec![
-            (ChangeType::Insert, RowId(11), ChangeId(5), &data[2]),
-        ]).await;
-        s_all.assert_updates(vec![
-            (ChangeType::Insert, RowId(12), ChangeId(6), &data[3]),
-        ]).await;
+        for i in 0..data.len() {
+            test.agents[0].insert_test_data(&data[i..=i]).await?;
+            let row = &data[i];
+            let i = i as u64;
 
-        dbg!("dupa");
-        s_all.assert_updates(vec![
-            (ChangeType::Insert, RowId(7), ChangeId(1), &data[0]),
-            (ChangeType::Insert, RowId(8), ChangeId(1), &data[1]),
-            (ChangeType::Insert, RowId(9), ChangeId(1), &data[2]),
-            (ChangeType::Insert, RowId(10), ChangeId(1), &data[3]),
-            (ChangeType::Insert, RowId(11), ChangeId(1), &data[4]),
-            (ChangeType::Insert, RowId(12), ChangeId(1), &data[5]),
-        ]).await;
+            s_all
+                .assert_updates(vec![(
+                    ChangeType::Insert,
+                    RowId(7 + i),
+                    ChangeId(1 + i),
+                    row,
+                )])
+                .await;
 
-        s_even.assert_updates(vec![
-            (ChangeType::Insert, RowId(4), ChangeId(1), &data[0]),
-            (ChangeType::Insert, RowId(5), ChangeId(1), &data[2]),
-            (ChangeType::Insert, RowId(6), ChangeId(1), &data[4]),
-        ]).await;
+            if i % 2 == 0 {
+                s_even
+                    .assert_updates(vec![(
+                        ChangeType::Insert,
+                        RowId(3 + i / 2),
+                        ChangeId(1 + i / 2),
+                        row,
+                    )])
+                    .await;
+            } else {
+                s_odd
+                    .assert_updates(vec![(
+                        ChangeType::Insert,
+                        RowId(3 + i / 2),
+                        ChangeId(1 + i / 2),
+                        row,
+                    )])
+                    .await;
+            }
+        }
 
-        s_odd.assert_updates(vec![
-            (ChangeType::Insert, RowId(4), ChangeId(1), &data[1]),
-            (ChangeType::Insert, RowId(5), ChangeId(1), &data[3]),
-            (ChangeType::Insert, RowId(6), ChangeId(1), &data[5]),
-        ]).await;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn test_resubscription() -> eyre::Result<()> {
+        _ = tracing_subscriber::fmt::try_init();
+        let test = PubSubTest::with_n_agents(1).await?;
+        let make_sub_fn =
+            async |sub_params: SubParams, query: &Either<corro_types::api::Statement, Uuid>| {
+                test.agents[0]
+                    .subscribe_to_test_table(sub_params, query.clone())
+                    .await
+            };
+        let q = Either::Left(TEST_QUERY1.into());
+
+        // From is only for existing subscriptions
+        for (from, skip_rows) in [(0, false), (10, false), (0, true), (10, true)] {
+            let _ = make_sub_fn(
+                SubParams {
+                    from: Some(from.into()),
+                    skip_rows,
+                },
+                &q,
+            )
+            .await
+            .expect_err("From is for resubscription - the subscription needs to first exist");
+        }
+
+        // Can't resubscribe to non-existing subscription
+        let _ = make_sub_fn(
+            SubParams {
+                from: None,
+                skip_rows: false,
+            },
+            &Either::Right(Uuid::new_v4()),
+        )
+        .await
+        .expect_err("Can't subscribe to non-existing subscription");
+
+        // Finally make a subscription
+        let mut s1 = make_sub_fn(
+            SubParams {
+                from: None,
+                skip_rows: false,
+            },
+            &q,
+        )
+        .await
+        .wrap_err("Failed to create initial subscription")?;
+        s1.assert_initial_query_results(vec!["id".into(), "text".into()], vec![], 0.into())
+            .await;
+
+        // Can't start from the future
+        let _ = make_sub_fn(
+            SubParams {
+                from: Some(10.into()),
+                skip_rows: false,
+            },
+            &q,
+        )
+        .await
+        .expect_err("Can't start from the future")
+        .wrap_err("AAAAAA");
 
         Ok(())
     }
@@ -1892,6 +1995,7 @@ mod tests {
         Ok(())
     }
 
+    #[derive(Debug)]
     struct RowsIter {
         body: axum::body::BoxBody,
         codec: LinesCodec,
