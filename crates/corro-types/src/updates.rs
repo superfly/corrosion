@@ -342,7 +342,7 @@ async fn batch_candidates(
                 break;
             }
             Some(candidates) = changes_rx.recv() => {
-                debug!(sub_id = %id, "updates got candidates: {candidates:?}");
+                trace!(sub_id = %id, "updates got candidates: {candidates:?}");
                 for (table, pk_map) in  candidates {
                     let buffed = buf.entry(table.clone()).or_default();
 
