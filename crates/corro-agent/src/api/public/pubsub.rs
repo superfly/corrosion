@@ -629,6 +629,8 @@ pub async fn upsert_sub(
 ) -> Result<Uuid, MatcherUpsertError> {
     if let Some(created) = maybe_created {
         if params.from.is_some() {
+            handle.cleanup().await;
+            subs.remove(&handle.id());
             return Err(MatcherUpsertError::SubFromWithoutMatcher);
         }
 
