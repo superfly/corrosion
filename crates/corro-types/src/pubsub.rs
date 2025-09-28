@@ -412,7 +412,7 @@ impl MatcherHandle {
     ) -> rusqlite::Result<ChangeId> {
         self.wait_for_running_state();
 
-        let mut prepped = conn.prepare_cached("SELECT MIN(id) FROM changes")?;
+        let mut prepped = conn.prepare_cached("SELECT COALESCE(MIN(id), 0) FROM changes")?;
         let min_change_id: u64 = prepped.query_row([], |row| row.get(0))?;
 
         // return error if we've cleared changes after the received change id
