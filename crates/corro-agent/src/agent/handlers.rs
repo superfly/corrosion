@@ -24,7 +24,7 @@ use corro_types::{
     actor::{Actor, ActorId},
     agent::{Agent, Bookie, SplitPool},
     base::CrsqlSeq,
-    broadcast::{BroadcastInput, BroadcastV1, ChangeSource, ChangeV1, FocaInput},
+    broadcast::{BroadcastInput, BroadcastV1, BroadcastV2, ChangeSource, ChangeV1, FocaInput},
     channel::CorroReceiver,
     members::MemberAddedResult,
     sync::generate_sync,
@@ -690,7 +690,7 @@ pub async fn handle_changes(
             continue;
         }
 
-        let src_str: &'static str = src.into();
+        let src_str: &'static str = (&src).into();
         let recv_lag = change.ts().and_then(|ts| {
             let mut our_ts = Timestamp::from(agent.clock().new_timestamp());
             if ts > our_ts {
@@ -705,7 +705,10 @@ pub async fn handle_changes(
             Some((our_ts.0 - ts.0).to_duration())
         });
 
-        if matches!(src, ChangeSource::Broadcast) {
+        if matches!(
+            src,
+            ChangeSource::Broadcast | ChangeSource::BroadcastV2(_, _)
+        ) {
             counter!("corro.broadcast.recv.count", "kind" => "change").increment(1);
         }
 
@@ -766,20 +769,32 @@ pub async fn handle_changes(
             }
         }
 
-        assert_sometimes!(
-            matches!(src, ChangeSource::Sync),
-            "Corrosion receives changes through sync"
-        );
-        if matches!(src, ChangeSource::Broadcast) && !change.is_empty() {
-            assert_sometimes!(true, "Corrosion rebroadcasts changes");
-            if let Err(_e) =
-                agent
-                    .tx_bcast()
-                    .try_send(BroadcastInput::Rebroadcast(BroadcastV1::Change(
+        if !change.is_empty() {
+            let bcast = match src.clone() {
+                ChangeSource::Broadcast => {
+                    assert_sometimes!(true, "Corrosion rebroadcasts changes");
+                    Some(BroadcastInput::Rebroadcast(BroadcastV1::Change(
                         change.clone(),
                     )))
-            {
-                debug!("broadcasts are full or done!");
+                }
+                ChangeSource::BroadcastV2(set, num_broadcasts) => {
+                    assert_sometimes!(true, "Corrosion rebroadcasts changes");
+                    Some(BroadcastInput::RebroadcastV2(BroadcastV2 {
+                        change: BroadcastV1::Change(change.clone()),
+                        set,
+                        num_broadcasts,
+                    }))
+                }
+                ChangeSource::Sync => {
+                    assert_sometimes!(true, "Corrosion receives changes through sync");
+                    None
+                }
+            };
+
+            if let Some(bcast) = bcast {
+                if let Err(_e) = agent.tx_bcast().try_send(bcast) {
+                    debug!("broadcasts are full or done!");
+                }
             }
         }
 

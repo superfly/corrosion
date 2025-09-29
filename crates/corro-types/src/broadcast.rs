@@ -10,6 +10,7 @@ use corro_base_types::{CrsqlDbVersionRange, CrsqlSeqRange};
 use foca::{Identity, Member, Notification, Runtime, Timer};
 use indexmap::{map::Entry, IndexMap};
 use metrics::counter;
+use probabilistic_set::ProbSet;
 use rusqlite::{
     types::{FromSql, FromSqlError},
     ToSql,
@@ -48,6 +49,7 @@ pub enum UniPayload {
 #[derive(Debug, Clone, Readable, Writable)]
 pub enum UniPayloadV1 {
     Broadcast(BroadcastV1),
+    BroadcastV2(BroadcastV2),
 }
 
 #[derive(Debug, Clone, Readable, Writable)]
@@ -94,6 +96,13 @@ pub enum BroadcastV1 {
     Change(ChangeV1),
 }
 
+#[derive(Clone, Debug, Readable, Writable)]
+pub struct BroadcastV2 {
+    pub change: BroadcastV1,
+    pub set: ProbSet,
+    pub num_broadcasts: u8,
+}
+
 #[derive(Debug, Clone, PartialEq, Readable, Writable)]
 pub struct ColumnChange {
     pub cid: ColumnName,
@@ -103,11 +112,12 @@ pub struct ColumnChange {
     pub cl: i64,
 }
 
-#[derive(Debug, Clone, Copy, strum::IntoStaticStr)]
+#[derive(Debug, Clone, strum::IntoStaticStr)]
 #[strum(serialize_all = "snake_case")]
 pub enum ChangeSource {
     Broadcast,
     Sync,
+    BroadcastV2(ProbSet, u8),
 }
 
 #[derive(Debug, Clone, PartialEq, Readable, Writable)]
@@ -586,6 +596,8 @@ pub enum BroadcastDecodeError {
 pub enum BroadcastInput {
     Rebroadcast(BroadcastV1),
     AddBroadcast(BroadcastV1),
+    AddBroadcastV2(BroadcastV2),
+    RebroadcastV2(BroadcastV2),
 }
 
 pub struct DispatchRuntime<T> {

@@ -231,6 +231,7 @@ pub struct PerfConfig {
     pub min_sync_backoff: u32,
     #[serde(default = "default_max_sync_backoff")]
     pub max_sync_backoff: u32,
+    pub max_broadcast_transmissions: Option<u8>,
 }
 
 impl Default for PerfConfig {
@@ -252,6 +253,7 @@ impl Default for PerfConfig {
             sql_tx_timeout: default_sql_tx_timeout(),
             min_sync_backoff: default_min_sync_backoff(),
             max_sync_backoff: default_max_sync_backoff(),
+            max_broadcast_transmissions: None,
         }
     }
 }

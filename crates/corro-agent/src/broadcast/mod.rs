@@ -20,6 +20,7 @@ use futures::{
 use governor::{Quota, RateLimiter};
 use metrics::{counter, gauge};
 use parking_lot::RwLock;
+use probabilistic_set::ProbSet;
 use rand::{rngs::StdRng, seq::IteratorRandom, SeedableRng};
 use rusqlite::params;
 use spawn::spawn_counted;
@@ -38,7 +39,10 @@ use tripwire::Tripwire;
 use corro_types::{
     actor::{Actor, ActorId},
     agent::Agent,
-    broadcast::{BroadcastInput, DispatchRuntime, FocaCmd, FocaInput, UniPayload, UniPayloadV1},
+    broadcast::{
+        BroadcastInput, BroadcastV1, BroadcastV2, ChangeV1, DispatchRuntime, FocaCmd, FocaInput,
+        UniPayload, UniPayloadV1,
+    },
     channel::{bounded, CorroReceiver, CorroSender},
 };
 
@@ -426,8 +430,6 @@ async fn handle_broadcasts(
 
     let mut bcast_buf = BytesMut::new();
     let mut local_bcast_buf = BytesMut::new();
-    let mut single_bcast_buf = BytesMut::new();
-
     let mut metrics_interval = interval(Duration::from_secs(10));
 
     let mut rng = StdRng::from_os_rng();
@@ -435,12 +437,16 @@ async fn handle_broadcasts(
     let mut idle_pendings =
         FuturesUnordered::<Pin<Box<dyn Future<Output = PendingBroadcast> + Send + 'static>>>::new();
 
+    let mut broadcast_v2_pendings =
+        FuturesUnordered::<Pin<Box<dyn Future<Output = BroadcastV2> + Send + 'static>>>::new();
+
     let mut bcast_interval = interval(opts.interval);
 
     enum Branch {
         Broadcast(BroadcastInput),
         BroadcastDeadline,
         WokePendingBroadcast(PendingBroadcast),
+        WokePendingBroadcastV2(BroadcastV2),
         Tripped,
         Metrics,
     }
@@ -452,10 +458,13 @@ async fn handle_broadcasts(
     let max_queue_len = agent.config().perf.processing_queue_len;
     const MAX_INFLIGHT_BROADCAST: usize = 500;
     let mut to_broadcast = VecDeque::new();
+    let mut to_broadcast_v2 = VecDeque::new();
     let mut to_local_broadcast = VecDeque::new();
     let mut log_count = 0;
 
+    let cfg_max_transmissions = agent.config().perf.max_broadcast_transmissions;
     let mut limited_log_count = 0;
+    let mut prev_set_size = 0;
 
     let bytes_per_sec: BroadcastRateLimiter = RateLimiter::direct(Quota::per_second(unsafe {
         NonZeroU32::new_unchecked(10 * 1024 * 1024)
@@ -491,6 +500,14 @@ async fn handle_broadcasts(
                     continue;
                 }
             },
+            maybe_woke = broadcast_v2_pendings.next(), if !broadcast_v2_pendings.is_terminated() => match maybe_woke {
+                Some(woke) => Branch::WokePendingBroadcastV2(woke),
+                None => {
+                    trace!("broadcast v2 pendings returned None");
+                    // I guess?
+                    continue;
+                }
+            },
 
             _ = &mut tripwire, if !tripped => {
                 tripped = true;
@@ -518,61 +535,58 @@ async fn handle_broadcasts(
                 }
             }
             Branch::Broadcast(input) => {
-                trace!("handling Branch::Broadcast");
+                trace!("handling Branch::Broadcast {input:?}");
+                match input {
+                    BroadcastInput::AddBroadcast(bcast) => {
+                        let BroadcastV1::Change(change) = bcast;
+                        to_local_broadcast.push_front(change);
+                    }
+                    BroadcastInput::AddBroadcastV2(bcast) => {
+                        // todo: rebroadcast immediates too??
+                        let BroadcastV2 {
+                            change: BroadcastV1::Change(change),
+                            ..
+                        } = bcast;
+                        to_local_broadcast.push_front(change);
+                    }
+                    // for old rebroadcast, treat as normal
+                    BroadcastInput::Rebroadcast(bcast) => {
+                        let payload = UniPayload::V1 {
+                            data: UniPayloadV1::Broadcast(bcast.clone()),
+                            cluster_id: agent.cluster_id(),
+                        };
+                        if let Err(e) = payload.write_to_stream((&mut ser_buf).writer()) {
+                            error!("could not encode UniPayload::V1 Broadcast: {e}");
+                            ser_buf.clear();
+                            continue;
+                        }
+                        if let Err(e) = bcast_codec.encode(ser_buf.split().freeze(), &mut bcast_buf)
+                        {
+                            error!("could not encode broadcast: {e}");
+                            bcast_buf.clear();
+                            continue;
+                        }
 
-                let (bcast, is_local) = match input {
-                    BroadcastInput::Rebroadcast(bcast) => (bcast, false),
-                    BroadcastInput::AddBroadcast(bcast) => (bcast, true),
+                        if bcast_buf.len() >= broadcast_cutoff {
+                            to_broadcast
+                                .push_front(PendingBroadcast::new(bcast_buf.split().freeze()));
+                        }
+                    }
+                    BroadcastInput::RebroadcastV2(bcast) => {
+                        let max_transmissions = config.read().max_transmissions.get();
+                        if bcast.num_broadcasts < max_transmissions {
+                            to_broadcast_v2.push_front(bcast);
+                        }
+                    }
                 };
-                trace!("adding broadcast: {bcast:?}, local? {is_local}");
-
-                if let Err(e) = (UniPayload::V1 {
-                    data: UniPayloadV1::Broadcast(bcast.clone()),
-                    cluster_id: agent.cluster_id(),
-                })
-                .write_to_stream((&mut ser_buf).writer())
-                {
-                    error!("could not encode UniPayload::V1 Broadcast: {e}");
-                    ser_buf.clear();
-                    continue;
-                }
-                trace!("ser buf len: {}", ser_buf.len());
-
-                if is_local {
-                    if let Err(e) =
-                        bcast_codec.encode(ser_buf.split().freeze(), &mut single_bcast_buf)
-                    {
-                        error!("could not encode local broadcast: {e}");
-                        single_bcast_buf.clear();
-                        continue;
-                    }
-
-                    let payload = single_bcast_buf.split().freeze();
-
-                    local_bcast_buf.extend_from_slice(&payload);
-
-                    to_local_broadcast.push_front(payload);
-
-                    if local_bcast_buf.len() >= broadcast_cutoff {
-                        to_broadcast.push_front(PendingBroadcast::new_local(
-                            local_bcast_buf.split().freeze(),
-                        ));
-                    }
-                } else {
-                    if let Err(e) = bcast_codec.encode(ser_buf.split().freeze(), &mut bcast_buf) {
-                        error!("could not encode broadcast: {e}");
-                        bcast_buf.clear();
-                        continue;
-                    }
-
-                    if bcast_buf.len() >= broadcast_cutoff {
-                        to_broadcast.push_front(PendingBroadcast::new(bcast_buf.split().freeze()));
-                    }
-                }
             }
             Branch::WokePendingBroadcast(pending) => {
                 trace!("handling Branch::WokePendingBroadcast");
                 to_broadcast.push_front(pending);
+            }
+            Branch::WokePendingBroadcastV2(pending) => {
+                trace!("handling Branch::WokePendingBroadcastV2");
+                to_broadcast_v2.push_front(pending);
             }
             Branch::Metrics => {
                 trace!("handling Branch::Metrics");
@@ -581,31 +595,91 @@ async fn handle_broadcasts(
                 gauge!("corro.broadcast.buffer.capacity").set(bcast_buf.capacity() as f64);
                 gauge!("corro.broadcast.serialization.buffer.capacity")
                     .set(ser_buf.capacity() as f64);
+                gauge!("corro.broadcast.prob_set.size").set(prev_set_size as f64);
             }
         }
 
         let prev_rate_limited = rate_limited;
 
+        let (members_count, ring0_count) = {
+            let members = agent.members().read();
+            let members_count = members.states.len();
+            let ring0_count = members.ring0(agent.cluster_id()).count();
+            (members_count, ring0_count)
+        };
+
+        let (choose_count, dynamic_count, max_transmissions) = {
+            let config = config.read();
+            let gossip_max_txns = config.max_transmissions.get();
+            let max_transmissions = cmp::min(
+                gossip_max_txns,
+                cfg_max_transmissions.unwrap_or(gossip_max_txns),
+            );
+            let dynamic_count = (members_count - ring0_count) / (max_transmissions as usize * 10);
+            let count = cmp::max(config.num_indirect_probes.get(), dynamic_count);
+
+            if prev_rate_limited {
+                // we've been rate limited on the last loop, try sending to less nodes...
+                (
+                    cmp::min(count, dynamic_count / 2),
+                    dynamic_count / 2,
+                    max_transmissions / 2,
+                )
+            } else {
+                (count, dynamic_count, max_transmissions)
+            }
+        };
+
         // start with local broadcasts, they're higher priority
-        let mut ring0 = HashSet::new();
+        let mut ring0: HashSet<SocketAddr> = HashSet::new();
+
+        let prob_set = {
+            // setting the size of the set to the number of times it'll broadcasted + number of members
+            // it will be broadcasted to with some padding
+            let dynamic_size = (dynamic_count + 1) * (max_transmissions + 1) as usize;
+            // clamp size to 500
+            let size = cmp::min(500, dynamic_size);
+
+            prev_set_size = size;
+            let mut set = ProbSet::new(size, 4);
+            let members = agent.members().read();
+            let members_ring0 = members.ring0(agent.cluster_id());
+            for (actor_id, addr) in members_ring0 {
+                set.insert(actor_id.to_u128());
+                ring0.insert(addr);
+            }
+            set
+        };
+
+        debug!("sending local broadcasts to ring0 nodes: {:?}", ring0);
         while !to_local_broadcast.is_empty() && join_set.len() < MAX_INFLIGHT_BROADCAST {
             // UNWRAP: we just checked that it wasn't empty
-            let payload = to_local_broadcast.pop_front().unwrap();
+            let change = to_local_broadcast.pop_front().unwrap();
 
-            let members = agent.members().read();
-            let mut spawn_count = 0;
-            let mut ring0_count = 0;
-            for addr in members.ring0(agent.cluster_id()) {
-                if join_set.len() >= MAX_INFLIGHT_BROADCAST {
-                    debug!(
-                        "breaking, max inflight broadcast reached: {}",
-                        MAX_INFLIGHT_BROADCAST
-                    );
-                    break;
+            let bcast_change = BroadcastV2 {
+                change: BroadcastV1::Change(change.clone()),
+                set: prob_set.clone(),
+                num_broadcasts: 1,
+            };
+
+            let uni_payload = UniPayload::V1 {
+                data: UniPayloadV1::BroadcastV2(bcast_change.clone()),
+                cluster_id: agent.cluster_id(),
+            };
+
+            let payload = {
+                match encode_framed(&mut bcast_codec, &mut ser_buf, &mut bcast_buf, &uni_payload) {
+                    Ok(payload) => payload,
+                    Err(e) => {
+                        error!("could not encode UniPayload::V1 BroadcastV2: {e}");
+                        continue;
+                    }
                 }
-                ring0_count += 1;
-                ring0.insert(addr);
+            };
 
+            let mut spawn_count = 0;
+            for addr in ring0.clone() {
+                debug!("sending broadcast to ring0 node: {addr}");
                 match try_transmit_broadcast(
                     &bytes_per_sec,
                     payload.clone(),
@@ -640,39 +714,19 @@ async fn handle_broadcasts(
             }
 
             // couldn't send it anywhere!
-            if rate_limited && spawn_count == 0 && ring0_count > 0 {
+            if rate_limited && spawn_count == 0 && !ring0.is_empty() {
                 // push it back in front since this got nowhere and it's still the
                 // freshest item we have in the queue
-                to_local_broadcast.push_front(payload);
+                to_local_broadcast.push_front(change);
                 break;
+            } else {
+                // TODO: test whether we still want to re-queue
+                to_broadcast_v2.push_front(bcast_change);
             }
-
             counter!("corro.broadcast.spawn", "type" => "local").increment(spawn_count);
         }
 
-        if !rate_limited && !to_broadcast.is_empty() && join_set.len() < MAX_INFLIGHT_BROADCAST {
-            let (members_count, ring0_count) = {
-                let members = agent.members().read();
-                let members_count = members.states.len();
-                let ring0_count = members.ring0(agent.cluster_id()).count();
-                (members_count, ring0_count)
-            };
-
-            let (choose_count, max_transmissions) = {
-                let config = config.read();
-                let max_transmissions = config.max_transmissions.get();
-                let dynamic_count =
-                    (members_count - ring0_count) / (max_transmissions as usize * 10);
-                let count = cmp::max(config.num_indirect_probes.get(), dynamic_count);
-
-                if prev_rate_limited {
-                    // we've been rate limited on the last loop, try sending to less nodes...
-                    (cmp::min(count, dynamic_count / 2), max_transmissions / 2)
-                } else {
-                    (count, max_transmissions)
-                }
-            };
-
+        if !rate_limited {
             debug!(
                 "choosing {} broadcasts, ring0 count: {}, MAX_INFLIGHT_BROADCAST: {}",
                 choose_count, ring0_count, MAX_INFLIGHT_BROADCAST
@@ -738,6 +792,7 @@ async fn handle_broadcasts(
                                         "broadcasts rate limited",
                                         &mut limited_log_count,
                                     );
+                                    rate_limited = true;
                                     break;
                                 }
                             }
@@ -778,8 +833,114 @@ async fn handle_broadcasts(
             }
         }
 
-        if drop_oldest_broadcast(&mut to_broadcast, &mut to_local_broadcast, max_queue_len)
-            .is_some()
+        if !rate_limited {
+            let member_states = {
+                let members = agent.members().read();
+                members.states.clone()
+            };
+
+            while !to_broadcast_v2.is_empty() && join_set.len() < MAX_INFLIGHT_BROADCAST {
+                let mut bcast_v2 = to_broadcast_v2.pop_front().unwrap();
+                let count = cmp::min(
+                    choose_count,
+                    MAX_INFLIGHT_BROADCAST.saturating_sub(join_set.len()),
+                );
+                let num_broadcasts = bcast_v2.num_broadcasts;
+                // let prev_set = bcast_change.set.clone();
+                let broadcast_to = member_states
+                    .iter()
+                    .filter_map(|(member_id, state)| {
+                        // don't broadcast to ourselves... or a member that's already in the set
+                        if *member_id == actor_id
+                            || state.cluster_id != agent.cluster_id()
+                            || bcast_v2.set.contains(member_id.to_u128())
+                        {
+                            None
+                        } else {
+                            Some((member_id, state.addr))
+                        }
+                    })
+                    .choose_multiple(&mut rng, count);
+
+                bcast_v2.num_broadcasts += 1;
+                for (member_id, _) in broadcast_to.clone() {
+                    bcast_v2.set.insert(member_id.to_u128());
+                }
+
+                let uni_payload = UniPayload::V1 {
+                    data: UniPayloadV1::BroadcastV2(bcast_v2.clone()),
+                    cluster_id: agent.cluster_id(),
+                };
+
+                let payload = match encode_framed(
+                    &mut bcast_codec,
+                    &mut ser_buf,
+                    &mut bcast_buf,
+                    &uni_payload,
+                ) {
+                    Ok(payload) => payload,
+                    Err(e) => {
+                        error!("could not encode UniPayload::V1 BroadcastV2: {e}");
+                        continue;
+                    }
+                };
+
+                let mut spawn_count = 0;
+                for (_, addr) in broadcast_to {
+                    match try_transmit_broadcast(
+                        &bytes_per_sec,
+                        payload.clone(),
+                        transport.clone(),
+                        addr,
+                    ) {
+                        Err(e) => {
+                            warn!("could not spawn broadcast transmission: {e}");
+                            match e {
+                                TransmitError::TooBig(_)
+                                | TransmitError::InsufficientCapacity(_) => {
+                                    // not sure this would ever happen
+                                    continue;
+                                }
+                                TransmitError::QuotaExceeded(_) => {
+                                    // exceeded our quota, stop trying to send this through
+                                    counter!("corro.broadcast.rate_limited").increment(1);
+                                    log_at_pow_10(
+                                        "broadcasts rate limited",
+                                        &mut limited_log_count,
+                                    );
+                                    rate_limited = true;
+                                    break;
+                                }
+                            }
+                        }
+                        Ok(fut) => {
+                            join_set.spawn(fut);
+                            spawn_count += 1;
+                        }
+                    }
+                }
+
+                let sleep_ms_base = if prev_rate_limited { 500 } else { 100 };
+
+                if spawn_count > 0 && num_broadcasts < max_transmissions {
+                    broadcast_v2_pendings.push(Box::pin(async move {
+                        tokio::time::sleep(Duration::from_millis(
+                            sleep_ms_base * num_broadcasts as u64,
+                        ))
+                        .await;
+                        bcast_v2
+                    }));
+                }
+            }
+        }
+
+        if drop_oldest_broadcast(
+            &mut to_broadcast,
+            &mut to_broadcast_v2,
+            &mut to_local_broadcast,
+            max_queue_len,
+        )
+        .is_some()
         {
             log_at_pow_10("dropped old change from broadcast queue", &mut log_count);
             counter!("corro.broadcast.dropped").increment(1);
@@ -789,23 +950,63 @@ async fn handle_broadcasts(
     info!("broadcasts are done");
 }
 
-// Drop the oldest, most sent item or the oldest local item
+#[derive(Debug, thiserror::Error)]
+pub enum EncodeFramedError {
+    #[error(transparent)]
+    IO(#[from] std::io::Error),
+    #[error(transparent)]
+    Speedy(#[from] speedy::Error),
+}
+
+fn encode_framed(
+    codec: &mut LengthDelimitedCodec,
+    ser_buf: &mut BytesMut,
+    frame_buf: &mut BytesMut,
+    payload: &UniPayload,
+) -> Result<Bytes, EncodeFramedError> {
+    if let Err(e) = payload.write_to_stream((&mut *ser_buf).writer()) {
+        ser_buf.clear();
+        return Err(e.into());
+    }
+    if let Err(e) = codec.encode(ser_buf.split().freeze(), frame_buf) {
+        frame_buf.clear();
+        return Err(e.into());
+    }
+    Ok(frame_buf.split().freeze())
+}
+
+// Drop the oldest, most sent item or the olde  st local item
 fn drop_oldest_broadcast(
     queue: &mut VecDeque<PendingBroadcast>,
-    local_queue: &mut VecDeque<Bytes>,
+    v2_queue: &mut VecDeque<BroadcastV2>,
+    local_queue: &mut VecDeque<ChangeV1>,
     max: usize,
-) -> Option<PendingBroadcast> {
-    if queue.len() + local_queue.len() > max {
+) -> Option<u8> {
+    if queue.len() + v2_queue.len() + local_queue.len() > max {
         // start by dropping from global queue
         let max_sent: Option<(_, _)> = queue
             .iter()
             .enumerate()
             .max_by_key(|(_, val)| val.send_count);
-        return if let Some((i, _)) = max_sent {
-            queue.remove(i)
-        } else {
-            local_queue.pop_back().map(PendingBroadcast::new_local)
-        };
+
+        if let Some((i, _)) = max_sent {
+            let removed = queue.remove(i);
+            return removed.map(|v| v.send_count);
+        }
+
+        let max_sent: Option<(_, _)> = v2_queue
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, val)| val.num_broadcasts);
+
+        if let Some((i, _)) = max_sent {
+            let removed = v2_queue.remove(i);
+            return removed.map(|v| v.num_broadcasts);
+        }
+
+        if local_queue.pop_back().is_some() {
+            return Some(0);
+        }
     }
 
     None
@@ -1056,38 +1257,49 @@ mod tests {
     fn test_behaviour_when_queue_is_full() -> eyre::Result<()> {
         let max = 4;
         let mut queue = VecDeque::new();
+        let mut v2_queue = VecDeque::new();
         let mut local_queue = VecDeque::new();
 
-        assert!(drop_oldest_broadcast(&mut queue, &mut local_queue, max).is_none());
+        assert!(drop_oldest_broadcast(&mut queue, &mut v2_queue, &mut local_queue, max).is_none());
 
-        queue.push_front(build_broadcast(1, 0));
+        queue.push_front(build_broadcast(1, 1));
         queue.push_front(build_broadcast(2, 3));
-        queue.push_front(build_broadcast(3, 1));
-        queue.push_front(build_broadcast(4, 1));
-        queue.push_front(build_broadcast(5, 2));
-        queue.push_front(build_broadcast(6, 1));
         queue.push_front(build_broadcast(7, 3));
-        queue.push_front(build_broadcast(8, 0));
-
+        queue.push_front(build_broadcast(5, 2));
+        v2_queue.push_front(build_v2_uni_payload(1));
+        v2_queue.push_front(build_v2_uni_payload(2));
+        v2_queue.push_front(build_v2_uni_payload(3));
+        v2_queue.push_front(build_v2_uni_payload(4));
+        v2_queue.push_front(build_v2_uni_payload(4));
+        v2_queue.push_front(build_v2_uni_payload(7));
         // drop oldest item with highest send count
-        let dropped = drop_oldest_broadcast(&mut queue, &mut local_queue, max).unwrap();
-        assert_eq!(dropped.send_count, 3);
-        assert_eq!(2_i64.to_be_bytes(), dropped.payload.as_ref());
+        let dropped =
+            drop_oldest_broadcast(&mut queue, &mut v2_queue, &mut local_queue, max).unwrap();
+        assert_eq!(dropped, 3);
 
-        let dropped = drop_oldest_broadcast(&mut queue, &mut local_queue, max).unwrap();
-        assert_eq!(dropped.send_count, 3);
-        assert_eq!(7_i64.to_be_bytes(), dropped.payload.as_ref());
+        let dropped =
+            drop_oldest_broadcast(&mut queue, &mut v2_queue, &mut local_queue, max).unwrap();
+        assert_eq!(dropped, 3);
 
-        let dropped = drop_oldest_broadcast(&mut queue, &mut local_queue, max).unwrap();
-        assert_eq!(dropped.send_count, 2);
-        assert_eq!(5_i64.to_be_bytes(), dropped.payload.as_ref());
+        let dropped =
+            drop_oldest_broadcast(&mut queue, &mut v2_queue, &mut local_queue, max).unwrap();
+        assert_eq!(dropped, 2);
 
-        let dropped = drop_oldest_broadcast(&mut queue, &mut local_queue, max).unwrap();
-        assert_eq!(dropped.send_count, 1);
-        assert_eq!(3_i64.to_be_bytes(), dropped.payload.as_ref());
+        let dropped =
+            drop_oldest_broadcast(&mut queue, &mut v2_queue, &mut local_queue, max).unwrap();
+        assert_eq!(dropped, 1);
+
+        // we drop from v2_queue next
+        let dropped =
+            drop_oldest_broadcast(&mut queue, &mut v2_queue, &mut local_queue, max).unwrap();
+        assert_eq!(dropped, 7);
+
+        let dropped =
+            drop_oldest_broadcast(&mut queue, &mut v2_queue, &mut local_queue, max).unwrap();
+        assert_eq!(dropped, 4);
 
         // queue is still at max now, no item gets dropped
-        assert!(drop_oldest_broadcast(&mut queue, &mut local_queue, max).is_none());
+        assert!(drop_oldest_broadcast(&mut queue, &mut v2_queue, &mut local_queue, max).is_none());
 
         Ok(())
     }
@@ -1098,6 +1310,23 @@ mod tests {
             is_local: false,
             send_count,
             sent_to: HashSet::new(),
+        }
+    }
+
+    fn build_v2_uni_payload(send_count: u8) -> BroadcastV2 {
+        BroadcastV2 {
+            change: BroadcastV1::Change(ChangeV1 {
+                actor_id: ActorId(Uuid::new_v4()),
+                changeset: Changeset::Full {
+                    version: CrsqlDbVersion(0),
+                    changes: vec![],
+                    seqs: dbsr!(0, 0),
+                    last_seq: CrsqlSeq(0),
+                    ts: Default::default(),
+                },
+            }),
+            set: ProbSet::new(10, 4),
+            num_broadcasts: send_count,
         }
     }
 
