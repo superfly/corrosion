@@ -900,7 +900,6 @@ mod tests {
     use corro_types::pubsub::pack_columns;
     use corro_types::{
         api::{ChangeId, RowId},
-        config::Config,
         pubsub::ChangeType,
     };
     use eyre::{Result, WrapErr};
@@ -988,6 +987,22 @@ mod tests {
                     .is_err()
             );
         }
+
+        async fn receive_all_events(&mut self) -> Vec<QueryEvent> {
+            let mut events = Vec::new();
+            // Receive events until reading times out
+            while let Ok(data) = timeout(Duration::from_millis(100), self.iter.recv::<QueryEvent>()).await {
+                if let Some(Ok(event)) = data {
+                    events.push(event);
+                } else if let Some(Err(err)) = data {
+                    println!("SubscriptionStream receive_all_events: {:?}", err);
+                }
+                if self.iter.done {
+                    break;
+                }
+            }
+            events
+        }
     }
 
     const TEST_QUERY1: &str = "select * from tests";
@@ -1074,6 +1089,7 @@ mod tests {
             Ok(())
         }
 
+        #[allow(dead_code)]
         async fn update_test_data(&self, rows: Vec<&Vec<SqliteValue>>) -> eyre::Result<()> {
             let rows_len = rows.len();
             let (status_code, body) = api_v1_transactions(
@@ -1417,7 +1433,7 @@ mod tests {
             };
         let q = Either::Left(TEST_QUERY1.into());
 
-        // From is only for existing subscriptions
+        // From is only for existing subscriptions - trying to resubscribe to non-existing subscription should fail
         for (from, skip_rows) in [(0, false), (10, false), (0, true), (10, true)] {
             let _ = make_sub_fn(
                 SubParams {
@@ -1442,7 +1458,7 @@ mod tests {
         .expect_err("Can't subscribe to non-existing subscription");
 
         // Finally make a subscription
-        let mut s1 = make_sub_fn(
+        let mut s_base = make_sub_fn(
             SubParams {
                 from: None,
                 skip_rows: false,
@@ -1451,11 +1467,14 @@ mod tests {
         )
         .await
         .wrap_err("Failed to create initial subscription")?;
-        s1.assert_initial_query_results(vec!["id".into(), "text".into()], vec![], 0.into())
+        s_base
+            .assert_initial_query_results(vec!["id".into(), "text".into()], vec![], 0.into())
             .await;
+        let sub_id = Either::Right(s_base.sub_id);
+        let mut active_subs = vec![&mut s_base];
 
-        // Can't start from the future
-        let mut s2 = make_sub_fn(
+        // Resubscribing from an future changeId should work
+        let mut s_future = make_sub_fn(
             SubParams {
                 from: Some(10.into()),
                 skip_rows: false,
@@ -1463,51 +1482,377 @@ mod tests {
             &q,
         )
         .await?;
-        let mut s3 = make_sub_fn(
+        let mut s_future_by_id = make_sub_fn(
             SubParams {
                 from: Some(100.into()),
                 skip_rows: false,
             },
-            &Either::Right(s2.sub_id),
+            &sub_id,
         )
         .await?;
-
-        //s2.assert_initial_query_results(vec!["id".into(), "text".into()], vec![], 0.into())
-        //.await;
+        active_subs.push(&mut s_future);
+        active_subs.push(&mut s_future_by_id);
 
         // Now check if updates work
         let data = [
             vec!["service-id-0".into(), "service-name-0".into()],
             vec!["service-id-1".into(), "service-name-1".into()],
+            vec!["service-id-2".into(), "service-name-2".into()],
+            vec!["service-id-3".into(), "service-name-3".into()],
+            vec!["service-id-4".into(), "service-name-4".into()],
+            vec!["service-id-5".into(), "service-name-5".into()],
         ];
-
-        for i in 0..data.len() {
+        for i in 0..2 {
             test.agents[0].insert_test_data(&data[i..=i]).await?;
             let row = &data[i];
             let i = i as u64;
 
-            s1.assert_updates(vec![(
+            for sub in &mut active_subs {
+                sub.assert_updates(vec![(
                     ChangeType::Insert,
                     RowId(1 + i),
                     ChangeId(1 + i),
                     row,
                 )])
                 .await;
-            s2.assert_updates(vec![(
-                    ChangeType::Insert,
-                    RowId(1 + i),
-                    ChangeId(1 + i),
-                    row,
-                )])
-                .await;
-            s3.assert_updates(vec![(
-                    ChangeType::Insert,
-                    RowId(1 + i),
-                    ChangeId(1 + i),
-                    row,
-                )])
-                .await;
+            }
         }
+
+        // Resubscribing from changeId 0 should work as if from was not set at all
+        let mut s_zero = make_sub_fn(
+            SubParams {
+                from: Some(0.into()),
+                skip_rows: false,
+            },
+            &q,
+        )
+        .await?;
+        let mut s_zero_by_id = make_sub_fn(
+            SubParams {
+                from: Some(0.into()),
+                skip_rows: false,
+            },
+            &sub_id,
+        )
+        .await?;
+        let mut s_zero_skip_rows = make_sub_fn(
+            SubParams {
+                from: Some(0.into()),
+                skip_rows: true,
+            },
+            &q,
+        )
+        .await?;
+        let mut s_zero_skip_rows_by_id = make_sub_fn(
+            SubParams {
+                from: Some(0.into()),
+                skip_rows: true,
+            },
+            &sub_id,
+        )
+        .await?;
+
+        // If skip_rows is true, the initial query should be skipped
+        // from = 0 is essentially equivalent to not setting the changeId at all - it will only return new changes
+        s_zero
+            .assert_initial_query_results(
+                vec!["id".into(), "text".into()],
+                data[0..2]
+                    .iter()
+                    .enumerate()
+                    .map(|(i, row)| (RowId(1 + i as u64), row))
+                    .collect(),
+                2.into(),
+            )
+            .await;
+        s_zero_by_id
+            .assert_initial_query_results(
+                vec!["id".into(), "text".into()],
+                data[0..2]
+                    .iter()
+                    .enumerate()
+                    .map(|(i, row)| (RowId(1 + i as u64), row))
+                    .collect(),
+                2.into(),
+            )
+            .await;
+
+        active_subs.push(&mut s_zero);
+        active_subs.push(&mut s_zero_by_id);
+        active_subs.push(&mut s_zero_skip_rows);
+        active_subs.push(&mut s_zero_skip_rows_by_id);
+
+        // Now check if updates work on all subscriptions
+        for i in 2..4 {
+            test.agents[0].insert_test_data(&data[i..=i]).await?;
+            let row = &data[i];
+            let i = i as u64;
+            for sub in &mut active_subs {
+                sub.assert_updates(vec![(
+                    ChangeType::Insert,
+                    RowId(1 + i),
+                    ChangeId(1 + i),
+                    row,
+                )])
+                .await;
+            }
+        }
+
+        // Resubscribing from changeId 1 should send all events from changeId 1
+        let mut s_one = make_sub_fn(
+            SubParams {
+                from: Some(1.into()),
+                skip_rows: false,
+            },
+            &q,
+        )
+        .await?;
+        let mut s_one_by_id = make_sub_fn(
+            SubParams {
+                from: Some(1.into()),
+                skip_rows: false,
+            },
+            &sub_id,
+        )
+        .await?;
+        let mut s_one_skip_rows = make_sub_fn(
+            SubParams {
+                from: Some(1.into()),
+                skip_rows: true,
+            },
+            &q,
+        )
+        .await?;
+        let mut s_one_skip_rows_by_id = make_sub_fn(
+            SubParams {
+                from: Some(1.into()),
+                skip_rows: true,
+            },
+            &sub_id,
+        )
+        .await?;
+
+        // We should get updates changeId 2 - 4
+        for i in 1..4 {
+            for sub in [
+                &mut s_one,
+                &mut s_one_by_id,
+                &mut s_one_skip_rows,
+                &mut s_one_skip_rows_by_id,
+            ] {
+                sub.assert_updates(vec![(
+                    ChangeType::Insert,
+                    RowId(1 + i),
+                    ChangeId(1 + i),
+                    &data[i as usize],
+                )])
+                .await;
+            }
+        }
+
+        active_subs.push(&mut s_one);
+        active_subs.push(&mut s_one_by_id);
+        active_subs.push(&mut s_one_skip_rows);
+        active_subs.push(&mut s_one_skip_rows_by_id);
+
+        // Now check if updates work on all subscriptions
+        for i in 4..6 {
+            test.agents[0].insert_test_data(&data[i..=i]).await?;
+            let row = &data[i];
+            let i = i as u64;
+            for sub in &mut active_subs {
+                sub.assert_updates(vec![(
+                    ChangeType::Insert,
+                    RowId(1 + i),
+                    ChangeId(1 + i),
+                    row,
+                )])
+                .await;
+            }
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn test_lagging_subscribers() -> eyre::Result<()> {
+        _ = tracing_subscriber::fmt::try_init();
+        let test = PubSubTest::with_n_agents(1).await?;
+        let agent = &test.agents[0];
+
+        // Start off simple with 2 rows and a subscription
+        let mut data: Vec<Vec<SqliteValue>> = vec![];
+        for i in 0..2 {
+            data.push(vec![
+                format!("service-id-{}", i).into(),
+                format!("service-name-{}", i).into(),
+            ]);
+            agent.insert_test_data(&data[i..=i]).await?;
+        }
+
+        let mut s = agent
+            .subscribe_to_test_table(
+                SubParams {
+                    from: None,
+                    skip_rows: false,
+                },
+                Either::Left(TEST_QUERY1.into()),
+            )
+            .await?;
+        s.assert_initial_query_results(
+            vec!["id".into(), "text".into()],
+            data.iter()
+                .enumerate()
+                .map(|(i, row)| (RowId(1 + i as u64), row))
+                .collect(),
+            0.into(),
+        )
+        .await; 
+
+        let mut bulk_insert_fn = async |hundreds: usize| -> eyre::Result<()> {
+            let chunk_size = 100;
+            let start_idx = data.len();
+            for i in 0..hundreds {
+                // Insert 100 rows at a time in the same transaction
+                for j in 0..chunk_size {
+                    let idx = start_idx + i * chunk_size + j;
+                    data.push(vec![
+                        format!("service-id-{}", idx).into(),
+                        format!("service-name-{}", idx).into(),
+                    ]);
+                }
+                agent.insert_test_data(&data[start_idx + i * chunk_size..=start_idx + i * chunk_size + chunk_size - 1])
+                    .await?;
+            }
+            Ok(())
+        };
+
+        // Now insert 10k rows and check that we can receive all of them
+        bulk_insert_fn(100).await?;
+        let events = s.receive_all_events().await;
+        assert_eq!(events.len(), 10000);
+        for i in 0..events.len() {
+            let QueryEvent::Change(ChangeType::Insert, row_id, _, change_id) = &events[i] else {
+                panic!("Expected QueryEvent::Change, got {:?}", events[i]);
+            };
+            assert_eq!(*row_id, RowId(i as u64 + 3));
+            assert_eq!(*change_id, ChangeId(i as u64 + 1));
+        }
+
+        // If we can't keep up with the events, we should get disconnected
+        bulk_insert_fn(410).await?;
+        let events = s.receive_all_events().await;
+        assert!(s.iter.done);
+        assert!(s.iter.body.data().await.is_none());
+        assert!(events.len() < 410 * 100);
+
+        // No more events should be received on that subscription
+        // Corrosion dropped the connection
+        bulk_insert_fn(1).await?;
+        // Calculate expected data length: 2 initial + 100*100 + 410*100 + 1*100
+        let data_len = 2 + 10000 + 41000 + 100;
+        let events = s.receive_all_events().await;
+        assert!(events.is_empty());
+
+        // Ensure the writes are flushed on the subscription
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        // Now check if we can subscribe and receive the full initial query result
+        let mut s2 = agent
+            .subscribe_to_test_table(
+                SubParams {
+                    from: None,
+                    skip_rows: false,
+                },
+                Either::Left(TEST_QUERY1.into()),
+            )
+            .await?;
+        let events = s2.receive_all_events().await;
+        assert_eq!(events.len(), data_len + 2); // data + columns + end of query
+
+        // The same should work for from = 0
+        let mut s3 = agent
+            .subscribe_to_test_table(
+                SubParams {
+                    from: Some(0.into()),
+                    skip_rows: false,
+                },
+                Either::Right(s2.sub_id),
+            )
+            .await?;
+        let events = s3.receive_all_events().await;
+        assert_eq!(events.len(), data_len + 2); // data + columns + end of query
+
+        // The same should work for from = 100 - nothing was purged yet
+        let mut s4 = agent
+            .subscribe_to_test_table(
+                SubParams {
+                    from: Some(100.into()),
+                    skip_rows: false,
+                },
+                Either::Right(s2.sub_id),
+            )
+            .await?;
+        let events = s4.receive_all_events().await;
+        assert_eq!(events.len(), data_len - 2 - 100); // data - from
+
+        // Purge the subscriptions, s2, s3 and s4 should not get disconnected
+        // We can't manipulate time in tokio runtime, so manually trigger the pruning
+        if let Some(matcher) = agent.ta.agent.subs_manager().get(&s2.sub_id) {
+            matcher.purge_old_changes().await
+                .expect("failed to purge old changes");
+        }
+
+        // Now subscribing to an small change id should fail
+        let mut s5 = agent
+            .subscribe_to_test_table(
+                SubParams {
+                    from: Some(100.into()),
+                    skip_rows: false,
+                },
+                Either::Right(s2.sub_id),
+            )
+            .await?;
+        let events = s5.receive_all_events().await;
+        assert_eq!(events.len(), 1); // data + columns + end of query
+        assert!(matches!(events[0], corro_types::api::TypedQueryEvent::Error(_)));
+
+        // Resubscribing from a large change id should work
+        let mut s6 = agent
+            .subscribe_to_test_table(
+                SubParams {
+                    from: Some(50600.into()),
+                    skip_rows: false,
+                },
+                Either::Right(s2.sub_id),
+            )
+            .await?;
+        let events = s6.receive_all_events().await;
+        assert_eq!(events.len(), data_len - 2 - 50600); // data - from
+
+        // Resubscribing from 0 should work
+        let mut s7 = agent
+            .subscribe_to_test_table(
+                SubParams {
+                    from: Some(0.into()),
+                    skip_rows: false,
+                },
+                Either::Right(s2.sub_id),
+            )
+            .await?;
+        let events = s7.receive_all_events().await;
+        assert_eq!(events.len(), data_len + 2); // data + columns + end of query
+
+        // Now check that events are sent to active subscriptions
+        bulk_insert_fn(1).await?;
+        // Ensure the writes are flushed on the subscription
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        for sub in [&mut s2, &mut s3, &mut s4, &mut s6, &mut s7] {
+            let events = sub.receive_all_events().await;
+            assert_eq!(events.len(), 100);
+        }
+
         Ok(())
     }
 
@@ -1522,30 +1867,45 @@ mod tests {
             vec!["service-id-3".into(), "service-name-3".into()],
         ];
 
-        test.agents[0].insert_test_data(&data[0..2]).await?;
+        let insert_agent = &test.agents[0];
+        let subscribe_agent = &test.agents[1];
 
+        insert_agent.insert_test_data(&data[0..2]).await?;
         test.wait_for_nodes_to_sync().await?;
 
-        let mut rows_iter = test.agents[1]
+        let mut s1 = subscribe_agent
             .subscribe_to_test_table(
                 SubParams {
                     from: None,
-                    skip_rows: true,
+                    skip_rows: false,
                 },
-                Either::Left(TEST_QUERY2.into()),
+                Either::Left(TEST_QUERY1.into()),
             )
             .await?;
 
-        test.agents[0].insert_test_data(&data[2..4]).await?;
+        s1.assert_initial_query_results(
+            vec!["id".into(), "text".into()],
+            data[0..2]
+                .iter()
+                .enumerate()
+                .map(|(i, row)| (RowId(1 + i as u64), row))
+                .collect(),
+            0.into(),
+        )
+        .await;
 
-        dbg!(rows_iter.iter.recv::<QueryEvent>().await);
-        dbg!(rows_iter.iter.recv::<QueryEvent>().await);
-        dbg!(rows_iter.iter.recv::<QueryEvent>().await);
-        dbg!(rows_iter.iter.recv::<QueryEvent>().await);
-        dbg!(rows_iter.iter.recv::<QueryEvent>().await);
-        dbg!(rows_iter.iter.recv::<QueryEvent>().await);
+        for i in 2..4 {
+            insert_agent.insert_test_data(&data[i..=i]).await?;
+            test.wait_for_nodes_to_sync().await?;
 
-        assert!(false);
+            s1.assert_updates(vec![(
+                ChangeType::Insert,
+                RowId(i as u64 + 1),
+                ChangeId(i as u64 + 1 - 2),
+                &data[i],
+            )])
+            .await;
+        }
 
         Ok(())
     }
