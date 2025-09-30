@@ -15,12 +15,10 @@ backup_addr=${backup_candidates[$((RANDOM % ${#backup_candidates[@]}))]}
 
 echo "Backup $addr to $backup_addr dir"
 
-exec {lockfd}<>"/tmp/backup-${backup_addr}.lock"
+exec {lockfd}<>"/var/lib/${backup_addr}/backup.lock"
 
 flock "$lockfd"
 
-if [ -f "/var/lib/${backup_addr}/backups/state.db" ]; then
-    rm /var/lib/${backup_addr}/backups/state.db
-fi
+rm -f /var/lib/${backup_addr}/backups/state.db
 
 corrosion -c /tmp/${addr}.toml backup  /var/lib/${backup_addr}/backups/state.db

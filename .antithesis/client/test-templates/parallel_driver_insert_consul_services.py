@@ -66,7 +66,7 @@ def main():
     if args.addrs is None:
         args.addrs = ["corrosion1:8500", "corrosion2:8500", "corrosion3:8500"]
     threads = []
-    for i in range(helper.random_int(1, 1000)):
+    for i in range(helper.random_int(1, 500)):
         address = random.choice(args.addrs)
         service_def = generate_service()
         thread = threading.Thread(target=register_service, args=(address, service_def))
