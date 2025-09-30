@@ -1227,7 +1227,7 @@ mod tests {
         }
 
         pub async fn add_node(&self, addr: SocketAddr) -> mpsc::Receiver<Bytes> {
-            let (tx, rx) = mpsc::channel(1024);
+            let (tx, rx) = mpsc::channel(50000);
             self.nodes.write().insert(addr, tx);
             rx
         }
@@ -1256,16 +1256,16 @@ mod tests {
         }
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn test_broadcast_spread() -> eyre::Result<()> {
         let _ = tracing_subscriber::fmt::try_init();
-        let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
+        let (tripwire, _, _) = Tripwire::new_simple();
         let opts = BroadcastOpts {
             interval: Duration::from_secs(2),
             bcast_cutoff: 5 * 1024,
         };
-        let num_nodes = 100;
-        let num_changes = 1000;
+        let num_nodes = 800;
+        let num_changes = 2000;
         let transport = TestTransport::new();
         let config = Arc::new(RwLock::new(foca::Config::new_wan(
             num_nodes.try_into().unwrap(),
@@ -1288,11 +1288,6 @@ mod tests {
             ));
             tas.push(agent);
         }
-
-        tripwire_tx.send(()).await.unwrap();
-        tripwire_worker.await;
-        spawn::wait_for_all_pending_handles().await;
-        println!("tripwire_worker closed done, continuing with other functions");
 
         let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
         let mut tx_bcasts: Vec<_> = Vec::new();
@@ -1325,30 +1320,32 @@ mod tests {
 
         let mut local: HashMap<ActorId, HashSet<u64>> = HashMap::new();
         for i in 1..=num_changes {
-            let (actor_id, tx_bcast) = tx_bcasts.choose(&mut rng).unwrap();
-            tx_bcast
-                .send(BroadcastInput::AddBroadcast(BroadcastV1::Change(
-                    ChangeV1 {
-                        actor_id: *actor_id,
-                        changeset: Changeset::Full {
-                            version: CrsqlDbVersion(i),
-                            changes: vec![],
-                            seqs: dbsr!(0, 0),
-                            last_seq: CrsqlSeq(0),
-                            ts: Default::default(),
+            let ring0 = tx_bcasts.choose_multiple(&mut rng, 50).collect::<Vec<_>>();
+            for (actor_id, tx_bcast) in ring0 {
+                tx_bcast
+                    .send(BroadcastInput::AddBroadcast(BroadcastV1::Change(
+                        ChangeV1 {
+                            actor_id: *actor_id,
+                            changeset: Changeset::Full {
+                                version: CrsqlDbVersion(i),
+                                changes: vec![],
+                                seqs: dbsr!(0, 0),
+                                last_seq: CrsqlSeq(0),
+                                ts: Default::default(),
+                            },
                         },
-                    },
-                )))
-                .await
-                .unwrap();
+                    )))
+                    .await
+                    .unwrap();
 
-            local
-                .entry(*actor_id)
-                .or_insert(Default::default())
-                .insert(i);
+                local
+                    .entry(*actor_id)
+                    .or_insert(Default::default())
+                    .insert(i);
+            }
         }
 
-        tokio::time::sleep(Duration::from_secs(3)).await;
+        tokio::time::sleep(Duration::from_secs(10)).await;
         cancel_token.cancel();
 
         tripwire_tx.send(()).await.unwrap();
@@ -1374,8 +1371,11 @@ mod tests {
         println!("total: {total}");
 
         let percent_received = (total_seen as f64 / total as f64) * 100.0;
-        assert!(percent_received > 90.0);
         println!("percentage received: {percent_received}");
+
+        let extras = (total_extra_recvs as f64 / total as f64) * 100.0;
+        println!("percentage extras: {extras}");
+        assert!(percent_received > 90.0);
         Ok(())
     }
 
@@ -1388,9 +1388,7 @@ mod tests {
         let mut seen = HashSet::new();
         loop {
             tokio::select! {
-                _ = cancel_token.cancelled() => {
-                    break;
-                }
+                biased;
                 maybe_bytes = transport_rx.recv() => {
                     match maybe_bytes {
                         Some(b) => {
@@ -1405,7 +1403,7 @@ mod tests {
                                 let bcast = UniPayload::read_from_buffer(&b).unwrap();
                                 match bcast {
                                     UniPayload::V1 {
-                                        data: UniPayloadV1::BroadcastV2(BroadcastV2 { change: BroadcastV1::Change(change), .. }),
+                                        data: UniPayloadV1::Broadcast(BroadcastV1::Change(change)),
                                         ..
                                     } => {
                                         for version in change.versions() {
@@ -1426,6 +1424,9 @@ mod tests {
                             break;
                         }
                     }
+                }
+                _ = cancel_token.cancelled() => {
+                    break;
                 }
             }
         }
