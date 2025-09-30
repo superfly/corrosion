@@ -42,7 +42,10 @@ use corro_types::{
     channel::{bounded, CorroReceiver, CorroSender},
 };
 
-use crate::{agent::util::log_at_pow_10, transport::Transport};
+use crate::{
+    agent::util::log_at_pow_10,
+    transport::{Transport, TransportExt},
+};
 
 #[derive(Clone)]
 struct TimerSpawner {
@@ -410,7 +413,7 @@ impl Default for BroadcastOpts {
 async fn handle_broadcasts(
     agent: Agent,
     mut rx_bcast: CorroReceiver<BroadcastInput>,
-    transport: Transport,
+    transport: impl TransportExt + Clone + Send + 'static,
     config: Arc<RwLock<foca::Config>>,
     mut tripwire: Tripwire,
     opts: BroadcastOpts,
@@ -1001,7 +1004,7 @@ enum TransmitError {
 fn try_transmit_broadcast(
     bytes_per_sec: &BroadcastRateLimiter,
     payload: Bytes,
-    transport: Transport,
+    transport: impl TransportExt + Send + 'static,
     addr: SocketAddr,
 ) -> Result<Pin<Box<dyn Future<Output = ()> + Send>>, TransmitError> {
     trace!("singly broadcasting to {addr}");
@@ -1044,12 +1047,22 @@ fn try_transmit_broadcast(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::spawn_unipayload_handler;
-    use corro_tests::launch_test_agent;
+    use crate::agent::{setup, spawn_unipayload_handler};
+    use crate::transport::{TransportError, TransportExt};
+    use async_trait::async_trait;
+    use corro_tests::{launch_test_agent, test_config};
     use corro_types::{
         base::{dbsr, CrsqlDbVersion, CrsqlSeq},
         broadcast::{BroadcastV1, ChangeV1, Changeset},
+        members::Members,
     };
+    use rand::seq::IndexedRandom;
+    use rangemap::RangeInclusiveSet;
+    use speedy::Readable;
+    use std::collections::HashSet;
+    use tokio::task::JoinSet;
+    use tokio_util::codec::FramedRead;
+    use tokio_util::sync::CancellationToken;
     use uuid::Uuid;
 
     #[test]
@@ -1199,5 +1212,224 @@ mod tests {
         spawn::wait_for_all_pending_handles().await;
 
         Ok(())
+    }
+
+    #[derive(Clone, Debug)]
+    pub struct TestTransport {
+        nodes: Arc<RwLock<HashMap<SocketAddr, mpsc::Sender<Bytes>>>>,
+    }
+
+    impl TestTransport {
+        pub fn new() -> Self {
+            Self {
+                nodes: Arc::new(RwLock::new(HashMap::new())),
+            }
+        }
+
+        pub async fn add_node(&self, addr: SocketAddr) -> mpsc::Receiver<Bytes> {
+            let (tx, rx) = mpsc::channel(1024);
+            self.nodes.write().insert(addr, tx);
+            rx
+        }
+    }
+
+    #[async_trait]
+    impl TransportExt for TestTransport {
+        async fn send_datagram(&self, addr: SocketAddr, data: Bytes) -> Result<(), TransportError> {
+            let tx = self.nodes.write().get(&addr).unwrap().clone();
+            tokio::spawn(async move {
+                tx.send(data)
+                    .await
+                    .map_err(|_| TransportError::SendError("channel closed".to_string()))
+            });
+            Ok(())
+        }
+
+        async fn send_uni(&self, addr: SocketAddr, data: Bytes) -> Result<(), TransportError> {
+            let tx = self.nodes.write().get(&addr).unwrap().clone();
+            tokio::spawn(async move {
+                tx.send(data)
+                    .await
+                    .map_err(|_| TransportError::SendError("channel closed".to_string()))
+            });
+            Ok(())
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn test_broadcast_spread() -> eyre::Result<()> {
+        let _ = tracing_subscriber::fmt::try_init();
+        let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
+        let opts = BroadcastOpts {
+            interval: Duration::from_secs(2),
+            bcast_cutoff: 5 * 1024,
+        };
+        let num_nodes = 100;
+        let num_changes = 1000;
+        let transport = TestTransport::new();
+        let config = Arc::new(RwLock::new(foca::Config::new_wan(
+            num_nodes.try_into().unwrap(),
+        )));
+
+        println!("config: {:?}", config.read().max_transmissions);
+        let cancel_token = CancellationToken::new();
+        let mut join_set = JoinSet::new();
+
+        let mut tas: Vec<_> = Vec::new();
+        let mut members = Members::default();
+        for _ in 0..num_nodes {
+            let (_, test_conf) = test_config(|conf| conf.build())?;
+            let (agent, _) = setup(test_conf.clone(), tripwire.clone()).await?;
+            members.add_member(&Actor::new(
+                agent.actor_id(),
+                agent.gossip_addr(),
+                agent.clock().new_timestamp().into(),
+                agent.cluster_id(),
+            ));
+            tas.push(agent);
+        }
+
+        tripwire_tx.send(()).await.unwrap();
+        tripwire_worker.await;
+        spawn::wait_for_all_pending_handles().await;
+        println!("tripwire_worker closed done, continuing with other functions");
+
+        let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
+        let mut tx_bcasts: Vec<_> = Vec::new();
+        for agent in tas.iter() {
+            let (tx_bcast, rx_bcast) = bounded(1000, "bcast");
+            let transport_rx: mpsc::Receiver<Bytes> = transport.add_node(agent.gossip_addr()).await;
+            tx_bcasts.push((agent.actor_id(), tx_bcast));
+
+            let agent_clone = agent.clone();
+            agent_clone.members().write().states = members.states.clone();
+            agent_clone.members().write().by_addr = members.by_addr.clone();
+            agent_clone.members().write().rtts = members.rtts.clone();
+
+            let cancel_token = cancel_token.clone();
+            join_set.spawn(process_broadcasts(
+                agent_clone.actor_id(),
+                transport_rx,
+                cancel_token,
+            ));
+            tokio::spawn(handle_broadcasts(
+                agent_clone.clone(),
+                rx_bcast,
+                transport.clone(),
+                config.clone(),
+                tripwire.clone(),
+                opts,
+            ));
+        }
+        let mut rng = StdRng::from_os_rng();
+
+        let mut local: HashMap<ActorId, HashSet<u64>> = HashMap::new();
+        for i in 1..=num_changes {
+            let (actor_id, tx_bcast) = tx_bcasts.choose(&mut rng).unwrap();
+            tx_bcast
+                .send(BroadcastInput::AddBroadcast(BroadcastV1::Change(
+                    ChangeV1 {
+                        actor_id: *actor_id,
+                        changeset: Changeset::Full {
+                            version: CrsqlDbVersion(i),
+                            changes: vec![],
+                            seqs: dbsr!(0, 0),
+                            last_seq: CrsqlSeq(0),
+                            ts: Default::default(),
+                        },
+                    },
+                )))
+                .await
+                .unwrap();
+
+            local
+                .entry(*actor_id)
+                .or_insert(Default::default())
+                .insert(i);
+        }
+
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        cancel_token.cancel();
+
+        tripwire_tx.send(()).await.unwrap();
+        tripwire_worker.await;
+        spawn::wait_for_all_pending_handles().await;
+
+        let results = join_set.join_all().await;
+        let total = num_nodes as u64 * num_changes as u64;
+        let mut total_extra_recvs = 0;
+        let mut total_seen = 0;
+        for (actor_id, extra_recvs, mut seen) in results {
+            if let Some(local_seen) = local.get(&actor_id) {
+                seen.extend(local_seen.iter().cloned());
+            }
+            total_extra_recvs += extra_recvs;
+            total_seen += seen.len();
+            let output = RangeInclusiveSet::from_iter(seen.iter().cloned().map(|v| v..=v));
+            println!("actor_id: {actor_id}, extra_recvs: {extra_recvs}, seen: {output:?}");
+        }
+
+        println!("total extra recvs: {total_extra_recvs}");
+        println!("total seen: {total_seen} ");
+        println!("total: {total}");
+
+        let percent_received = (total_seen as f64 / total as f64) * 100.0;
+        assert!(percent_received > 90.0);
+        println!("percentage received: {percent_received}");
+        Ok(())
+    }
+
+    async fn process_broadcasts(
+        actor_id: ActorId,
+        mut transport_rx: mpsc::Receiver<Bytes>,
+        cancel_token: CancellationToken,
+    ) -> (ActorId, usize, HashSet<u64>) {
+        let mut extra_recvs = 0;
+        let mut seen = HashSet::new();
+        loop {
+            tokio::select! {
+                _ = cancel_token.cancelled() => {
+                    break;
+                }
+                maybe_bytes = transport_rx.recv() => {
+                    match maybe_bytes {
+                        Some(b) => {
+                            let mut framed = FramedRead::new(
+                                b.as_ref(),
+                                LengthDelimitedCodec::builder()
+                                    .max_frame_length(100 * 1_024 * 1_024)
+                                    .new_codec(),
+                            );
+
+                            while let Some(Ok(b)) = framed.next().await {
+                                let bcast = UniPayload::read_from_buffer(&b).unwrap();
+                                match bcast {
+                                    UniPayload::V1 {
+                                        data: UniPayloadV1::BroadcastV2(BroadcastV2 { change: BroadcastV1::Change(change), .. }),
+                                        ..
+                                    } => {
+                                        for version in change.versions() {
+                                            if seen.contains(&version.0) {
+                                                extra_recvs += 1;
+                                                continue;
+                                            }
+                                            seen.insert(version.0);
+                                        }
+                                    }
+                                    _ => {
+                                        panic!("unexpected broadcast type");
+                                    }
+                                }
+                            }
+                        }
+                        None => {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        (actor_id, extra_recvs, seen)
     }
 }

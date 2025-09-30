@@ -16,7 +16,7 @@ use crate::{
         SyncClientError, ANNOUNCE_INTERVAL,
     },
     api::peer::parallel_sync,
-    transport::Transport,
+    transport::{Transport, TransportExt},
 };
 use antithesis_sdk::assert_sometimes;
 use camino::Utf8Path;

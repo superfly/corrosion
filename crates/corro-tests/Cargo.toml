@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+async-trait = { workspace = true }
+bytes = { workspace = true }
 corro-agent = { path = "../corro-agent" }
 corro-client = { path = "../corro-client" }
 corro-types = { path = "../corro-types" }

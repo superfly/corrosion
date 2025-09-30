@@ -60,10 +60,9 @@ pub struct TestAgent {
     pub config: Config,
 }
 
-pub async fn launch_test_agent<F: FnOnce(ConfigBuilder) -> Result<Config, ConfigBuilderError>>(
+pub fn test_config<F: FnOnce(ConfigBuilder) -> Result<Config, ConfigBuilderError>>(
     f: F,
-    tripwire: Tripwire,
-) -> eyre::Result<TestAgent> {
+) -> eyre::Result<(TempDir, Config)> {
     let tmpdir = TempDir::new(tempfile::tempdir()?);
     let schema_path = tmpdir.path().join("schema");
 
@@ -74,9 +73,17 @@ pub async fn launch_test_agent<F: FnOnce(ConfigBuilder) -> Result<Config, Config
         .db_path(tmpdir.path().join("corrosion.db").display().to_string())
         .add_schema_path(schema_path.display().to_string()))?;
 
-    tokio::fs::create_dir(&schema_path).await?;
-    tokio::fs::write(schema_path.join("tests.sql"), TEST_SCHEMA.as_bytes()).await?;
+    std::fs::create_dir(&schema_path)?;
+    std::fs::write(schema_path.join("tests.sql"), TEST_SCHEMA.as_bytes())?;
 
+    Ok((tmpdir, conf))
+}
+
+pub async fn launch_test_agent<F: FnOnce(ConfigBuilder) -> Result<Config, ConfigBuilderError>>(
+    f: F,
+    tripwire: Tripwire,
+) -> eyre::Result<TestAgent> {
+    let (tmpdir, conf) = test_config(f)?;
     let (agent, bookie, _, _) = start_with_config(conf.clone(), tripwire).await?;
 
     Ok(TestAgent {
