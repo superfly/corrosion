@@ -874,6 +874,7 @@ version = "0.1.0"
 dependencies = [
  "antithesis_sdk",
  "arc-swap",
+ "async-trait",
  "axum",
  "axum-extra",
  "backoff",
@@ -1057,6 +1058,8 @@ dependencies = [
 name = "corro-tests"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "bytes",
  "corro-agent",
  "corro-client",
  "corro-types",
