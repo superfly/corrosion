@@ -56,7 +56,7 @@ pub async fn make_broadcastable_changes<F, T>(
     f: F,
 ) -> Result<(T, Option<CrsqlDbVersion>, Duration), ChangeError>
 where
-    F: Fn(&InterruptibleTransaction<Transaction>) -> Result<T, ChangeError>,
+    F: FnOnce(&InterruptibleTransaction<Transaction>) -> Result<T, ChangeError>,
 {
     trace!("getting conn...");
     let mut conn = agent.pool().write_priority().await?;
