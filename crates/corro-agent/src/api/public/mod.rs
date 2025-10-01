@@ -195,6 +195,7 @@ pub async fn api_v1_transactions(
         );
     }
 
+    counter!("corro.api.connection.count", "protocol" => "http").increment(1);
     assert_sometimes!(true, "Corrosion receives transactions through HTTP API");
     let res = make_broadcastable_changes(&agent, params.timeout, move |tx| {
         let mut total_rows_affected = 0;
