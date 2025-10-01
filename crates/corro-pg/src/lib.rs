@@ -2046,6 +2046,7 @@ impl<'conn> Session<'conn> {
                 self.tx_state
                     .set_write_permit(self.agent.write_permit_blocking()?);
 
+                counter!("corro.acquired.write.permit.count", "protocol" => "pg").increment(1);
                 self.set_ts()?;
             }
 
