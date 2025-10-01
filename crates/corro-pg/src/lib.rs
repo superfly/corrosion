@@ -24,6 +24,7 @@ use corro_types::{
 };
 use fallible_iterator::FallibleIterator;
 use futures::{SinkExt, StreamExt};
+use metrics::counter;
 use pgwire::{
     api::{
         results::{DataRowEncoder, FieldFormat, FieldInfo, Tag},
@@ -561,6 +562,8 @@ pub async fn start(
             };
             let tls_acceptor = tls_acceptor.clone();
             debug!("Accepted a PostgreSQL connection (from: {remote_addr})");
+
+            counter!("corro.api.connection.count", "protocol" => "pg").increment(1);
 
             let agent = agent.clone();
             tokio::spawn(async move {
