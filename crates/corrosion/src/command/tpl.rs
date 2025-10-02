@@ -31,7 +31,7 @@ pub async fn run(
     template: &Vec<String>,
     flags: &TemplateFlags,
 ) -> eyre::Result<()> {
-    let client = CorrosionApiClient::new(api_addr);
+    let client = CorrosionApiClient::new(api_addr)?;
 
     let mut filepaths = vec![];
 

@@ -5,14 +5,12 @@ edition = "2021"
 description = "Consul client"
 license = "MIT"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
 [dependencies]
 camino = { workspace = true }
-hyper = { workspace = true }
+http.workspace = true
 hyper-rustls = { workspace = true }
+reqwest.workspace = true
 rustls = { workspace = true }
-rustls-pemfile = { workspace = true }
 rusqlite = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

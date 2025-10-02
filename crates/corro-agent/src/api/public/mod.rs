@@ -472,7 +472,7 @@ pub async fn api_v1_queries(
     axum::extract::Query(params): axum::extract::Query<TimeoutParams>,
     axum::extract::Json(stmt): axum::extract::Json<Statement>,
 ) -> impl IntoResponse {
-    let (mut tx, body) = hyper::Body::channel();
+    let (mut tx, body) = http_body_util::Channel::<bytes::Bytes, std::convert::Infallible>::new(16);
 
     counter!("corro.api.queries.count").increment(1);
     // TODO: timeout on data send instead of infinitely waiting for channel space.
@@ -516,24 +516,22 @@ pub async fn api_v1_queries(
         Ok(_) => {
             histogram!("corro.api.queries.processing.time.seconds", "result" => "success")
                 .record(start.elapsed());
-            #[allow(clippy::needless_return)]
-            return hyper::Response::builder()
+            hyper::Response::builder()
                 .status(StatusCode::OK)
-                .body(body)
-                .expect("could not build query response body");
+                .body(axum::body::Body::new(body))
+                .expect("could not build query response body")
         }
         Err((status, res)) => {
             histogram!("corro.api.queries.processing.time.seconds", "result" => "error")
                 .record(start.elapsed());
-            #[allow(clippy::needless_return)]
-            return hyper::Response::builder()
+            hyper::Response::builder()
                 .status(status)
                 .body(
                     serde_json::to_vec(&res)
                         .expect("could not serialize query error response")
                         .into(),
                 )
-                .expect("could not build query response body");
+                .expect("could not build query response body")
         }
     }
 }
@@ -712,7 +710,7 @@ mod tests {
         config::Config,
         schema::SqliteType,
     };
-    use http_body::Body;
+    use futures::StreamExt;
     use tokio::sync::mpsc::error::TryRecvError;
     use tokio_util::codec::{Decoder, LinesCodec};
     use tripwire::Tripwire;
@@ -871,13 +869,13 @@ mod tests {
 
         assert_eq!(res.status(), StatusCode::OK);
 
-        let mut body = res.into_body();
+        let mut body = res.into_body().into_data_stream();
 
         let mut lines = LinesCodec::new();
 
         let mut buf = BytesMut::new();
 
-        buf.extend_from_slice(&body.data().await.unwrap()?);
+        buf.extend_from_slice(&body.next().await.unwrap()?);
 
         let s = lines.decode(&mut buf).unwrap().unwrap();
 
@@ -885,7 +883,7 @@ mod tests {
 
         assert_eq!(cols, QueryEvent::Columns(vec!["id".into(), "text".into()]));
 
-        buf.extend_from_slice(&body.data().await.unwrap()?);
+        buf.extend_from_slice(&body.next().await.unwrap()?);
 
         let s = lines.decode(&mut buf).unwrap().unwrap();
 
@@ -896,7 +894,7 @@ mod tests {
             QueryEvent::Row(RowId(1), vec!["service-id".into(), "service-name".into()])
         );
 
-        buf.extend_from_slice(&body.data().await.unwrap()?);
+        buf.extend_from_slice(&body.next().await.unwrap()?);
 
         let s = lines.decode(&mut buf).unwrap().unwrap();
 
@@ -910,7 +908,7 @@ mod tests {
             )
         );
 
-        buf.extend_from_slice(&body.data().await.unwrap()?);
+        buf.extend_from_slice(&body.next().await.unwrap()?);
 
         let s = lines.decode(&mut buf).unwrap().unwrap();
 
@@ -918,7 +916,7 @@ mod tests {
 
         assert!(matches!(query_evt, QueryEvent::EndOfQuery { .. }));
 
-        assert!(body.data().await.is_none());
+        assert!(body.next().await.is_none());
 
         Ok(())
     }

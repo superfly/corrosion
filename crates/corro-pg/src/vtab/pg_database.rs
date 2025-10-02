@@ -129,7 +129,7 @@ unsafe impl VTabCursor for PgDatabaseTableCursor<'_> {
     }
 
     fn eof(&self) -> bool {
-        dbg!(dbg!(self.row_id) >= dbg!(self.databases.len()) as i64)
+        self.row_id >= self.databases.len() as i64
     }
 
     fn column(&self, ctx: &mut rusqlite::vtab::Context, col: c_int) -> rusqlite::Result<()> {

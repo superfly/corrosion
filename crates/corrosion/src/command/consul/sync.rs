@@ -42,7 +42,7 @@ pub async fn run<P: AsRef<Path>>(
             .into_boxed_str(),
     );
 
-    let corrosion = CorrosionClient::new(api_addr, db_path);
+    let corrosion = CorrosionClient::new(api_addr, db_path)?;
     let consul = consul_client::Client::new(config.client.clone())?;
 
     info!("Setting up corrosion for consul sync");
@@ -798,7 +798,7 @@ mod tests {
         )
         .await?;
 
-        let ta1_client = CorrosionClient::new(ta1.agent.api_addr(), ta1.agent.db_path());
+        let ta1_client = CorrosionClient::new(ta1.agent.api_addr(), ta1.agent.db_path())?;
 
         setup(&ta1_client).await?;
 
@@ -916,7 +916,7 @@ mod tests {
 
         assert_eq!(svc_hashes.get("service-id"), Some(&hash_service(&svc)));
 
-        let ta2_client = CorrosionClient::new(ta2.agent.api_addr(), ta2.agent.db_path());
+        let ta2_client = CorrosionClient::new(ta2.agent.api_addr(), ta2.agent.db_path())?;
 
         setup(&ta2_client).await?;
 
