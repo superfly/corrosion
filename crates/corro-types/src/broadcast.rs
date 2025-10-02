@@ -664,7 +664,7 @@ pub async fn broadcast_changes(
     db_version: CrsqlDbVersion,
     last_seq: CrsqlSeq,
     ts: Timestamp,
-) -> Result<(), BroadcastError> {
+) -> Result<(), BroadcastError> {   
     let actor_id = agent.actor_id();
     let conn = agent.pool().read().await?;
     trace!("got conn for broadcast");
