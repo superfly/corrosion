@@ -61,6 +61,7 @@ uhlc = { workspace = true }
 uuid = { workspace = true }
 corro-pg = { path = "../corro-pg" }
 indexmap = { workspace = true }
+pin-project-lite = { workspace = true }
 governor.workspace = true
 
 [dev-dependencies]

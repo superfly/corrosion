@@ -10,6 +10,7 @@ use corro_types::{
     updates::{Handle, UpdateCreated, UpdateHandle, UpdatesManager},
 };
 use futures::future::poll_fn;
+use metrics::gauge;
 use tokio::sync::{
     broadcast::{self, error::RecvError},
     mpsc, RwLock as TokioRwLock,
@@ -18,7 +19,7 @@ use tracing::{debug, info, warn};
 use tripwire::Tripwire;
 use uuid::Uuid;
 
-use crate::api::public::pubsub::MatcherUpsertError;
+use crate::api::{public::pubsub::MatcherUpsertError, utils::CountedBody};
 
 pub type UpdateBroadcastCache = HashMap<Uuid, broadcast::Sender<Bytes>>;
 pub type SharedUpdateBroadcastCache = Arc<TokioRwLock<UpdateBroadcastCache>>;
@@ -48,16 +49,20 @@ pub async fn api_v1_updates(
 
     let (handle, maybe_created) = match upsert_res {
         Ok(res) => res,
-        Err(e) => return hyper::Response::<hyper::Body>::from(MatcherUpsertError::from(e)),
+        Err(e) => {
+            return hyper::Response::<CountedBody<hyper::Body>>::from(MatcherUpsertError::from(e))
+        }
     };
 
-    let (tx, body) = hyper::Body::channel();
+    let (tx, body) = CountedBody::channel(
+        gauge!("corro.api.active.streams", "source" => "updates", "protocol" => "http"),
+    );
     // let (forward_tx, forward_rx) = mpsc::channel(10240);
 
     let (update_id, sub_rx) =
         match upsert_update(handle.clone(), maybe_created, updates, &mut bcast_write).await {
             Ok(id) => id,
-            Err(e) => return hyper::Response::<hyper::Body>::from(e),
+            Err(e) => return hyper::Response::<CountedBody<hyper::Body>>::from(e),
         };
 
     tokio::spawn(forward_update_bytes_to_body_sender(

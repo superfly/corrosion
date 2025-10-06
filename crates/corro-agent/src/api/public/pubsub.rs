@@ -1,5 +1,6 @@
 use std::{collections::HashMap, io::Write, sync::Arc, time::Duration};
 
+use crate::api::utils::CountedBody;
 use axum::{http::StatusCode, response::IntoResponse, Extension};
 use bytes::{BufMut, Bytes, BytesMut};
 use compact_str::{format_compact, ToCompactString};
@@ -11,6 +12,7 @@ use corro_types::{
     sqlite::SqlitePoolError,
 };
 use futures::future::poll_fn;
+use metrics::gauge;
 use rusqlite::Connection;
 use serde::Deserialize;
 use tokio::{
@@ -50,7 +52,7 @@ async fn sub_by_id(
     params: SubParams,
     bcast_cache: &SharedMatcherBroadcastCache,
     tripwire: Tripwire,
-) -> hyper::Response<hyper::Body> {
+) -> impl IntoResponse {
     let matcher_rx = bcast_cache.read().await.get(&id).and_then(|tx| {
         subs.get(&id).map(|matcher| {
             debug!("found matcher by id {id}");
@@ -99,7 +101,9 @@ async fn sub_by_id(
     let query_hash = matcher.hash().to_owned();
     tokio::spawn(catch_up_sub(matcher, params, rx, evt_tx));
 
-    let (tx, body) = hyper::Body::channel();
+    let (tx, body) = CountedBody::channel(
+        gauge!("corro.api.active.streams", "source" => "subscriptions", "protocol" => "http"),
+    );
 
     tokio::spawn(forward_bytes_to_body_sender(id, evt_rx, tx, tripwire));
 
@@ -302,7 +306,7 @@ impl MatcherUpsertError {
     }
 }
 
-impl From<MatcherUpsertError> for hyper::Response<hyper::Body> {
+impl From<MatcherUpsertError> for hyper::Response<CountedBody<hyper::Body>> {
     fn from(value: MatcherUpsertError) -> Self {
         hyper::Response::builder()
             .status(value.status_code())
@@ -676,7 +680,7 @@ pub async fn api_v1_subs(
 ) -> impl IntoResponse {
     let stmt = match expand_sql(&agent, &stmt).await {
         Ok(stmt) => stmt,
-        Err(e) => return hyper::Response::<hyper::Body>::from(e),
+        Err(e) => return hyper::Response::<CountedBody<hyper::Body>>::from(e),
     };
 
     info!("Received subscription request for query: {stmt}");
@@ -695,10 +699,14 @@ pub async fn api_v1_subs(
 
     let (handle, maybe_created) = match upsert_res {
         Ok(res) => res,
-        Err(e) => return hyper::Response::<hyper::Body>::from(MatcherUpsertError::from(e)),
+        Err(e) => {
+            return hyper::Response::<CountedBody<hyper::Body>>::from(MatcherUpsertError::from(e))
+        }
     };
 
-    let (tx, body) = hyper::Body::channel();
+    let (tx, body) = CountedBody::channel(
+        gauge!("corro.api.active.streams", "source" => "subscriptions", "protocol" => "http"),
+    );
     let (forward_tx, forward_rx) = mpsc::channel(10240);
 
     tokio::spawn(forward_bytes_to_body_sender(
@@ -720,7 +728,7 @@ pub async fn api_v1_subs(
     .await
     {
         Ok(id) => id,
-        Err(e) => return hyper::Response::<hyper::Body>::from(e),
+        Err(e) => return hyper::Response::<CountedBody<hyper::Body>>::from(e),
     };
 
     hyper::Response::builder()

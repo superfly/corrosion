@@ -1,4 +1,5 @@
 pub mod sql_state;
+pub mod utils;
 mod vtab;
 
 use std::{
@@ -24,7 +25,7 @@ use corro_types::{
 };
 use fallible_iterator::FallibleIterator;
 use futures::{SinkExt, StreamExt};
-use metrics::counter;
+use metrics::{counter, gauge};
 use pgwire::{
     api::{
         results::{DataRowEncoder, FieldFormat, FieldInfo, Tag},
@@ -72,6 +73,7 @@ use tripwire::{Outcome, PreemptibleFutureExt, TimeoutFutureExt, Tripwire};
 
 use crate::{
     sql_state::SqlState,
+    utils::CountedTcpStream,
     vtab::{
         pg_class::PgClassTable,
         pg_database::{PgDatabase, PgDatabaseTable},
@@ -556,10 +558,14 @@ pub async fn start(
 
     tokio::spawn(async move {
         loop {
-            let (mut conn, remote_addr) = match server.accept().preemptible(&mut tripwire).await {
+            let (tcp_conn, remote_addr) = match server.accept().preemptible(&mut tripwire).await {
                 Outcome::Completed(res) => res?,
                 Outcome::Preempted(_) => break,
             };
+            let mut conn = CountedTcpStream::wrap(
+                tcp_conn,
+                gauge!("corro.api.active.streams", "source" => "postgres", "protocol" => "pg"),
+            );
             let tls_acceptor = tls_acceptor.clone();
             debug!("Accepted a PostgreSQL connection (from: {remote_addr})");
 
@@ -567,16 +573,16 @@ pub async fn start(
 
             let agent = agent.clone();
             tokio::spawn(async move {
-                conn.set_nodelay(true)?;
+                conn.stream.set_nodelay(true)?;
                 {
-                    let sock = SockRef::from(&conn);
+                    let sock = SockRef::from(&conn.stream);
                     let ka = TcpKeepalive::new()
                         .with_time(Duration::from_secs(10))
                         .with_interval(Duration::from_secs(10))
                         .with_retries(4);
                     sock.set_tcp_keepalive(&ka)?;
                 }
-                let is_sslrequest = peek_for_sslrequest(&mut conn).await?;
+                let is_sslrequest = peek_for_sslrequest(&mut conn.stream).await?;
 
                 // reject non-ssl connections if ssl is required (client cert auth)
                 if ssl_required && !is_sslrequest {
@@ -586,7 +592,7 @@ pub async fn start(
 
                 let (mut framed, secured) = match (tls_acceptor, is_sslrequest) {
                     (Some(tls_acceptor), true) => {
-                        conn.write_all(b"S").await?;
+                        conn.stream.write_all(b"S").await?;
                         let tls_conn = tls_acceptor.accept(conn).await?;
                         (
                             Framed::new(
@@ -600,7 +606,7 @@ pub async fn start(
                     }
                     (_, is_sslreq) => {
                         if is_sslreq {
-                            conn.write_all(b"N").await?;
+                            conn.stream.write_all(b"N").await?;
                         }
                         (
                             Framed::new(
