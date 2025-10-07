@@ -838,8 +838,6 @@ fn diff_member_states(
     let members = agent.members().read();
     let membership_id = agent.config().gossip.membership_id;
 
-    let mut to_delete = vec![];
-
     let to_update = foca_states
         .iter()
         .filter_map(|(id, member)| {
@@ -873,6 +871,8 @@ fn diff_member_states(
             }
         })
         .collect::<Vec<_>>();
+
+    let mut to_delete = vec![];
 
     last_states.retain(|id, _v| {
         let foca_state = foca_states.get(id);
