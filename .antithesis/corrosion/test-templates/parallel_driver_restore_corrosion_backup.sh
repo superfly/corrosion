@@ -12,8 +12,11 @@ if [ -f "/var/lib/corrosion/backups/state.db" ]; then
     supervisorctl stop corrosion
 
     corrosion restore /var/lib/corrosion/backups/state.db
+    echo "Restore done. Starting corrosion"
     supervisorctl start corrosion
     supervisorctl restart corro-consul
+
+    rm -f /var/lib/corrosion/backups/state.db
     exit 0
 fi
 
