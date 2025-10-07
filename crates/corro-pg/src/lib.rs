@@ -556,6 +556,11 @@ pub async fn start(
     let server = TcpListener::bind(pg.bind_addr).await?;
     let (tls_acceptor, ssl_required) = setup_tls(pg).await?;
     let local_addr = server.local_addr()?;
+    let conn_gauge = persistent_gauge!("corro.api.active.streams",
+    "source" => "postgres",
+    "protocol" => "pg",
+    "readonly" => readonly.to_string(),
+    );
 
     tokio::spawn(async move {
         loop {
@@ -563,14 +568,11 @@ pub async fn start(
                 Outcome::Completed(res) => res?,
                 Outcome::Preempted(_) => break,
             };
-            let mut conn = CountedTcpStream::wrap(
-                tcp_conn,
-                persistent_gauge!("corro.api.active.streams", "source" => "postgres", "protocol" => "pg"),
-            );
+            let mut conn = CountedTcpStream::wrap(tcp_conn, conn_gauge.clone());
             let tls_acceptor = tls_acceptor.clone();
             debug!("Accepted a PostgreSQL connection (from: {remote_addr})");
 
-            counter!("corro.api.connection.count", "protocol" => "pg").increment(1);
+            counter!("corro.api.connection.count", "protocol" => "pg", "readonly" => readonly.to_string()).increment(1);
 
             let agent = agent.clone();
             tokio::spawn(async move {
