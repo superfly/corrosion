@@ -4,6 +4,7 @@ use crate::api::utils::CountedBody;
 use axum::{http::StatusCode, response::IntoResponse, Extension};
 use bytes::{BufMut, Bytes, BytesMut};
 use compact_str::{format_compact, ToCompactString};
+use corro_types::persistent_gauge;
 use corro_types::updates::Handle;
 use corro_types::{
     agent::Agent,
@@ -12,7 +13,6 @@ use corro_types::{
     sqlite::SqlitePoolError,
 };
 use futures::future::poll_fn;
-use metrics::gauge;
 use rusqlite::Connection;
 use serde::Deserialize;
 use tokio::{
@@ -102,7 +102,7 @@ async fn sub_by_id(
     tokio::spawn(catch_up_sub(matcher, params, rx, evt_tx));
 
     let (tx, body) = CountedBody::channel(
-        gauge!("corro.api.active.streams", "source" => "subscriptions", "protocol" => "http"),
+        persistent_gauge!("corro.api.active.streams", "source" => "subscriptions", "protocol" => "http"),
     );
 
     tokio::spawn(forward_bytes_to_body_sender(id, evt_rx, tx, tripwire));
@@ -705,7 +705,7 @@ pub async fn api_v1_subs(
     };
 
     let (tx, body) = CountedBody::channel(
-        gauge!("corro.api.active.streams", "source" => "subscriptions", "protocol" => "http"),
+        persistent_gauge!("corro.api.active.streams", "source" => "subscriptions", "protocol" => "http"),
     );
     let (forward_tx, forward_rx) = mpsc::channel(10240);
 

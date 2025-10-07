@@ -12,6 +12,8 @@ use tokio::{
     time::sleep,
 };
 
+use crate::persistent_gauge;
+
 /// A tokio channel wrapper sender that tracks various metrics
 pub struct CorroSender<T> {
     send_count: Counter,
@@ -54,7 +56,8 @@ pub fn bounded<T: Send + 'static>(
     capacity: usize,
     label: &'static str,
 ) -> (CorroSender<T>, CorroReceiver<T>) {
-    gauge!("corro.runtime.channel.max_capacity", "channel_name" => label).set(capacity as f64);
+    persistent_gauge!("corro.runtime.channel.max_capacity", "channel_name" => label)
+        .set(capacity as f64);
 
     // Count the number of sends and receives going through the channel
     let send_count = counter!("corro.runtime.channel.send_count", "channel_name" => label);

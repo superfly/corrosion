@@ -20,12 +20,13 @@ use corro_types::{
     broadcast::{broadcast_changes, Timestamp},
     change::{insert_local_changes, InsertChangesInfo},
     config::PgConfig,
+    persistent_gauge,
     schema::{parse_sql, Column, Schema, SchemaError, SqliteType, Table},
     sqlite::CrConn,
 };
 use fallible_iterator::FallibleIterator;
 use futures::{SinkExt, StreamExt};
-use metrics::{counter, gauge};
+use metrics::counter;
 use pgwire::{
     api::{
         results::{DataRowEncoder, FieldFormat, FieldInfo, Tag},
@@ -564,7 +565,7 @@ pub async fn start(
             };
             let mut conn = CountedTcpStream::wrap(
                 tcp_conn,
-                gauge!("corro.api.active.streams", "source" => "postgres", "protocol" => "pg"),
+                persistent_gauge!("corro.api.active.streams", "source" => "postgres", "protocol" => "pg"),
             );
             let tls_acceptor = tls_acceptor.clone();
             debug!("Accepted a PostgreSQL connection (from: {remote_addr})");

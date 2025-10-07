@@ -4,7 +4,11 @@ use antithesis_sdk::prelude::*;
 use build_info::VersionControl;
 use camino::Utf8PathBuf;
 use corro_admin::{AdminConfig, TracingHandle};
-use corro_types::config::{Config, PrometheusConfig};
+use corro_types::{
+    config::{Config, PrometheusConfig},
+    gauge::PERSISTENT_GAUGE_REGISTRY,
+    persistent_gauge,
+};
 use metrics::gauge;
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
 use metrics_util::MetricKindMask;
@@ -37,23 +41,18 @@ pub async fn run(
             (unknown.clone(), unknown.clone())
         };
 
-        // required because gauges are subject to a idle timeout, so we need to touch this frequently
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(30));
-            loop {
-                interval.tick().await;
+        persistent_gauge!(
+            "corro.build.info",
+            "version" => info.crate_info.version.to_string(),
+            "ts" => info.timestamp.to_string(),
+            "rustc_version" => info.compiler.version.to_string(),
+            "git_commit" => git_commit.clone(),
+            "git_branch" => git_branch.clone()
+        )
+        .set(1.0);
 
-                gauge!(
-                    "corro.build.info",
-                    "version" => info.crate_info.version.to_string(),
-                    "ts" => info.timestamp.to_string(),
-                    "rustc_version" => info.compiler.version.to_string(),
-                    "git_commit" => git_commit.clone(),
-                    "git_branch" => git_branch.clone(),
-                )
-                .set(1.0);
-            }
-        });
+        // Ensure all persistent gauges get touched every 30s
+        PERSISTENT_GAUGE_REGISTRY.clone().spawn_handle_update();
 
         start_tokio_runtime_reporter();
     }

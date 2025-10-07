@@ -19,11 +19,12 @@ use corro_types::{
     base::CrsqlDbVersion,
     broadcast::Timestamp,
     change::{insert_local_changes, InsertChangesInfo, SqliteValue},
+    persistent_gauge,
     schema::{apply_schema, parse_sql},
     sqlite::SqlitePoolError,
 };
 use hyper::StatusCode;
-use metrics::{counter, gauge, histogram};
+use metrics::{counter, histogram};
 use rusqlite::{params_from_iter, ToSql, Transaction};
 use serde::Deserialize;
 use spawn::spawn_counted;
@@ -474,7 +475,7 @@ pub async fn api_v1_queries(
     axum::extract::Json(stmt): axum::extract::Json<Statement>,
 ) -> impl IntoResponse {
     let (mut tx, body) = CountedBody::channel(
-        gauge!("corro.api.active.streams", "source" => "queries", "protocol" => "http"),
+        persistent_gauge!("corro.api.active.streams", "source" => "queries", "protocol" => "http"),
     );
 
     counter!("corro.api.queries.count").increment(1);

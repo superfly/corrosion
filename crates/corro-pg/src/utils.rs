@@ -1,7 +1,7 @@
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use metrics::Gauge;
+use corro_types::gauge::PersistentGauge;
 use pin_project_lite::pin_project;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
@@ -10,19 +10,19 @@ pin_project! {
     pub struct CountedTcpStream {
         #[pin]
         pub stream: TcpStream,
-        gauge: Gauge,
+        gauge: PersistentGauge,
     }
 
     impl PinnedDrop for CountedTcpStream {
         fn drop(this: Pin<&mut Self>) {
-            this.gauge.decrement(1);
+            this.gauge.decrement(1.0);
         }
     }
 }
 
 impl CountedTcpStream {
-    pub fn wrap(stream: TcpStream, gauge: Gauge) -> Self {
-        gauge.increment(1);
+    pub fn wrap(stream: TcpStream, gauge: PersistentGauge) -> Self {
+        gauge.increment(1.0);
         Self { stream, gauge }
     }
 }

@@ -7,10 +7,10 @@ use compact_str::ToCompactString;
 use corro_types::{
     agent::Agent,
     api::NotifyEvent,
+    persistent_gauge,
     updates::{Handle, UpdateCreated, UpdateHandle, UpdatesManager},
 };
 use futures::future::poll_fn;
-use metrics::gauge;
 use tokio::sync::{
     broadcast::{self, error::RecvError},
     mpsc, RwLock as TokioRwLock,
@@ -55,7 +55,7 @@ pub async fn api_v1_updates(
     };
 
     let (tx, body) = CountedBody::channel(
-        gauge!("corro.api.active.streams", "source" => "updates", "protocol" => "http"),
+        persistent_gauge!("corro.api.active.streams", "source" => "updates", "protocol" => "http"),
     );
     // let (forward_tx, forward_rx) = mpsc::channel(10240);
 

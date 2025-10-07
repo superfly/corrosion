@@ -1,5 +1,5 @@
+use corro_types::gauge::PersistentGauge;
 use hyper::body::{Body, HttpBody, Sender, SizeHint};
-use metrics::Gauge;
 use pin_project_lite::pin_project;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -8,22 +8,22 @@ pin_project! {
     pub struct CountedBody<B: HttpBody> {
         #[pin]
         body: B,
-        gauge: Option<Gauge>,
+        gauge: Option<PersistentGauge>,
     }
 
     impl<B: HttpBody> PinnedDrop for CountedBody<B> {
         fn drop(this: Pin<&mut Self>) {
             if let Some(gauge) = &this.gauge {
-                gauge.decrement(1);
+                gauge.decrement(1.0);
             }
         }
     }
 }
 
 impl<B: HttpBody> CountedBody<B> {
-    fn new(body: B, gauge: Option<Gauge>) -> Self {
+    fn new(body: B, gauge: Option<PersistentGauge>) -> Self {
         if let Some(gauge) = &gauge {
-            gauge.increment(1);
+            gauge.increment(1.0);
         }
         Self { body, gauge }
     }
@@ -31,7 +31,7 @@ impl<B: HttpBody> CountedBody<B> {
 
 impl CountedBody<Body> {
     // Channel bodies need to be counted as they can be long lived
-    pub fn channel(gauge: Gauge) -> (Sender, Self) {
+    pub fn channel(gauge: PersistentGauge) -> (Sender, Self) {
         let (tx, body) = hyper::Body::channel();
         (tx, Self::new(body, Some(gauge)))
     }
