@@ -66,8 +66,8 @@ use tower_http::trace::TraceLayer;
 use tracing::{debug, error, info, trace, warn};
 use tripwire::{Outcome, PreemptibleFutureExt, Tripwire};
 
-pub async fn initialise_foca(agent: &Agent) {
-    let states = load_member_states(agent).await;
+pub async fn initialise_foca(agent: &Agent, states: Vec<(SocketAddr, Member<Actor>)>) {
+    info!("loaded member states: {:?}", states);
     if !states.is_empty() {
         let mut foca_states = BTreeMap::<SocketAddr, Member<Actor>>::new();
 
@@ -95,6 +95,7 @@ pub async fn initialise_foca(agent: &Agent) {
             }
         }
 
+        info!("foca states: {:?}", foca_states);
         if let Err(e) = agent
             .tx_foca()
             .send(FocaInput::ApplyMany(foca_states.into_values().collect()))

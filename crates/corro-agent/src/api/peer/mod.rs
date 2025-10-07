@@ -2413,6 +2413,7 @@ mod tests {
             plaintext: false,
             max_mtu: None,
             disable_gso: false,
+            membership_id: None,
         };
 
         let server = gossip_server_endpoint(&gossip_config).await?;

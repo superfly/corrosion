@@ -386,10 +386,11 @@ async fn handle_conn(
 
                         let (cb_tx, cb_rx) = oneshot::channel();
 
+                        let membership_id = agent.membership_id();
                         agent
                             .tx_foca()
                             .blocking_send(FocaInput::Cmd(FocaCmd::ChangeIdentity(
-                                agent.actor(cluster_id),
+                                agent.actor(cluster_id, membership_id),
                                 cb_tx,
                             )))
                             .map_err(|_| ProcessingError::Send)?;

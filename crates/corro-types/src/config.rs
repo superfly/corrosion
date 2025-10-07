@@ -1,5 +1,6 @@
 use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
 
+use crate::actor::MembershipId;
 use camino::Utf8PathBuf;
 use serde::{Deserialize, Serialize};
 use serde_with::{formats::PreferOne, serde_as, OneOrMany};
@@ -195,6 +196,8 @@ pub struct GossipConfig {
     pub idle_timeout_secs: u32,
     #[serde(default)]
     pub disable_gso: bool,
+    #[serde(default)]
+    pub membership_id: Option<MembershipId>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -347,6 +350,7 @@ pub struct ConfigBuilder {
     consul: Option<ConsulConfig>,
     tls: Option<TlsConfig>,
     perf: Option<PerfConfig>,
+    membership_id: Option<MembershipId>,
 }
 
 impl ConfigBuilder {
@@ -405,6 +409,11 @@ impl ConfigBuilder {
         self
     }
 
+    pub fn membership_id(mut self, membership_id: MembershipId) -> Self {
+        self.membership_id = Some(membership_id);
+        self
+    }
+
     pub fn build(self) -> Result<Config, ConfigBuilderError> {
         let db_path = self.db_path.ok_or(ConfigBuilderError::DbPathRequired)?;
 
@@ -442,6 +451,7 @@ impl ConfigBuilder {
                 idle_timeout_secs: default_gossip_idle_timeout(),
                 max_mtu: None, // TODO: add a builder function for it
                 disable_gso: false,
+                membership_id: self.membership_id,
             },
             perf: self.perf.unwrap_or_default(),
             admin: AdminConfig {
