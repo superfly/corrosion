@@ -221,6 +221,7 @@ pub fn spawn_swim_announcer(agent: &Agent, gossip_addr: SocketAddr, mut tripwire
                     _ = timer.as_mut() => {}
                 }
 
+                // TODO: find way to find and filter out addrs with a different membership id
                 match bootstrap::generate_bootstrap(
                     agent.config().gossip.bootstrap.as_slice(),
                     gossip_addr,
@@ -297,6 +298,12 @@ pub async fn handle_notifications(
         trace!("handle notification");
         match notification {
             OwnedNotification::MemberUp(actor) => {
+                if actor.membership_id() != agent.config().gossip.membership_id {
+                    let removed = { agent.members().write().remove_member(&actor) };
+                    info!("Member Up but different membership id {actor:?} (removed: {removed})");
+                    continue;
+                }
+
                 let member_added_res = agent.members().write().add_member(&actor);
                 info!("Member Up {actor:?} (result: {member_added_res:?})");
 
