@@ -5,6 +5,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::api::utils::CountedBody;
 use antithesis_sdk::assert_sometimes;
 use axum::{extract::ConnectInfo, response::IntoResponse, Extension};
 use bytes::{BufMut, BytesMut};
@@ -18,6 +19,7 @@ use corro_types::{
     base::CrsqlDbVersion,
     broadcast::Timestamp,
     change::{insert_local_changes, InsertChangesInfo, SqliteValue},
+    persistent_gauge,
     schema::{apply_schema, parse_sql},
     sqlite::SqlitePoolError,
 };
@@ -472,7 +474,9 @@ pub async fn api_v1_queries(
     axum::extract::Query(params): axum::extract::Query<TimeoutParams>,
     axum::extract::Json(stmt): axum::extract::Json<Statement>,
 ) -> impl IntoResponse {
-    let (mut tx, body) = hyper::Body::channel();
+    let (mut tx, body) = CountedBody::channel(
+        persistent_gauge!("corro.api.active.streams", "source" => "queries", "protocol" => "http"),
+    );
 
     counter!("corro.api.queries.count").increment(1);
     // TODO: timeout on data send instead of infinitely waiting for channel space.

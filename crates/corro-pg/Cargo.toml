@@ -33,6 +33,7 @@ sqlparser = { version = "0.39.0" }
 chrono = { version = "0.4.31" }
 socket2 = { version = "0.5" }
 tokio-rustls = "0.24.1"
+pin-project-lite = { workspace = true }
 
 [dev-dependencies]
 corro-tests = { path = "../corro-tests" }
