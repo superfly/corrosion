@@ -524,7 +524,7 @@ pub async fn start(
                 Outcome::Completed(res) => res?,
                 Outcome::Preempted(_) => break,
             };
-            let mut conn = CountedTcpStream::wrap(tcp_conn, conn_gauge.clone());
+            let conn = CountedTcpStream::wrap(tcp_conn, conn_gauge.clone());
             let tls_acceptor = tls_acceptor.clone();
             debug!("Accepted a PostgreSQL connection (from: {remote_addr})");
 
