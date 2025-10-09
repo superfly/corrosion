@@ -1,6 +1,6 @@
 use std::{collections::HashMap, io::Write, sync::Arc, time::Duration};
 
-use crate::api::utils::CountedBody;
+use crate::api::utils::{BodySender, CountedBody};
 use axum::{http::StatusCode, response::IntoResponse, Extension};
 use bytes::{BufMut, Bytes, BytesMut};
 use compact_str::{format_compact, ToCompactString};
@@ -26,8 +26,6 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use tripwire::Tripwire;
 use uuid::Uuid;
-
-type BodySender = crate::streaming_body::Sender<Bytes>;
 
 #[derive(Clone, Copy, Debug, Default, Deserialize)]
 pub struct SubParams {
@@ -791,7 +789,7 @@ async fn handle_sub_event(
     meta: QueryEventMeta,
     tx: &mut BodySender,
     last_change_id: &mut ChangeId,
-) -> Result<(), crate::streaming_body::SendError> {
+) -> Result<(), crate::api::utils::BodySendError> {
     match meta {
         QueryEventMeta::EndOfQuery(Some(change_id)) | QueryEventMeta::Change(change_id) => {
             if !last_change_id.is_zero() && change_id > *last_change_id + 1 {
