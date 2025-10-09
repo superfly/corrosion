@@ -18,7 +18,10 @@ use tracing::{debug, info, warn};
 use tripwire::Tripwire;
 use uuid::Uuid;
 
-use crate::api::{public::pubsub::MatcherUpsertError, utils::CountedBody};
+use crate::api::{
+    public::pubsub::MatcherUpsertError,
+    utils::{BodySender, CountedBody},
+};
 
 pub type UpdateBroadcastCache = HashMap<Uuid, broadcast::Sender<Bytes>>;
 pub type SharedUpdateBroadcastCache = Arc<TokioRwLock<UpdateBroadcastCache>>;
@@ -184,7 +187,7 @@ fn make_query_event_bytes(
 async fn forward_update_bytes_to_body_sender(
     update: UpdateHandle,
     mut rx: broadcast::Receiver<Bytes>,
-    mut tx: crate::streaming_body::Sender<Bytes>,
+    mut tx: BodySender,
     mut tripwire: Tripwire,
 ) {
     let mut buf = BytesMut::new();
