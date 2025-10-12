@@ -1257,7 +1257,7 @@ pub fn process_complete_version<T: Deref<Target = rusqlite::Connection> + Commit
 
     debug!(%actor_id, %version, "complete change, applying right away! seqs: {seqs:?}, last_seq: {last_seq}, changes len: {len}, db version: {version}");
 
-    let details = json!({"len": len, "seqs": seqs.start_int(), "seqs_end": seqs.end_int()});
+    let details = json!({"len": len, "seqs": seqs.start_int(), "seqs_end": seqs.end_int(), "actor_id": actor_id, "version": version});
     assert_always!(
         len <= seqs.len(),
         "number of changes is greater than the seq num",
