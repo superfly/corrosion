@@ -40,8 +40,8 @@ impl http_body::Body for CountedBody {
         let mut this = self.project();
 
         match this.rx_frame.poll_recv(cx) {
-            Poll::Ready(frame @ Some(_)) => return Poll::Ready(frame.map(Ok)),
-            Poll::Ready(None) => return Poll::Ready(None),
+            Poll::Ready(frame @ Some(_)) => Poll::Ready(frame.map(Ok)),
+            Poll::Ready(None) => Poll::Ready(None),
             Poll::Pending => Poll::Pending,
         }
     }
