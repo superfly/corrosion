@@ -46,7 +46,7 @@ jobs:
         if: startsWith(matrix.os, 'ubuntu')
 
       - name: Run sccache-cache
-        uses: mozilla-actions/sccache-action@v0.0.3
+        uses: mozilla-actions/sccache-action@v0.0.9
 
       - uses: taiki-e/upload-rust-binary-action@v1
         with:
