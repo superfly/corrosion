@@ -407,20 +407,22 @@ impl MatcherHandle {
 
     /// Purges old changes from the subscription's changes table, keeping only the most recent 500.
     /// Returns the number of rows deleted.
-    /// 
+    ///
     /// This method sends a request to the Matcher task to perform the purge.
     pub async fn purge_old_changes(&self) -> rusqlite::Result<usize> {
         self.wait_for_running_state();
-        
+
         let (tx, rx) = oneshot::channel();
-        
+
         // Send purge request to the Matcher task
-        self.inner.purge_tx.send(tx).await
+        self.inner
+            .purge_tx
+            .send(tx)
+            .await
             .map_err(|_| rusqlite::Error::InvalidQuery)?;
-        
+
         // Wait for the result
-        rx.await
-            .map_err(|_| rusqlite::Error::InvalidQuery)?
+        rx.await.map_err(|_| rusqlite::Error::InvalidQuery)?
     }
 
     pub fn changes_since(
@@ -869,7 +871,7 @@ impl Matcher {
         let tx = conn.transaction()?;
         let deleted = tx
             .prepare_cached(
-                "DELETE FROM changes WHERE id < (SELECT COALESCE(MAX(id),0) - 500 FROM changes)"
+                "DELETE FROM changes WHERE id < (SELECT COALESCE(MAX(id),0) - 500 FROM changes)",
             )?
             .execute([])?;
         tx.commit()?;
@@ -1229,9 +1231,7 @@ impl Matcher {
                 }
                 Branch::PurgeOldChanges(maybe_response_tx) => {
                     let start = Instant::now();
-                    let res = block_in_place(|| {
-                        Self::purge_old_changes(&mut self.conn)
-                    });
+                    let res = block_in_place(|| Self::purge_old_changes(&mut self.conn));
 
                     match &res {
                         Ok(deleted) => {

@@ -991,7 +991,9 @@ mod tests {
         async fn receive_all_events(&mut self) -> Vec<QueryEvent> {
             let mut events = Vec::new();
             // Receive events until reading times out
-            while let Ok(data) = timeout(Duration::from_millis(100), self.iter.recv::<QueryEvent>()).await {
+            while let Ok(data) =
+                timeout(Duration::from_millis(100), self.iter.recv::<QueryEvent>()).await
+            {
                 if let Some(Ok(event)) = data {
                     events.push(event);
                 } else if let Some(Err(err)) = data {
@@ -1707,7 +1709,7 @@ mod tests {
                 .collect(),
             0.into(),
         )
-        .await; 
+        .await;
 
         let mut bulk_insert_fn = async |hundreds: usize| -> eyre::Result<()> {
             let chunk_size = 100;
@@ -1721,7 +1723,11 @@ mod tests {
                         format!("service-name-{}", idx).into(),
                     ]);
                 }
-                agent.insert_test_data(&data[start_idx + i * chunk_size..=start_idx + i * chunk_size + chunk_size - 1])
+                agent
+                    .insert_test_data(
+                        &data[start_idx + i * chunk_size
+                            ..=start_idx + i * chunk_size + chunk_size - 1],
+                    )
                     .await?;
             }
             Ok(())
@@ -1799,7 +1805,9 @@ mod tests {
         // Purge the subscriptions, s2, s3 and s4 should not get disconnected
         // We can't manipulate time in tokio runtime, so manually trigger the pruning
         if let Some(matcher) = agent.ta.agent.subs_manager().get(&s2.sub_id) {
-            matcher.purge_old_changes().await
+            matcher
+                .purge_old_changes()
+                .await
                 .expect("failed to purge old changes");
         }
 
@@ -1815,7 +1823,10 @@ mod tests {
             .await?;
         let events = s5.receive_all_events().await;
         assert_eq!(events.len(), 1); // data + columns + end of query
-        assert!(matches!(events[0], corro_types::api::TypedQueryEvent::Error(_)));
+        assert!(matches!(
+            events[0],
+            corro_types::api::TypedQueryEvent::Error(_)
+        ));
 
         // Resubscribing from a large change id should work
         let mut s6 = agent

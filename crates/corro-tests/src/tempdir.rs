@@ -1,5 +1,5 @@
-use std::ops::Deref;
 use std::env;
+use std::ops::Deref;
 
 pub struct TempDir(Option<tempfile::TempDir>);
 

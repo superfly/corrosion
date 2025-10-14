@@ -5,7 +5,8 @@ use corro_agent::agent::start_with_config;
 pub use corro_client::{CorrosionApiClient, CorrosionClient};
 use corro_types::{
     agent::{Agent, Bookie},
-    config::{Config, ConfigBuilder, ConfigBuilderError}, sqlite::{rusqlite_to_crsqlite, SqlitePool},
+    config::{Config, ConfigBuilder, ConfigBuilderError},
+    sqlite::{rusqlite_to_crsqlite, SqlitePool},
 };
 use tripwire::Tripwire;
 
@@ -101,9 +102,9 @@ impl TestAgent {
     // Use for out-of-band inserts
     pub fn oob_pool(&self) -> SqlitePool {
         sqlite_pool::Config::new(self.agent.db_path())
-        .max_size(1)
-        .create_pool_transform(rusqlite_to_crsqlite)
-        .unwrap()
+            .max_size(1)
+            .create_pool_transform(rusqlite_to_crsqlite)
+            .unwrap()
     }
 }
 
