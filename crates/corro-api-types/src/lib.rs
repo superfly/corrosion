@@ -580,6 +580,18 @@ impl From<f64> for SqliteValue {
     }
 }
 
+impl From<&SqliteValue> for SqliteValue {
+    fn from(value: &SqliteValue) -> Self {
+        value.clone()
+    }
+}
+
+impl From<&&SqliteValue> for SqliteValue {
+    fn from(value: &&SqliteValue) -> Self {
+        (*value).clone()
+    }
+}
+
 impl FromSql for SqliteValue {
     fn column_result(value: ValueRef<'_>) -> rusqlite::types::FromSqlResult<Self> {
         Ok(match value {

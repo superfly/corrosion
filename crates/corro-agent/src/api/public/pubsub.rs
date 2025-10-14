@@ -1014,6 +1014,44 @@ mod tests {
         "select * from tests where substr(id, -1) IN ('0', '2', '4', '6', '8')";
     const TEST_QUERY3: &str =
         "select * from tests where substr(id, -1) IN ('1', '3', '5', '7', '9')";
+    
+    /// Helper struct for executing prepared statements
+    struct PreparedStatement<'a> {
+        agent: &'a PubSubAgent,
+        sql: &'static str,
+    }
+
+    impl<'a> PreparedStatement<'a> {
+        async fn execute<P, I, V>(&self, rows: I) -> eyre::Result<()>
+        where
+            I: IntoIterator<Item = P>,
+            P: IntoIterator<Item = V>,
+            V: Into<SqliteValue>,
+        {
+            let statements: Vec<Statement> = rows
+                .into_iter()
+                .map(|params| {
+                    Statement::WithParams(
+                        self.sql.into(),
+                        params.into_iter().map(|v| v.into().into()).collect(),
+                    )
+                })
+                .collect();
+            
+            let count = statements.len();
+            let (status_code, body) = api_v1_transactions(
+                Extension(self.agent.ta.agent.clone()),
+                axum::extract::Query(TimeoutParams { timeout: None }),
+                axum::Json(statements),
+            )
+            .await;
+
+            assert_eq!(status_code, StatusCode::OK);
+            assert_eq!(body.0.results.len(), count);
+            Ok(())
+        }
+    }
+
     impl PubSubAgent {
         async fn subscribe_to_test_table(
             &self,
@@ -1069,73 +1107,40 @@ mod tests {
             })
         }
 
-        async fn insert_test_data(&self, rows: &[Vec<SqliteValue>]) -> eyre::Result<()> {
-            let (status_code, body) = api_v1_transactions(
-                Extension(self.ta.agent.clone()),
-                axum::extract::Query(TimeoutParams { timeout: None }),
-                axum::Json(
-                    rows.into_iter()
-                        .map(|row| {
-                            Statement::WithParams(
-                                "insert into tests (id, text) values (?,?)".into(),
-                                row.iter().map(|v| v.clone().into()).collect(),
-                            )
-                        })
-                        .collect(),
-                ),
-            )
-            .await;
+        /// Prepares a statement that can be executed multiple times with different parameters
+        fn prepare_statement(&self, sql: &'static str) -> PreparedStatement {
+            PreparedStatement { agent: self, sql }
+        }
 
-            assert_eq!(status_code, StatusCode::OK);
-            assert!(body.0.results.len() == rows.len());
-            Ok(())
+        async fn insert_test_data<P, I, V>(&self, rows: I) -> eyre::Result<()>
+        where
+            I: IntoIterator<Item = P>,
+            P: IntoIterator<Item = V>,
+            V: Into<SqliteValue>,
+        {
+            const INSERT_TEST: &str = "insert into tests (id, text) values (?,?)";
+            self.prepare_statement(INSERT_TEST).execute(rows).await
         }
 
         #[allow(dead_code)]
-        async fn update_test_data(&self, rows: Vec<&Vec<SqliteValue>>) -> eyre::Result<()> {
-            let rows_len = rows.len();
-            let (status_code, body) = api_v1_transactions(
-                Extension(self.ta.agent.clone()),
-                axum::extract::Query(TimeoutParams { timeout: None }),
-                axum::Json(
-                    rows.iter()
-                        .map(|row| {
-                            Statement::WithParams(
-                                "update tests set text = ?2 where id = ?1".into(),
-                                row.iter().map(|v| v.clone().into()).collect(),
-                            )
-                        })
-                        .collect(),
-                ),
-            )
-            .await;
-
-            assert_eq!(status_code, StatusCode::OK);
-            assert!(body.0.results.len() == rows_len);
-            Ok(())
+        async fn update_test_data<P, I, V>(&self, rows: I) -> eyre::Result<()>
+        where
+            I: IntoIterator<Item = P>,
+            P: IntoIterator<Item = V>,
+            V: Into<SqliteValue>,
+        {
+            const UPDATE_TEST: &str = "update tests set text = ?2 where id = ?1";
+            self.prepare_statement(UPDATE_TEST).execute(rows).await
         }
 
-        async fn delete_test_data(&self, rows: Vec<&SqliteValue>) -> eyre::Result<()> {
-            let rows_len = rows.len();
-            let (status_code, body) = api_v1_transactions(
-                Extension(self.ta.agent.clone()),
-                axum::extract::Query(TimeoutParams { timeout: None }),
-                axum::Json(
-                    rows.iter()
-                        .map(|id| {
-                            Statement::WithParams(
-                                "delete from tests where id = ?1".into(),
-                                vec![(*id).clone().into()],
-                            )
-                        })
-                        .collect(),
-                ),
-            )
-            .await;
-
-            assert_eq!(status_code, StatusCode::OK);
-            assert!(body.0.results.len() == rows_len);
-            Ok(())
+        async fn delete_test_data<P, I, V>(&self, rows: I) -> eyre::Result<()>
+        where
+            I: IntoIterator<Item = P>,
+            P: IntoIterator<Item = V>,
+            V: Into<SqliteValue>,
+        {
+            const DELETE_TEST: &str = "delete from tests where id = ?1";
+            self.prepare_statement(DELETE_TEST).execute(rows).await
         }
     }
 
@@ -2084,7 +2089,7 @@ mod tests {
             .await;
 
             agent.insert_test_data(&data[5..6]).await?;
-            agent.delete_test_data(vec![&data[5][0]]).await?;
+            agent.delete_test_data([vec![&data[5][0]]]).await?;
 
             // when we make changes to the same primary key in quick succession,
             // the newer event might get sent first (but in that case, the older one should be dropped)
