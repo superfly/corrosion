@@ -1403,7 +1403,7 @@ mod tests {
                 s_even
                     .assert_updates(vec![(
                         ChangeType::Insert,
-                        RowId(3 + i / 2),
+                        RowId(4 + i / 2),
                         ChangeId(1 + i / 2),
                         row,
                     )])
@@ -1412,7 +1412,7 @@ mod tests {
                 s_odd
                     .assert_updates(vec![(
                         ChangeType::Insert,
-                        RowId(3 + i / 2),
+                        RowId(4 + i / 2),
                         ChangeId(1 + i / 2),
                         row,
                     )])
