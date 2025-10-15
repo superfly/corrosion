@@ -1,9 +1,10 @@
 #!/usr/bin/env -S python3 -u
 
+import argparse
 import json
 import random
-import requests
 import string
+import sys
 import time
 sys.path.append("/opt/antithesis/py-resources")
 import helper
@@ -31,20 +32,19 @@ def update_in_corrosion(address, op, id, encoded_id, status):
         return
     print(f"Successfully {op}d user {id} in Corrosion node.")
 
-def get_user_ids(address):
-    data = helper.query_sql(address, "SELECT id FROM users ORDER BY RANDOM() LIMIT 100")
+def get_user_ids(address, http_port):
+    data = helper.query_sql(address, http_port, "SELECT id FROM users ORDER BY RANDOM() LIMIT 100")
     print(f"Found {len(data)} users in Corrosion.")
     numbers = []
     for line in data:
         numbers.append(line[0])
     return numbers
 
-def do_updates():
-    corro_addrs = ["corrosion1:8080", "corrosion2:8080", "corrosion3:8080"]
+def do_updates(corro_addrs, pg_port, http_port):
     address = random.choice(corro_addrs)
 
     try:
-        user_ids = get_user_ids(address)
+        user_ids = get_user_ids(address, http_port)
         if len(user_ids) < 2:
             print("Not enough users in Corrosion.")
             exit(0)
@@ -55,12 +55,21 @@ def do_updates():
             encoded_id = random_name()
             status = random.choice(["active", "inactive", "blocked", "suspended", "admin"])
             op = random.choice(["update", "delete"])
-            update_in_corrosion(address, op, id, encoded_id, status)
+            update_in_corrosion(f"{address}:{http_port}", op, id, encoded_id, status)
     except Exception as e:
         print(f"Error updating users: {e}")
 
 def main():
-    do_updates()
+    parser = argparse.ArgumentParser(description='Insert teams and users into corrosion databases')
+    parser.add_argument('--addrs', nargs='+', help='List of corrosion hostnames (e.g., --addresses corrosion1 corrosion2)')
+    parser.add_argument('--pg-port', nargs='?', type=int, default=5470, help='postgres port')
+    parser.add_argument('--http-port', nargs='?', type=int, default=8080, help='http port')
+
+    args = parser.parse_args()
+    if args.addrs is None:
+        args.addrs = ["corrosion1", "corrosion2", "corrosion3"]
+
+    do_updates(args.addrs, args.pg_port, args.http_port)
 
 if __name__ == "__main__":
     main()
