@@ -1014,7 +1014,7 @@ mod tests {
         "select * from tests where substr(id, -1) IN ('0', '2', '4', '6', '8')";
     const TEST_QUERY3: &str =
         "select * from tests where substr(id, -1) IN ('1', '3', '5', '7', '9')";
-    
+
     /// Helper struct for executing prepared statements
     struct PreparedStatement<'a> {
         agent: &'a PubSubAgent,
@@ -1037,7 +1037,7 @@ mod tests {
                     )
                 })
                 .collect();
-            
+
             let count = statements.len();
             let (status_code, body) = api_v1_transactions(
                 Extension(self.agent.ta.agent.clone()),
@@ -2476,5 +2476,257 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Stress test that hammers the database with concurrent operations for 5 seconds
+    /// and validates that:
+    /// - We never receive an update event for a deleted row/non existing row
+    /// - We never receive an delete event for a row that wasn't inserted
+    /// - We never receive an insert for a row that's already inserted
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_subscription_interleaving() -> eyre::Result<()> {
+        use rand::{rngs::StdRng, Rng, SeedableRng};
+        use std::collections::{HashSet, VecDeque};
+
+        _ = tracing_subscriber::fmt::try_init();
+
+        let test = PubSubTest::with_n_agents(2).await?;
+
+        // Create subscriptions on both nodes
+        let mut sub1 = test.agents[0]
+            .subscribe_to_test_table(
+                SubParams {
+                    from: None,
+                    skip_rows: false,
+                },
+                Either::Left(TEST_QUERY1.into()),
+            )
+            .await?;
+
+        let mut sub2 = test.agents[1]
+            .subscribe_to_test_table(
+                SubParams {
+                    from: None,
+                    skip_rows: false,
+                },
+                Either::Left(TEST_QUERY1.into()),
+            )
+            .await?;
+
+        // Consume initial query results from both subscriptions
+        sub1.assert_initial_query_results(vec!["id".into(), "text".into()], vec![], 0.into())
+            .await;
+
+        sub2.assert_initial_query_results(vec!["id".into(), "text".into()], vec![], 0.into())
+            .await;
+
+        let (tripwire, _, tripwire_tx) = Tripwire::new_simple();
+
+        // Spawn multiple worker threads that hammer the database
+        const NUM_WORKERS: usize = 8;
+        const NUM_ROW_IDS: usize = 100;
+        const TEST_DURATION_SECS: u64 = 5;
+        const BATCH_SIZE_MIN: usize = 5;
+        const BATCH_SIZE_MAX: usize = 20;
+        const MIN_DELAY: u64 = 1;
+        const MAX_DELAY: u64 = 5;
+        const RNG_SEED: u64 = 1337;
+
+        let mut task_handles = vec![];
+        for worker_id in 0..NUM_WORKERS {
+            let mut rng = StdRng::seed_from_u64(RNG_SEED + worker_id as u64);
+            // Alternate workers between nodes
+            let node_idx = worker_id % 2;
+            let ta_agent = test.agents[node_idx].ta.agent.clone();
+            let ta_client = test.agents[node_idx].ta_client.clone();
+            let tripwire = tripwire.clone();
+
+            let handle = tokio::spawn(async move {
+                let mut tripwire = tripwire;
+
+                loop {
+                    let mut existing_pks: HashSet<String> = HashSet::new();
+                    {
+                        let conn = ta_client.pool().get().await.unwrap();
+                        let mut statement = conn.prepare("SELECT id FROM tests").unwrap();
+                        let mut q = statement.query([]).unwrap();
+                        while let Some(row) = q.next().unwrap() {
+                            existing_pks.insert(row.get(0).unwrap());
+                        }
+                    }
+
+                    let mut statements = Vec::new();
+                    for _ in 0..(rng.random_range(BATCH_SIZE_MIN..=BATCH_SIZE_MAX)) {
+                        let row_id = format!("row-{}", rng.random_range(0..NUM_ROW_IDS));
+                        let should_update = rng.random_bool(0.5);
+                        let rand_val = rng.random::<u32>();
+
+                        let statement = match (existing_pks.contains(&row_id), should_update) {
+                            // When the row doesn't exist, we can only insert
+                            (false, _) => {
+                                let text = format!("w{}-n{}-{}", worker_id, node_idx, rand_val);
+                                Statement::WithParams(
+                                    "INSERT INTO tests (id, text) VALUES (?, ?)".into(),
+                                    vec![
+                                        SqliteValue::Text(row_id.clone().into()).into(),
+                                        SqliteValue::Text(text.into()).into(),
+                                    ],
+                                )
+                            }
+                            (true, true) => {
+                                let text = format!("w{}-n{}-{}", worker_id, node_idx, rand_val);
+                                Statement::WithParams(
+                                    "UPDATE tests SET text = ?2 WHERE id = ?1".into(),
+                                    vec![
+                                        SqliteValue::Text(row_id.clone().into()).into(),
+                                        SqliteValue::Text(text.into()).into(),
+                                    ],
+                                )
+                            }
+                            (true, false) => Statement::WithParams(
+                                "DELETE FROM tests WHERE id = ?1".into(),
+                                vec![SqliteValue::Text(row_id.clone().into()).into()],
+                            )
+                        };
+
+                        statements.push(statement);
+                    }
+
+                    let (status_code, _body) = api_v1_transactions(
+                        Extension(ta_agent.clone()),
+                        axum::extract::Query(TimeoutParams { timeout: None }),
+                        axum::Json(statements),
+                    )
+                    .await;
+
+                    if status_code != StatusCode::OK {
+                        panic!(
+                            "Worker {} (node {}) failed batch operation: status {}",
+                            worker_id, node_idx, status_code
+                        );
+                    }
+
+                    // Small random delay
+                    let delay = Duration::from_millis(rng.random_range(MIN_DELAY..MAX_DELAY));
+                    tokio::select! {
+                        _ = tokio::time::sleep(delay) => {},
+                        _ = &mut tripwire => break,
+                    }
+                }
+            });
+
+            task_handles.push(handle);
+        }
+
+        for (node_idx, mut sub) in [(0, sub1), (1, sub2)] {
+            let tripwire = tripwire.clone();
+            let mut event_history = VecDeque::<Option<Result<QueryEvent>>>::new();
+
+            let handle = tokio::spawn(async move {
+                let mut observed_existing_pks = HashSet::<String>::new();
+                let mut tripwire = tripwire;
+
+                loop {
+                    // Try to receive an event with a short timeout or check for stop signal
+                    let event_result = tokio::select! {
+                        res = sub.iter.recv::<QueryEvent>() => res,
+                        _ = &mut tripwire => return,
+                    };
+                    event_history.push_back(event_result);
+                    if event_history.len() > 100 {
+                        event_history.pop_front();
+                    }
+                    let event_result = event_history.back().unwrap();
+
+                    let mut error_message = None;
+                    match event_result {
+                        Some(Ok(event)) => {
+                            match event {
+                                QueryEvent::Change(change_type, _row_id, row_data, _change_id) => {
+                                    // Extract the actual row ID from the data
+                                    let actual_row_id =
+                                        if let Some(SqliteValue::Text(id)) = row_data.get(0) {
+                                            id.to_string()
+                                        } else {
+                                            continue;
+                                        };
+
+                                    // Validate state transitions
+                                    match (
+                                        observed_existing_pks.contains(&actual_row_id),
+                                        change_type,
+                                    ) {
+                                        (false, ChangeType::Insert) => {
+                                            // Valid: Insert when row doesn't exist
+                                            observed_existing_pks.insert(actual_row_id.clone());
+                                        }
+                                        (true, ChangeType::Update) => {
+                                            // Valid: Update when row exists
+                                        }
+                                        (true, ChangeType::Delete) => {
+                                            // Valid: Delete when row exists
+                                            observed_existing_pks.remove(&actual_row_id);
+                                        }
+                                        (false, ChangeType::Update) => {
+                                            // INVALID: Update on non-existent row
+                                            error_message = Some(format!(
+                                                "INVALID STATE TRANSITION: Received UPDATE for row '{}' that doesn't exist",
+                                                actual_row_id
+                                            ));
+                                        }
+                                        (false, ChangeType::Delete) => {
+                                            // INVALID: Delete on non-existent row
+                                            error_message = Some(format!(
+                                                "INVALID STATE TRANSITION: Received DELETE for row '{}' that doesn't exist",
+                                                actual_row_id
+                                            ));
+                                        }
+                                        (true, ChangeType::Insert) => {
+                                            // INVALID: Insert when row already exists
+                                            error_message = Some(format!(
+                                                "INVALID STATE TRANSITION: Received INSERT for row '{}' that already exist",
+                                                actual_row_id
+                                            ));
+                                        }
+                                    }
+                                }
+                                _ => {
+                                    // Ignore other event types
+                                }
+                            }
+                        }
+                        Some(Err(e)) => {
+                            error_message = Some(format!("Error receiving event: {}", e));
+                        }
+                        None => {
+                            // Stream ended
+                            break;
+                        }
+                    }
+
+                    if let Some(error_message) = error_message {
+                        for event in event_history {
+                            println!("{:?}", event);
+                        }
+                        panic!("Node {} failed test: {}", node_idx, error_message);
+                    }
+                }
+            });
+
+            task_handles.push(handle);
+        }
+
+        // Run for the specified duration
+        tokio::time::sleep(Duration::from_secs(TEST_DURATION_SECS)).await;
+
+        // Trigger tripwire to stop all tasks
+        tripwire_tx.send(()).await.ok();
+
+        // Wait for all tasks to finish
+        for handle in task_handles {
+            let _ = handle.await;
+        }
+
+        Ok(())
     }
 }
