@@ -347,10 +347,10 @@ pub async fn setup_http_api_handler(
 
                     tokio::select! {
                         _res = conn.as_mut() => {
-                            info!("corrosion api is done");
+                            trace!("corrosion api is done");
                         }
                         _ = &mut tw => {
-                            info!("corrosion api http tripped {api_addr}");
+                            debug!("corrosion api http tripped {api_addr}");
                             conn.as_mut().graceful_shutdown();
                         }
                     };

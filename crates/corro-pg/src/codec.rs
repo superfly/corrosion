@@ -1,4 +1,4 @@
-//! Reimpl of PgWireMessageServerCodec from <https://github.com/sunng87/pgwire/blob/master/src/tokio/server.rs>,
+//! Reimpl of PgWireMessageServerCodec from <https://github.com/sunng87/pgwire/blob/a12c5f28aef8ada3e13a387da9f9dd5a70cfea41/src/tokio/server.rs>,
 //! the implementation was public, but was made (accidentally?) private in <https://github.com/sunng87/pgwire/pull/214>
 
 use pgwire::{
