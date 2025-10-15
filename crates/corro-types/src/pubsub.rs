@@ -32,7 +32,7 @@ use sqlite3_parser::{
 };
 use sqlite_pool::RusqlitePool;
 use tokio::{
-    sync::{mpsc, watch, AcquireError},
+    sync::{mpsc, oneshot, watch, AcquireError},
     task::block_in_place,
 };
 use tokio_util::sync::{CancellationToken, DropGuard, WaitForCancellationFuture};
@@ -273,6 +273,7 @@ struct InnerMatcherHandle {
     cancel: CancellationToken,
     changes_tx: mpsc::Sender<MatchCandidates>,
     last_change_rx: watch::Receiver<ChangeId>,
+    purge_tx: mpsc::Sender<oneshot::Sender<rusqlite::Result<usize>>>,
     // some state from the matcher so we can take a look later
     subs_path: String,
     cached_statements: HashMap<String, MatcherStmt>,
@@ -402,6 +403,26 @@ impl MatcherHandle {
         let mut prepped =
             conn.prepare_cached("SELECT COALESCE(MAX(__corro_rowid), 0) FROM query")?;
         prepped.query_row([], |row| row.get(0))
+    }
+
+    /// Purges old changes from the subscription's changes table, keeping only the most recent 500.
+    /// Returns the number of rows deleted.
+    ///
+    /// This method sends a request to the Matcher task to perform the purge.
+    pub async fn purge_old_changes(&self) -> rusqlite::Result<usize> {
+        self.wait_for_running_state();
+
+        let (tx, rx) = oneshot::channel();
+
+        // Send purge request to the Matcher task
+        self.inner
+            .purge_tx
+            .send(tx)
+            .await
+            .map_err(|_| rusqlite::Error::InvalidQuery)?;
+
+        // Wait for the result
+        rx.await.map_err(|_| rusqlite::Error::InvalidQuery)?
     }
 
     pub fn changes_since(
@@ -540,6 +561,7 @@ pub struct Matcher {
     state: StateLock,
     last_change_tx: watch::Sender<ChangeId>,
     changes_rx: mpsc::Receiver<MatchCandidates>,
+    purge_rx: mpsc::Receiver<oneshot::Sender<rusqlite::Result<usize>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -767,6 +789,9 @@ impl Matcher {
         // big channel to not miss anything
         let (changes_tx, changes_rx) = mpsc::channel(20480);
 
+        // channel for triggering purges
+        let (purge_tx, purge_rx) = mpsc::channel(10);
+
         // metrics counters
         let mut counter_map = HashMap::new();
         for table in parsed.table_columns.keys() {
@@ -790,6 +815,7 @@ impl Matcher {
                 cancel: cancel.clone(),
                 last_change_rx,
                 changes_tx,
+                purge_tx,
                 cached_statements: statements.clone(),
                 subs_path: sub_path.to_string(),
                 metrics: counter_map,
@@ -813,6 +839,7 @@ impl Matcher {
             state,
             last_change_tx,
             changes_rx,
+            purge_rx,
         };
 
         Ok((matcher, handle))
@@ -836,6 +863,19 @@ impl Matcher {
 
     pub fn sub_db_path(subs_path: &Utf8Path, id: Uuid) -> Utf8PathBuf {
         Self::sub_path(subs_path, id).join(SUB_DB_PATH)
+    }
+
+    /// Purges old changes from the subscription's changes table, keeping only the most recent 500.
+    /// Returns the number of rows deleted.
+    pub fn purge_old_changes(conn: &mut Connection) -> rusqlite::Result<usize> {
+        let tx = conn.transaction()?;
+        let deleted = tx
+            .prepare_cached(
+                "DELETE FROM changes WHERE id < (SELECT COALESCE(MAX(id),0) - 500 FROM changes)",
+            )?
+            .execute([])?;
+        tx.commit()?;
+        Ok(deleted)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1102,7 +1142,7 @@ impl Matcher {
         loop {
             enum Branch {
                 NewCandidates(MatchCandidates),
-                PurgeOldChanges,
+                PurgeOldChanges(Option<oneshot::Sender<rusqlite::Result<usize>>>),
             }
 
             // trace!("looping...");
@@ -1151,7 +1191,8 @@ impl Matcher {
                     // just return!
                     break;
                 }
-                _ = purge_changes_interval.tick() => Branch::PurgeOldChanges,
+                _ = purge_changes_interval.tick() => Branch::PurgeOldChanges(None),
+                Some(response_tx) = self.purge_rx.recv() => Branch::PurgeOldChanges(Some(response_tx)),
                 else => {
                     return;
                 }
@@ -1188,27 +1229,22 @@ impl Matcher {
                         .as_mut()
                         .reset((Instant::now() + PROCESS_BUFFER_DEADLINE).into());
                 }
-                Branch::PurgeOldChanges => {
+                Branch::PurgeOldChanges(maybe_response_tx) => {
                     let start = Instant::now();
-                    let res = block_in_place(|| {
-                        let tx = self.conn.transaction()?;
+                    let res = block_in_place(|| Self::purge_old_changes(&mut self.conn));
 
-                        let deleted = tx
-                            .prepare_cached(
-                                "DELETE FROM changes WHERE id < (SELECT COALESCE(MAX(id),0) - 500 FROM changes)"
-                            )?
-                            .execute([])?;
-
-                        tx.commit().map(|_| deleted)
-                    });
-
-                    match res {
+                    match &res {
                         Ok(deleted) => {
                             info!(sub_id = %self.id, "Deleted {deleted} old changes row in {:?}", start.elapsed());
                         }
                         Err(e) => {
                             error!(sub_id = %self.id, "could not delete old changes: {e}");
                         }
+                    }
+
+                    // Maybe send the result back to the caller
+                    if let Some(response_tx) = maybe_response_tx {
+                        let _ = response_tx.send(res);
                     }
                 }
             }

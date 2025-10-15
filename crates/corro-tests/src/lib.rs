@@ -1,9 +1,12 @@
 use std::sync::Arc;
 
 use corro_agent::agent::start_with_config;
+// Reexport CorrosionClient and CorrosionApiClient
+pub use corro_client::{CorrosionApiClient, CorrosionClient};
 use corro_types::{
     agent::{Agent, Bookie},
     config::{Config, ConfigBuilder, ConfigBuilderError},
+    sqlite::{rusqlite_to_crsqlite, SqlitePool},
 };
 use tripwire::Tripwire;
 
@@ -85,6 +88,24 @@ pub async fn launch_test_agent<F: FnOnce(ConfigBuilder) -> Result<Config, Config
         tmpdir: Arc::new(tmpdir),
         config: conf,
     })
+}
+
+impl TestAgent {
+    pub fn client(&self) -> CorrosionClient {
+        CorrosionClient::new(self.agent.api_addr(), self.agent.db_path())
+    }
+
+    pub fn api_client(&self) -> CorrosionApiClient {
+        CorrosionApiClient::new(self.agent.api_addr())
+    }
+
+    // Use for out-of-band inserts
+    pub fn oob_pool(&self) -> SqlitePool {
+        sqlite_pool::Config::new(self.agent.db_path())
+            .max_size(1)
+            .create_pool_transform(rusqlite_to_crsqlite)
+            .unwrap()
+    }
 }
 
 impl Drop for TestAgent {
