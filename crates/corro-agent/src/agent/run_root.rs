@@ -127,7 +127,7 @@ async fn run(
 
     tokio::spawn(util::clear_buffered_meta_loop(agent.clone(), rx_clear_buf));
 
-    tokio::spawn(metrics::metrics_loop(agent.clone(), transport.clone()));
+    //tokio::spawn(metrics::metrics_loop(agent.clone(), transport.clone()));
     tokio::spawn(handlers::handle_gossip_to_send(
         transport.clone(),
         to_send_rx,
