@@ -997,7 +997,7 @@ mod tests {
                 if let Some(Ok(event)) = data {
                     events.push(event);
                 } else if let Some(Err(err)) = data {
-                    println!("SubscriptionStream receive_all_events: {:?}", err);
+                    println!("SubscriptionStream receive_all_events: {err:?}");
                 }
                 if self.iter.done {
                     break;
@@ -1691,8 +1691,8 @@ mod tests {
         let mut data: Vec<Vec<SqliteValue>> = vec![];
         for i in 0..2 {
             data.push(vec![
-                format!("service-id-{}", i).into(),
-                format!("service-name-{}", i).into(),
+                format!("service-id-{i}").into(),
+                format!("service-name-{i}").into(),
             ]);
             agent.insert_test_data(&data[i..=i]).await?;
         }
@@ -1724,8 +1724,8 @@ mod tests {
                 for j in 0..chunk_size {
                     let idx = start_idx + i * chunk_size + j;
                     data.push(vec![
-                        format!("service-id-{}", idx).into(),
-                        format!("service-name-{}", idx).into(),
+                        format!("service-id-{idx}").into(),
+                        format!("service-name-{idx}").into(),
                     ]);
                 }
                 agent
@@ -1742,9 +1742,9 @@ mod tests {
         bulk_insert_fn(100).await?;
         let events = s.receive_all_events().await;
         assert_eq!(events.len(), 10000);
-        for i in 0..events.len() {
-            let QueryEvent::Change(ChangeType::Insert, row_id, _, change_id) = &events[i] else {
-                panic!("Expected QueryEvent::Change, got {:?}", events[i]);
+        for (i, event) in events.iter().enumerate() {
+            let QueryEvent::Change(ChangeType::Insert, row_id, _, change_id) = event else {
+                panic!("Expected QueryEvent::Change, got {event:?}");
             };
             assert_eq!(*row_id, RowId(i as u64 + 3));
             assert_eq!(*change_id, ChangeId(i as u64 + 1));
@@ -2049,7 +2049,7 @@ mod tests {
 
             // Both s1 and s2 should receive the insert
             let query_evt = (ChangeType::Insert, RowId(5), ChangeId(3), &data[4]);
-            s1.assert_updates(vec![query_evt.clone()]).await;
+            s1.assert_updates(vec![query_evt]).await;
             s2.assert_updates(vec![query_evt]).await;
 
             // And both notifications should be received
@@ -2171,8 +2171,8 @@ mod tests {
         agent.insert_test_data(&data[5..6]).await?;
 
         let upd = (ChangeType::Insert, RowId(6), ChangeId(4), &data[5]);
-        s_skip.assert_updates(vec![upd.clone()]).await;
-        s_zero.assert_updates(vec![upd.clone()]).await;
+        s_skip.assert_updates(vec![upd]).await;
+        s_zero.assert_updates(vec![upd]).await;
 
         // skip rows AND from
         let mut s_skip_from = agent
@@ -2185,7 +2185,7 @@ mod tests {
             )
             .await?;
 
-        s_skip_from.assert_updates(vec![upd.clone()]).await;
+        s_skip_from.assert_updates(vec![upd]).await;
         s_skip_from.assert_no_more_events().await;
 
         Ok(())
@@ -2560,33 +2560,28 @@ mod tests {
                         let row_id = format!("row-{}", rng.random_range(0..NUM_ROW_IDS));
                         let should_update = rng.random_bool(0.5);
                         let rand_val = rng.random::<u32>();
+                        let text = format!("w{worker_id}-n{node_idx}-{rand_val}");
 
                         let statement = match (existing_pks.contains(&row_id), should_update) {
                             // When the row doesn't exist, we can only insert
-                            (false, _) => {
-                                let text = format!("w{}-n{}-{}", worker_id, node_idx, rand_val);
-                                Statement::WithParams(
-                                    "INSERT INTO tests (id, text) VALUES (?, ?)".into(),
-                                    vec![
-                                        SqliteValue::Text(row_id.clone().into()).into(),
-                                        SqliteValue::Text(text.into()).into(),
-                                    ],
-                                )
-                            }
-                            (true, true) => {
-                                let text = format!("w{}-n{}-{}", worker_id, node_idx, rand_val);
-                                Statement::WithParams(
-                                    "UPDATE tests SET text = ?2 WHERE id = ?1".into(),
-                                    vec![
-                                        SqliteValue::Text(row_id.clone().into()).into(),
-                                        SqliteValue::Text(text.into()).into(),
-                                    ],
-                                )
-                            }
+                            (false, _) => Statement::WithParams(
+                                "INSERT INTO tests (id, text) VALUES (?, ?)".into(),
+                                vec![
+                                    SqliteValue::Text(row_id.clone().into()).into(),
+                                    SqliteValue::Text(text.into()).into(),
+                                ],
+                            ),
+                            (true, true) => Statement::WithParams(
+                                "UPDATE tests SET text = ?2 WHERE id = ?1".into(),
+                                vec![
+                                    SqliteValue::Text(row_id.clone().into()).into(),
+                                    SqliteValue::Text(text.into()).into(),
+                                ],
+                            ),
                             (true, false) => Statement::WithParams(
                                 "DELETE FROM tests WHERE id = ?1".into(),
                                 vec![SqliteValue::Text(row_id.clone().into()).into()],
-                            )
+                            ),
                         };
 
                         statements.push(statement);
@@ -2601,8 +2596,7 @@ mod tests {
 
                     if status_code != StatusCode::OK {
                         panic!(
-                            "Worker {} (node {}) failed batch operation: status {}",
-                            worker_id, node_idx, status_code
+                            "Worker {worker_id} (node {node_idx}) failed batch operation: status {status_code}",
                         );
                     }
 
@@ -2645,7 +2639,7 @@ mod tests {
                                 QueryEvent::Change(change_type, _row_id, row_data, _change_id) => {
                                     // Extract the actual row ID from the data
                                     let actual_row_id =
-                                        if let Some(SqliteValue::Text(id)) = row_data.get(0) {
+                                        if let Some(SqliteValue::Text(id)) = row_data.first() {
                                             id.to_string()
                                         } else {
                                             continue;
@@ -2670,22 +2664,19 @@ mod tests {
                                         (false, ChangeType::Update) => {
                                             // INVALID: Update on non-existent row
                                             error_message = Some(format!(
-                                                "INVALID STATE TRANSITION: Received UPDATE for row '{}' that doesn't exist",
-                                                actual_row_id
+                                                "INVALID STATE TRANSITION: Received UPDATE for row '{actual_row_id}' that doesn't exist",
                                             ));
                                         }
                                         (false, ChangeType::Delete) => {
                                             // INVALID: Delete on non-existent row
                                             error_message = Some(format!(
-                                                "INVALID STATE TRANSITION: Received DELETE for row '{}' that doesn't exist",
-                                                actual_row_id
+                                                "INVALID STATE TRANSITION: Received DELETE for row '{actual_row_id}' that doesn't exist",
                                             ));
                                         }
                                         (true, ChangeType::Insert) => {
                                             // INVALID: Insert when row already exists
                                             error_message = Some(format!(
-                                                "INVALID STATE TRANSITION: Received INSERT for row '{}' that already exist",
-                                                actual_row_id
+                                                "INVALID STATE TRANSITION: Received INSERT for row '{actual_row_id}' that already exist",
                                             ));
                                         }
                                     }
@@ -2696,7 +2687,7 @@ mod tests {
                             }
                         }
                         Some(Err(e)) => {
-                            error_message = Some(format!("Error receiving event: {}", e));
+                            error_message = Some(format!("Error receiving event: {e}"));
                         }
                         None => {
                             // Stream ended
@@ -2706,9 +2697,9 @@ mod tests {
 
                     if let Some(error_message) = error_message {
                         for event in event_history {
-                            println!("{:?}", event);
+                            println!("{event:?}");
                         }
-                        panic!("Node {} failed test: {}", node_idx, error_message);
+                        panic!("Node {node_idx} failed test: {error_message}");
                     }
                 }
             });
