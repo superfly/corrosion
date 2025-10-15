@@ -22,12 +22,15 @@ def insert_user(address, team_id):
     #     print(f"Inserted user {name} for team {team_id}")
 
 def do_inserts(address):
-    id = helper.get_random_cols(address, "teams", ["id"])
-    print(f"inserting user for team {id} into {address}")
-    if id is not None:
-        for j in range(helper.random_int(1, 2)):
-            insert_user(address, id[0])
-
+    try:
+        id = helper.get_random_cols(address, "teams", ["id"])
+        print(f"inserting user for team {id} into {address}")
+        if id is not None:
+            for j in range(helper.random_int(1, 2)):
+                insert_user(address, id[0])
+    except Exception as e:
+        print(f"Error inserting user: {e}")
+        return
 
 def main():
     parser = argparse.ArgumentParser(description='Insert teams and users into corrosion databases')

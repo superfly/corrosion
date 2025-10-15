@@ -1,40 +1,19 @@
 #!/usr/bin/env -S python3 -u
 
+import argparse
 import json
 import random
-import requests
 import string
+import sys
 import time
+sys.path.append("/opt/antithesis/py-resources")
+import helper
 
 from antithesis.assertions import (
     reachable,
     always,
     sometimes
 )
-
-def execute_sql(address, sql_command):
-    headers = {'Content-Type': 'application/json'}
-    try:
-        result = requests.post(f"http://{address}/v1/transactions", headers=headers, json=[sql_command])
-        sometimes(result.status_code == 200, "Clients can make successful transactions to corrosion", {"status_code": result.status_code})
-        if result.status_code != 200:
-            return False, f"Unexpected status code: {result.status_code} - {result.text}"
-        else:
-            return True, None
-    except requests.exceptions.ConnectionError as e:
-        return False, e
-
-def query_sql(address, sql_command):
-    headers = {'Content-Type': 'application/json'}
-    try:
-        result = requests.post(f"http://{address}/v1/queries", headers=headers, json=f"{sql_command}")
-        sometimes(result.status_code == 200, "Clients can make successful queries to corrosion", {"status_code": result.status_code})
-        if result.status_code != 200:
-            return False, f"Unexpected status code: {result.status_code} - {result.text}"
-        else:
-            return result.text, None
-    except requests.exceptions.ConnectionError as e:
-        return False, e
 
 def random_name(length=6):
     return ''.join(random.choices(string.ascii_letters, k=length))
@@ -47,46 +26,50 @@ def update_in_corrosion(address, op, id, encoded_id, status):
     elif op == "delete":
         sql_command = f"DELETE FROM users WHERE id = {id}"
 
-    success, err = execute_sql(address, sql_command)
+    success, err = helper.execute_sql(address, sql_command)
     if not success:
         print(f"Error executing {op} for user {id}: {err}")
         return
     print(f"Successfully {op}d user {id} in Corrosion node.")
 
-def get_user_ids(address):
-    data, err = query_sql(address, "SELECT id FROM users ORDER BY RANDOM() LIMIT 100")
-    if err:
-        print(f"Error getting user ids: {err}")
-        return []
-    print(f"Found {data} users in Corrosion.")
+def get_user_ids(address, http_port):
+    data = helper.query_sql(address, http_port, "SELECT id FROM users ORDER BY RANDOM() LIMIT 100")
+    print(f"Found {len(data)} users in Corrosion.")
     numbers = []
-    lines = data.splitlines()
-    for line in lines:
-        parsed = json.loads(line)
-        if 'row' in parsed:
-            inner_number = parsed["row"][1][0]
-            numbers.append(inner_number)
+    for line in data:
+        numbers.append(line[0])
     return numbers
 
-def do_updates():
-    corro_addrs = ["corrosion1:8080", "corrosion2:8080", "corrosion3:8080"]
+def do_updates(corro_addrs, pg_port, http_port):
     address = random.choice(corro_addrs)
 
-    user_ids = get_user_ids(address)
-    if len(user_ids) < 15:
-        print("Not enough users in Corrosion.")
-        exit(0)
+    try:
+        user_ids = get_user_ids(address, http_port)
+        if len(user_ids) < 2:
+            print("Not enough users in Corrosion.")
+            exit(0)
 
-    update_ids = random.choices(user_ids, k=15)
-    # todo: use psql here
-    for id in update_ids:
-        encoded_id = random_name()
-        status = random.choice(["active", "inactive", "blocked", "suspended", "admin"])
-        op = random.choice(["update", "delete"])
-        update_in_corrosion(address, op, id, encoded_id, status)
+        update_ids = random.choices(user_ids, k=15)
+        # todo: use psql here
+        for id in update_ids:
+            encoded_id = random_name()
+            status = random.choice(["active", "inactive", "blocked", "suspended", "admin"])
+            op = random.choice(["update", "delete"])
+            update_in_corrosion(f"{address}:{http_port}", op, id, encoded_id, status)
+    except Exception as e:
+        print(f"Error updating users: {e}")
 
 def main():
-    do_updates()
+    parser = argparse.ArgumentParser(description='Insert teams and users into corrosion databases')
+    parser.add_argument('--addrs', nargs='+', help='List of corrosion hostnames (e.g., --addresses corrosion1 corrosion2)')
+    parser.add_argument('--pg-port', nargs='?', type=int, default=5470, help='postgres port')
+    parser.add_argument('--http-port', nargs='?', type=int, default=8080, help='http port')
+
+    args = parser.parse_args()
+    if args.addrs is None:
+        args.addrs = ["corrosion1", "corrosion2", "corrosion3"]
+
+    do_updates(args.addrs, args.pg_port, args.http_port)
 
 if __name__ == "__main__":
     main()

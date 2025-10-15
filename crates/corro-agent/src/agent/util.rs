@@ -463,6 +463,8 @@ pub async fn apply_fully_buffered_changes_loop(
             }
             Err(e) => {
                 error!(%actor_id, %version, "could not apply fully buffered changes: {e}");
+                let details = json!({"error": e.to_string()});
+                assert_unreachable!("could not apply fully buffered changes", &details);
             }
         }
     }
@@ -1260,7 +1262,7 @@ pub fn process_complete_version<T: Deref<Target = rusqlite::Connection> + Commit
     let details = json!({"len": len, "seqs": seqs.start_int(), "seqs_end": seqs.end_int(), "actor_id": actor_id, "version": version});
     assert_always!(
         len <= seqs.len(),
-        "number of changes is greater than the seq num",
+        "number of changes is equal to the seq num",
         &details
     );
     debug_assert!(len <= seqs.len(), "change from actor {actor_id} version {version} has len {len} but seqs range is {seqs:?} and last_seq is {last_seq}");
