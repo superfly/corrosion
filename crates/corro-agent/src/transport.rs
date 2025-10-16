@@ -60,7 +60,7 @@ impl Transport {
             // non-zero client addr port means we can only use 1
             1
         };
-        for i in 0..endpoints_count {
+        for i in 0..0 {
             let ep = gossip_client_endpoint(config).await?;
             info!(
                 "Transport ({i}) for outgoing connections bound to socket {}",
@@ -416,6 +416,16 @@ impl Transport {
         gauge!("corro.transport.udp_tx.bytes").set(stats.udp_tx.bytes as f64);
         gauge!("corro.transport.udp_tx.datagrams").set(stats.udp_tx.datagrams as f64);
         gauge!("corro.transport.udp_tx.transmits").set(stats.udp_tx.transmits as f64);
+    }
+
+    pub async fn teardown(&self) {
+        for ep in &self.0.endpoints {
+            ep.close(quinn::VarInt::from_u32(0), b"corro-agent");
+        }
+        for ep in &self.0.endpoints {
+            ep.wait_idle().await;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
     }
 }
 

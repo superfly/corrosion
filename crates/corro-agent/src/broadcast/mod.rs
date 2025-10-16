@@ -152,7 +152,7 @@ pub fn runtime_loop(
 
     tokio::spawn(async move {
         while let Some((duration, timer)) = to_schedule_rx.recv().await {
-            timer_spawner.spawn((duration, timer));
+            //timer_spawner.spawn((duration, timer));
         }
     });
 

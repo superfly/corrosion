@@ -390,6 +390,12 @@ impl From<i64> for SqliteParam {
     }
 }
 
+impl From<i32> for SqliteParam {
+    fn from(value: i32) -> Self {
+        Self::Integer(value.into())
+    }
+}
+
 impl From<SqliteValue> for SqliteParam {
     fn from(value: SqliteValue) -> Self {
         match value {
