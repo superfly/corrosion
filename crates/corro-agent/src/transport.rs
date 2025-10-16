@@ -425,7 +425,6 @@ impl Transport {
     }
 }
 
-
 const NO_ERROR: quinn::VarInt = quinn::VarInt::from_u32(0);
 
 fn test_conn(conn: &Connection) -> bool {

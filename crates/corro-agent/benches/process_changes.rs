@@ -308,7 +308,9 @@ fn run_benchmark_with_config(c: &mut Criterion, bench_name: &str, config: &Bench
                 .get()
                 .await
                 .expect("Failed to get connection")
-                .query_row(&format!("SELECT COUNT(*) FROM {table_name}"), [], |row| row.get(0))
+                .query_row(&format!("SELECT COUNT(*) FROM {table_name}"), [], |row| {
+                    row.get(0)
+                })
                 .unwrap()
         });
         assert!(sanity_check_row_count == config.initial_rows_per_table);
@@ -486,12 +488,12 @@ criterion_group! {
         .measurement_time(Duration::from_secs(15))
         .warm_up_time(Duration::from_secs(1))
         .sample_size(10);
-    targets = 
-        bench_fulls_one_large_table_mixed, 
-        bench_fulls_four_large_tables_mixed, 
-        bench_fulls_one_large_table_insert_only, 
-        bench_fulls_one_large_table_update_only, 
-        bench_fulls_one_large_table_delete_only, 
+    targets =
+        bench_fulls_one_large_table_mixed,
+        bench_fulls_four_large_tables_mixed,
+        bench_fulls_one_large_table_insert_only,
+        bench_fulls_one_large_table_update_only,
+        bench_fulls_one_large_table_delete_only,
         bench_partials
 }
 
