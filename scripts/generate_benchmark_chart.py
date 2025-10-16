@@ -21,6 +21,7 @@ BENCHMARK_LABELS = {
     "bench_fulls_one_large_table_delete_only": "1 table\n100% deletes",
     "bench_fulls_one_large_table_mixed": "1 table\n40% inserts\n50% updates\n10% deletes",
     "bench_fulls_four_large_tables_mixed": "4 tables\n40% inserts\n50% updates\n10% deletes",
+    "bench_partials": "Partial changesets\n(buffered)",
 }
 
 # Batch sizes to display (columns in the chart)
@@ -297,6 +298,115 @@ def generate_chart(results: dict, output_file: Path):
     plt.close()
 
 
+def generate_partials_chart(results: dict, output_file: Path):
+    """
+    Generate a separate chart for partial changesets benchmark.
+    """
+    if "bench_partials" not in results:
+        print("Warning: No bench_partials results found, skipping partials chart")
+        return
+    
+    # Set up the figure with a clean, professional style
+    plt.style.use('seaborn-v0_8-darkgrid')
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
+    
+    # Get data for bench_partials
+    bench_name = "bench_partials"
+    x_values = []
+    throughput_values = []
+    time_values = []
+    
+    for batch_size in BATCH_SIZES:
+        if batch_size in results[bench_name]:
+            data = results[bench_name][batch_size]
+            x_values.append(data["elements"])
+            throughput_values.append(data["throughput"])
+            time_values.append(data["time_ms"])
+    
+    if not x_values:
+        print("Warning: No data points for bench_partials")
+        return
+    
+    # Color for partials
+    color = '#9B59B6'
+    marker = 'D'
+    
+    # Plot throughput (left)
+    ax1.plot(
+        x_values,
+        throughput_values,
+        label=BENCHMARK_LABELS[bench_name],
+        color=color,
+        marker=marker,
+        markersize=8,
+        linewidth=2.5,
+        alpha=0.9
+    )
+    
+    # Plot processing time (right)
+    ax2.plot(
+        x_values,
+        time_values,
+        label=BENCHMARK_LABELS[bench_name],
+        color=color,
+        marker=marker,
+        markersize=8,
+        linewidth=2.5,
+        alpha=0.9
+    )
+    
+    # Add vertical line at x=50 on both subplots
+    for ax in [ax1, ax2]:
+        ax.axvline(x=50, color='red', linestyle='--', linewidth=2, alpha=0.7, zorder=1)
+    
+    # Add label on the left subplot
+    ax1.text(50, ax1.get_ylim()[1] * 0.95, 'Current batch size', 
+            rotation=90, verticalalignment='top', horizontalalignment='right',
+            fontsize=9, color='red', fontweight='bold')
+    
+    # Customize left subplot (throughput)
+    ax1.set_xlabel('Number of Changes', fontsize=11, fontweight='bold')
+    ax1.set_ylabel('Throughput (Kelem/s)', fontsize=11, fontweight='bold')
+    ax1.set_title('Throughput', fontsize=12, fontweight='bold', pad=15)
+    ax1.legend(loc='upper left', framealpha=0.9, fontsize=9)
+    ax1.grid(True, alpha=0.6, linestyle='-', linewidth=0.8, which='major', color='gray')
+    ax1.grid(True, alpha=0.3, linestyle=':', linewidth=0.5, which='minor', color='gray')
+    ax1.set_xscale('log')
+    ax1.set_facecolor('white')
+    
+    # Customize right subplot (processing time)
+    ax2.set_xlabel('Number of Changes', fontsize=11, fontweight='bold')
+    ax2.set_ylabel('Processing Time (ms)', fontsize=11, fontweight='bold')
+    ax2.set_title('Processing Time', fontsize=12, fontweight='bold', pad=15)
+    ax2.legend(loc='upper left', framealpha=0.9, fontsize=9)
+    ax2.grid(True, alpha=0.6, linestyle='-', linewidth=0.8, which='major', color='gray')
+    ax2.grid(True, alpha=0.3, linestyle=':', linewidth=0.5, which='minor', color='gray')
+    ax2.set_xscale('log')
+    ax2.set_yscale('log', base=2)
+    ax2.set_facecolor('white')
+    
+    # Add overall title
+    fig.suptitle('Partial Changesets Performance (Buffered Sync)', 
+                 fontsize=14, fontweight='bold', y=0.98)
+    
+    # Add a subtle background
+    fig.patch.set_facecolor('white')
+    
+    # Adjust layout to prevent label cutoff
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    
+    # Save the chart
+    plt.savefig(output_file, dpi=300, bbox_inches='tight')
+    print(f"Partials chart saved to: {output_file}")
+    
+    # Also save as SVG for better quality in presentations
+    svg_file = output_file.with_suffix('.svg')
+    plt.savefig(svg_file, format='svg', bbox_inches='tight')
+    print(f"Partials SVG chart saved to: {svg_file}")
+    
+    plt.close()
+
+
 def main():
     # Find the Criterion target directory
     repo_root = Path(__file__).parent.parent
@@ -325,9 +435,17 @@ def main():
                 print(f"  Batch {batch_size:3d} ({data['elements']:3d} elements): {data['throughput']:7.2f} Kelem/s")
     print("=" * 80)
     
-    # Generate the chart
-    output_file = repo_root / "benchmark_results.png"
+    # Ensure the benchmark_results directory exists
+    benchmark_results_dir = repo_root / "benchmark_results"
+    benchmark_results_dir.mkdir(parents=True, exist_ok=True)
+
+    # Generate the main chart (full changesets)
+    output_file = benchmark_results_dir / "sync_fulls.png"
     generate_chart(results, output_file)
+    
+    # Generate the partials chart (if data exists)
+    partials_output_file = benchmark_results_dir / "sync_partials.png"
+    generate_partials_chart(results, partials_output_file)
     
     print(f"\n✓ Chart generation complete!")
 
