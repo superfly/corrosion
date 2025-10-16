@@ -6,3 +6,4 @@
 .direnv/**
 *.log
 .antithesis/config/volumes
+benchmark_results.*
