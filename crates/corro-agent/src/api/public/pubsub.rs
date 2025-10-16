@@ -900,7 +900,7 @@ mod tests {
         pubsub::ChangeType,
     };
     use eyre::{Result, WrapErr};
-    use http_body::Body;
+    use futures::StreamExt;
     use serde::de::DeserializeOwned;
     use spawn::wait_for_all_pending_handles;
     use std::time::Instant;
@@ -916,6 +916,24 @@ mod tests {
     use crate::api::public::{api_v1_db_schema, api_v1_transactions};
     use corro_tests::launch_test_agent;
     use corro_types::api::SqliteValue::Integer;
+
+    async fn assert_ok(res: http::Response<axum::body::Body>) -> axum::body::BodyDataStream {
+        let status = res.status();
+        if status != StatusCode::OK {
+            match axum::body::to_bytes(res.into_body(), usize::MAX).await {
+                Ok(body) => {
+                    println!("body: {}", String::from_utf8_lossy(&body));
+                }
+                Err(err) => {
+                    println!("unable to read body: {err}");
+                }
+            }
+
+            panic!("{status} != OK");
+        } else {
+            res.into_body().into_data_stream()
+        }
+    }
 
     struct PubSubAgent {
         ta: corro_tests::TestAgent,
@@ -1055,7 +1073,7 @@ mod tests {
             sub_params: SubParams,
             query_or_sub_id: Either<corro_types::api::Statement, Uuid>,
         ) -> eyre::Result<SubscriptionStream> {
-            let mut res = match &query_or_sub_id {
+            let res = match &query_or_sub_id {
                 Either::Right(sub_id) => api_v1_sub_by_id(
                     Extension(self.ta.agent.clone()),
                     Extension(self.subs_bcast_cache.clone()),
@@ -1076,11 +1094,6 @@ mod tests {
                 .into_response(),
             };
 
-            if res.status() != StatusCode::OK {
-                let b = res.body_mut().data().await.unwrap().unwrap();
-                return Err(eyre::eyre!(String::from_utf8_lossy(&b).to_string()));
-            }
-
             // The api should always return a corro-query-id header
             let query_id_header = res
                 .headers()
@@ -1093,13 +1106,10 @@ mod tests {
                 assert_eq!(sub_id, res_sub_id);
             }
 
+            let body = assert_ok(res).await;
+
             Ok(SubscriptionStream {
-                iter: RowsIter {
-                    body: res.into_body(),
-                    codec: LinesCodec::new(),
-                    buf: BytesMut::new(),
-                    done: false,
-                },
+                iter: RowsIter::new(body),
                 sub_id: res_sub_id,
             })
         }
@@ -1751,7 +1761,7 @@ mod tests {
         bulk_insert_fn(410).await?;
         let events = s.receive_all_events().await;
         assert!(s.iter.done);
-        assert!(s.iter.body.data().await.is_none());
+        assert!(s.iter.body.next().await.is_none());
         assert!(events.len() < 410 * 100);
 
         // No more events should be received on that subscription
@@ -1921,22 +1931,6 @@ mod tests {
         }
 
         Ok(())
-    async fn assert_ok(res: http::Response<axum::body::Body>) -> axum::body::BodyDataStream {
-        let status = res.status();
-        if status != StatusCode::OK {
-            match axum::body::to_bytes(res.into_body(), usize::MAX).await {
-                Ok(body) => {
-                    println!("body: {}", String::from_utf8_lossy(&body));
-                }
-                Err(err) => {
-                    println!("unable to read body: {err}");
-                }
-            }
-
-            panic!("{status} != OK");
-        } else {
-            res.into_body().into_data_stream()
-        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
@@ -1964,24 +1958,13 @@ mod tests {
                     Either::Left(TEST_QUERY1.into()),
                 )
                 .await?;
-            let res = api_v1_subs(
-                Extension(agent.clone()),
-                Extension(bcast_cache.clone()),
-                Extension(tripwire.clone()),
-                axum::extract::Query(SubParams::default()),
-                axum::Json(Statement::Simple("select * from tests".into())),
-            )
-            .await
-            .into_response();
-
-            let body = assert_ok(res).await;
 
             // only want notifications
             // small sleep here to make sure `broadcast_changes` has already run
             // for earlier transactions
             tokio::time::sleep(Duration::from_secs(1)).await;
 
-            let mut notify_res = api_v1_updates(
+            let notify_res = api_v1_updates(
                 Extension(agent.ta.agent.clone()),
                 Extension(agent.updates_bcast_cache.clone()),
                 Extension(agent.tripwire.clone()),
@@ -1994,12 +1977,7 @@ mod tests {
 
             agent.insert_test_data(&data[2..3]).await?;
 
-            let mut notify_rows = RowsIter {
-                body: notify_res.into_body(),
-                codec: LinesCodec::new(),
-                buf: BytesMut::new(),
-                done: false,
-            };
+            let mut notify_rows = RowsIter::new(notify_body);
 
             s1.assert_initial_query_results(
                 vec!["id".into(), "text".into()],
@@ -2041,7 +2019,7 @@ mod tests {
                 .await;
 
             // new subscriber for updates
-            let mut notify_res2 = api_v1_updates(
+            let notify_res2 = api_v1_updates(
                 Extension(agent.ta.agent.clone()),
                 Extension(agent.updates_bcast_cache.clone()),
                 Extension(agent.tripwire.clone()),
@@ -2448,7 +2426,7 @@ mod tests {
                     }
                 }
 
-                let bytes_res = timeout(RECV_TIMEOUT, self.body.data()).await;
+                let bytes_res = timeout(RECV_TIMEOUT, self.body.next()).await;
                 match bytes_res {
                     Ok(Some(Ok(b))) => {
                         // debug!("read {} bytes", b.len());
