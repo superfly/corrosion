@@ -42,7 +42,7 @@ use tracing::{debug, error, trace, warn};
 use tripwire::Tripwire;
 
 use crate::{
-    actor::{Actor, ActorId, ClusterId},
+    actor::{Actor, ActorId, ClusterId, MembershipId},
     base::{CrsqlDbVersion, CrsqlDbVersionRange, CrsqlSeq, CrsqlSeqRange},
     broadcast::{BroadcastInput, ChangeSource, ChangeV1, FocaInput, Timestamp},
     channel::{bounded, CorroSender},
@@ -147,12 +147,17 @@ impl Agent {
         }))
     }
 
-    pub fn actor<C: Into<Option<ClusterId>>>(&self, cluster_id: C) -> Actor {
+    pub fn actor<C: Into<Option<ClusterId>>, M: Into<Option<MembershipId>>>(
+        &self,
+        cluster_id: C,
+        membership_id: M,
+    ) -> Actor {
         Actor::new(
             self.0.actor_id,
             self.external_addr().unwrap_or_else(|| self.gossip_addr()),
             self.clock().new_timestamp().into(),
             cluster_id.into().unwrap_or_else(|| self.cluster_id()),
+            membership_id.into(),
         )
     }
 
@@ -255,6 +260,10 @@ impl Agent {
 
     pub fn cluster_id(&self) -> ClusterId {
         *self.0.cluster_id.load().as_ref()
+    }
+
+    pub fn membership_id(&self) -> Option<MembershipId> {
+        self.0.config.load().gossip.membership_id
     }
 
     pub fn update_clock_with_timestamp(
