@@ -1165,6 +1165,8 @@ impl VersionsSnapshot {
                 }, |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
 
                 warn!("already had gaps entry! actor_id: {actor_id}, start: {start}, end: {end}");
+                let details = json!({"actor_id": actor_id, "start": start, "end": end});
+                assert_unreachable!("gaps entry present", &details);
 
                 return Err(e);
             }
