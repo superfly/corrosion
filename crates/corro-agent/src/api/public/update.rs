@@ -10,7 +10,6 @@ use corro_types::{
     persistent_gauge,
     updates::{Handle, UpdateCreated, UpdateHandle, UpdatesManager},
 };
-use futures::future::poll_fn;
 use tokio::sync::{
     broadcast::{self, error::RecvError},
     mpsc, RwLock as TokioRwLock,
@@ -19,7 +18,10 @@ use tracing::{debug, info, warn};
 use tripwire::Tripwire;
 use uuid::Uuid;
 
-use crate::api::{public::pubsub::MatcherUpsertError, utils::CountedBody};
+use crate::api::{
+    public::pubsub::MatcherUpsertError,
+    utils::{BodySender, CountedBody},
+};
 
 pub type UpdateBroadcastCache = HashMap<Uuid, broadcast::Sender<Bytes>>;
 pub type SharedUpdateBroadcastCache = Arc<TokioRwLock<UpdateBroadcastCache>>;
@@ -49,20 +51,17 @@ pub async fn api_v1_updates(
 
     let (handle, maybe_created) = match upsert_res {
         Ok(res) => res,
-        Err(e) => {
-            return hyper::Response::<CountedBody<hyper::Body>>::from(MatcherUpsertError::from(e))
-        }
+        Err(e) => return hyper::Response::from(MatcherUpsertError::from(e)),
     };
 
     let (tx, body) = CountedBody::channel(
         persistent_gauge!("corro.api.active.streams", "source" => "updates", "protocol" => "http"),
     );
-    // let (forward_tx, forward_rx) = mpsc::channel(10240);
 
     let (update_id, sub_rx) =
         match upsert_update(handle.clone(), maybe_created, updates, &mut bcast_write).await {
             Ok(id) => id,
-            Err(e) => return hyper::Response::<CountedBody<hyper::Body>>::from(e),
+            Err(e) => return hyper::Response::from(e),
         };
 
     tokio::spawn(forward_update_bytes_to_body_sender(
@@ -72,7 +71,7 @@ pub async fn api_v1_updates(
     hyper::Response::builder()
         .status(StatusCode::OK)
         .header("corro-query-id", update_id.to_string())
-        .body(body)
+        .body(axum::body::Body::new(body))
         .expect("could not generate ok http response for update request")
 }
 
@@ -188,7 +187,7 @@ fn make_query_event_bytes(
 async fn forward_update_bytes_to_body_sender(
     update: UpdateHandle,
     mut rx: broadcast::Receiver<Bytes>,
-    mut tx: hyper::body::Sender,
+    mut tx: BodySender,
     mut tripwire: Tripwire,
 ) {
     let mut buf = BytesMut::new();
@@ -215,7 +214,7 @@ async fn forward_update_bytes_to_body_sender(
                         return;
                     },
                     Err(RecvError::Closed) => {
-                        info!(update_id = %update.id(), "events subcription ran out");
+                        info!(update_id = %update.id(), "events subscription ran out");
                         return;
                     },
                 }
@@ -227,8 +226,8 @@ async fn forward_update_bytes_to_body_sender(
                         return;
                     }
                 } else {
-                    if let Err(e) = poll_fn(|cx| tx.poll_ready(cx)).await {
-                        warn!(update_id = %update.id(), error = %e, "body sender was closed or errored, stopping event broadcast sends");
+                    if tx.is_closed() {
+                        warn!(update_id = %update.id(), "body sender was closed, stopping event broadcast sends");
                         return;
                     }
                     send_deadline.as_mut().reset(tokio::time::Instant::now() + Duration::from_millis(10));

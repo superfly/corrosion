@@ -92,11 +92,11 @@ pub async fn launch_test_agent<F: FnOnce(ConfigBuilder) -> Result<Config, Config
 
 impl TestAgent {
     pub fn client(&self) -> CorrosionClient {
-        CorrosionClient::new(self.agent.api_addr(), self.agent.db_path())
+        CorrosionClient::new(self.agent.api_addr(), self.agent.db_path()).unwrap()
     }
 
     pub fn api_client(&self) -> CorrosionApiClient {
-        CorrosionApiClient::new(self.agent.api_addr())
+        CorrosionApiClient::new(self.agent.api_addr()).unwrap()
     }
 
     // Use for out-of-band inserts

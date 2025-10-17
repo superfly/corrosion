@@ -34,14 +34,16 @@ use antithesis_sdk::{assert_always, assert_unreachable};
 use axum::{
     error_handling::HandleErrorLayer,
     extract::DefaultBodyLimit,
-    headers::{authorization::Bearer, Authorization},
     routing::{get, post},
-    BoxError, Extension, Router, TypedHeader,
+    BoxError, Extension, Router,
+};
+use axum_extra::{
+    headers::{authorization::Bearer, Authorization},
+    TypedHeader,
 };
 use corro_types::broadcast::Timestamp;
 use foca::Member;
-use futures::FutureExt;
-use hyper::{server::conn::AddrIncoming, StatusCode};
+use http::StatusCode;
 use metrics::{counter, histogram};
 use rangemap::{RangeInclusiveMap, RangeInclusiveSet};
 use rusqlite::{named_params, params, Connection};
@@ -176,7 +178,7 @@ pub async fn load_member_states(agent: &Agent) -> Vec<(SocketAddr, Member<Actor>
 
 pub async fn setup_http_api_handler(
     agent: &Agent,
-    tripwire: &Tripwire,
+    tripwire: &mut Tripwire,
     subs_bcast_cache: BcastCache,
     updates_bcast_cache: SharedUpdateBroadcastCache,
     subs_manager: &SubsManager,
@@ -228,7 +230,7 @@ pub async fn setup_http_api_handler(
             ),
         )
         .route(
-            "/v1/updates/:table",
+            "/v1/updates/{table}",
             post(api_v1_updates).route_layer(
                 tower::ServiceBuilder::new()
                     .layer(HandleErrorLayer::new(|_error: BoxError| async {
@@ -242,7 +244,7 @@ pub async fn setup_http_api_handler(
             ),
         )
         .route(
-            "/v1/subscriptions/:id",
+            "/v1/subscriptions/{id}",
             get(api_v1_sub_by_id).route_layer(
                 tower::ServiceBuilder::new()
                     .layer(HandleErrorLayer::new(|_error: BoxError| async {
@@ -294,40 +296,79 @@ pub async fn setup_http_api_handler(
                 .layer(Extension(tripwire.clone())),
         )
         .layer(DefaultBodyLimit::disable())
-        .layer(TraceLayer::new_for_http());
+        .layer(TraceLayer::new_for_http())
+        .into_make_service_with_connect_info::<std::net::SocketAddr>();
 
     let mut handles: Vec<JoinHandle<()>> = vec![];
     for api_listener in api_listeners {
         let api_addr = api_listener.local_addr()?;
         info!("Starting API listener on tcp/{api_addr}");
-        let mut incoming = AddrIncoming::from_listener(api_listener)?;
-        incoming.set_nodelay(true);
 
-        let fut = axum::Server::builder(incoming)
-            .executor(CountedExecutor)
-            .serve(
-                api.clone()
-                    .into_make_service_with_connect_info::<SocketAddr>(),
-            )
-            .with_graceful_shutdown(
-                tripwire
-                    .clone()
-                    .inspect(move |_| info!("corrosion api http tripped {api_addr}")),
-            )
-            .inspect(|_| info!("corrosion api is done"));
-        handles.push(spawn_counted(async move {
-            let _ = fut.await;
-        }));
+        let mut svc = api.clone();
+        let mut tw = tripwire.clone();
+        let handle = spawn_counted(async move {
+            loop {
+                let (stream, addr) = tokio::select! {
+                    res = api_listener.accept() => {
+                        match res {
+                            Ok(s) => s,
+                            Err(error) => {
+                                debug!(%api_addr, %error, "API listener closed");
+                                break;
+                            }
+                        }
+                    }
+                    _ = &mut tw => {
+                        break;
+                    }
+                };
+
+                if let Err(error) = stream.set_nodelay(true) {
+                    error!(%addr, %error, "failed to set nodelay");
+                    continue;
+                }
+
+                use tower::Service;
+                let Ok(svc) = svc.call(addr).await;
+                let mut tw = tw.clone();
+                tokio::spawn(async move {
+                    let stream = hyper_util::rt::TokioIo::new(stream);
+
+                    let hyper_service = hyper::service::service_fn(
+                        move |request: hyper::Request<hyper::body::Incoming>| {
+                            svc.clone().call(request)
+                        },
+                    );
+
+                    let builder =
+                        hyper_util::server::conn::auto::Builder::new(CountedExecutor).http1_only();
+                    let conn = builder.serve_connection_with_upgrades(stream, hyper_service);
+                    tokio::pin!(conn);
+
+                    tokio::select! {
+                        _res = conn.as_mut() => {
+                            trace!("corrosion api is done");
+                        }
+                        _ = &mut tw => {
+                            debug!("corrosion api http tripped {api_addr}");
+                            conn.as_mut().graceful_shutdown();
+                        }
+                    };
+                });
+            }
+        });
+
+        handles.push(handle);
     }
 
     Ok(handles)
 }
 
-async fn require_authz<B>(
+async fn require_authz(
     Extension(agent): Extension<Agent>,
     maybe_authz_header: Option<TypedHeader<Authorization<Bearer>>>,
-    request: axum::http::Request<B>,
-    next: axum::middleware::Next<B>,
+    request: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
 ) -> Result<axum::response::Response, axum::http::StatusCode> {
     let passed = if let Some(ref authz) = agent.config().api.authorization {
         match authz {
