@@ -338,7 +338,6 @@ async fn test_pg_readonly() {
     wait_for_all_pending_handles().await;
 }
 
-
 #[tracing_test::traced_test]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_pg_corrrosion_shutdown() {
@@ -370,10 +369,17 @@ async fn test_pg_corrrosion_shutdown() {
     wait_for_all_pending_handles().await;
 
     // Check that we receive 57P01 error
-    let e = tokio::time::timeout(Duration::from_secs(2), rx).await.unwrap().unwrap();
+    let e = tokio::time::timeout(Duration::from_secs(2), rx)
+        .await
+        .unwrap()
+        .unwrap();
     assert!(client.is_closed());
     assert!(e.as_db_error().unwrap().code().code().eq("57P01"));
-    assert!(e.as_db_error().unwrap().message().contains("Corrosion is shutting down"));
+    assert!(e
+        .as_db_error()
+        .unwrap()
+        .message()
+        .contains("Corrosion is shutting down"));
 }
 
 struct TestCertificates {
