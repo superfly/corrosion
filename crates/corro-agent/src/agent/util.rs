@@ -474,13 +474,18 @@ pub async fn apply_fully_buffered_changes_loop(
 pub async fn clear_buffered_meta_loop(
     agent: Agent,
     mut rx_partials: CorroReceiver<(ActorId, CrsqlDbVersionRange)>,
+    tripwire: Tripwire,
 ) {
     let tx_timeout: Duration = Duration::from_secs(agent.config().perf.sql_tx_timeout as u64);
 
-    while let Some((actor_id, versions)) = rx_partials.recv().await {
+    let mut recv_tripwire = tripwire.clone();
+    while let Outcome::Completed(Some((actor_id, versions))) =
+        rx_partials.recv().preemptible(&mut recv_tripwire).await
+    {
         let pool = agent.pool().clone();
         let self_actor_id = agent.actor_id();
-        tokio::spawn(async move {
+        let mut tripwire = tripwire.clone();
+        spawn_counted(async move {
             loop {
                 let res = {
                     let mut conn = pool.write_low().await?;
@@ -525,7 +530,12 @@ pub async fn clear_buffered_meta_loop(
                     }
                 }
 
-                tokio::time::sleep(Duration::from_secs(2)).await;
+                tokio::select! {
+                    _ = &mut tripwire => {
+                        break;
+                    }
+                    _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+                }
             }
 
             Ok::<_, eyre::Report>(())

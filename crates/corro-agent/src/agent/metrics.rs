@@ -4,12 +4,16 @@ use metrics::gauge;
 use std::time::Duration;
 use tokio::task::block_in_place;
 use tracing::error;
+use tripwire::Tripwire;
 
-pub async fn metrics_loop(agent: Agent, transport: Transport) {
+pub async fn metrics_loop(agent: Agent, transport: Transport, mut tripwire: Tripwire) {
     let mut metrics_interval = tokio::time::interval(Duration::from_secs(10));
 
     loop {
-        metrics_interval.tick().await;
+        tokio::select! {
+            _ = metrics_interval.tick() => {},
+            _ = &mut tripwire => break,
+        }
 
         block_in_place(|| collect_metrics(&agent, &transport));
     }

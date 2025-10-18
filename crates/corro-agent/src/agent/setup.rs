@@ -9,6 +9,7 @@ use metrics::counter;
 use parking_lot::RwLock;
 use rusqlite::{Connection, OptionalExtension};
 use serde_json::json;
+use spawn::spawn_counted;
 use std::{net::SocketAddr, ops::DerefMut, sync::Arc, time::Duration};
 use tokio::{
     net::TcpListener,
@@ -180,14 +181,20 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
         }
     });
 
-    tokio::spawn({
+    spawn_counted({
         let registry = lock_registry.clone();
+        let mut tripwire = tripwire.clone();
         async move {
             const WARNING_THRESHOLD: Duration = Duration::from_secs(10);
             let mut interval = tokio::time::interval(Duration::from_secs(60));
 
             loop {
-                interval.tick().await;
+                tokio::select! {
+                    _ = interval.tick() => {}
+                    _ = &mut tripwire => {
+                        return;
+                    }
+                }
                 trace!("inspecting the lock registry...");
 
                 let top: IndexMap<_, _> = {
