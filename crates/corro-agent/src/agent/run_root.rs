@@ -97,7 +97,7 @@ async fn run(
     );
 
     //// Update member connection RTTs
-    handlers::spawn_rtt_handler(&agent, rtt_rx);
+    handlers::spawn_rtt_handler(&agent, rtt_rx, tripwire.clone());
 
     handlers::spawn_swim_announcer(&agent, gossip_addr, tripwire.clone());
 
@@ -125,16 +125,26 @@ async fn run(
     .await?;
     handles.append(&mut http_handles);
 
-    tokio::spawn(util::clear_buffered_meta_loop(agent.clone(), rx_clear_buf));
+    spawn_counted(util::clear_buffered_meta_loop(
+        agent.clone(),
+        rx_clear_buf,
+        tripwire.clone(),
+    ));
 
+    spawn_counted(metrics::metrics_loop(
+        agent.clone(),
+        transport.clone(),
+        tripwire.clone(),
+    ));
     spawn_counted(handlers::handle_gossip_to_send(
         transport.clone(),
         to_send_rx,
         tripwire.clone(),
     ));
-    tokio::spawn(handlers::handle_notifications(
+    spawn_counted(handlers::handle_notifications(
         agent.clone(),
         notifications_rx,
+        tripwire.clone(),
     ));
 
     spawn_handle_db_maintenance(&agent);

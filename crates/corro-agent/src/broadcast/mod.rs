@@ -33,7 +33,7 @@ use tokio::{
 use tokio_stream::StreamExt;
 use tokio_util::codec::{Encoder, LengthDelimitedCodec};
 use tracing::{debug, error, log::info, trace, warn};
-use tripwire::Tripwire;
+use tripwire::{Outcome, PreemptibleFutureExt, Tripwire};
 
 use corro_types::{
     actor::{Actor, ActorId},
@@ -150,11 +150,16 @@ pub fn runtime_loop(
     let (timer_tx, mut timer_rx) = mpsc::channel(10);
     let timer_spawner = TimerSpawner::new(timer_tx);
 
-    tokio::spawn(async move {
-        while let Some((duration, timer)) = to_schedule_rx.recv().await {
-            timer_spawner.spawn((duration, timer));
-        }
-    });
+    {
+        let mut tripwire = tripwire.clone();
+        spawn_counted(async move {
+            while let Outcome::Completed(Some((duration, timer))) =
+                to_schedule_rx.recv().preemptible(&mut tripwire).await
+            {
+                timer_spawner.spawn((duration, timer));
+            }
+        });
+    }
 
     let cluster_size = Arc::new(AtomicU32::new(1));
 
@@ -375,7 +380,7 @@ pub fn runtime_loop(
         }
     });
 
-    tokio::spawn(handle_broadcasts(
+    spawn_counted(handle_broadcasts(
         agent,
         rx_bcast,
         transport,
