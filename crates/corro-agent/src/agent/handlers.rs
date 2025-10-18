@@ -261,9 +261,9 @@ pub fn spawn_swim_announcer(agent: &Agent, gossip_addr: SocketAddr, mut tripwire
 pub async fn handle_gossip_to_send(
     transport: Transport,
     mut swim_to_send_rx: CorroReceiver<(Actor, Bytes)>,
+    mut tripwire: Tripwire,
 ) {
-    // TODO: use tripwire and drain messages to send when that happens...
-    while let Some((actor, data)) = swim_to_send_rx.recv().await {
+    let spawn_sender_fn = |(actor, data): (Actor, Bytes)| {
         trace!("got gossip to send to {actor:?}");
 
         let addr = actor.addr();
@@ -284,6 +284,16 @@ pub async fn handle_gossip_to_send(
             }
             .instrument(debug_span!("send_swim_payload", %addr, %actor_id, buf_size = len)),
         );
+    };
+        
+    while let Outcome::Completed(Some((actor, data))) = swim_to_send_rx.recv().preemptible(&mut tripwire).await {
+        spawn_sender_fn((actor, data));
+    }
+    if tripwire.is_shutting_down() {
+        // Send any remaining messages
+        while let Ok((actor, data)) = swim_to_send_rx.try_recv() {
+            spawn_sender_fn((actor, data));
+        }
     }
 }
 

@@ -691,7 +691,8 @@ pub async fn start(
                             Ok::<_, BoxError>(())
                         }
                         .preemptible(&mut tripwire)
-                        .await {
+                        .await
+                        {
                             Outcome::Completed(res) => res?,
                             Outcome::Preempted(_) => {}
                         }
