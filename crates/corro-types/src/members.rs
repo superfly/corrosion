@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, trace};
 
 use crate::{
-    actor::{Actor, ActorId, ClusterId},
+    actor::{Actor, ActorId, ClusterId, MemberId},
     broadcast::Timestamp,
 };
 
@@ -17,16 +17,23 @@ pub struct MemberState {
 
     pub ring: Option<u8>,
     pub last_sync_ts: Option<Timestamp>,
+    pub member_id: Option<MemberId>,
 }
 
 impl MemberState {
-    pub fn new(addr: SocketAddr, ts: Timestamp, cluster_id: ClusterId) -> Self {
+    pub fn new(
+        addr: SocketAddr,
+        ts: Timestamp,
+        cluster_id: ClusterId,
+        member_id: Option<MemberId>,
+    ) -> Self {
         Self {
             addr,
             ts,
             cluster_id,
             ring: None,
             last_sync_ts: None,
+            member_id: member_id,
         }
     }
 
@@ -44,6 +51,7 @@ pub struct Rtt {
 
 #[derive(Default)]
 pub struct Members {
+    pub member_id: Option<MemberId>,
     pub states: BTreeMap<ActorId, MemberState>,
     pub by_addr: BTreeMap<SocketAddr, ActorId>,
     pub rtts: BTreeMap<SocketAddr, Rtt>,
@@ -52,11 +60,19 @@ pub struct Members {
 #[derive(Debug, PartialEq)]
 pub enum MemberAddedResult {
     NewMember,
+    Removed,
     Updated,
     Ignored,
 }
 
 impl Members {
+    pub fn new(member_id: Option<MemberId>) -> Self {
+        Members {
+            member_id: member_id,
+            ..Default::default()
+        }
+    }
+
     pub fn get(&self, id: &ActorId) -> Option<&MemberState> {
         self.states.get(id)
     }
@@ -73,9 +89,24 @@ impl Members {
         let actor_id = actor.id();
         let mut ret = MemberAddedResult::Ignored;
 
+        if actor.member_id() != self.member_id {
+            let removed = self.states.remove(&actor_id).is_some();
+            self.by_addr.remove(&actor.addr());
+            return if removed {
+                MemberAddedResult::Removed
+            } else {
+                MemberAddedResult::Ignored
+            };
+        }
+
         let member = self.states.entry(actor_id).or_insert_with(|| {
             ret = MemberAddedResult::NewMember;
-            MemberState::new(actor.addr(), actor.ts(), actor.cluster_id())
+            MemberState::new(
+                actor.addr(),
+                actor.ts(),
+                actor.cluster_id(),
+                actor.member_id(),
+            )
         });
 
         trace!("member: {member:?}");
@@ -96,6 +127,7 @@ impl Members {
             member.addr = actor.addr();
             member.ts = actor.ts();
             member.cluster_id = actor.cluster_id();
+            member.member_id = actor.member_id();
             ret = MemberAddedResult::Updated;
         }
 

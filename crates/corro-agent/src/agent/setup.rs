@@ -74,7 +74,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
     }
 
     // do this early to error earlier
-    let members = Members::default();
+    let members = Members::new(conf.gossip.member_id);
 
     let actor_id = {
         // we need to set auto_vacuum before any tables are created

@@ -836,14 +836,14 @@ fn diff_member_states(
     }
 
     let members = agent.members().read();
-    let membership_id = agent.config().gossip.membership_id;
+    let member_id = agent.config().gossip.member_id;
 
     let to_update = foca_states
         .iter()
         .filter_map(|(id, member)| {
             let member = *member;
 
-            if member.id().membership_id() != membership_id {
+            if member.id().member_id() != member_id {
                 return None;
             }
 
@@ -876,7 +876,7 @@ fn diff_member_states(
 
     last_states.retain(|id, _v| {
         let foca_state = foca_states.get(id);
-        if foca_state.is_some() && foca_state.unwrap().id().membership_id() == membership_id {
+        if foca_state.is_some() && foca_state.unwrap().id().member_id() == member_id {
             true
         } else {
             to_delete.push(*id);

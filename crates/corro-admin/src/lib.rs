@@ -135,7 +135,7 @@ pub enum LogCommand {
 pub enum ClusterCommand {
     Rejoin,
     Members,
-    MembershipStates,
+    MembershipStates { local: bool },
     SetId(ClusterId),
 }
 
@@ -347,9 +347,20 @@ async fn handle_conn(
                     }
                     send_success(&mut stream).await;
                 }
-                Command::Cluster(ClusterCommand::MembershipStates) => {
+                Command::Cluster(ClusterCommand::MembershipStates { local }) => {
                     info_log(&mut stream, "gathering membership state").await;
 
+                    if local {
+                        let members = agent.members().read().states.clone();
+                        for member in members {
+                            match serde_json::to_value(&member) {
+                                Ok(json) => send(&mut stream, Response::Json(json)).await,
+                                Err(e) => send_error(&mut stream, e).await,
+                            }
+                        }
+                        send_success(&mut stream).await;
+                        continue;
+                    }
                     let (tx, mut rx) = mpsc::channel(1024);
                     if let Err(e) = agent
                         .tx_foca()
@@ -386,11 +397,11 @@ async fn handle_conn(
 
                         let (cb_tx, cb_rx) = oneshot::channel();
 
-                        let membership_id = agent.membership_id();
+                        let member_id = agent.member_id();
                         agent
                             .tx_foca()
                             .blocking_send(FocaInput::Cmd(FocaCmd::ChangeIdentity(
-                                agent.actor(cluster_id, membership_id),
+                                agent.actor(cluster_id, member_id),
                                 cb_tx,
                             )))
                             .map_err(|_| ProcessingError::Send)?;

@@ -88,7 +88,7 @@ async fn run(
     //// Start the main SWIM runtime loop
     runtime_loop(
         // here the agent already has the current cluster_id, we don't need to pass one
-        agent.actor(None, agent.config().gossip.membership_id),
+        agent.actor(None, agent.config().gossip.member_id),
         agent.clone(),
         transport.clone(),
         rx_foca,

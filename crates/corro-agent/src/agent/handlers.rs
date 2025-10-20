@@ -298,17 +298,11 @@ pub async fn handle_notifications(
         trace!("handle notification");
         match notification {
             OwnedNotification::MemberUp(actor) => {
-                if actor.membership_id() != agent.config().gossip.membership_id {
-                    let removed = { agent.members().write().remove_member(&actor) };
-                    info!("Member Up but different membership id {actor:?} (removed: {removed})");
-                    continue;
-                }
-
                 let member_added_res = agent.members().write().add_member(&actor);
                 info!("Member Up {actor:?} (result: {member_added_res:?})");
 
                 match member_added_res {
-                    MemberAddedResult::NewMember => {
+                    MemberAddedResult::NewMember | MemberAddedResult::Removed => {
                         debug!("Member Added {actor:?}");
                         counter!("corro.gossip.member.added", "id" => actor.id().0.to_string(), "addr" => actor.addr().to_string()).increment(1);
 
@@ -839,7 +833,9 @@ pub async fn handle_sync(
                 .iter()
                 // Filter out self
                 .filter(|(id, state)| {
-                    **id != agent.actor_id() && state.cluster_id == agent.cluster_id()
+                    **id != agent.actor_id()
+                        && state.cluster_id == agent.cluster_id()
+                        && state.member_id == agent.member_id()
                 })
                 // Grab a ring-buffer index to the member RTT range
                 .map(|(id, state)| {
