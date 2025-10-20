@@ -35,6 +35,7 @@ services:
     container_name: corro-client
     hostname: corro-client
     image: corro-client:${SHORT_COMMIT}
+    init: true
     volumes:
       - ./volumes/corrosion1:/var/lib/corrosion1
       - ./volumes/corrosion2:/var/lib/corrosion2

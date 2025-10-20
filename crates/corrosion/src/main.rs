@@ -219,7 +219,7 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
                                 |row| row.get::<_, bool>(0),
                             )?;
                             if exists {
-                                eyre::bail!("Site id missing");
+                                eyre::bail!("Site id missing (but has rows in table: {table})");
                             }
                         }
                     }
