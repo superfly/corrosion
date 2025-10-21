@@ -61,6 +61,7 @@ use tokio::{
         mpsc::{channel, Sender},
         AcquireError, OwnedSemaphorePermit,
     },
+    time::timeout,
 };
 use tokio_rustls::TlsAcceptor;
 use tokio_util::{codec::Framed, either::Either, sync::CancellationToken};
@@ -506,7 +507,7 @@ async fn setup_tls(pg: PgConfig) -> eyre::Result<(Option<TlsAcceptor>, bool)> {
 pub async fn start(
     agent: Agent,
     pg: PgConfig,
-    mut tripwire: Tripwire,
+    tripwire: Tripwire,
 ) -> Result<PgServer, PgStartError> {
     let readonly = pg.readonly;
     let server = TcpListener::bind(pg.bind_addr).await?;
@@ -518,12 +519,14 @@ pub async fn start(
     "readonly" => readonly.to_string(),
     );
 
-    tokio::spawn(async move {
+    spawn_counted(async move {
+        let mut conn_tripwire = tripwire.clone();
         loop {
-            let (tcp_conn, remote_addr) = match server.accept().preemptible(&mut tripwire).await {
-                Outcome::Completed(res) => res?,
-                Outcome::Preempted(_) => break,
-            };
+            let (tcp_conn, remote_addr) =
+                match server.accept().preemptible(&mut conn_tripwire).await {
+                    Outcome::Completed(res) => res?,
+                    Outcome::Preempted(_) => break,
+                };
             let conn = CountedTcpStream::wrap(tcp_conn, conn_gauge.clone());
             let tls_acceptor = tls_acceptor.clone();
             debug!("Accepted a PostgreSQL connection (from: {remote_addr})");
@@ -531,6 +534,9 @@ pub async fn start(
             counter!("corro.api.connection.count", "protocol" => "pg", "readonly" => readonly.to_string()).increment(1);
 
             let agent = agent.clone();
+            let tripwire = tripwire.clone();
+            // Don't use spawn_counted here
+            // Until the connection gets fully established we don't need to gracefully close it
             tokio::spawn(async move {
                 conn.stream.set_nodelay(true)?;
                 {
@@ -639,45 +645,56 @@ pub async fn start(
 
                 let cancel = CancellationToken::new();
 
-                let mut frontend_task = tokio::spawn({
+                // If we're shutting down corrosion, both frontend and backend tasks will finish
+                let mut frontend_task = spawn_counted({
                     // Use a weak sender here; it should NOT hold the backend channel (and half-connection) open
                     let back_tx = back_tx.clone().downgrade();
                     let cancel = cancel.clone();
+                    let mut tripwire = tripwire.clone();
                     async move {
                         // cancel stuff if this loop breaks
                         let _drop_guard = cancel.drop_guard();
 
-                        while let Some(decode_res) = stream.next().await {
-                            let msg = match decode_res {
-                                Ok(msg) => msg,
-                                Err(PgWireError::IoError(io_error)) => {
-                                    debug!("postgres io error: {io_error}");
-                                    break;
-                                }
-                                Err(e) => {
-                                    warn!("could not receive pg frontend message: {e}");
-                                    // attempt to send this...
-                                    if let Some(back_tx) = back_tx.upgrade() {
-                                        _ = back_tx.try_send(
-                                            (
-                                                PgWireBackendMessage::ErrorResponse(
-                                                    ErrorInfo::new(
-                                                        "FATAL".to_owned(),
-                                                        "XX000".to_owned(),
-                                                        e.to_string(),
-                                                    )
-                                                    .into(),
-                                                ),
-                                                true,
-                                            )
-                                                .into(),
-                                        );
+                        match async move {
+                            while let Some(decode_res) = stream.next().await {
+                                let msg = match decode_res {
+                                    Ok(msg) => msg,
+                                    Err(PgWireError::IoError(io_error)) => {
+                                        debug!("postgres io error: {io_error}");
+                                        break;
                                     }
-                                    break;
-                                }
-                            };
+                                    Err(e) => {
+                                        warn!("could not receive pg frontend message: {e}");
+                                        // attempt to send this...
+                                        if let Some(back_tx) = back_tx.upgrade() {
+                                            _ = back_tx.try_send(
+                                                (
+                                                    PgWireBackendMessage::ErrorResponse(
+                                                        ErrorInfo::new(
+                                                            "FATAL".to_owned(),
+                                                            "XX000".to_owned(),
+                                                            e.to_string(),
+                                                        )
+                                                        .into(),
+                                                    ),
+                                                    true,
+                                                )
+                                                    .into(),
+                                            );
+                                        }
+                                        break;
+                                    }
+                                };
 
-                            front_tx.send(msg).await?;
+                                front_tx.send(msg).await?;
+                            }
+                            Ok::<_, BoxError>(())
+                        }
+                        .preemptible(&mut tripwire)
+                        .await
+                        {
+                            Outcome::Completed(res) => res?,
+                            Outcome::Preempted(_) => {}
                         }
                         debug!("frontend stream is done");
 
@@ -685,35 +702,67 @@ pub async fn start(
                     }
                 });
 
-                let mut backend_task = tokio::spawn({
+                let mut backend_task = spawn_counted({
                     let cancel = cancel.clone();
+                    let mut tripwire = tripwire.clone();
                     async move {
                         let _drop_guard = cancel.drop_guard();
-                        while let Some(back) = back_rx.recv().await {
-                            match back {
-                                BackendResponse::Message { message, flush } => {
-                                    if let PgWireBackendMessage::ErrorResponse(e) = &message {
-                                        warn!("sending: {e:?}");
-                                    } else {
-                                        debug!("sending: {message:?}");
+                        match async {
+                            while let Some(back) = back_rx.recv().await {
+                                match back {
+                                    BackendResponse::Message { message, flush } => {
+                                        if let PgWireBackendMessage::ErrorResponse(e) = &message {
+                                            warn!("sending: {e:?}");
+                                        } else {
+                                            debug!("sending: {message:?}");
+                                        }
+                                        sink.feed(message).await?;
+                                        if flush {
+                                            sink.flush().await?;
+                                        }
                                     }
-                                    sink.feed(message).await?;
-                                    if flush {
+                                    BackendResponse::Flush => {
                                         sink.flush().await?;
                                     }
                                 }
-                                BackendResponse::Flush => {
-                                    sink.flush().await?;
-                                }
                             }
+                            Ok::<_, std::io::Error>(())
                         }
-                        debug!("backend stream is done");
-                        // If we get here, we know that `back_rx` has been fully drained.
-                        // Close the sink, this calls shutdown() on the underlying TCP socket
-                        // If the other side behaves correctly, the frontend task will eventually receive an EOF
-                        // and will also complete; by that point we know all messages have been sent successfully over TCP.
-                        // However, if this is not handled correctly we time out later.
-                        sink.close().await?;
+                        .preemptible(&mut tripwire)
+                        .await
+                        {
+                            Outcome::Completed(res) => res?,
+                            Outcome::Preempted(_) => {}
+                        }
+                        if tripwire.is_shutting_down() {
+                            debug!("Closing connection due to corrosion shutdown");
+                            // Give 1s for graceful shutdown of the connection
+                            timeout(Duration::from_millis(1000), async move {
+                                let _ = sink
+                                    .feed(PgWireBackendMessage::ErrorResponse(
+                                        ErrorInfo::new(
+                                            "ERROR".to_owned(),
+                                            sql_state::SqlState::ADMIN_SHUTDOWN.code().into(),
+                                            "Corrosion is shutting down".into(),
+                                        )
+                                        .into(),
+                                    ))
+                                    .await;
+                                let _ = sink.flush().await;
+                                let _ = sink.close().await;
+                            })
+                            .await?;
+                        } else {
+                            debug!("Closing connection due to client disconnection");
+                            // If we get here, we know that `back_rx` has been fully drained.
+                            // Close the sink, this calls shutdown() on the underlying TCP socket
+                            // If the other side behaves correctly, the frontend task will eventually receive an EOF
+                            // and will also complete; by that point we know all messages have been sent successfully over TCP.
+                            // However, if this is not handled correctly we time out later.
+                            //
+                            // If we are shutting down when the client disconnects, we just exit. Don't need to timeout here
+                            let _ = sink.close().preemptible(&mut tripwire).await;
+                        }
                         Ok::<_, std::io::Error>(())
                     }
                 });

@@ -338,6 +338,50 @@ async fn test_pg_readonly() {
     wait_for_all_pending_handles().await;
 }
 
+#[tracing_test::traced_test]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_pg_corrrosion_shutdown() {
+    let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
+
+    let (_ta, server) = setup_pg_test_server(tripwire.clone(), None).await;
+
+    // Connect to the server
+    let conn_str = format!(
+        "host={} port={} user=testuser",
+        server.local_addr.ip(),
+        server.local_addr.port()
+    );
+
+    let (client, client_conn) = tokio_postgres::connect(&conn_str, NoTls)
+        .await
+        .expect("failed to connect to server");
+    println!("client is ready!");
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        if let Err(e) = client_conn.await {
+            tx.send(e).unwrap();
+        }
+    });
+
+    // Simulate a graceful shutdown
+    tripwire_tx.send(()).await.ok();
+    tripwire_worker.await;
+    wait_for_all_pending_handles().await;
+
+    // Check that we receive 57P01 error
+    let e = tokio::time::timeout(Duration::from_secs(2), rx)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(client.is_closed());
+    assert!(e.as_db_error().unwrap().code().code().eq("57P01"));
+    assert!(e
+        .as_db_error()
+        .unwrap()
+        .message()
+        .contains("Corrosion is shutting down"));
+}
+
 struct TestCertificates {
     ca_cert: Certificate,
     client_cert_signed: String,

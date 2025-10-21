@@ -143,18 +143,35 @@ pub fn spawn_incoming_connection_handlers(
 
 /// Spawn a single task that accepts chunks from a receiver and
 /// updates cluster member round-trip-times in the agent state.
-pub fn spawn_rtt_handler(agent: &Agent, rtt_rx: TokioReceiver<(SocketAddr, Duration)>) {
-    tokio::spawn({
+pub fn spawn_rtt_handler(
+    agent: &Agent,
+    rtt_rx: TokioReceiver<(SocketAddr, Duration)>,
+    tripwire: Tripwire,
+) {
+    spawn_counted({
         let agent = agent.clone();
+        let mut tripwire = tripwire.clone();
         async move {
             let stream = ReceiverStream::new(rtt_rx);
             // we can handle a lot of them I think...
             let chunker = stream.chunks_timeout(1024, Duration::from_secs(1));
             tokio::pin!(chunker);
-            while let Some(chunks) = StreamExt::next(&mut chunker).await {
-                let mut members = agent.members().write();
-                for (addr, rtt) in chunks {
-                    members.add_rtt(addr, rtt);
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = &mut tripwire => {
+                        break;
+                    }
+                    chunks = chunker.next() => {
+                        if let Some(chunks) = chunks {
+                            let mut members = agent.members().write();
+                            for (addr, rtt) in chunks {
+                                members.add_rtt(addr, rtt);
+                            }
+                        } else {
+                            break;
+                        }
+                    }
                 }
             }
         }
@@ -203,9 +220,10 @@ pub fn spawn_foca_handler(agent: &Agent, tripwire: &Tripwire, conn: &quinn::Conn
 /// everyone.
 ///
 ///
-pub fn spawn_swim_announcer(agent: &Agent, gossip_addr: SocketAddr, mut tripwire: Tripwire) {
-    tokio::spawn({
+pub fn spawn_swim_announcer(agent: &Agent, gossip_addr: SocketAddr, tripwire: Tripwire) {
+    spawn_counted({
         let agent = agent.clone();
+        let mut tripwire = tripwire.clone();
         async move {
             let mut boff = backoff::Backoff::new(10)
                 .timeout_range(Duration::from_secs(5), Duration::from_secs(120))
@@ -261,9 +279,9 @@ pub fn spawn_swim_announcer(agent: &Agent, gossip_addr: SocketAddr, mut tripwire
 pub async fn handle_gossip_to_send(
     transport: Transport,
     mut swim_to_send_rx: CorroReceiver<(Actor, Bytes)>,
+    mut tripwire: Tripwire,
 ) {
-    // TODO: use tripwire and drain messages to send when that happens...
-    while let Some((actor, data)) = swim_to_send_rx.recv().await {
+    let spawn_sender_fn = |(actor, data): (Actor, Bytes)| {
         trace!("got gossip to send to {actor:?}");
 
         let addr = actor.addr();
@@ -284,6 +302,18 @@ pub async fn handle_gossip_to_send(
             }
             .instrument(debug_span!("send_swim_payload", %addr, %actor_id, buf_size = len)),
         );
+    };
+
+    while let Outcome::Completed(Some((actor, data))) =
+        swim_to_send_rx.recv().preemptible(&mut tripwire).await
+    {
+        spawn_sender_fn((actor, data));
+    }
+    if tripwire.is_shutting_down() {
+        // Send any remaining messages
+        while let Ok((actor, data)) = swim_to_send_rx.try_recv() {
+            spawn_sender_fn((actor, data));
+        }
     }
 }
 
@@ -292,8 +322,11 @@ pub async fn handle_gossip_to_send(
 pub async fn handle_notifications(
     agent: Agent,
     mut notification_rx: CorroReceiver<OwnedNotification<Actor>>,
+    mut tripwire: Tripwire,
 ) {
-    while let Some(notification) = notification_rx.recv().await {
+    while let Outcome::Completed(Some(notification)) =
+        notification_rx.recv().preemptible(&mut tripwire).await
+    {
         trace!("handle notification");
         match notification {
             OwnedNotification::MemberUp(actor) => {
