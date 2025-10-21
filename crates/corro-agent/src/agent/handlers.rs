@@ -159,6 +159,9 @@ pub fn spawn_rtt_handler(
             loop {
                 tokio::select! {
                     biased;
+                    _ = &mut tripwire => {
+                        break;
+                    }
                     chunks = chunker.next() => {
                         if let Some(chunks) = chunks {
                             let mut members = agent.members().write();
@@ -168,9 +171,6 @@ pub fn spawn_rtt_handler(
                         } else {
                             break;
                         }
-                    }
-                    _ = &mut tripwire => {
-                        break;
                     }
                 }
             }
