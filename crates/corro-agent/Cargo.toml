@@ -71,3 +71,9 @@ governor.workspace = true
 [dev-dependencies]
 corro-tests = { path = "../corro-tests" }
 reqwest.workspace = true
+http-body = { workspace = true }
+criterion = { version = "0.5", features = ["async_tokio"] }
+
+[[bench]]
+name = "process_changes"
+harness = false
