@@ -585,6 +585,7 @@ async fn handle_broadcasts(
         }
 
         let prev_rate_limited = rate_limited;
+        rate_limited = false;
 
         // start with local broadcasts, they're higher priority
         let mut ring0 = HashSet::new();
