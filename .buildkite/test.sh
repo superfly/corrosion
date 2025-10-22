@@ -5,7 +5,7 @@ export RUST_LOG=info,corro=debug
 # Tests (with coverage + generating JUnit XML report)
 export NEXTEST_PROFILE=ci
 set +e
-cargo nextest run --all-targets --workspace
+cargo nextest run --tests --workspace
 test_status=$?
 set -e
 
