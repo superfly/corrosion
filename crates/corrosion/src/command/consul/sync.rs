@@ -576,6 +576,7 @@ async fn update_consul(
                 Ok(update_services(services, service_hashes, skip_hash_check))
             }
             Ok(Err(e)) => {
+                error!("error getting services from consul: {e}");
                 counter!("corro_consul.consul.response.errors", "error" => e.to_string(), "type" => "services").increment(1);
                 Err(e.into())
             }
