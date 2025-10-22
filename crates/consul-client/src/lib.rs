@@ -66,7 +66,7 @@ impl Client {
 
             reqwest::ClientBuilder::new()
                 .use_preconfigured_tls(tls_config)
-                .http2_prior_knowledge()
+                // .http2_prior_knowledge()
                 .build()
         } else {
             reqwest::ClientBuilder::new().http1_only().build()
