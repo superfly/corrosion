@@ -7,6 +7,7 @@ use std::{
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_with::{serde_as, NoneAsEmptyString};
+use tracing::error;
 
 use rusqlite::types::{FromSql, FromSqlError, ValueRef};
 
@@ -89,6 +90,7 @@ impl Client {
         let res = match self.client.get(format!("{}{path}", self.addr)).send().await {
             Ok(res) => res,
             Err(e) => {
+                error!("error getting {path} from consul: {e:?}");
                 return Err(e.into());
             }
         };
