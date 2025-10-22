@@ -67,7 +67,7 @@ impl Client {
                 .use_preconfigured_tls(tls_config)
                 .build()
         } else {
-            reqwest::ClientBuilder::new().http1_only().build()
+            reqwest::ClientBuilder::new().build()
         };
 
         Ok(Self {
