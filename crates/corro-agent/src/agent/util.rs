@@ -901,7 +901,7 @@ pub async fn process_multiple_changes(
                                 res
                             }
                             Err(e) => {
-                                error!("error processing single version: {e}");
+                                error!(%actor_id, versions = ?versions, "error processing single version: {e}");
                                 if e.sqlite_error_code().is_some_and(|code| {
                                     code != rusqlite::ErrorCode::DiskFull
                                         && code != rusqlite::ErrorCode::OperationInterrupted
