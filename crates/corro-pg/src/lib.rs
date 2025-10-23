@@ -9,6 +9,7 @@ use std::{
     collections::{BTreeSet, HashMap, VecDeque},
     fmt,
     net::SocketAddr,
+    rc::Rc,
     str::{FromStr, Utf8Error},
     sync::Arc,
     time::Duration,
@@ -52,7 +53,7 @@ use socket2::{SockRef, TcpKeepalive};
 use spawn::spawn_counted;
 use sqlite3_parser::ast::{
     As, Cmd, ColumnDefinition, CreateTableBody, Expr, FromClause, Id, InsertBody, Limit, Literal,
-    Name, OneSelect, ResultColumn, Select, SelectBody, SelectTable, Stmt, With,
+    Name, OneSelect, QualifiedName, ResultColumn, Select, SelectBody, SelectTable, Stmt, With,
 };
 use sqlparser::ast::Statement as PgStatement;
 use tokio::{
@@ -982,14 +983,29 @@ pub async fn start(
                                                 .collect();
 
                                             debug!("params types {param_types:?}");
+                                            debug!("prepped parameter count: {}", prepped.parameter_count());
 
                                             if param_types.len() != prepped.parameter_count() {
-                                                param_types = parameter_types(&schema, &parsed_cmd)
-                                                    .params
+                                                let extracted_types = parameter_types(&schema, &parsed_cmd);
+
+                                                if extracted_types.is_err() {
+                                                        let e = extracted_types.unwrap_err();
+                                                        back_tx.blocking_send(BackendResponse::Message {
+                                                            message: e.into(),
+                                                            flush: true,
+                                                        })?;
+                                                        discard_until_sync = true;
+                                                        continue;
+                                                    }
+                                                param_types = extracted_types.unwrap().params
                                                     .into_iter()
                                                     .map(|param| {
                                                         trace!("got param: {param:?}");
                                                         match (param.sqlite_type, param.source) {
+                                                            (SqliteType::Null, Some("TEXT[]")) => Type::TEXT_ARRAY,
+                                                            (SqliteType::Null, Some("INT[]")) => Type::INT8_ARRAY,
+                                                            (SqliteType::Null, Some("REAL[]")) => Type::FLOAT8_ARRAY,
+                                                            (SqliteType::Null, Some("BLOB[]")) => Type::BYTEA_ARRAY,
                                                             (SqliteType::Null, _) => unreachable!(),
                                                             (SqliteType::Text, src) => match src {
                                                                 Some("JSON") => Type::JSON,
@@ -1516,7 +1532,54 @@ pub async fn start(
                                                                 prepped
                                                                     .raw_bind_parameter(idx, dt)?;
                                                             }
-
+                                                            t @ &Type::INT8_ARRAY => {
+                                                                let value: Vec<i64> =
+                                                                    from_array_type_and_format(
+                                                                        t,
+                                                                        b,
+                                                                        format_code,
+                                                                    )?;
+                                                                trace!("binding idx {idx} w/ array value: {value:?}");
+                                                                prepped.raw_bind_parameter(
+                                                                    idx, Rc::new(value.into_iter().map(|v| v.into()).collect::<Vec<rusqlite::types::Value>>()),
+                                                                )?;
+                                                            }
+                                                            t @ &Type::TEXT_ARRAY => {
+                                                                let value: Vec<String> =
+                                                                    from_array_type_and_format(
+                                                                        t,
+                                                                        b,
+                                                                        format_code,
+                                                                    )?;
+                                                                trace!("binding idx {idx} w/ array value: {value:?}");
+                                                                prepped.raw_bind_parameter(
+                                                                    idx, Rc::new(value.into_iter().map(|v| v.into()).collect::<Vec<rusqlite::types::Value>>()),
+                                                                )?;
+                                                            }
+                                                            t @ &Type::BYTEA_ARRAY => {
+                                                                let value: Vec<Vec<u8>> =
+                                                                    from_array_type_and_format(
+                                                                        t,
+                                                                        b,
+                                                                        format_code,
+                                                                    )?;
+                                                                trace!("binding idx {idx} w/ array value: {value:?}");
+                                                                prepped.raw_bind_parameter(
+                                                                    idx, Rc::new(value.into_iter().map(|v| v.into()).collect::<Vec<rusqlite::types::Value>>()),
+                                                                )?;
+                                                            }
+                                                            t @ &Type::FLOAT8_ARRAY => {
+                                                                let value: Vec<f64> =
+                                                                    from_array_type_and_format(
+                                                                        t,
+                                                                        b,
+                                                                        format_code,
+                                                                    )?;
+                                                                trace!("binding idx {idx} w/ array value: {value:?}");
+                                                                prepped.raw_bind_parameter(
+                                                                    idx, Rc::new(value.into_iter().map(|v| v.into()).collect::<Vec<rusqlite::types::Value>>()),
+                                                                )?;
+                                                            }
                                                         t => {
                                                             warn!("unsupported type: {t:?}");
                                                             back_tx.blocking_send(
@@ -2492,6 +2555,8 @@ enum QueryError {
     Rusqlite(#[from] rusqlite::Error),
     #[error(transparent)]
     Unsupported(#[from] UnsupportedSqliteToPostgresType),
+    #[error(transparent)]
+    UntypedUnnest(#[from] UntypedUnnestParameter),
     #[error("statement is not parsable as SQLite-flavored SQL")]
     NotSqlite,
     #[error(transparent)]
@@ -2527,6 +2592,7 @@ impl TryFrom<QueryError> for PgWireBackendMessage {
                 _ => ErrorInfo::new("ERROR".to_owned(), "XX000".to_owned(), e.to_string()).into(),
             },
             QueryError::Unsupported(e) => e.into(),
+            QueryError::UntypedUnnest(e) => e.into(),
             e @ QueryError::NotSqlite => {
                 ErrorInfo::new("ERROR".to_owned(), "XX000".to_owned(), e.to_string()).into()
             }
@@ -2581,6 +2647,17 @@ fn from_type_and_format<'a, E, T: FromSql<'a> + FromStr<Err = E>>(
     })
 }
 
+fn from_array_type_and_format<'a, T: FromSql<'a>>(
+    t: &Type,
+    b: &'a [u8],
+    format_code: FormatCode,
+) -> Result<Vec<T>, ToParamError<String>> {
+    Ok(match format_code {
+        FormatCode::Text => panic!("Impossible - arrays are only sent in binary format"),
+        FormatCode::Binary => Vec::<T>::from_sql(t, b).map_err(ToParamError::FromSql)?,
+    })
+}
+
 #[derive(Debug, thiserror::Error)]
 #[error("Unsupported data type: {0}")]
 struct UnsupportedSqliteToPostgresType(String);
@@ -2594,6 +2671,22 @@ impl From<UnsupportedSqliteToPostgresType> for PgWireBackendMessage {
 impl From<UnsupportedSqliteToPostgresType> for ErrorResponse {
     fn from(value: UnsupportedSqliteToPostgresType) -> Self {
         ErrorInfo::new("ERROR".to_owned(), "42846".to_owned(), value.to_string()).into()
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("Untyped array argument for unnest(), please use CAST($N AS T) where T is one of: TEXT[] BLOB[] INT[] INTEGER[] BIGINT[] REAL[] FLOAT[] DOUBLE[]")]
+struct UntypedUnnestParameter;
+
+impl From<UntypedUnnestParameter> for PgWireBackendMessage {
+    fn from(value: UntypedUnnestParameter) -> Self {
+        PgWireBackendMessage::ErrorResponse(value.into())
+    }
+}
+
+impl From<UntypedUnnestParameter> for ErrorResponse {
+    fn from(value: UntypedUnnestParameter) -> Self {
+        ErrorInfo::new("ERROR".to_owned(), "42804".to_owned(), value.to_string()).into()
     }
 }
 
@@ -2725,7 +2818,7 @@ fn extract_params<'schema, 'stmt>(
     expr: &'stmt Expr,
     tables: &HashMap<String, &'schema Table>,
     params: &mut ParamsList<'stmt, 'schema>,
-) {
+) -> Result<(), UntypedUnnestParameter> {
     match expr {
         // expr BETWEEN expr AND expr
         Expr::Between {
@@ -2778,8 +2871,8 @@ fn extract_params<'schema, 'stmt>(
                     }
                 }
             } else {
-                extract_params(schema, lhs, tables, params);
-                extract_params(schema, rhs, tables, params);
+                extract_params(schema, lhs, tables, params)?;
+                extract_params(schema, rhs, tables, params)?;
             }
         }
 
@@ -2803,7 +2896,7 @@ fn extract_params<'schema, 'stmt>(
         Expr::DoublyQualified(_, _, _) => {}
 
         // EXISTS ( select )
-        Expr::Exists(select) => handle_select(schema, select, params),
+        Expr::Exists(select) => handle_select(schema, select, params)?,
 
         // function-name ( [DISTINCT] expr, ... ) filter-clause over-clause
         Expr::FunctionCall {
@@ -2876,7 +2969,7 @@ fn extract_params<'schema, 'stmt>(
             rhs,
         } => {
             // TODO: check LHS here
-            handle_select(schema, rhs.as_ref(), params);
+            handle_select(schema, rhs.as_ref(), params)?;
         }
 
         // expr IN schema-name.table-name | schema-name.table-function ( expr, ... )
@@ -2913,7 +3006,7 @@ fn extract_params<'schema, 'stmt>(
         // ( expr, ... )
         Expr::Parenthesized(exprs) => {
             for expr in exprs.iter() {
-                extract_params(schema, expr, tables, params)
+                extract_params(schema, expr, tables, params)?
             }
         }
 
@@ -2924,7 +3017,7 @@ fn extract_params<'schema, 'stmt>(
         Expr::Raise(_, _) => {}
 
         // SELECT
-        Expr::Subquery(select) => handle_select(schema, select, params),
+        Expr::Subquery(select) => handle_select(schema, select, params)?,
 
         // NOT | ~ | - | + expr
         Expr::Unary(_, _) => {}
@@ -2932,6 +3025,7 @@ fn extract_params<'schema, 'stmt>(
         // ? | $ | :
         Expr::Variable(_) => {}
     }
+    Ok(())
 }
 
 fn rem_first_and_last(value: &str) -> &str {
@@ -2945,7 +3039,7 @@ fn handle_select<'schema, 'stmt>(
     schema: &'schema Schema,
     select: &'stmt Select,
     params: &mut ParamsList<'stmt, 'schema>,
-) {
+) -> Result<(), UntypedUnnestParameter> {
     let tables = match &select.body.select {
         OneSelect::Select {
             columns,
@@ -2956,10 +3050,10 @@ fn handle_select<'schema, 'stmt>(
             window_clause: _,
         } => {
             let tables = if let Some(from) = from {
-                let tables = handle_from(schema, from, params);
+                let tables = handle_from(schema, from, params)?;
                 if let Some(where_clause) = where_clause {
                     trace!("WHERE CLAUSE: {where_clause:?}");
-                    extract_params(schema, where_clause, &tables, params);
+                    extract_params(schema, where_clause, &tables, params)?;
                 }
                 tables
             } else {
@@ -2995,15 +3089,80 @@ fn handle_select<'schema, 'stmt>(
         }
     };
     if let Some(limit) = &select.limit {
-        handle_limit(schema, limit, &tables, params);
+        handle_limit(schema, limit, &tables, params)?;
     }
+    Ok(())
+}
+
+/// Handle parameters in table function calls like unnest()
+/// Returns an error if unnest() is called with an untyped parameter
+///
+/// TODO: Perhaps we should enable chaining let expressions in the compiler
+///       to avoid the nesting here
+fn handle_table_call_params<'schema, 'stmt>(
+    qname: &QualifiedName,
+    args: &'stmt Option<Vec<Expr>>,
+    params: &mut ParamsList<'stmt, 'schema>,
+) -> Result<(), UntypedUnnestParameter> {
+    if let Some(exprs) = args {
+        let is_unnest = qname.name.0.eq_ignore_ascii_case("UNNEST");
+
+        for expr in exprs.iter() {
+            // If not unnest, just extract params
+            // TODO: handle expressions more generally
+            if !is_unnest {
+                if let Some(kind) = as_param(expr) {
+                    params.insert(Param {
+                        kind,
+                        sqlite_type: SqliteType::Text,
+                        source: None,
+                    });
+                }
+                continue;
+            }
+
+            // For unnest we force "CAST($1 AS type[])" for parameters
+            // We can't use the ANYARRAY postgres type here as it doesn't work with client libraries
+            if let Expr::Cast {
+                expr: inner_expr,
+                type_name,
+            } = expr
+            {
+                if let Some(kind) = as_param(inner_expr) {
+                    let type_str = type_name.name.to_uppercase();
+                    let is_array_type = type_str.ends_with("[]");
+                    let base_type = type_str[..type_str.len() - 2].trim();
+                    let param_source = match base_type {
+                        "TEXT" => Some("TEXT[]"),
+                        "BLOB" => Some("BLOB[]"),
+                        "INT" | "INTEGER" | "BIGINT" => Some("INT[]"),
+                        "REAL" | "FLOAT" | "DOUBLE" => Some("REAL[]"),
+                        _ => None,
+                    };
+                    if is_array_type {
+                        if let Some(source) = param_source {
+                            params.insert(Param {
+                                kind,
+                                sqlite_type: SqliteType::Null,
+                                source: Some(source),
+                            });
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            return Err(UntypedUnnestParameter);
+        }
+    }
+    Ok(())
 }
 
 fn handle_from<'schema, 'stmt>(
     schema: &'schema Schema,
     from: &'stmt FromClause,
     params: &mut ParamsList<'stmt, 'schema>,
-) -> HashMap<String, &'schema Table> {
+) -> Result<HashMap<String, &'schema Table>, UntypedUnnestParameter> {
     let mut tables: HashMap<String, &Table> = HashMap::new();
     if let Some(select) = from.select.as_deref() {
         match select {
@@ -3025,9 +3184,11 @@ fn handle_from<'schema, 'stmt>(
                     }
                 }
             }
-            SelectTable::TableCall(_, _, _) => {}
+            SelectTable::TableCall(qname, args, _alias) => {
+                handle_table_call_params(qname, args, params)?;
+            }
             SelectTable::Select(select, _) => {
-                handle_select(schema, select, params);
+                handle_select(schema, select, params)?;
             }
             SelectTable::Sub(_, _) => {}
         }
@@ -3053,15 +3214,17 @@ fn handle_from<'schema, 'stmt>(
                         }
                     }
                 }
-                SelectTable::TableCall(_, _, _) => {}
+                SelectTable::TableCall(qname, args, _alias) => {
+                    handle_table_call_params(qname, args, params)?;
+                }
                 SelectTable::Select(select, _) => {
-                    handle_select(schema, select, params);
+                    handle_select(schema, select, params)?;
                 }
                 SelectTable::Sub(_, _) => {}
             }
         }
     }
-    tables
+    Ok(tables)
 }
 
 #[derive(Debug)]
@@ -3095,7 +3258,7 @@ fn handle_limit<'schema, 'stmt>(
     limit: &'stmt Limit,
     tables: &HashMap<String, &'schema Table>,
     params: &mut ParamsList<'stmt, 'schema>,
-) {
+) -> Result<(), UntypedUnnestParameter> {
     if let Some(kind) = as_param(&limit.expr) {
         trace!("limit was a param (variable), pushing Integer type");
         params.insert(Param {
@@ -3104,7 +3267,7 @@ fn handle_limit<'schema, 'stmt>(
             source: None,
         });
     } else {
-        extract_params(schema, &limit.expr, tables, params);
+        extract_params(schema, &limit.expr, tables, params)?;
     }
     if let Some(offset) = &limit.offset {
         if let Some(kind) = as_param(offset) {
@@ -3115,19 +3278,20 @@ fn handle_limit<'schema, 'stmt>(
                 source: None,
             });
         } else {
-            extract_params(schema, offset, tables, params);
+            extract_params(schema, offset, tables, params)?;
         }
     }
+    Ok(())
 }
 
 fn handle_with<'schema, 'stmt>(
     schema: &'schema Schema,
     with: &'stmt With,
     params: &mut ParamsList<'stmt, 'schema>,
-) -> Vec<Table> {
+) -> Result<Vec<Table>, UntypedUnnestParameter> {
     let mut tables = vec![];
     for cte in with.ctes.iter() {
-        handle_select(schema, &cte.select, params);
+        handle_select(schema, &cte.select, params)?;
         tables.push(Table {
             name: cte.tbl_name.0.clone(),
             pk: Default::default(),
@@ -3162,18 +3326,18 @@ fn handle_with<'schema, 'stmt>(
             raw: CreateTableBody::AsSelect(cte.select.clone()),
         })
     }
-    tables
+    Ok(tables)
 }
 
 fn parameter_types<'schema, 'stmt>(
     schema: &'schema Schema,
     cmd: &'stmt ParsedCmd,
-) -> ParamsList<'stmt, 'schema> {
+) -> Result<ParamsList<'stmt, 'schema>, UntypedUnnestParameter> {
     let mut params = ParamsList::default();
 
     if let ParsedCmd::Sqlite(Cmd::Stmt(stmt)) = cmd {
         match stmt {
-            Stmt::Select(select) => handle_select(schema, select, &mut params),
+            Stmt::Select(select) => handle_select(schema, select, &mut params)?,
             Stmt::Delete {
                 with,
                 tbl_name,
@@ -3183,7 +3347,7 @@ fn parameter_types<'schema, 'stmt>(
             } => {
                 if let Some(with) = with {
                     // TODO: do something w/ the accumulated tables?
-                    handle_with(schema, with, &mut params);
+                    handle_with(schema, with, &mut params)?;
                 }
 
                 let mut tables = HashMap::new();
@@ -3191,11 +3355,11 @@ fn parameter_types<'schema, 'stmt>(
                     tables.insert(tbl_name.name.0.clone(), tbl);
                 }
                 if let Some(where_clause) = where_clause {
-                    extract_params(schema, where_clause, &tables, &mut params);
+                    extract_params(schema, where_clause, &tables, &mut params)?;
                 }
 
                 if let Some(limit) = limit {
-                    handle_limit(schema, limit, &tables, &mut params);
+                    handle_limit(schema, limit, &tables, &mut params)?;
                 }
             }
             Stmt::Insert {
@@ -3209,7 +3373,7 @@ fn parameter_types<'schema, 'stmt>(
 
                 if let Some(with) = with {
                     // TODO: do something w/ the accumulated tables?
-                    handle_with(schema, with, &mut params);
+                    handle_with(schema, with, &mut params)?;
                 }
 
                 if let Some(table) = schema.tables.get(&tbl_name.name.0) {
@@ -3239,7 +3403,7 @@ fn parameter_types<'schema, 'stmt>(
                                     }
                                 }
                             } else {
-                                handle_select(schema, select, &mut params)
+                                handle_select(schema, select, &mut params)?
                             }
                         }
                         InsertBody::DefaultValues => {
@@ -3262,7 +3426,7 @@ fn parameter_types<'schema, 'stmt>(
             } => {
                 if let Some(with) = with {
                     // TODO: do something w/ the accumulated tables?
-                    handle_with(schema, with, &mut params);
+                    handle_with(schema, with, &mut params)?;
                 }
 
                 let mut tables: HashMap<String, &'schema Table> = Default::default();
@@ -3293,17 +3457,17 @@ fn parameter_types<'schema, 'stmt>(
                 }
 
                 if let Some(from) = from {
-                    let from_tables = handle_from(schema, from, &mut params);
+                    let from_tables = handle_from(schema, from, &mut params)?;
 
                     tables.extend(from_tables);
                 }
 
                 if let Some(where_clause) = where_clause {
                     trace!("WHERE CLAUSE: {where_clause:?}");
-                    extract_params(schema, where_clause, &tables, &mut params);
+                    extract_params(schema, where_clause, &tables, &mut params)?;
                 }
                 if let Some(limit) = limit {
-                    handle_limit(schema, limit, &tables, &mut params);
+                    handle_limit(schema, limit, &tables, &mut params)?;
                 }
             }
             _ => {
@@ -3312,7 +3476,7 @@ fn parameter_types<'schema, 'stmt>(
         }
     }
 
-    params
+    Ok(params)
 }
 
 enum FieldFormats<'a> {
@@ -3324,7 +3488,12 @@ impl<'a> FieldFormats<'a> {
     fn get(&self, i: usize) -> FieldFormat {
         match self {
             FieldFormats::All(format) => *format,
-            FieldFormats::Each(formats) => formats.get(i).copied().unwrap_or(FieldFormat::Text),
+            // If there is less formats than columns, use the first format for all columns
+            // Default to binary codecs if there are no formats
+            FieldFormats::Each(formats) => formats
+                .get(i)
+                .copied()
+                .unwrap_or(formats.first().copied().unwrap_or(FieldFormat::Binary)),
         }
     }
 }
