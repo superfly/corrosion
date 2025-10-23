@@ -26,7 +26,7 @@ BENCHMARK_LABELS = {
 
 # Batch sizes to display (columns in the chart)
 BATCH_SIZES = [1, 2, 5, 10, 25, 50, 100]
-
+DEFAULT_BATCH_SIZE = 100
 
 def parse_criterion_results(target_dir: Path):
     """
@@ -212,15 +212,15 @@ def generate_chart(results: dict, output_file: Path):
             alpha=0.9
         )
     
-    # Add vertical line at x=50 on all subplots
+    # Add vertical line at the default batch size on all subplots
     for ax in [ax1, ax2, ax3, ax4]:
-        ax.axvline(x=50, color='red', linestyle='--', linewidth=2, alpha=0.7, zorder=1)
+        ax.axvline(x=DEFAULT_BATCH_SIZE, color='red', linestyle='--', linewidth=2, alpha=0.7, zorder=1)
     
     # Add labels on the top subplots
-    ax1.text(50, ax1.get_ylim()[1] * 0.95, 'Current batch size', 
+    ax1.text(DEFAULT_BATCH_SIZE, ax1.get_ylim()[1] * 0.95, 'Default batch size', 
             rotation=90, verticalalignment='top', horizontalalignment='right',
             fontsize=9, color='red', fontweight='bold')
-    ax2.text(50, ax2.get_ylim()[1] * 0.95, 'Current batch size', 
+    ax2.text(DEFAULT_BATCH_SIZE, ax2.get_ylim()[1] * 0.95, 'Default batch size', 
             rotation=90, verticalalignment='top', horizontalalignment='right',
             fontsize=9, color='red', fontweight='bold')
     
@@ -355,12 +355,12 @@ def generate_partials_chart(results: dict, output_file: Path):
         alpha=0.9
     )
     
-    # Add vertical line at x=50 on both subplots
+    # Add vertical line at x=DEFAULT_BATCH_SIZE on both subplots
     for ax in [ax1, ax2]:
-        ax.axvline(x=50, color='red', linestyle='--', linewidth=2, alpha=0.7, zorder=1)
+        ax.axvline(x=DEFAULT_BATCH_SIZE, color='red', linestyle='--', linewidth=2, alpha=0.7, zorder=1)
     
     # Add label on the left subplot
-    ax1.text(50, ax1.get_ylim()[1] * 0.95, 'Current batch size', 
+    ax1.text(DEFAULT_BATCH_SIZE, ax1.get_ylim()[1] * 0.95, 'Default batch size', 
             rotation=90, verticalalignment='top', horizontalalignment='right',
             fontsize=9, color='red', fontweight='bold')
     
