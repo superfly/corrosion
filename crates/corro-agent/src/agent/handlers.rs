@@ -771,6 +771,7 @@ pub async fn handle_changes(
             {
                 trace!("already seen, stop disseminating");
                 if matches!(src, ChangeSource::Broadcast) {
+                    debug!("already seen, stop disseminating version: {:?} from actor {:?}", change.versions(), change.actor_id);
                     counter!("corro.broadcast.duplicate.count", "from" => "bookie").increment(1);
                 }
                 continue;
