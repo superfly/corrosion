@@ -551,7 +551,7 @@ fn update_checks(
 
 #[derive(Debug, thiserror::Error)]
 enum UpdateError {
-    #[error("consul: {0}")]
+    #[error("consul: {0:?}")]
     Consul(#[from] consul_client::Error),
     #[error("timed out")]
     TimedOut,
