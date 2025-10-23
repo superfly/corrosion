@@ -4,10 +4,14 @@ use std::{
 };
 
 use once_cell::sync::Lazy;
-use rusqlite::{params, trace::TraceEventCodes, Connection, Transaction};
+use rusqlite::{
+    params, trace::TraceEventCodes, vtab::eponymous_only_module, Connection, Transaction,
+};
 use sqlite_pool::{Committable, SqliteConn};
 use tempfile::TempDir;
 use tracing::{error, info, trace, warn};
+
+use crate::vtab::unnest::UnnestTab;
 
 pub type SqlitePool = sqlite_pool::Pool<CrConn>;
 pub type SqlitePoolError = sqlite_pool::PoolError;
@@ -47,6 +51,9 @@ pub fn rusqlite_to_crsqlite(mut conn: rusqlite::Connection) -> rusqlite::Result<
     init_cr_conn(&mut conn)?;
     setup_conn(&conn)?;
     sqlite_functions::add_to_connection(&conn)?;
+
+    // Register unnest for PostgreSQL-style multi-array unnesting
+    conn.create_module("unnest", eponymous_only_module::<UnnestTab>(), None)?;
 
     const SLOW_THRESHOLD: Duration = Duration::from_secs(1);
     conn.trace_v2(
