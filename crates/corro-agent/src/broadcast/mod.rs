@@ -12,7 +12,7 @@ use std::{
 };
 
 use bytes::{BufMut, Bytes, BytesMut};
-use foca::{BincodeCodec, Foca, Identity, NoCustomBroadcast, OwnedNotification, Timer};
+use foca::{BincodeCodec, Foca, Identity, Member, NoCustomBroadcast, OwnedNotification, Timer};
 use futures::{
     stream::{FusedStream, FuturesUnordered},
     Future,
@@ -127,6 +127,7 @@ pub fn runtime_loop(
     to_send_tx: CorroSender<(Actor, Bytes)>,
     notifications_tx: CorroSender<OwnedNotification<Actor>>,
     tripwire: Tripwire,
+    member_states: Vec<(SocketAddr, Member<Actor>)>,
 ) {
     debug!("starting runtime loop for actor: {actor:?}");
     let rng = StdRng::from_os_rng();
@@ -174,7 +175,10 @@ pub fn runtime_loop(
             let mut metrics_interval = tokio::time::interval(Duration::from_secs(10));
             let mut last_cluster_size = unsafe { NonZeroU32::new_unchecked(1) };
 
-            let mut last_states = HashMap::new();
+            let mut last_states = member_states
+                .into_iter()
+                .map(|(_, member)| (member.id().id(), (member, None)))
+                .collect::<HashMap<_, _>>();
             let mut diff_last_states_every = tokio::time::interval(Duration::from_secs(60));
 
             #[derive(EnumDiscriminants)]
@@ -838,11 +842,17 @@ fn diff_member_states(
     }
 
     let members = agent.members().read();
+    let member_id = agent.config().gossip.member_id;
 
     let to_update = foca_states
         .iter()
         .filter_map(|(id, member)| {
             let member = *member;
+
+            if member.id().member_id() != member_id {
+                return None;
+            }
+
             let rtt = members
                 .rtts
                 .get(&member.id().addr())
@@ -871,7 +881,8 @@ fn diff_member_states(
     let mut to_delete = vec![];
 
     last_states.retain(|id, _v| {
-        if foca_states.contains_key(id) {
+        let foca_state = foca_states.get(id);
+        if foca_state.is_some() && foca_state.unwrap().id().member_id() == member_id {
             true
         } else {
             to_delete.push(*id);
@@ -1132,6 +1143,7 @@ mod tests {
             ta2_gossip_addr,
             Default::default(),
             ta1.agent.cluster_id(),
+            None,
         );
         ta1.agent.members().write().add_member(&ta2_actor);
 

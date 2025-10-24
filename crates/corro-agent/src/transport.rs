@@ -18,7 +18,7 @@ use tokio::{
     sync::{mpsc, Mutex, RwLock},
     time::error::Elapsed,
 };
-use tracing::{debug, debug_span, info, warn, Instrument};
+use tracing::{debug, debug_span, info, trace, warn, Instrument};
 
 use crate::api::peer::gossip_client_endpoint;
 
@@ -80,11 +80,11 @@ impl Transport {
     #[tracing::instrument(skip(self, data), fields(buf_size = data.len()), level = "debug", err)]
     pub async fn send_datagram(&self, addr: SocketAddr, data: Bytes) -> Result<(), TransportError> {
         let conn = self.connect(addr).await?;
-        debug!("connected to {addr}");
+        trace!("connected to {addr}");
 
         match conn.send_datagram(data.clone()) {
             Ok(send) => {
-                debug!("sent datagram to {addr}");
+                trace!("sent datagram to {addr}");
                 return Ok(send);
             }
             Err(SendDatagramError::ConnectionLost(e)) => {
