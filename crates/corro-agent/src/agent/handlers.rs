@@ -304,7 +304,7 @@ pub async fn handle_notifications(
                 match member_added_res {
                     MemberAddedResult::NewMember | MemberAddedResult::Removed => {
                         if matches!(member_added_res, MemberAddedResult::Removed) {
-                            debug!("Member Removed {actor:?}");
+                            debug!("Member Removed {actor:?} due to member id mismatch");
                             counter!("corro.gossip.member.removed", "id" => actor.id().0.to_string(), "addr" => actor.addr().to_string()).increment(1);
                         } else {
                             debug!("Member Added {actor:?}");
