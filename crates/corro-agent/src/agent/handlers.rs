@@ -303,8 +303,13 @@ pub async fn handle_notifications(
 
                 match member_added_res {
                     MemberAddedResult::NewMember | MemberAddedResult::Removed => {
-                        debug!("Member Added {actor:?}");
-                        counter!("corro.gossip.member.added", "id" => actor.id().0.to_string(), "addr" => actor.addr().to_string()).increment(1);
+                        if matches!(member_added_res, MemberAddedResult::Removed) {
+                            debug!("Member Removed {actor:?}");
+                            counter!("corro.gossip.member.removed", "id" => actor.id().0.to_string(), "addr" => actor.addr().to_string()).increment(1);
+                        } else {
+                            debug!("Member Added {actor:?}");
+                            counter!("corro.gossip.member.added", "id" => actor.id().0.to_string(), "addr" => actor.addr().to_string()).increment(1);
+                        }
 
                         let members_len = { agent.members().read().states.len() as u32 };
 
