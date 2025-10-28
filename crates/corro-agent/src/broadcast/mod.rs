@@ -11,6 +11,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use antithesis_sdk::assert_unreachable;
 use bytes::{BufMut, Bytes, BytesMut};
 use foca::{BincodeCodec, Foca, Identity, Member, NoCustomBroadcast, OwnedNotification, Timer};
 use futures::{
@@ -22,6 +23,7 @@ use metrics::{counter, gauge};
 use parking_lot::RwLock;
 use rand::{rngs::StdRng, seq::IteratorRandom, SeedableRng};
 use rusqlite::params;
+use serde_json::json;
 use spawn::spawn_counted;
 use speedy::Writable;
 use strum::EnumDiscriminants;
@@ -238,6 +240,10 @@ pub fn runtime_loop(
                         FocaInput::Data(data) => {
                             trace!("handling FocaInput::Data");
                             if let Err(e) = foca.handle_data(&data, &mut runtime) {
+                                let details = json!({
+                                    "error": e.to_string(),
+                                });
+                                assert_unreachable!("error handling foca data", &details);
                                 error!("error handling foca data: {e}");
                             }
                         }
