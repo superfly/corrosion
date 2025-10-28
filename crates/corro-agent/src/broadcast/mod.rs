@@ -12,7 +12,7 @@ use std::{
 };
 
 use bytes::{BufMut, Bytes, BytesMut};
-use foca::{BincodeCodec, Foca, Identity, Member, NoCustomBroadcast, OwnedNotification, Timer};
+use foca::{BincodeCodec, Codec, Foca, Identity, Member, NoCustomBroadcast, OwnedNotification, Timer};
 use futures::{
     stream::{FusedStream, FuturesUnordered},
     Future,
@@ -134,11 +134,13 @@ pub fn runtime_loop(
 
     let config = Arc::new(RwLock::new(make_foca_config(1.try_into().unwrap())));
 
+    let mut codec: BincodeCodec<bincode::config::Configuration> = foca::BincodeCodec(bincode::config::Configuration::default());
+
     let mut foca = Foca::with_custom_broadcast(
         actor,
         config.read().clone(),
         rng,
-        foca::BincodeCodec(bincode::config::Configuration::default()),
+        codec,
         NoCustomBroadcast,
     );
 
@@ -237,8 +239,20 @@ pub fn runtime_loop(
                         }
                         FocaInput::Data(data) => {
                             trace!("handling FocaInput::Data");
+
+                            let header: foca::Header<Actor> = {
+                                let mut dup_data = data.clone();
+                                match codec.decode_header(&mut dup_data) {
+                                    Ok(header) => header,
+                                    Err(e) => {
+                                        error!("error decoding foca header: {e}");
+                                        continue;
+                                    }
+                                }
+                            };
+                            
                             if let Err(e) = foca.handle_data(&data, &mut runtime) {
-                                error!("error handling foca data: {e}");
+                                error!("error handling foca data: {e}, {header:?}");
                             }
                         }
                         FocaInput::ClusterSize(size) => {
