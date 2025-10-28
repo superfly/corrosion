@@ -32,7 +32,7 @@ use crate::{
 use corro_tests::*;
 use corro_types::change::Change;
 use corro_types::{
-    actor::ActorId,
+    actor::{ActorId, MemberId},
     api::{ExecResponse, ExecResult, Statement},
     base::{dbsr, dbsri, dbvri, CrsqlDbVersion, CrsqlDbVersionRange, CrsqlSeq},
     broadcast::{ChangeSource, ChangeV1, Changeset},
@@ -1390,6 +1390,103 @@ async fn many_small_changes() -> eyre::Result<()> {
 
         println!("actor: {}, count: {count}", ta.agent.actor_id());
     }
+
+    tripwire_tx.send(()).await.ok();
+    tripwire_worker.await;
+    wait_for_all_pending_handles().await;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_diff_member_id() -> eyre::Result<()> {
+    _ = tracing_subscriber::fmt::try_init();
+    let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
+
+    let (ta1_tp, ta1_tp_worker, ta1_tp_tx) = Tripwire::new_simple();
+    let ta1 = launch_test_agent(|conf| conf.member_id(MemberId(1)).build(), ta1_tp.clone()).await?;
+    let ta2 = launch_test_agent(
+        |conf| {
+            conf.bootstrap(vec![ta1.agent.gossip_addr().to_string()])
+                .member_id(MemberId(2))
+                .build()
+        },
+        tripwire.clone(),
+    )
+    .await?;
+
+    let ta3 = launch_test_agent(
+        |conf| {
+            conf.bootstrap(vec![ta2.agent.gossip_addr().to_string()])
+                .member_id(MemberId(1))
+                .build()
+        },
+        tripwire.clone(),
+    )
+    .await?;
+
+    let ta4 = launch_test_agent(
+        |conf| {
+            conf.bootstrap(vec![ta1.agent.gossip_addr().to_string()])
+                .member_id(MemberId(2))
+                .build()
+        },
+        tripwire.clone(),
+    )
+    .await?;
+
+    // small sleep to ensure they announce themselves to each other
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    let members = ta1.agent.members().read().states.clone();
+    assert_eq!(members.len(), 1);
+    assert!(members.contains_key(&ta3.agent.actor_id()));
+
+    let members = ta3.agent.members().read().states.clone();
+    assert_eq!(members.len(), 1);
+    assert!(members.contains_key(&ta1.agent.actor_id()));
+
+    let members = ta2.agent.members().read().states.clone();
+    assert_eq!(members.len(), 1);
+    assert!(members.contains_key(&ta4.agent.actor_id()));
+
+    let members = ta4.agent.members().read().states.clone();
+    assert_eq!(members.len(), 1);
+    assert!(members.contains_key(&ta2.agent.actor_id()));
+
+    // restart ta1 with a different membership id
+    println!("ta1: {:?}", ta1.agent.actor_id());
+    let ta1_db_path = ta1.agent.db_path();
+    let ta1_gossip_addr = ta1.agent.gossip_addr();
+    ta1_tp_tx.send(()).await.ok();
+    ta1_tp_worker.await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let ta1 = launch_test_agent(
+        |conf| {
+            conf.member_id(MemberId(2))
+                .db_path(ta1_db_path)
+                .gossip_addr(ta1_gossip_addr)
+                .bootstrap(vec![ta2.agent.gossip_addr().to_string()])
+                .build()
+        },
+        tripwire.clone(),
+    )
+    .await?;
+
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    let members = ta1.agent.members().read().states.clone();
+    assert_eq!(members.len(), 2);
+    assert!(members.contains_key(&ta2.agent.actor_id()));
+    assert!(members.contains_key(&ta4.agent.actor_id()));
+
+    let members = ta3.agent.members().read().states.clone();
+    assert_eq!(members.len(), 0);
+
+    let members = ta2.agent.members().read().states.clone();
+    assert_eq!(members.len(), 2);
+    assert!(members.contains_key(&ta1.agent.actor_id()));
+    assert!(members.contains_key(&ta4.agent.actor_id()));
 
     tripwire_tx.send(()).await.ok();
     tripwire_worker.await;

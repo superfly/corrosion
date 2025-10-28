@@ -239,6 +239,7 @@ pub fn spawn_swim_announcer(agent: &Agent, gossip_addr: SocketAddr, tripwire: Tr
                     _ = timer.as_mut() => {}
                 }
 
+                // TODO: find way to find and filter out addrs with a different membership id
                 match bootstrap::generate_bootstrap(
                     agent.config().gossip.bootstrap.as_slice(),
                     gossip_addr,
@@ -334,9 +335,14 @@ pub async fn handle_notifications(
                 info!("Member Up {actor:?} (result: {member_added_res:?})");
 
                 match member_added_res {
-                    MemberAddedResult::NewMember => {
-                        debug!("Member Added {actor:?}");
-                        counter!("corro.gossip.member.added", "id" => actor.id().0.to_string(), "addr" => actor.addr().to_string()).increment(1);
+                    MemberAddedResult::NewMember | MemberAddedResult::Removed => {
+                        if matches!(member_added_res, MemberAddedResult::Removed) {
+                            debug!("Member Removed {actor:?} due to member id mismatch");
+                            counter!("corro.gossip.member.removed", "id" => actor.id().0.to_string(), "addr" => actor.addr().to_string()).increment(1);
+                        } else {
+                            debug!("Member Added {actor:?}");
+                            counter!("corro.gossip.member.added", "id" => actor.id().0.to_string(), "addr" => actor.addr().to_string()).increment(1);
+                        }
 
                         let members_len = { agent.members().read().states.len() as u32 };
 
@@ -865,7 +871,9 @@ pub async fn handle_sync(
                 .iter()
                 // Filter out self
                 .filter(|(id, state)| {
-                    **id != agent.actor_id() && state.cluster_id == agent.cluster_id()
+                    **id != agent.actor_id()
+                        && state.cluster_id == agent.cluster_id()
+                        && state.member_id == agent.member_id()
                 })
                 // Grab a ring-buffer index to the member RTT range
                 .map(|(id, state)| {

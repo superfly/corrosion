@@ -83,10 +83,12 @@ async fn run(
     let (notifications_tx, notifications_rx) =
         bounded(pconf.notifications_channel_len, "notifications");
 
+    let member_states = util::load_member_states(&agent).await;
+
     //// Start the main SWIM runtime loop
     runtime_loop(
         // here the agent already has the current cluster_id, we don't need to pass one
-        agent.actor(None),
+        agent.actor(None, agent.config().gossip.member_id),
         agent.clone(),
         transport.clone(),
         rx_foca,
@@ -94,6 +96,7 @@ async fn run(
         to_send_tx,
         notifications_tx,
         tripwire.clone(),
+        member_states.clone(),
     );
 
     //// Update member connection RTTs
@@ -102,7 +105,7 @@ async fn run(
     handlers::spawn_swim_announcer(&agent, gossip_addr, tripwire.clone());
 
     // Load existing cluster members into the SWIM runtime
-    util::initialise_foca(&agent).await;
+    util::initialise_foca(&agent, member_states).await;
 
     // Load schema from paths
     let stmts = corro_utils::read_files_from_paths(&agent.config().db.schema_paths).await?;
