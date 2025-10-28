@@ -370,10 +370,10 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
             ))
             .await?;
         }
-        Command::Cluster(ClusterCommand::MembershipStates { local }) => {
+        Command::Cluster(ClusterCommand::MembershipStates) => {
             let mut conn = AdminConn::connect(cli.admin_path()).await?;
             conn.send_command(corro_admin::Command::Cluster(
-                corro_admin::ClusterCommand::MembershipStates { local: *local },
+                corro_admin::ClusterCommand::MembershipStates,
             ))
             .await?;
         }
@@ -773,10 +773,7 @@ enum ClusterCommand {
     /// Dumps the current members
     Members,
     /// Dumps the current member SWIM states
-    MembershipStates {
-        #[arg(long, default_value = "false")]
-        local: bool,
-    },
+    MembershipStates,
     /// Set a new cluster ID for the node
     SetId { cluster_id: u16 },
 }
