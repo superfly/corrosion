@@ -1440,19 +1440,19 @@ async fn test_diff_member_id() -> eyre::Result<()> {
 
     let members = ta1.agent.members().read().states.clone();
     assert_eq!(members.len(), 1);
-    assert!(members.get(&ta3.agent.actor_id()).is_some());
+    assert!(members.contains_key(&ta3.agent.actor_id()));
 
     let members = ta3.agent.members().read().states.clone();
     assert_eq!(members.len(), 1);
-    assert!(members.get(&ta1.agent.actor_id()).is_some());
+    assert!(members.contains_key(&ta1.agent.actor_id()));
 
     let members = ta2.agent.members().read().states.clone();
     assert_eq!(members.len(), 1);
-    assert!(members.get(&ta4.agent.actor_id()).is_some());
+    assert!(members.contains_key(&ta4.agent.actor_id()));
 
     let members = ta4.agent.members().read().states.clone();
     assert_eq!(members.len(), 1);
-    assert!(members.get(&ta2.agent.actor_id()).is_some());
+    assert!(members.contains_key(&ta2.agent.actor_id()));
 
     // restart ta1 with a different membership id
     println!("ta1: {:?}", ta1.agent.actor_id());
@@ -1477,16 +1477,16 @@ async fn test_diff_member_id() -> eyre::Result<()> {
 
     let members = ta1.agent.members().read().states.clone();
     assert_eq!(members.len(), 2);
-    assert!(members.get(&ta2.agent.actor_id()).is_some());
-    assert!(members.get(&ta4.agent.actor_id()).is_some());
+    assert!(members.contains_key(&ta2.agent.actor_id()));
+    assert!(members.contains_key(&ta4.agent.actor_id()));
 
     let members = ta3.agent.members().read().states.clone();
     assert_eq!(members.len(), 0);
 
     let members = ta2.agent.members().read().states.clone();
     assert_eq!(members.len(), 2);
-    assert!(members.get(&ta1.agent.actor_id()).is_some());
-    assert!(members.get(&ta4.agent.actor_id()).is_some());
+    assert!(members.contains_key(&ta1.agent.actor_id()));
+    assert!(members.contains_key(&ta4.agent.actor_id()));
 
     tripwire_tx.send(()).await.ok();
     tripwire_worker.await;
