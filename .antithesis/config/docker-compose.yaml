@@ -5,8 +5,8 @@ services:
     image: corrosion:${SHORT_COMMIT}
     command: ["rust-load-generator", "corrosion1:8080", "corrosion2:8080", "corrosion3:8080"]
     environment:
-    - RUST_LOG=info
-    - RUST_BACKTRACE=full
+      RUST_LOG: "info"
+      RUST_BACKTRACE: "full"
     annotations:
       com.antithesis.exclude.faults: "all"
 
@@ -15,7 +15,7 @@ services:
     hostname: corrosion1
     image: corrosion:${SHORT_COMMIT}
     environment:
-    - RUST_LOG="foca=trace,info"
+      RUST_LOG: "info,foca=trace"
     volumes:
       - ./volumes/corrosion1:/var/lib/corrosion
 
@@ -24,7 +24,7 @@ services:
     hostname: corrosion2
     image: corrosion:${SHORT_COMMIT}
     environment:
-    - RUST_LOG="foca=trace,info"
+      RUST_LOG: "info,foca=trace"
     volumes:
       - ./volumes/corrosion2:/var/lib/corrosion
 
@@ -33,7 +33,7 @@ services:
     hostname: corrosion3
     image: corrosion:${SHORT_COMMIT}
     environment:
-    - RUST_LOG="foca=trace,info"
+      RUST_LOG: "info,foca=trace"
     volumes:
       - ./volumes/corrosion3:/var/lib/corrosion 
 
