@@ -44,7 +44,7 @@ use rusqlite::Result;
 // This must match rusqlite's internal ARRAY_TYPE constant
 const ARRAY_TYPE: *const c_char = c"rarray".as_ptr();
 // Maximum number of arrays supported
-const MAX_ARRAYS: usize = 10;
+const MAX_ARRAYS: usize = 32;
 lazy_static::lazy_static! {
     static ref UNNEST_SCHEMA: String =
         format!("CREATE TABLE x({}, {})",

@@ -806,6 +806,91 @@ async fn test_unnest_typing() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn test_unnest_max_parameters() {
+    let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
+
+    let (_ta, server) = setup_pg_test_server(tripwire, None).await;
+
+    let conn_str = format!(
+        "host={} port={} user=testuser",
+        server.local_addr.ip(),
+        server.local_addr.port()
+    );
+
+    {
+        let (client, client_conn) = tokio_postgres::connect(&conn_str, NoTls).await.unwrap();
+        println!("client is ready!");
+        tokio::spawn(client_conn);
+
+        // expected_max_arrays parameters should work
+        let expected_max_arrays = 32;
+        let per_column = 16;
+        {
+            let cols = (0..expected_max_arrays)
+                .map(|i| {
+                    (0..per_column)
+                        .map(|j| i * 1000 + j as i64)
+                        .collect::<Vec<i64>>()
+                })
+                .collect::<Vec<Vec<i64>>>();
+            let rets = (0..expected_max_arrays)
+                .map(|i| format!("CAST(value{i} AS int)"))
+                .collect::<Vec<_>>()
+                .join(",");
+            let arrs = (0..expected_max_arrays)
+                .map(|i| format!("CAST(${i} AS int[])"))
+                .collect::<Vec<_>>()
+                .join(",");
+            let params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = cols
+                .iter()
+                .map(|v| v as &(dyn tokio_postgres::types::ToSql + Sync))
+                .collect();
+            let rows = client
+                .query(&format!("SELECT {rets} FROM unnest({arrs})"), &params)
+                .await
+                .unwrap();
+            for (i, row) in rows.iter().enumerate() {
+                for j in 0..per_column {
+                    let val: i64 = row.get(j);
+                    assert_eq!(val, cols[i][j]);
+                }
+            }
+        }
+
+        // but not expected_max_arrays + 1
+        {
+            let cols = (0..expected_max_arrays + 1)
+                .map(|i| {
+                    (0..per_column)
+                        .map(|j| i * 1000 + j as i64)
+                        .collect::<Vec<i64>>()
+                })
+                .collect::<Vec<Vec<i64>>>();
+            let rets = (0..expected_max_arrays + 1)
+                .map(|i| format!("CAST(value{i} AS int)"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let arrs = (0..expected_max_arrays + 1)
+                .map(|i| format!("CAST(${i} AS int[])"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = cols
+                .iter()
+                .map(|v| v as &(dyn tokio_postgres::types::ToSql + Sync))
+                .collect();
+            assert!(client
+                .query(&format!("SELECT {rets} FROM unnest({arrs})"), &params,)
+                .await
+                .is_err());
+        }
+    }
+
+    tripwire_tx.send(()).await.ok();
+    tripwire_worker.await;
+    wait_for_all_pending_handles().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_unnest_vtab() {
     let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
 
