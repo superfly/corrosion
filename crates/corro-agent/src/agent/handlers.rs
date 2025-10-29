@@ -1038,7 +1038,7 @@ mod tests {
                     col_version: 1,
                     db_version: CrsqlDbVersion(i as u64),
                     seq: CrsqlSeq(0),
-                    site_id: agent.actor_id().to_bytes(),
+                    site_id: other_actor.to_bytes(),
                     cl: 1,
                 };
 
