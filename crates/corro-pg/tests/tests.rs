@@ -8,6 +8,7 @@ use corro_types::{
     config::{PgConfig, PgTlsConfig},
     tls::{generate_ca, generate_client_cert, generate_server_cert},
 };
+use postgres_types::ToSql;
 use rcgen::Certificate;
 use rustls::pki_types::pem::PemObject;
 use spawn::wait_for_all_pending_handles;
@@ -587,6 +588,487 @@ async fn test_pg_mtls() {
         );
 
         println!("successfully failed to connect without client auth cert");
+    }
+
+    tripwire_tx.send(()).await.ok();
+    tripwire_worker.await;
+    wait_for_all_pending_handles().await;
+}
+
+// Checks for what types of arrays unnest can accept
+async fn run_typing_unnest_case<T: Sync + Send + ToSql>(
+    client: &tokio_postgres::Client,
+    param_type: &str,
+    should_work: &[&str],
+    should_fail: &[&str],
+    example_data: Vec<T>,
+) {
+    for fail_example in should_fail {
+        let q =
+            format!("SELECT CAST(value0 AS {param_type}) FROM unnest(cast ($1 as {fail_example}))");
+        let r = client.query(&q, &[&example_data]).await;
+        if r.is_ok() {
+            println!("[FAIL] {fail_example}: Expected error, but got success");
+            panic!("test failed");
+        }
+        let error = r.unwrap_err();
+        let message = error.as_db_error().unwrap().message();
+        let expected = "please use CAST($N AS T) where T is one of:";
+        if !message.contains(expected) {
+            println!(
+                "[FAIL] {fail_example}: Expected error to contain {expected}, but got: {message}"
+            );
+            panic!("test failed");
+        }
+    }
+    for work_example in should_work {
+        let q =
+            format!("SELECT CAST(value0 AS {param_type}) FROM unnest(cast ($1 as {work_example}))");
+        let r = client.query(&q, &[&example_data]).await;
+        if r.is_err() {
+            println!("[FAIL] {work_example}: {:?}", r.unwrap_err());
+            panic!("test failed");
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_unnest_typing() {
+    let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
+
+    let (_ta, server) = setup_pg_test_server(tripwire, None).await;
+
+    let conn_str = format!(
+        "host={} port={} user=testuser",
+        server.local_addr.ip(),
+        server.local_addr.port()
+    );
+
+    {
+        let (client, client_conn) = tokio_postgres::connect(&conn_str, NoTls).await.unwrap();
+        println!("client is ready!");
+        tokio::spawn(client_conn);
+
+        // Untyped arrays should fail - I wasn't able to make the "anyarray" type work
+        {
+            assert!(client
+                .query("SELECT value0 FROM unnest($1)", &[&vec![1i64, 2, 3]])
+                .await
+                .unwrap_err()
+                .as_db_error()
+                .unwrap()
+                .message()
+                .contains("Untyped array argument"));
+        }
+
+        // Arrays only work for specific types
+        // Test int types
+        {
+            let should_work = [
+                "int[]",
+                "integer[]",
+                "bigint[]",
+                "INT[]",
+                "INTEGER[]",
+                "BIGINT[]",
+                "InT[]",
+                "InTeGer[]",
+                "BiGInT[]",
+                "int      []",
+            ];
+            let should_fail = [
+                "int", "integer", "bigint", "INT", "INTEGER", "BIGINT", "InT", "InTeGer", "BiGInT",
+                "int",
+            ];
+            run_typing_unnest_case(&client, "int", &should_work, &should_fail, vec![1i64, 2, 3])
+                .await;
+
+            // Array types are very pedantic - need i64 or else it won't work :(
+            let pedantic = (
+                vec![1i32, 2, 3],
+                vec![1i16, 2, 3],
+                vec![1i8, 2, 3],
+                vec![1u32, 2, 3],
+                vec![1u8, 2, 3],
+            );
+            assert!(client
+                .query(
+                    "SELECT CAST(value0 AS int) FROM unnest(CAST($1 AS int[]))",
+                    &[&pedantic.0]
+                )
+                .await
+                .is_err());
+            assert!(client
+                .query(
+                    "SELECT CAST(value0 AS int) FROM unnest(CAST($1 AS int[]))",
+                    &[&pedantic.1]
+                )
+                .await
+                .is_err());
+            assert!(client
+                .query(
+                    "SELECT CAST(value0 AS int) FROM unnest(CAST($1 AS int[]))",
+                    &[&pedantic.2]
+                )
+                .await
+                .is_err());
+            assert!(client
+                .query(
+                    "SELECT CAST(value0 AS int) FROM unnest(CAST($1 AS int[]))",
+                    &[&pedantic.3]
+                )
+                .await
+                .is_err());
+            assert!(client
+                .query(
+                    "SELECT CAST(value0 AS int) FROM unnest(CAST($1 AS int[]))",
+                    &[&pedantic.4]
+                )
+                .await
+                .is_err());
+        }
+        // Test float types
+        {
+            let should_work = [
+                "real[]",
+                "float[]",
+                "double[]",
+                "REAL[]",
+                "FLOAT[]",
+                "DOUBLE[]",
+                "ReAl[]",
+                "FlOat[]",
+                "DoUbLe[]",
+                "real      []",
+                "float      []",
+                "double      []",
+            ];
+            let should_fail = [
+                "real", "float", "double", "REAL", "FLOAT", "DOUBLE", "ReAl", "FlOat", "DoUbLe",
+            ];
+            run_typing_unnest_case(
+                &client,
+                "float",
+                &should_work,
+                &should_fail,
+                vec![1.0, 2.0, 3.0],
+            )
+            .await;
+
+            // Array types are very pedantic - need f64 or else it won't work :(
+            let pedantic = (vec![1.0f32, 2.0, 3.0], vec![1i64, 2, 3]);
+            assert!(client
+                .query(
+                    "SELECT CAST(value0 AS float) FROM unnest(CAST($1 AS float[]))",
+                    &[&pedantic.0]
+                )
+                .await
+                .is_err());
+            assert!(client
+                .query(
+                    "SELECT CAST(value0 AS float) FROM unnest(CAST($1 AS float[]))",
+                    &[&pedantic.1]
+                )
+                .await
+                .is_err());
+        }
+        // Test text types
+        {
+            let should_work = ["text[]", "TEXT[]", "Text[]", "text      []"];
+            let should_fail = ["text", "TEXT", "Text", "text"];
+            run_typing_unnest_case(
+                &client,
+                "text",
+                &should_work,
+                &should_fail,
+                vec!["a", "b", "c"],
+            )
+            .await;
+        }
+        // Test blob types
+        {
+            let should_work = ["blob[]", "BLOB[]", "Blob[]", "blob      []"];
+            let should_fail = ["blob", "BLOB", "Blob", "blob"];
+            run_typing_unnest_case(
+                &client,
+                "blob",
+                &should_work,
+                &should_fail,
+                vec![b"a", b"b", b"c"],
+            )
+            .await;
+        }
+    }
+
+    tripwire_tx.send(()).await.ok();
+    tripwire_worker.await;
+    wait_for_all_pending_handles().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_unnest_max_parameters() {
+    let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
+
+    let (_ta, server) = setup_pg_test_server(tripwire, None).await;
+
+    let conn_str = format!(
+        "host={} port={} user=testuser",
+        server.local_addr.ip(),
+        server.local_addr.port()
+    );
+
+    {
+        let (client, client_conn) = tokio_postgres::connect(&conn_str, NoTls).await.unwrap();
+        println!("client is ready!");
+        tokio::spawn(client_conn);
+
+        // expected_max_arrays parameters should work
+        let expected_max_arrays = 32;
+        let per_column = 16;
+        {
+            let cols = (0..expected_max_arrays)
+                .map(|i| {
+                    (0..per_column)
+                        .map(|j| i * 1000 + j as i64)
+                        .collect::<Vec<i64>>()
+                })
+                .collect::<Vec<Vec<i64>>>();
+            let rets = (0..expected_max_arrays)
+                .map(|i| format!("CAST(value{i} AS int)"))
+                .collect::<Vec<_>>()
+                .join(",");
+            let arrs = (0..expected_max_arrays)
+                .map(|i| format!("CAST(${i} AS int[])"))
+                .collect::<Vec<_>>()
+                .join(",");
+            let params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = cols
+                .iter()
+                .map(|v| v as &(dyn tokio_postgres::types::ToSql + Sync))
+                .collect();
+            let rows = client
+                .query(&format!("SELECT {rets} FROM unnest({arrs})"), &params)
+                .await
+                .unwrap();
+            for (i, row) in rows.iter().enumerate() {
+                for j in 0..per_column {
+                    let val: i64 = row.get(j);
+                    assert_eq!(val, cols[i][j]);
+                }
+            }
+        }
+
+        // but not expected_max_arrays + 1
+        {
+            let cols = (0..expected_max_arrays + 1)
+                .map(|i| {
+                    (0..per_column)
+                        .map(|j| i * 1000 + j as i64)
+                        .collect::<Vec<i64>>()
+                })
+                .collect::<Vec<Vec<i64>>>();
+            let rets = (0..expected_max_arrays + 1)
+                .map(|i| format!("CAST(value{i} AS int)"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let arrs = (0..expected_max_arrays + 1)
+                .map(|i| format!("CAST(${i} AS int[])"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = cols
+                .iter()
+                .map(|v| v as &(dyn tokio_postgres::types::ToSql + Sync))
+                .collect();
+            assert!(client
+                .query(&format!("SELECT {rets} FROM unnest({arrs})"), &params,)
+                .await
+                .is_err());
+        }
+    }
+
+    tripwire_tx.send(()).await.ok();
+    tripwire_worker.await;
+    wait_for_all_pending_handles().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_unnest_vtab() {
+    let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
+
+    let (_ta, server) = setup_pg_test_server(tripwire, None).await;
+
+    let conn_str = format!(
+        "host={} port={} user=testuser",
+        server.local_addr.ip(),
+        server.local_addr.port()
+    );
+
+    {
+        let (client, client_conn) = tokio_postgres::connect(&conn_str, NoTls).await.unwrap();
+        println!("client is ready!");
+        tokio::spawn(client_conn);
+
+        // Test single array unnest with int type
+        {
+            let col1 = vec![1i64, 2, 3, 4, 1337, 12312312312];
+            let rows = client
+                .query(
+                    "SELECT CAST(value0 AS int) FROM unnest(CAST($1 AS int[]))",
+                    &[&col1],
+                )
+                .await
+                .unwrap();
+            for (i, row) in rows.iter().enumerate() {
+                let val: i64 = row.get(0);
+                assert_eq!(val, col1[i]);
+            }
+        }
+
+        // Test single array unnest with text type
+        {
+            let col1 = vec!["a", "b", "c", "d", "e", "f"];
+            let rows = client
+                .query(
+                    "SELECT CAST(value0 AS text) FROM unnest(CAST($1 AS text[]))",
+                    &[&col1],
+                )
+                .await
+                .unwrap();
+            for (i, row) in rows.iter().enumerate() {
+                let val: String = row.get(0);
+                assert_eq!(val, col1[i]);
+            }
+        }
+
+        // Test single array unnest with float type
+        {
+            let col1 = vec![1.0, 2.0, 3.0, 4.0, 1337.0, 12312312312.0];
+            let rows = client
+                .query(
+                    "SELECT CAST(value0 AS float) FROM unnest(CAST($1 AS float[]))",
+                    &[&col1],
+                )
+                .await
+                .unwrap();
+            for (i, row) in rows.iter().enumerate() {
+                let val: f64 = row.get(0);
+                assert_eq!(val, col1[i]);
+            }
+        }
+
+        // Test single array unnest with blob type
+        {
+            let col1 = vec![b"a", b"b", b"c", b"d", b"e", b"f"];
+            let rows = client
+                .query(
+                    "SELECT CAST(value0 AS blob) FROM unnest(CAST($1 AS blob[]))",
+                    &[&col1],
+                )
+                .await
+                .unwrap();
+            for (i, row) in rows.iter().enumerate() {
+                let val: Vec<u8> = row.get(0);
+                assert_eq!(val, col1[i]);
+            }
+        }
+
+        // Now try all at once with different types
+        {
+            let col1 = vec![1i64, 2, 3, 4, 1337, 12312312312];
+            let col2 = vec!["a", "b", "c", "d", "e", "f"];
+            let col3 = vec![1.0, 2.0, 3.0, 4.0, 1337.0, 12312312312.0];
+            let col4 = vec![b"a", b"b", b"c", b"d", b"e", b"f"];
+            let rows = client
+                .query(
+                    "SELECT
+                    CAST(value0 AS int), CAST(value1 AS text), CAST(value2 AS float), CAST(value3 AS blob) FROM unnest(CAST($1 AS int[]), CAST($2 AS text[]), CAST($3 AS float[]), CAST($4 AS blob[]))",
+                    &[&col1, &col2, &col3, &col4],
+                )
+                .await
+                .unwrap();
+            for (i, row) in rows.iter().enumerate() {
+                let val0: i64 = row.get(0);
+                let val1: String = row.get(1);
+                let val2: f64 = row.get(2);
+                let val3: Vec<u8> = row.get(3);
+                assert_eq!(val0, col1[i]);
+                assert_eq!(val1, col2[i]);
+                assert_eq!(val2, col3[i]);
+                assert_eq!(val3, col4[i]);
+            }
+        }
+
+        // If one array is longer than the others, the shorter arrays should be padded with NULLs
+        // This matches the behavior of PostgreSQL
+        {
+            let col1 = vec![1i64, 2, 3];
+            let col2 = vec!["a", "b", "c", "d", "e", "f"];
+            let statement = "SELECT CAST(value0 AS int), CAST(value1 AS text) FROM unnest(CAST($1 AS int[]), CAST($2 AS text[]))";
+            let rows = client.query(statement, &[&col1, &col2]).await.unwrap();
+            assert_eq!(rows.len(), col2.len());
+            for (i, row) in rows.iter().enumerate() {
+                let val0: Option<i64> = row.get(0);
+                let val1: String = row.get(1);
+                assert_eq!(val0, col1.get(i).copied());
+                assert_eq!(val1, col2[i]);
+            }
+        }
+
+        // Test with WHERE clause
+        {
+            let col1 = vec![10i64, 20, 30, 40];
+            let rows = client
+                .query(
+                    "SELECT CAST(value0 AS int) FROM unnest(CAST($1 AS int[])) WHERE value0 > 20",
+                    &[&col1],
+                )
+                .await
+                .unwrap();
+            assert_eq!(rows.len(), 2);
+            for (i, row) in rows.iter().enumerate() {
+                let val0: i64 = row.get(0);
+                assert_eq!(val0, col1[i + 2]);
+            }
+        }
+
+        // Test INSERT, JOIN and IN
+        {
+            let ids = [1i64, 2, 3];
+            let texts = ["one", "two", "three"];
+            client
+                .execute("INSERT INTO tests (id, text) SELECT value0, value1 FROM unnest(CAST($1 AS int[]), CAST($2 AS text[]))", &[&ids, &texts])
+                .await
+                .unwrap();
+
+            let joiner = [1i64, 2];
+            let rows = client
+                .query(
+                    "SELECT t.id, t.text, CAST(u.value0 AS int) FROM tests t 
+                     JOIN unnest(CAST($1 AS int[])) u ON t.id = u.value0",
+                    &[&joiner],
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0].get::<_, i64>(0), 1);
+            assert_eq!(rows[0].get::<_, String>(1), "one");
+            assert_eq!(rows[1].get::<_, i64>(0), 2);
+            assert_eq!(rows[1].get::<_, String>(1), "two");
+
+            let rows = client
+                .query(
+                    "SELECT t.id, t.text FROM tests t WHERE t.id IN (SELECT value0 FROM unnest(CAST($1 AS int[])))",
+                    &[&joiner],
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0].get::<_, i64>(0), 1);
+            assert_eq!(rows[0].get::<_, String>(1), "one");
+            assert_eq!(rows[1].get::<_, i64>(0), 2);
+            assert_eq!(rows[1].get::<_, String>(1), "two");
+        }
     }
 
     tripwire_tx.send(()).await.ok();
