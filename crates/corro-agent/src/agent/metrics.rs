@@ -61,32 +61,6 @@ pub fn collect_light_metrics(agent: &Agent, transport: &Transport) {
                 continue;
             }
         }
-        match conn
-            .prepare_cached(&format!("SELECT count(*) FROM {table}__crsql_pks"))
-            .and_then(|mut prepped| prepped.query_row([], |row| row.get::<_, i64>(0)))
-        {
-            Ok(count) => {
-                gauge!("corro.db.table.bookkeeping.pks.rows.total", "table" => table.clone())
-                    .set(count as f64);
-            }
-            Err(e) => {
-                error!("could not query __crsql_pks count for table {table}: {e}");
-                continue;
-            }
-        }
-        match conn
-            .prepare_cached(&format!("SELECT count(*) FROM {table}__crsql_clock"))
-            .and_then(|mut prepped| prepped.query_row([], |row| row.get::<_, i64>(0)))
-        {
-            Ok(count) => {
-                gauge!("corro.db.table.bookkeeping.clock.rows.total", "table" => table.clone())
-                    .set(count as f64);
-            }
-            Err(e) => {
-                error!("could not query __crsql_clock count for table {table}: {e}");
-                continue;
-            }
-        }
     }
 
     // TODO: collect from bookie?
@@ -191,5 +165,33 @@ pub fn collect_heavy_metrics(agent: &Agent) {
             .set(real_usage as f64);
         persistent_gauge!("corro.db.table.bookkeeping.btree.bytes", "table" => table.clone())
             .set(bookkeeping_usage as f64);
+
+        // Pks and Clock counts
+        match conn
+            .prepare_cached(&format!("SELECT count(*) FROM {table}__crsql_pks"))
+            .and_then(|mut prepped| prepped.query_row([], |row| row.get::<_, i64>(0)))
+        {
+            Ok(count) => {
+                persistent_gauge!("corro.db.table.bookkeeping.pks.rows.total", "table" => table.clone())
+                    .set(count as f64);
+            }
+            Err(e) => {
+                error!("could not query __crsql_pks count for table {table}: {e}");
+                continue;
+            }
+        }
+        match conn
+            .prepare_cached(&format!("SELECT count(*) FROM {table}__crsql_clock"))
+            .and_then(|mut prepped| prepped.query_row([], |row| row.get::<_, i64>(0)))
+        {
+            Ok(count) => {
+                persistent_gauge!("corro.db.table.bookkeeping.clock.rows.total", "table" => table.clone())
+                    .set(count as f64);
+            }
+            Err(e) => {
+                error!("could not query __crsql_clock count for table {table}: {e}");
+                continue;
+            }
+        }
     }
 }
