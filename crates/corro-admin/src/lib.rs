@@ -19,14 +19,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use spawn::spawn_counted;
 use time::OffsetDateTime;
+#[cfg(target_os = "linux")]
+use tokio::time::timeout;
 use tokio::{
     net::{UnixListener, UnixStream},
     sync::{mpsc, oneshot},
     task::block_in_place,
 };
 use tokio_serde::{formats::Json, Framed};
-#[cfg(target_os = "linux")]
-use tokio::time::timeout;
 use tokio_util::codec::LengthDelimitedCodec;
 use tracing::{debug, error, info, warn};
 use tracing_filter::{legacy::Filter, FilterLayer};
@@ -105,7 +105,9 @@ pub fn start_server(
 pub enum Command {
     Ping,
     Sync(SyncCommand),
-    Locks { top: usize },
+    Locks {
+        top: usize,
+    },
     Cluster(ClusterCommand),
     Actor(ActorCommand),
     Subs(SubsCommand),
@@ -592,7 +594,6 @@ async fn handle_conn(
                 Command::DumpTokioState => {
                     info_log(&mut stream, "dumping tokio state").await;
                     let handle = tokio::runtime::Handle::current();
-
 
                     if let Ok(dump) = timeout(Duration::from_secs(2), handle.dump()).await {
                         for task in dump.tasks().iter() {

@@ -129,7 +129,7 @@ pub fn runtime_loop(
     tripwire: Tripwire,
     member_states: Vec<(SocketAddr, Member<Actor>)>,
 ) {
-    debug!("starting runtime loop for actor: {actor:?}");
+    info!("starting runtime loop for actor: {actor:?}");
     let rng = StdRng::from_os_rng();
 
     let config = Arc::new(RwLock::new(make_foca_config(1.try_into().unwrap())));
@@ -332,6 +332,7 @@ pub fn runtime_loop(
                 }
             }
 
+            info!("runtime_loop done, leaving cluster");
             // leave the cluster gracefully
             if let Err(e) = foca.leave_cluster(&mut runtime) {
                 error!("could not leave cluster: {e}");
