@@ -25,6 +25,8 @@ use tokio::{
     task::block_in_place,
 };
 use tokio_serde::{formats::Json, Framed};
+#[cfg(target_os = "linux")]
+use tokio::time::timeout;
 use tokio_util::codec::LengthDelimitedCodec;
 use tracing::{debug, error, info, warn};
 use tracing_filter::{legacy::Filter, FilterLayer};
@@ -108,6 +110,8 @@ pub enum Command {
     Actor(ActorCommand),
     Subs(SubsCommand),
     Log(LogCommand),
+    #[cfg(target_os = "linux")]
+    DumpTokioState,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -584,6 +588,24 @@ async fn handle_conn(
                         }
                     }
                 },
+                #[cfg(target_os = "linux")]
+                Command::DumpTokioState => {
+                    info_log(&mut stream, "dumping tokio state").await;
+                    let handle = tokio::runtime::Handle::current();
+
+
+                    if let Ok(dump) = timeout(Duration::from_secs(2), handle.dump()).await {
+                        for task in dump.tasks().iter() {
+                            let id = task.id();
+                            let trace = task.trace();
+                            println!("TASK {id}:");
+                            println!("{trace}\n");
+                        }
+                    } else {
+                        send_error(&mut stream, "timed out inspecting tokio state").await;
+                        continue;
+                    }
+                }
             },
             Ok(None) => {
                 debug!("done with admin conn");

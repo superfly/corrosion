@@ -4,7 +4,8 @@ rustflags = [
     "-C", "link-arg=-fuse-ld=mold",
     "-C", "force-frame-pointers",
     "-C", "symbol-mangling-version=v0",
-    "--cfg", "tokio_unstable"
+    "--cfg", "tokio_unstable",
+    "--cfg", "tokio_taskdump"
 ]
 
 [target.aarch64-unknown-linux-gnu]
@@ -12,8 +13,10 @@ linker = "clang"
 rustflags = [
     "-C", "force-frame-pointers",
     "-C", "symbol-mangling-version=v0",
-    "--cfg", "tokio_unstable"
+    "--cfg", "tokio_unstable",
+    "--cfg", "tokio_taskdump"
 ]
 
+# tokio dump not support on darwin
 [target.aarch64-apple-darwin]
 rustflags = ["--cfg", "tokio_unstable"]

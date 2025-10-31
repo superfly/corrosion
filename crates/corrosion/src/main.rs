@@ -584,6 +584,12 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
             conn.send_command(corro_admin::Command::Log(corro_admin::LogCommand::Reset))
                 .await?;
         }
+        #[cfg(target_os = "linux")]
+        Command::DumpTokioState => {
+            let mut conn = AdminConn::connect(cli.admin_path()).await?;
+            conn.send_command(corro_admin::Command::DumpTokioState)
+                .await?;
+        }
     }
 
     Ok(())
@@ -693,6 +699,10 @@ enum Command {
         #[arg(long)]
         actor_id: Option<Uuid>,
     },
+
+    /// Dump tokio state (expensive! don't do this often)
+    #[cfg(target_os = "linux")]
+    DumpTokioState,
 
     /// Cluster interactions
     #[command(subcommand)]
