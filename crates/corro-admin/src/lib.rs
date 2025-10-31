@@ -599,8 +599,13 @@ async fn handle_conn(
                         for task in dump.tasks().iter() {
                             let id = task.id();
                             let trace = task.trace();
-                            println!("TASK {id}:");
-                            println!("{trace}\n");
+                            // info!("TASK {id}:");
+                            // info!("{trace}\n");
+
+                            send(&mut stream, Response::Json(serde_json::json!({
+                                "id": id,
+                                "trace": trace.to_string(),
+                            }))).await;
                         }
                     } else {
                         send_error(&mut stream, "timed out inspecting tokio state").await;
