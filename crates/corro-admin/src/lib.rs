@@ -21,6 +21,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use spawn::spawn_counted;
 use time::OffsetDateTime;
+#[cfg(target_os = "linux")]
+use tokio::time::timeout;
 use tokio::{
     net::{UnixListener, UnixStream},
     sync::{mpsc, oneshot},
@@ -112,6 +114,8 @@ pub enum Command {
     Subs(SubsCommand),
     Log(LogCommand),
     Reload,
+    #[cfg(target_os = "linux")]
+    DumpTokioState,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -627,6 +631,23 @@ async fn handle_conn(
                         }
                     }
                 },
+                #[cfg(target_os = "linux")]
+                Command::DumpTokioState => {
+                    info_log(&mut stream, "dumping tokio state").await;
+                    let handle = tokio::runtime::Handle::current();
+
+                    if let Ok(dump) = timeout(Duration::from_secs(2), handle.dump()).await {
+                        for task in dump.tasks().iter() {
+                            let id = task.id();
+                            let trace = task.trace();
+                            println!("TASK {id}:");
+                            println!("{trace}\n");
+                        }
+                    } else {
+                        send_error(&mut stream, "timed out inspecting tokio state").await;
+                        continue;
+                    }
+                }
             },
             Ok(None) => {
                 debug!("done with admin conn");
