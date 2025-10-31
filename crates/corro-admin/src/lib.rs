@@ -602,15 +602,14 @@ async fn handle_conn(
                             // info!("TASK {id}:");
                             // info!("{trace}\n");
 
-                            send(&mut stream, Response::Json(serde_json::json!({
-                                "id": id,
-                                "trace": trace.to_string(),
-                            }))).await;
+                            send_log(&mut stream, LogLevel::Info, format!("TASK {id}:")).await;
+                            send_log(&mut stream, LogLevel::Info, trace.to_string()).await;
                         }
                     } else {
                         send_error(&mut stream, "timed out inspecting tokio state").await;
-                        continue;
+                        break;
                     }
+                    send_success(&mut stream).await;
                 }
             },
             Ok(None) => {
