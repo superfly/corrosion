@@ -22,7 +22,7 @@
         pkgs = import nixpkgs { inherit system; };
         rust-toolchain = fenix.packages."${system}".fromToolchainFile {
           file = ./rust-toolchain.toml;
-          sha256 = "sha256-3aoA7PuH09g8F+60uTUQhnHrb/ARDLueSOD08ZVsWe0=";
+          sha256 = "sha256-Qxt8XAuaUR2OMdKbN4u8dBJOhSHxS+uS06Wl9+flVEk=";
         };
       in
         {
