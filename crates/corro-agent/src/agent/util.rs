@@ -1132,44 +1132,50 @@ pub fn process_incomplete_version<T: Deref<Target = rusqlite::Connection> + Comm
 
     debug!(%actor_id, %version, "incomplete change, seqs: {seqs:?}, last_seq: {last_seq:?}, len: {}", changes.len());
     assert_sometimes!(true, "Corrosion processes incomplete changes");
-    let mut inserted = 0;
-    for change in changes.iter() {
-        trace!("buffering change! {change:?}");
 
-        // insert change, do nothing on conflict
-        let new_insertion = sp
-            .prepare_cached(
+    trace!("buffering changes! {changes:?}");
+    // Insert all changes in one go. Return the table names for which we buffered changes.
+    let mut stmt = sp.prepare_cached(
                 r#"
                 INSERT INTO __corro_buffered_changes
                     ("table", pk, cid, val, col_version, db_version, site_id, cl, seq, ts)
-                VALUES
-                    (:table, :pk, :cid, :val, :col_version, :db_version, :site_id, :cl, :seq, :ts)
+                SELECT
+                    value0, value1, value2, value3, value4, value5, value6, value7, value8, value9
+                FROM
+                    unnest(:table_arr, :pk_arr, :cid_arr, :val_arr, :col_version_arr, :db_version_arr, :site_id_arr, :cl_arr, :seq_arr, :ts_arr)
+                -- Otherwise sqlite will think ON CONFLICT is part of a JOIN
+                WHERE TRUE
                 ON CONFLICT (site_id, db_version, seq)
                     DO NOTHING
+                RETURNING
+                    "table"
             "#,
-            )?
-            .execute(named_params! {
-                ":table": change.table.as_str(),
-                ":pk": change.pk,
-                ":cid": change.cid.as_str(),
-                ":val": &change.val,
-                ":col_version": change.col_version,
-                ":db_version": change.db_version,
-                ":site_id": &change.site_id,
-                ":cl": change.cl,
-                ":seq": change.seq,
-                ":ts": ts,
-            })?;
+            )?;
+    let table_names = stmt
+        .query_map(
+            named_params! {
+                ":table_arr": unnest_param(changes.iter().map(|change| change.table.as_str())),
+                ":pk_arr": unnest_param(changes.iter().map(|change| &change.pk)),
+                ":cid_arr": unnest_param(changes.iter().map(|change| change.cid.as_str())),
+                ":val_arr": unnest_param(changes.iter().map(|change| &change.val)),
+                ":col_version_arr": unnest_param(changes.iter().map(|change| change.col_version)),
+                ":db_version_arr": unnest_param(changes.iter().map(|change| change.db_version)),
+                ":site_id_arr": unnest_param(changes.iter().map(|change| &change.site_id)),
+                ":cl_arr": unnest_param(changes.iter().map(|change| change.cl)),
+                ":seq_arr": unnest_param(changes.iter().map(|change| change.seq)),
+                ":ts_arr": unnest_param(changes.iter().map(|_| ts)),
+            },
+            |row| row.get::<_, String>(0),
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
 
-        inserted += new_insertion;
-
-        if let Some(counter) = changes_per_table.get_mut(&change.table) {
-            *counter += 1;
-        } else {
-            changes_per_table.insert(change.table.clone(), 1);
-        }
+    let inserted = table_names.len();
+    for table_name in table_names {
+        changes_per_table
+            .entry(table_name)
+            .and_modify(|c| *c += 1)
+            .or_insert(1);
     }
-
     debug!(%actor_id, %version, "buffered {inserted} changes");
 
     let deleted: Vec<RangeInclusive<CrsqlSeq>> = sp
@@ -1375,7 +1381,7 @@ pub fn process_complete_version<T: Deref<Target = rusqlite::Connection> + Commit
                 .entry(table_name)
                 .and_modify(|counter| *counter += 1)
                 .or_insert(1);
-                }
+        }
     }
 
     let (known_version, new_changeset) = if impactful_changeset.is_empty() {
