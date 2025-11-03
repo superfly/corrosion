@@ -40,6 +40,7 @@ use corro_types::{
     agent::Agent,
     broadcast::{BroadcastInput, DispatchRuntime, FocaCmd, FocaInput, UniPayload, UniPayloadV1},
     channel::{bounded, CorroReceiver, CorroSender},
+    sqlite::unnest_param,
 };
 
 use crate::{agent::util::log_at_pow_10, transport::Transport};
@@ -918,39 +919,47 @@ fn diff_member_states(
         let res = block_in_place(|| {
             let tx = conn.immediate_transaction()?;
 
-            for (member, rtt_min) in to_update {
-                let foca_state = serde_json::to_string(&member).unwrap();
+            upserted += tx
+                .prepare_cached(
+                    "
+                INSERT INTO __corro_members (actor_id, address, foca_state, rtt_min, updated_at)
+                    SELECT                   value0,   value1,  value2,     value3, value4
+                    FROM              unnest(?,        ?,       ?,          ?,       ?)
+                    -- Otherwise sqlite will think ON CONFLICT is part of a JOIN
+                    WHERE true
+                    ON CONFLICT (actor_id)
+                        DO UPDATE SET
+                            foca_state = excluded.foca_state,
+                            address = excluded.address,
+                            rtt_min = COALESCE(excluded.rtt_min, rtt_min),
+                            updated_at = excluded.updated_at
+                        WHERE excluded.updated_at > updated_at
+            ",
+                )?
+                .execute(params![
+                    unnest_param(to_update.iter().map(|(member, _)| member.id().id())),
+                    unnest_param(
+                        to_update
+                            .iter()
+                            .map(|(member, _)| member.id().addr().to_string())
+                    ),
+                    unnest_param(
+                        to_update
+                            .iter()
+                            .map(|(member, _)| serde_json::to_string(&member).unwrap())
+                    ),
+                    unnest_param(to_update.iter().map(|(_, rtt_min)| rtt_min)),
+                    unnest_param(to_update.iter().map(|_| updated_at)),
+                ])?;
 
-                upserted += tx
-                    .prepare_cached(
-                        "
-                    INSERT INTO __corro_members (actor_id, address, foca_state, rtt_min, updated_at)
-                        VALUES                  (?,        ?,       ?,          ?,       ?)
-                        ON CONFLICT (actor_id)
-                            DO UPDATE SET
-                                foca_state = excluded.foca_state,
-                                address = excluded.address,
-                                rtt_min = CASE excluded.rtt_min WHEN NULL THEN rtt_min ELSE excluded.rtt_min END,
-                                updated_at = excluded.updated_at
-                            WHERE excluded.updated_at > updated_at
-                ",
-                    )?
-                    .execute(params![
-                        member.id().id(),
-                        member.id().addr().to_string(),
-                        foca_state,
-                        rtt_min,
-                        updated_at
-                    ])?;
-            }
-
-            for id in to_delete {
-                deleted += tx
-                    .prepare_cached(
-                        "DELETE FROM __corro_members WHERE actor_id = ? AND updated_at < ?",
-                    )?
-                    .execute(params![id, updated_at])?;
-            }
+            deleted += tx
+                .prepare_cached(
+                    r#"DELETE FROM __corro_members 
+                            WHERE actor_id IN (SELECT value0 FROM UNNEST(?)) 
+                            AND updated_at < ?
+                        "#,
+                )?
+                .execute(params![unnest_param(to_delete.iter()), updated_at])?;
 
             tx.commit()?;
 
