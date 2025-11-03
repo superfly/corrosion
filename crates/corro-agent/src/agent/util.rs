@@ -25,6 +25,7 @@ use corro_types::{
     channel::CorroReceiver,
     config::AuthzConfig,
     pubsub::SubsManager,
+    sqlite::{unnest_param, INSERT_CRSQL_CHANGES_QUERY},
     updates::{match_changes, match_changes_from_db_version},
 };
 
@@ -819,6 +820,7 @@ pub async fn process_multiple_changes(
 
         let mut tx =
             InterruptibleTransaction::new(tx, Some(tx_timeout), "process_multiple_changes");
+
         let mut processed: BTreeMap<ActorId, Vec<_>> = BTreeMap::new();
         let mut changesets = vec![];
 
@@ -1271,57 +1273,109 @@ pub fn process_complete_version<T: Deref<Target = rusqlite::Connection> + Commit
     let details = json!({"len": len, "seqs": seqs.start_int(), "seqs_end": seqs.end_int(), "actor_id": actor_id, "version": version});
     assert_always!(
         len <= seqs.len(),
-        "number of changes is equal to the seq num",
+        "number of changes is equal to the seq len",
         &details
     );
     debug_assert!(len <= seqs.len(), "change from actor {actor_id} version {version} has len {len} but seqs range is {seqs:?} and last_seq is {last_seq}");
 
+    // Insert all the changes in a single statement
+    // This will return a non zero rowid only if the change impacted the database
+    let mut stmt = sp.prepare_cached(INSERT_CRSQL_CHANGES_QUERY)?;
+    trace!("inserting {:?} changes into crsql_changes", changes);
+    let params = params![
+        unnest_param(changes.iter().map(|c| c.table.as_str())),
+        unnest_param(changes.iter().map(|c| &c.pk)),
+        unnest_param(changes.iter().map(|c| c.cid.as_str())),
+        unnest_param(changes.iter().map(|c| &c.val)),
+        unnest_param(changes.iter().map(|c| &c.col_version)),
+        unnest_param(changes.iter().map(|c| &c.db_version)),
+        unnest_param(changes.iter().map(|c| &c.site_id)),
+        unnest_param(changes.iter().map(|c| &c.cl)),
+        unnest_param(changes.iter().map(|c| &c.seq)),
+        unnest_param(changes.iter().map(|_| &ts)),
+    ];
+    let mut last_rowids = stmt
+        .query_map(params, |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+        .collect::<rusqlite::Result<Vec<(CrsqlDbVersion, CrsqlSeq, i64)>>>()?;
+
+    // Ignore this, it's just for debugging if we hit this very rare VDBE bug in production
+    let last_rowids_len = last_rowids.len();
+    if last_rowids_len != len {
+        // This should never happen, but if it does, i need data for debugging
+        let query_plan = sp
+            .prepare(&format!("EXPLAIN QUERY PLAN {INSERT_CRSQL_CHANGES_QUERY}",))?
+            .query_map(params, |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })?
+            // id, parent, notused, detail
+            .collect::<rusqlite::Result<Vec<(i32, i32, i32, String)>>>()?;
+        let vdbe_program = sp
+            .prepare(&format!("EXPLAIN {INSERT_CRSQL_CHANGES_QUERY}"))?
+            .query_map(params, |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<
+                Vec<(
+                    i32,            // addr
+                    String,         // opcode
+                    i32,            // p1
+                    i32,            // p2
+                    i32,            // p3
+                    Option<String>, // p4
+                    Option<i32>,    // p5
+                    Option<String>, // comment
+                )>,
+            >>()?;
+        let details = json!({
+            "changes_len": len,
+            "returned_rowids_len": last_rowids.len(),
+            "query_plan": query_plan,
+            "vdbe_program": vdbe_program,
+        });
+        error!("Possible returning statement BUG: {details}");
+        assert_unreachable!("Possible returning statement BUG:", &details);
+    }
+
+    debug!("successfully inserted {len} changes into crsql_changes");
+    trace!("last_rowids before shift: {last_rowids:?}");
+
+    // RETURNING returns rows BEFORE the insert, not after
+    // so the rowids we get will be shifted by one
+    // we need to shift them back
+    for i in 0..(last_rowids_len - 1) {
+        last_rowids[i].2 = last_rowids[i + 1].2;
+    }
+    last_rowids[last_rowids_len - 1].2 = sp
+        .prepare_cached("SELECT last_insert_rowid()")?
+        .query_row(params![], |row| row.get(0))?;
+
+    trace!("last_rowids after shift: {last_rowids:?}");
+
+    // Now determine which exact changes impacted the database
+    // This is mostly for keeping accurate metrics
     let mut impactful_changeset = vec![];
-
-    let mut last_rows_impacted = 0;
-
     let mut changes_per_table = BTreeMap::new();
-
-    for change in changes {
-        trace!("inserting change! {change:?}");
-
-        sp.prepare_cached(
-            r#"
-                INSERT INTO crsql_changes
-                    ("table", pk, cid, val, col_version, db_version, site_id, cl, seq, ts)
-                VALUES
-                    (?,       ?,  ?,   ?,   ?,           ?,          ?,       ?,  ?, ?)
-            "#,
-        )?
-        .execute(params![
-            change.table.as_str(),
-            change.pk,
-            change.cid.as_str(),
-            &change.val,
-            change.col_version,
-            change.db_version,
-            &change.site_id,
-            change.cl,
-            // increment the seq by the start_seq or else we'll have multiple change rows with the same seq
-            change.seq,
-            ts,
-        ])?;
-        let rows_impacted: i64 = sp
-            .prepare_cached("SELECT crsql_rows_impacted()")?
-            .query_row((), |row| row.get(0))?;
-
-        if rows_impacted > last_rows_impacted {
-            trace!("inserted the change into crsql_changes");
+    for (change, (db_version, seq, rowid)) in changes.into_iter().zip(last_rowids) {
+        // Those asserts are only a sanity check
+        assert!(db_version == change.db_version);
+        assert!(seq == change.seq);
+        if rowid != 0 {
+            let table_name = change.table.clone();
             impactful_changeset.push(change);
-            if let Some(c) = impactful_changeset.last() {
-                if let Some(counter) = changes_per_table.get_mut(&c.table) {
-                    *counter += 1;
-                } else {
-                    changes_per_table.insert(c.table.clone(), 1);
+            changes_per_table
+                .entry(table_name)
+                .and_modify(|counter| *counter += 1)
+                .or_insert(1);
                 }
-            }
-        }
-        last_rows_impacted = rows_impacted;
     }
 
     let (known_version, new_changeset) = if impactful_changeset.is_empty() {
