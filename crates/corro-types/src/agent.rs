@@ -14,7 +14,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use antithesis_sdk::{assert_always, assert_unreachable};
+use antithesis_sdk::assert_unreachable;
 use arc_swap::ArcSwap;
 use camino::Utf8PathBuf;
 use compact_str::{CompactString, ToCompactString};
@@ -50,8 +50,8 @@ use crate::{
     pubsub::SubsManager,
     schema::Schema,
     sqlite::{
-        rusqlite_to_crsqlite, rusqlite_to_crsqlite_write, setup_conn, CrConn, Migration,
-        SqlitePool, SqlitePoolError,
+        rusqlite_to_crsqlite, rusqlite_to_crsqlite_write, setup_conn, unnest_param, CrConn,
+        Migration, SqlitePool, SqlitePoolError,
     },
     updates::UpdatesManager,
 };
@@ -1135,51 +1135,88 @@ impl VersionsSnapshot {
         trace!(actor_id = %self.actor_id, "new: {:?}", changes.insert_set);
 
         // those are actual ranges we had stored and will change, remove them from the DB
-        for range in std::mem::take(&mut changes.remove_ranges) {
-            debug!(actor_id = %self.actor_id, "deleting {range:?}");
+        {
+            let remove_ranges = std::mem::take(&mut changes.remove_ranges);
+            let actors = unnest_param(remove_ranges.iter().map(|_| self.actor_id));
+            let starts = unnest_param(remove_ranges.iter().map(|r| r.start()));
+            let ends = unnest_param(remove_ranges.iter().map(|r| r.end()));
+            // TODO: use returning to discover which ranges were actually deleted
             let count = conn
-                .prepare_cached("DELETE FROM __corro_bookkeeping_gaps WHERE actor_id = :actor_id AND start = :start AND end = :end")?
-                .execute(named_params! {
-                    ":actor_id": self.actor_id,
-                    ":start": range.start(),
-                    ":end": range.end()
-                })?;
-            if count != 1 {
-                warn!(actor_id = %self.actor_id, "did not delete gap from db: {range:?}");
-            }
-            let details = json!({"count": count, "range": range});
-            assert_always!(count == 1, "ineffective deletion of gaps in-db", &details);
-            for version in CrsqlDbVersionRange::from(&range) {
-                self.partials.remove(&version);
-            }
-            self.needed.remove(range);
-        }
-
-        for range in std::mem::take(&mut changes.insert_set) {
-            debug!(actor_id = %self.actor_id, "inserting {range:?}");
-            let res = conn
                 .prepare_cached(
-                    "INSERT INTO __corro_bookkeeping_gaps VALUES (:actor_id, :start, :end)",
+                    "
+                    DELETE FROM __corro_bookkeeping_gaps WHERE (actor_id, start, end) 
+                    IN (SELECT value0, value1, value2 FROM unnest(:actors, :starts, :ends))
+                    ",
                 )?
                 .execute(named_params! {
-                    ":actor_id": self.actor_id,
-                    ":start": range.start(),
-                    ":end": range.end()
-                });
-
-            if let Err(e) = res {
-                let (actor_id, start, end) : (ActorId, CrsqlDbVersion, CrsqlDbVersion) = conn.query_row("SELECT actor_id, start, end FROM __corro_bookkeeping_gaps WHERE actor_id = :actor_id AND start = :start", named_params! {
-                    ":actor_id": self.actor_id,
-                    ":start": range.start(),
-                }, |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
-
-                warn!("already had gaps entry! actor_id: {actor_id}, start: {start}, end: {end}");
-                let details = json!({"actor_id": actor_id, "start": start, "end": end});
-                assert_unreachable!("gaps entry present", &details);
-
-                return Err(e);
+                    ":actors": actors,
+                    ":starts": starts,
+                    ":ends": ends,
+                })?;
+            if count != remove_ranges.len() {
+                warn!(actor_id = %self.actor_id, "did not delete some gaps from db: {remove_ranges:?}");
+                let details: serde_json::Value = json!({"count": count, "ranges": remove_ranges});
+                assert_unreachable!("ineffective deletion of gaps in-db", &details);
             }
-            self.needed.insert(range);
+
+            for range in remove_ranges {
+                for version in CrsqlDbVersionRange::from(&range) {
+                    self.partials.remove(&version);
+                }
+                self.needed.remove(range);
+            }
+        }
+
+        {
+            let insert_set = std::mem::take(&mut changes.insert_set);
+            let actors = unnest_param(insert_set.iter().map(|_| self.actor_id));
+            let starts = unnest_param(insert_set.iter().map(|r| r.start()));
+            let ends = unnest_param(insert_set.iter().map(|r| r.end()));
+            debug!(actor_id = %self.actor_id, "inserting {insert_set:?}");
+            // TODO: use returning to discover which ranges were actually inserted
+            let count = conn
+                .prepare_cached(
+                    "
+                    INSERT OR IGNORE INTO __corro_bookkeeping_gaps (actor_id, start, end) 
+                    SELECT value0, value1, value2 FROM unnest(:actors, :starts, :ends)
+                    ",
+                )?
+                .execute(named_params! {
+                    ":actors": actors,
+                    ":starts": starts,
+                    ":ends": ends,
+                })?;
+            if count != insert_set.len() {
+                warn!(actor_id = %self.actor_id, "did not insert some gaps into db: {insert_set:?}");
+
+                let existing: Vec<(ActorId, CrsqlDbVersion, CrsqlDbVersion)> = conn
+                    .prepare_cached(
+                        "
+                    SELECT actor_id, start, end FROM __corro_bookkeeping_gaps 
+                    WHERE (actor_id, start) 
+                    IN (SELECT value0, value1 FROM unnest(:actors, :starts))",
+                    )?
+                    .query_map(
+                        named_params! {
+                            ":actors": actors,
+                            ":starts": starts,
+                        },
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    )?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+
+                warn!("already had gaps entries! existing: {existing:?}");
+                let details: serde_json::Value =
+                    json!({"count": count, "insert_set": insert_set, "existing": existing});
+                assert_unreachable!("ineffective insertion of gaps in-db", &details);
+                return Err(rusqlite::Error::ModuleError(
+                    "Gaps entries already present in DB".to_string(),
+                ));
+            }
+
+            for range in insert_set {
+                self.needed.insert(range);
+            }
         }
 
         self.max = changes.max.take();
