@@ -4,10 +4,12 @@ use std::{
 };
 
 use once_cell::sync::Lazy;
+use rusqlite::types::{ToSql, ToSqlOutput, Value};
 use rusqlite::{
     params, trace::TraceEventCodes, vtab::eponymous_only_module, Connection, Transaction,
 };
 use sqlite_pool::{Committable, SqliteConn};
+use std::rc::Rc;
 use tempfile::TempDir;
 use tracing::{error, info, trace, warn};
 
@@ -159,6 +161,9 @@ pub fn setup_conn(conn: &Connection) -> Result<(), rusqlite::Error> {
 
     rusqlite::vtab::series::load_module(conn)?;
 
+    // Register unnest for PostgreSQL-style multi-array unnesting
+    conn.create_module("unnest", eponymous_only_module::<UnnestTab>(), None)?;
+
     Ok(())
 }
 
@@ -222,6 +227,26 @@ pub fn migrate(conn: &mut Connection, migrations: Vec<Box<dyn Migration>>) -> ru
 
     tx.commit()?;
     Ok(())
+}
+
+// Converts any iterator over something convertible to SQL
+// into a vector of SQL values, which can be used as a parameter
+// to the `unnest` function in SQL.
+// Due to limitations in rusqlite we need to use owned values
+pub fn unnest_param<T, K>(iter: T) -> Rc<Vec<Value>>
+where
+    T: IntoIterator<Item = K>,
+    K: ToSql,
+{
+    Rc::new(
+        iter.into_iter()
+            .map(|to_sql| match to_sql.to_sql() {
+                Ok(ToSqlOutput::Borrowed(v)) => v.into(),
+                Ok(ToSqlOutput::Owned(v)) => v,
+                _ => panic!("Nope"),
+            })
+            .collect::<Vec<Value>>(),
+    )
 }
 
 #[cfg(test)]
