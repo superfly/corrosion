@@ -134,11 +134,15 @@ async fn run(
         tripwire.clone(),
     ));
 
-    spawn_counted(metrics::metrics_loop(
+    spawn_counted(metrics::light_metrics_loop(
         agent.clone(),
         transport.clone(),
         tripwire.clone(),
     ));
+
+    if !agent.config().telemetry.disable_heavy_metrics {
+        spawn_counted(metrics::heavy_metrics_loop(agent.clone(), tripwire.clone()));
+    }
     spawn_counted(handlers::handle_gossip_to_send(
         transport.clone(),
         to_send_rx,

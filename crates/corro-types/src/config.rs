@@ -86,6 +86,8 @@ pub struct Config {
 pub struct TelemetryConfig {
     pub prometheus: Option<PrometheusConfig>,
     pub open_telemetry: Option<OtelConfig>,
+    #[serde(default)]
+    pub disable_heavy_metrics: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -422,6 +424,7 @@ impl ConfigBuilder {
                 .prometheus_addr
                 .map(|bind_addr| PrometheusConfig { bind_addr }),
             open_telemetry: None,
+            disable_heavy_metrics: false,
         };
 
         if self.api_addr.is_empty() {
