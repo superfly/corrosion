@@ -25,6 +25,7 @@ use corro_types::{
     channel::CorroReceiver,
     config::AuthzConfig,
     pubsub::SubsManager,
+    sqlite::{unnest_param, INSERT_CRSQL_CHANGES_QUERY},
     updates::{match_changes, match_changes_from_db_version},
 };
 
@@ -819,6 +820,7 @@ pub async fn process_multiple_changes(
 
         let mut tx =
             InterruptibleTransaction::new(tx, Some(tx_timeout), "process_multiple_changes");
+
         let mut processed: BTreeMap<ActorId, Vec<_>> = BTreeMap::new();
         let mut changesets = vec![];
 
@@ -1130,44 +1132,50 @@ pub fn process_incomplete_version<T: Deref<Target = rusqlite::Connection> + Comm
 
     debug!(%actor_id, %version, "incomplete change, seqs: {seqs:?}, last_seq: {last_seq:?}, len: {}", changes.len());
     assert_sometimes!(true, "Corrosion processes incomplete changes");
-    let mut inserted = 0;
-    for change in changes.iter() {
-        trace!("buffering change! {change:?}");
 
-        // insert change, do nothing on conflict
-        let new_insertion = sp
-            .prepare_cached(
+    trace!("buffering changes! {changes:?}");
+    // Insert all changes in one go. Return the table names for which we buffered changes.
+    let mut stmt = sp.prepare_cached(
                 r#"
                 INSERT INTO __corro_buffered_changes
                     ("table", pk, cid, val, col_version, db_version, site_id, cl, seq, ts)
-                VALUES
-                    (:table, :pk, :cid, :val, :col_version, :db_version, :site_id, :cl, :seq, :ts)
+                SELECT
+                    value0, value1, value2, value3, value4, value5, value6, value7, value8, value9
+                FROM
+                    unnest(:table_arr, :pk_arr, :cid_arr, :val_arr, :col_version_arr, :db_version_arr, :site_id_arr, :cl_arr, :seq_arr, :ts_arr)
+                -- Otherwise sqlite will think ON CONFLICT is part of a JOIN
+                WHERE TRUE
                 ON CONFLICT (site_id, db_version, seq)
                     DO NOTHING
+                RETURNING
+                    "table"
             "#,
-            )?
-            .execute(named_params! {
-                ":table": change.table.as_str(),
-                ":pk": change.pk,
-                ":cid": change.cid.as_str(),
-                ":val": &change.val,
-                ":col_version": change.col_version,
-                ":db_version": change.db_version,
-                ":site_id": &change.site_id,
-                ":cl": change.cl,
-                ":seq": change.seq,
-                ":ts": ts,
-            })?;
+            )?;
+    let table_names = stmt
+        .query_map(
+            named_params! {
+                ":table_arr": unnest_param(changes.iter().map(|change| change.table.as_str())),
+                ":pk_arr": unnest_param(changes.iter().map(|change| &change.pk)),
+                ":cid_arr": unnest_param(changes.iter().map(|change| change.cid.as_str())),
+                ":val_arr": unnest_param(changes.iter().map(|change| &change.val)),
+                ":col_version_arr": unnest_param(changes.iter().map(|change| change.col_version)),
+                ":db_version_arr": unnest_param(changes.iter().map(|change| change.db_version)),
+                ":site_id_arr": unnest_param(changes.iter().map(|change| &change.site_id)),
+                ":cl_arr": unnest_param(changes.iter().map(|change| change.cl)),
+                ":seq_arr": unnest_param(changes.iter().map(|change| change.seq)),
+                ":ts_arr": unnest_param(changes.iter().map(|_| ts)),
+            },
+            |row| row.get::<_, String>(0),
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
 
-        inserted += new_insertion;
-
-        if let Some(counter) = changes_per_table.get_mut(&change.table) {
-            *counter += 1;
-        } else {
-            changes_per_table.insert(change.table.clone(), 1);
-        }
+    let inserted = table_names.len();
+    for table_name in table_names {
+        changes_per_table
+            .entry(table_name)
+            .and_modify(|c| *c += 1)
+            .or_insert(1);
     }
-
     debug!(%actor_id, %version, "buffered {inserted} changes");
 
     let deleted: Vec<RangeInclusive<CrsqlSeq>> = sp
@@ -1271,57 +1279,109 @@ pub fn process_complete_version<T: Deref<Target = rusqlite::Connection> + Commit
     let details = json!({"len": len, "seqs": seqs.start_int(), "seqs_end": seqs.end_int(), "actor_id": actor_id, "version": version});
     assert_always!(
         len <= seqs.len(),
-        "number of changes is equal to the seq num",
+        "number of changes is equal to the seq len",
         &details
     );
     debug_assert!(len <= seqs.len(), "change from actor {actor_id} version {version} has len {len} but seqs range is {seqs:?} and last_seq is {last_seq}");
 
+    // Insert all the changes in a single statement
+    // This will return a non zero rowid only if the change impacted the database
+    let mut stmt = sp.prepare_cached(INSERT_CRSQL_CHANGES_QUERY)?;
+    trace!("inserting {:?} changes into crsql_changes", changes);
+    let params = params![
+        unnest_param(changes.iter().map(|c| c.table.as_str())),
+        unnest_param(changes.iter().map(|c| &c.pk)),
+        unnest_param(changes.iter().map(|c| c.cid.as_str())),
+        unnest_param(changes.iter().map(|c| &c.val)),
+        unnest_param(changes.iter().map(|c| &c.col_version)),
+        unnest_param(changes.iter().map(|c| &c.db_version)),
+        unnest_param(changes.iter().map(|c| &c.site_id)),
+        unnest_param(changes.iter().map(|c| &c.cl)),
+        unnest_param(changes.iter().map(|c| &c.seq)),
+        unnest_param(changes.iter().map(|_| &ts)),
+    ];
+    let mut last_rowids = stmt
+        .query_map(params, |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+        .collect::<rusqlite::Result<Vec<(CrsqlDbVersion, CrsqlSeq, i64)>>>()?;
+
+    // Ignore this, it's just for debugging if we hit this very rare VDBE bug in production
+    let last_rowids_len = last_rowids.len();
+    if last_rowids_len != len {
+        // This should never happen, but if it does, i need data for debugging
+        let query_plan = sp
+            .prepare(&format!("EXPLAIN QUERY PLAN {INSERT_CRSQL_CHANGES_QUERY}",))?
+            .query_map(params, |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })?
+            // id, parent, notused, detail
+            .collect::<rusqlite::Result<Vec<(i32, i32, i32, String)>>>()?;
+        let vdbe_program = sp
+            .prepare(&format!("EXPLAIN {INSERT_CRSQL_CHANGES_QUERY}"))?
+            .query_map(params, |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<
+                Vec<(
+                    i32,            // addr
+                    String,         // opcode
+                    i32,            // p1
+                    i32,            // p2
+                    i32,            // p3
+                    Option<String>, // p4
+                    Option<i32>,    // p5
+                    Option<String>, // comment
+                )>,
+            >>()?;
+        let details = json!({
+            "changes_len": len,
+            "returned_rowids_len": last_rowids.len(),
+            "query_plan": query_plan,
+            "vdbe_program": vdbe_program,
+        });
+        error!("Possible returning statement BUG: {details}");
+        assert_unreachable!("Possible returning statement BUG:", &details);
+    }
+
+    debug!("successfully inserted {len} changes into crsql_changes");
+    trace!("last_rowids before shift: {last_rowids:?}");
+
+    // RETURNING returns rows BEFORE the insert, not after
+    // so the rowids we get will be shifted by one
+    // we need to shift them back
+    for i in 0..(last_rowids_len - 1) {
+        last_rowids[i].2 = last_rowids[i + 1].2;
+    }
+    last_rowids[last_rowids_len - 1].2 = sp
+        .prepare_cached("SELECT last_insert_rowid()")?
+        .query_row(params![], |row| row.get(0))?;
+
+    trace!("last_rowids after shift: {last_rowids:?}");
+
+    // Now determine which exact changes impacted the database
+    // This is mostly for keeping accurate metrics
     let mut impactful_changeset = vec![];
-
-    let mut last_rows_impacted = 0;
-
     let mut changes_per_table = BTreeMap::new();
-
-    for change in changes {
-        trace!("inserting change! {change:?}");
-
-        sp.prepare_cached(
-            r#"
-                INSERT INTO crsql_changes
-                    ("table", pk, cid, val, col_version, db_version, site_id, cl, seq, ts)
-                VALUES
-                    (?,       ?,  ?,   ?,   ?,           ?,          ?,       ?,  ?, ?)
-            "#,
-        )?
-        .execute(params![
-            change.table.as_str(),
-            change.pk,
-            change.cid.as_str(),
-            &change.val,
-            change.col_version,
-            change.db_version,
-            &change.site_id,
-            change.cl,
-            // increment the seq by the start_seq or else we'll have multiple change rows with the same seq
-            change.seq,
-            ts,
-        ])?;
-        let rows_impacted: i64 = sp
-            .prepare_cached("SELECT crsql_rows_impacted()")?
-            .query_row((), |row| row.get(0))?;
-
-        if rows_impacted > last_rows_impacted {
-            trace!("inserted the change into crsql_changes");
+    for (change, (db_version, seq, rowid)) in changes.into_iter().zip(last_rowids) {
+        // Those asserts are only a sanity check
+        assert!(db_version == change.db_version);
+        assert!(seq == change.seq);
+        if rowid != 0 {
+            let table_name = change.table.clone();
             impactful_changeset.push(change);
-            if let Some(c) = impactful_changeset.last() {
-                if let Some(counter) = changes_per_table.get_mut(&c.table) {
-                    *counter += 1;
-                } else {
-                    changes_per_table.insert(c.table.clone(), 1);
-                }
-            }
+            changes_per_table
+                .entry(table_name)
+                .and_modify(|counter| *counter += 1)
+                .or_insert(1);
         }
-        last_rows_impacted = rows_impacted;
     }
 
     let (known_version, new_changeset) = if impactful_changeset.is_empty() {

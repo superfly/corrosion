@@ -4,10 +4,12 @@ use std::{
 };
 
 use once_cell::sync::Lazy;
+use rusqlite::types::{ToSql, ToSqlOutput, Value};
 use rusqlite::{
     params, trace::TraceEventCodes, vtab::eponymous_only_module, Connection, Transaction,
 };
 use sqlite_pool::{Committable, SqliteConn};
+use std::rc::Rc;
 use tempfile::TempDir;
 use tracing::{error, info, trace, warn};
 
@@ -47,13 +49,27 @@ pub fn rusqlite_to_crsqlite_write(conn: rusqlite::Connection) -> rusqlite::Resul
     Ok(conn)
 }
 
+// Due to an unknown bug, when this query get's prepared inside process_single_change_loop
+// It sometimes decides to not return any rows, even though it should
+// By preparing it when initializing the connection, it just works.
+pub const INSERT_CRSQL_CHANGES_QUERY: &str = r#"
+    INSERT INTO crsql_changes ("table", pk, cid, val, col_version, db_version, site_id, cl, seq, ts)
+        SELECT value0, value1, value2, value3, value4, value5, value6, value7, value8, value9
+        FROM unnest(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        -- WARNING: This returns a row BEFORE inserting not after
+        RETURNING db_version, seq, last_insert_rowid()
+    "#;
+
 pub fn rusqlite_to_crsqlite(mut conn: rusqlite::Connection) -> rusqlite::Result<CrConn> {
     init_cr_conn(&mut conn)?;
     setup_conn(&conn)?;
     sqlite_functions::add_to_connection(&conn)?;
 
-    // Register unnest for PostgreSQL-style multi-array unnesting
-    conn.create_module("unnest", eponymous_only_module::<UnnestTab>(), None)?;
+    // Prepare problematic queries here to avoid issues
+    // DON'T TOUCH IT, There are many dragons to tackle if u remove it
+    // If we don't prepare it here, there's a chance invalid VDBE will get generated
+    // I spent too much time debugging, it looks like a real bug in sqlite .-.
+    let _ = conn.prepare_cached(INSERT_CRSQL_CHANGES_QUERY)?;
 
     const SLOW_THRESHOLD: Duration = Duration::from_secs(1);
     conn.trace_v2(
@@ -159,6 +175,9 @@ pub fn setup_conn(conn: &Connection) -> Result<(), rusqlite::Error> {
 
     rusqlite::vtab::series::load_module(conn)?;
 
+    // Register unnest for PostgreSQL-style multi-array unnesting
+    conn.create_module("unnest", eponymous_only_module::<UnnestTab>(), None)?;
+
     Ok(())
 }
 
@@ -222,6 +241,26 @@ pub fn migrate(conn: &mut Connection, migrations: Vec<Box<dyn Migration>>) -> ru
 
     tx.commit()?;
     Ok(())
+}
+
+// Converts any iterator over something convertible to SQL
+// into a vector of SQL values, which can be used as a parameter
+// to the `unnest` function in SQL.
+// Due to limitations in rusqlite we need to use owned values
+pub fn unnest_param<T, K>(iter: T) -> Rc<Vec<Value>>
+where
+    T: IntoIterator<Item = K>,
+    K: ToSql,
+{
+    Rc::new(
+        iter.into_iter()
+            .map(|to_sql| match to_sql.to_sql() {
+                Ok(ToSqlOutput::Borrowed(v)) => v.into(),
+                Ok(ToSqlOutput::Owned(v)) => v,
+                _ => panic!("Nope"),
+            })
+            .collect::<Vec<Value>>(),
+    )
 }
 
 #[cfg(test)]
