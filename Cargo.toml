@@ -4,6 +4,7 @@ members = [ ".antithesis/client/rust-load-generator",
 	"integration-tests"
 ]
 resolver = "2"
+exclude = ["local-deps/libsqlite3-sys"]
 
 [workspace.dependencies]
 arc-swap = { version = "1.6.0" }
@@ -60,7 +61,7 @@ rangemap = { version = "1.5.1", features = ["serde1"] }
 rcgen = { version = "0.11.1", features = ["x509-parser"] }
 reqwest = { version = "0.12", default-features = false, features = ["http2", "rustls-tls", "rustls-tls-webpki-roots"] }
 rhai = { version = "1.15.1", features = ["sync"] }
-rusqlite = { version = "0.33.0", features = ["serde_json", "time", "bundled", "uuid", "array", "load_extension", "column_decltype", "vtab", "functions", "chrono", "series", "trace"] }
+rusqlite = { version = "0.37.0", features = ["serde_json", "time", "bundled", "uuid", "array", "load_extension", "column_decltype", "vtab", "functions", "chrono", "series", "trace"] }
 rustls = { version = "0.23.0", default-features = false, features = ["ring"] }
 seahash = "4.1.0"
 serde = "1.0.159"
@@ -88,6 +89,9 @@ tracing-test = "0.2"
 uhlc = { version = "0.7", features = ["defmt"] }
 uuid = { version = "1.3.1", features = ["v4", "serde"] }
 webpki = { version = "0.22.0", default-features = false, features = ["std"] }
+
+[patch.crates-io]
+libsqlite3-sys = { path = "local-deps/libsqlite3-sys" }
 
 [profile.release]
 debug = 1

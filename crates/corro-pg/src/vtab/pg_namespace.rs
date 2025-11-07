@@ -1,7 +1,7 @@
 use std::{marker::PhantomData, os::raw::c_int};
 
 use rusqlite::vtab::{
-    sqlite3_vtab, sqlite3_vtab_cursor, IndexInfo, VTab, VTabConnection, VTabCursor, Values,
+    sqlite3_vtab, sqlite3_vtab_cursor, IndexInfo, VTab, VTabConnection, VTabCursor, Values, Filters
 };
 
 const PG_NAMESPACES: &[(i64, &str, i64, &str)] = &[
@@ -70,7 +70,7 @@ unsafe impl VTabCursor for PgNamespaceTableCursor<'_> {
         &mut self,
         _idx_num: c_int,
         _idx_str: Option<&str>,
-        _args: &Values<'_>,
+        _args: &Filters<'_>,
     ) -> rusqlite::Result<()> {
         self.row_id = 0;
         Ok(())

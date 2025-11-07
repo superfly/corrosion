@@ -36,7 +36,7 @@ use std::os::raw::c_char;
 use rusqlite::ffi;
 use rusqlite::types::Value;
 use rusqlite::vtab::{
-    array::Array, Context, IndexConstraintOp, IndexInfo, VTab, VTabConnection, VTabCursor, Values,
+    array::Array, Context, IndexConstraintOp, IndexInfo, VTab, VTabConnection, VTabCursor, Values, Filters
 };
 use rusqlite::Result;
 
@@ -194,7 +194,7 @@ impl UnnestTabCursor<'_> {
 }
 
 unsafe impl VTabCursor for UnnestTabCursor<'_> {
-    fn filter(&mut self, idx_num: c_int, _idx_str: Option<&str>, args: &Values<'_>) -> Result<()> {
+    fn filter(&mut self, idx_num: c_int, _idx_str: Option<&str>, args: &Filters<'_>) -> Result<()> {
         self.arrays.clear();
         self.row_id = 1;
 

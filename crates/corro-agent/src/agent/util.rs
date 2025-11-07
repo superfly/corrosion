@@ -1286,6 +1286,11 @@ pub fn process_complete_version<T: Deref<Target = rusqlite::Connection> + Commit
 
     // Insert all the changes in a single statement
     // This will return a non zero rowid only if the change impacted the database
+    /*sp.execute(
+        r#"
+            PRAGMA parser_trace = ON;
+        "#, &[]
+    )?;*/
     let mut stmt = sp.prepare_cached(INSERT_CRSQL_CHANGES_QUERY)?;
     trace!("inserting {:?} changes into crsql_changes", changes);
     let params = params![

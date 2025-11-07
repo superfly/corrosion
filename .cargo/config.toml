@@ -17,3 +17,6 @@ rustflags = [
 
 [target.aarch64-apple-darwin]
 rustflags = ["--cfg", "tokio_unstable"]
+
+[env]
+LIBSQLITE3_FLAGS = "-DSQLITE_DEBUG -DSQLITE_OMIT_SHARED_CACHE"

@@ -69,7 +69,7 @@ pub fn rusqlite_to_crsqlite(mut conn: rusqlite::Connection) -> rusqlite::Result<
     // DON'T TOUCH IT, There are many dragons to tackle if u remove it
     // If we don't prepare it here, there's a chance invalid VDBE will get generated
     // I spent too much time debugging, it looks like a real bug in sqlite .-.
-    let _ = conn.prepare_cached(INSERT_CRSQL_CHANGES_QUERY)?;
+    //let _ = conn.prepare_cached(INSERT_CRSQL_CHANGES_QUERY)?;
 
     const SLOW_THRESHOLD: Duration = Duration::from_secs(1);
     conn.trace_v2(
@@ -170,6 +170,7 @@ pub fn setup_conn(conn: &Connection) -> Result<(), rusqlite::Error> {
             PRAGMA synchronous = NORMAL;
             PRAGMA recursive_triggers = ON;
             PRAGMA mmap_size = 8589934592; -- 8GB
+            PRAGMA vdbe_listing = ON;
         "#,
     )?;
 
