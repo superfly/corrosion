@@ -8,7 +8,7 @@ declare -A queue_state
 
 
 # Check if the queue has been full for more than 20 minutes
-for i in {1..40}; do
+for i in {1..20}; do
     for addr in "${addrs[@]}"; do
         value=$(curl -s http://$addr:9090/metrics | grep "^corro_agent_changes_in_queue" | awk '{print $2}')
 
