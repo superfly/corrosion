@@ -1796,8 +1796,7 @@ checksum = "3f9eec918d3f24069decb9af1554cad7c880e2da24a9afd88aca000531ab82c1"
 [[package]]
 name = "foca"
 version = "0.19.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "298571ae7aab7a82f664d8c8817b12c58480fcf7c5900400fe48e0144cb691c3"
+source = "git+https://github.com/somtochiama/foca.git?branch=debug-error#26d56c06f1736c2dfce1b45bfd24b74d9c012677"
 dependencies = [
  "bincode 2.0.1",
  "bytes",
