@@ -723,8 +723,6 @@ async fn handle_broadcasts(
                         )
                 };
 
-                let pending_sent_instance = pending.sent_to.len();
-
                 let mut spawn_count = 0;
                 trace!("broadcasting to: {:?}", broadcast_to);
                 for addr in broadcast_to {
@@ -764,26 +762,22 @@ async fn handle_broadcasts(
 
                 counter!("corro.broadcast.spawn", "type" => "global").increment(spawn_count);
 
-                if pending_sent_instance != pending.sent_to.len() {
-                    // we've sent this to at least 1 member...
+                if let Some(send_count) = pending.send_count.checked_add(1) {
+                    trace!("send_count: {send_count}, max_transmissions: {max_transmissions}");
+                    pending.send_count = send_count;
 
-                    if let Some(send_count) = pending.send_count.checked_add(1) {
-                        trace!("send_count: {send_count}, max_transmissions: {max_transmissions}");
-                        pending.send_count = send_count;
-
-                        if send_count < max_transmissions {
-                            debug!("queueing for re-send");
-                            idle_pendings.push(Box::pin(async move {
-                                // slow our send pace if we've been previously rate limited
-                                let sleep_ms_base = if prev_rate_limited { 500 } else { 100 };
-                                // send with increasing latency as we've already sent the updates out
-                                tokio::time::sleep(Duration::from_millis(
-                                    sleep_ms_base * send_count as u64,
-                                ))
-                                .await;
-                                pending
-                            }));
-                        }
+                    if send_count < max_transmissions {
+                        debug!("queueing for re-send");
+                        idle_pendings.push(Box::pin(async move {
+                            // slow our send pace if we've been previously rate limited
+                            let sleep_ms_base = if prev_rate_limited { 500 } else { 100 };
+                            // send with increasing latency as we've already sent the updates out
+                            tokio::time::sleep(Duration::from_millis(
+                                sleep_ms_base * send_count as u64,
+                            ))
+                            .await;
+                            pending
+                        }));
                     }
                 }
             }
