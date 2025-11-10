@@ -19,7 +19,7 @@ use antithesis_sdk::assert_sometimes;
 use corro_types::{
     actor::{Actor, ActorId},
     agent::{Agent, Bookie, ChangeError, CurrentVersion, KnownDbVersion, PartialVersion},
-    api::TableName,
+    api::{ColumnName, TableName},
     base::{CrsqlDbVersion, CrsqlDbVersionRange, CrsqlSeq},
     broadcast::{ChangeSource, ChangeV1, Changeset, ChangesetParts, FocaCmd, FocaInput},
     channel::CorroReceiver,
@@ -1273,6 +1273,19 @@ pub fn process_complete_version<T: Deref<Target = rusqlite::Connection> + Commit
     } = parts;
 
     let len = changes.len();
+
+    for change in changes.iter() {
+        if change.table == TableName::from("machines")
+            && change.cid == ColumnName::from("status")
+            && change.val.as_str() == Some("destroyed")
+            && change.cl == 1
+            && change.col_version == 1
+        {
+            return Err(rusqlite::Error::ModuleError(
+                "disallow new insertions for deleted machines".into(),
+            ));
+        }
+    }
 
     debug!(%actor_id, %version, "complete change, applying right away! seqs: {seqs:?}, last_seq: {last_seq}, changes len: {len}, db version: {version}");
 
