@@ -1796,7 +1796,7 @@ checksum = "3f9eec918d3f24069decb9af1554cad7c880e2da24a9afd88aca000531ab82c1"
 [[package]]
 name = "foca"
 version = "0.19.0"
-source = "git+https://github.com/somtochiama/foca.git?branch=debug-error#26d56c06f1736c2dfce1b45bfd24b74d9c012677"
+source = "git+https://github.com/somtochiama/foca.git?branch=debug-error#a7cf0f86c1b05462f4fdb496a8873399c7d5c6a2"
 dependencies = [
  "bincode 2.0.1",
  "bytes",
