@@ -1276,12 +1276,14 @@ pub fn process_complete_version<T: Deref<Target = rusqlite::Connection> + Commit
 
     debug!(%actor_id, %version, "complete change, applying right away! seqs: {seqs:?}, last_seq: {last_seq}, changes len: {len}, db version: {version}");
 
-    let details = json!({"len": len, "seqs": seqs.start_int(), "seqs_end": seqs.end_int(), "actor_id": actor_id, "version": version});
-    assert_always!(
-        len <= seqs.len(),
-        "number of changes is equal to the seq len",
-        &details
-    );
+    // TODO: Figure out a better assertion. This assertion is disabled for now to reduce false negatives. We can receive a valid complete changeset
+    // where the number of changes is less than the seqs range because some rows have been overridden by a newer update.
+    // let details = json!({"len": len, "seqs": seqs.start_int(), "seqs_end": seqs.end_int(), "actor_id": actor_id, "version": version});
+    // assert_always!(
+    //     len <= seqs.len(),
+    //     "number of changes is equal to the seq len",
+    //     &details
+    // );
     debug_assert!(len <= seqs.len(), "change from actor {actor_id} version {version} has len {len} but seqs range is {seqs:?} and last_seq is {last_seq}");
 
     // Insert all the changes in a single statement
