@@ -217,17 +217,14 @@ impl PartialEq for ActorAddr {
 }
 
 impl Identity for Actor {
-    type Addr = ActorAddr;
+    type Addr = SocketAddr;
 
     // Since a client outside the cluster will not be aware of our
     // `bump` field, we implement the optional trait method
     // `has_same_prefix` to allow anyone that knows our `addr`
     // to join our cluster.
     fn addr(&self) -> Self::Addr {
-        ActorAddr {
-            id: self.id,
-            addr: self.addr,
-        }
+        self.addr
     }
 
     // And by implementing `renew` we enable automatic rejoining:
