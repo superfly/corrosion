@@ -20,6 +20,7 @@ use corro_types::{
     api::{ExecResult, QueryEvent, Statement},
     base::CrsqlDbVersion,
     config::{default_admin_path, Config, ConfigError, LogFormat, OtelConfig},
+    sqlite::CrConn,
 };
 use futures::StreamExt;
 use once_cell::sync::OnceCell;
@@ -180,7 +181,9 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
                     _ = tokio::fs::create_dir_all(parent).await;
                 }
 
-                let conn = Connection::open(&path)?;
+                // crsqlite connection here cause crsql_site_id table has a trigger
+                // that calls a crsqlite function.
+                let conn = CrConn::init(Connection::open(&path)?)?;
 
                 let tables: Vec<String> = conn.prepare("SELECT name FROM sqlite_schema WHERE type = 'table' AND name LIKE '%__crsql_clock'")?.query_map([], |row| row.get(0))?.collect::<Result<Vec<_>, _>>()?;
 
