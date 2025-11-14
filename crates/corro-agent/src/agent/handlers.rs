@@ -397,6 +397,7 @@ pub async fn handle_notifications(
                 counter!("corro.swim.notification", "type" => "memberdown").increment(1);
             }
             OwnedNotification::Rename(a, b) => {
+                info!("Member Rename {a:?} to {b:?}");
                 let mut lock = agent.members().write();
                 lock.remove_member(&a);
                 lock.add_member(&b);
