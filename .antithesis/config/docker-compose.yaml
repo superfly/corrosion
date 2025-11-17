@@ -46,7 +46,7 @@ services:
   consul:
     container_name: consul
     hostname: consul
-    image: consul:1.15.4
+    image: docker.io/consul:1.15.4
     command: consul agent -data-dir=/consul/data -config-dir=/consul/config -dev -server -bind=0.0.0.0 -client=0.0.0.0 -log-level=debug
     annotations:
       com.antithesis.exclude.faults: "all"
