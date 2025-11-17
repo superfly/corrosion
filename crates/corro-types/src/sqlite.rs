@@ -17,6 +17,7 @@ use rusqlite::{
 use sqlite_pool::{Committable, SqliteConn};
 use std::rc::Rc;
 use tempfile::TempDir;
+use thread_local::ThreadLocal;
 use tracing::{error, info, trace, warn};
 use tripwire::Tripwire;
 
@@ -24,14 +25,11 @@ use crate::vtab::unnest::UnnestTab;
 
 pub type SqlitePool = sqlite_pool::Pool<CrConn>;
 pub type SqlitePoolError = sqlite_pool::PoolError;
-use lazy_static::lazy_static;
 
-// Global registry for query stats - single shared HashMap
-// TODO: use the thread_local crate here
-lazy_static! {
-    // (sql, readonly) => (total_count, total_nanos)
-    static ref QUERY_STATS: Mutex<HashMap<(String, bool), (u64, u128)>> = Mutex::new(HashMap::new());
-}
+// Global registry for query stats
+// (sql, readonly) => (total_count, total_nanos)
+type QueryStats = HashMap<(String, bool), (u64, u128)>;
+static QUERY_STATS: ThreadLocal<Mutex<QueryStats>> = ThreadLocal::new();
 pub async fn query_metrics_loop(mut tripwire: Tripwire) {
     let mut interval = tokio::time::interval(Duration::from_secs(10));
     let mut prev_tick = interval.tick().await;
@@ -54,11 +52,19 @@ const IMPACTFUL_QUERY_THRESHOLD_MS_PER_SECOND: f64 = 10.0;
 // The default length in prometheus is 4kb but 1kb is more than enough
 const MAX_QUERY_LABEL_LENGTH: usize = 1024;
 fn handle_query_metrics(elapsed: Duration) {
-    let mut stats = QUERY_STATS.lock();
-    let to_send = stats.drain().collect::<Vec<_>>();
-    drop(stats);
+    // Aggregate and drain stats from all threads into a single map
+    let mut aggregated: QueryStats = Default::default();
 
-    for ((query_raw, readonly), (total_count, total_nanos)) in to_send.into_iter() {
+    for stats_mutex in QUERY_STATS.iter() {
+        let mut stats = stats_mutex.lock();
+        for (key, (count, nanos)) in stats.drain() {
+            let entry = aggregated.entry(key).or_insert((0u64, 0u128));
+            entry.0 += count;
+            entry.1 += nanos;
+        }
+    }
+
+    for ((query_raw, readonly), (total_count, total_nanos)) in aggregated.into_iter() {
         let total_ms = (total_nanos / 1_000_000) as u64;
         let ms_per_second = total_ms as f64 / elapsed.as_secs_f64();
         if ms_per_second > IMPACTFUL_QUERY_THRESHOLD_MS_PER_SECOND {
@@ -97,8 +103,9 @@ fn handle_sql_tracing_event(ev: rusqlite::trace::TraceEvent, readonly: bool) {
         let dur = duration.as_nanos();
         let sql = stmt_ref.sql().to_string();
 
-        // Update shared stats
-        let mut stats = QUERY_STATS.lock();
+        // Update per-thread stats to avoid contention on hot path
+        let stats_mutex = QUERY_STATS.get_or_default();
+        let mut stats = stats_mutex.lock();
         let entry = stats
             .entry((sql.clone(), readonly))
             .or_insert((0u64, 0u128));
