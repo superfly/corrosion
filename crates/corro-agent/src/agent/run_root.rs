@@ -139,6 +139,9 @@ async fn run(
         transport.clone(),
         tripwire.clone(),
     ));
+
+    spawn_counted(corro_types::sqlite::query_metrics_loop(tripwire.clone()));
+
     spawn_counted(handlers::handle_gossip_to_send(
         transport.clone(),
         to_send_rx,

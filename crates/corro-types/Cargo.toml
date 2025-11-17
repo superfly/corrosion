@@ -51,6 +51,7 @@ tokio = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
 tripwire = { version = "0.1.0-alpha.0", path = "../tripwire" }
+thread_local = { workspace = true }
 uhlc = { workspace = true }
 uuid = { workspace = true }
 strum = { workspace = true }

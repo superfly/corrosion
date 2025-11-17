@@ -25,6 +25,7 @@ use rangemap::RangeInclusiveSet;
 use rusqlite::{named_params, Connection, OpenFlags, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use sqlite_pool::SqliteConn;
 use tokio::{
     runtime::Handle,
     sync::{oneshot, Semaphore},
@@ -50,8 +51,8 @@ use crate::{
     pubsub::SubsManager,
     schema::Schema,
     sqlite::{
-        rusqlite_to_crsqlite, rusqlite_to_crsqlite_write, setup_conn, unnest_param, CrConn,
-        Migration, SqlitePool, SqlitePoolError,
+        rusqlite_to_crsqlite, rusqlite_to_crsqlite_write, setup_conn, trace_heavy_queries,
+        unnest_param, CrConn, Migration, SqlitePool, SqlitePoolError,
     },
     updates::UpdatesManager,
 };
@@ -570,13 +571,16 @@ impl SplitPool {
     pub fn dedicated(&self) -> rusqlite::Result<Connection> {
         let conn = rusqlite::Connection::open(&self.0.path)?;
         setup_conn(&conn)?;
+        trace_heavy_queries(&conn)?;
         Ok(conn)
     }
 
     #[tracing::instrument(skip(self), level = "debug")]
     pub fn client_dedicated(&self) -> rusqlite::Result<CrConn> {
         let conn = rusqlite::Connection::open(&self.0.path)?;
-        rusqlite_to_crsqlite_write(conn)
+        let cr_conn = rusqlite_to_crsqlite_write(conn)?;
+        trace_heavy_queries(cr_conn.conn())?;
+        Ok(cr_conn)
     }
 
     #[tracing::instrument(skip(self), level = "debug")]
@@ -585,7 +589,9 @@ impl SplitPool {
             &self.0.path,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
-        rusqlite_to_crsqlite(conn)
+        let cr_conn = rusqlite_to_crsqlite(conn)?;
+        trace_heavy_queries(cr_conn.conn())?;
+        Ok(cr_conn)
     }
 
     // get a high priority write connection (e.g. client input)

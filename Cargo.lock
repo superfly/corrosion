@@ -1194,6 +1194,7 @@ dependencies = [
  "strum",
  "tempfile",
  "thiserror 1.0.69",
+ "thread_local",
  "time",
  "tokio",
  "tokio-util",
