@@ -64,8 +64,10 @@ fn handle_query_metrics(elapsed: Duration) {
         }
     }
 
-    let mut other_queries_count = 0u64;
-    let mut other_queries_nanos = 0u128;
+    let mut other_ro_queries_count = 0u64;
+    let mut other_ro_queries_nanos = 0u128;
+    let mut other_rw_queries_count = 0u64;
+    let mut other_rw_queries_nanos = 0u128;
     for ((query_raw, readonly), (total_query_count, total_query_nanos)) in aggregated.into_iter() {
         let total_query_ms = (total_query_nanos / 1_000_000) as u64;
         let ms_per_second = total_query_ms as f64 / elapsed.as_secs_f64();
@@ -90,16 +92,26 @@ fn handle_query_metrics(elapsed: Duration) {
             counter!("corro.db.query.count", "query" => query.clone(), "readonly" => readonly.to_string()).increment(total_query_count);
         } else {
             // For all other queries let's just sum them up
-            other_queries_count += total_query_count;
-            other_queries_nanos += total_query_nanos;
+            if readonly {
+                other_ro_queries_count += total_query_count;
+                other_ro_queries_nanos += total_query_nanos;
+            } else {
+                other_rw_queries_count += total_query_count;
+                other_rw_queries_nanos += total_query_nanos;
+            }
         }
     }
-    let other_queries_ms = (other_queries_nanos / 1_000_000) as u64;
     let other_queries_name = "OTHER";
+    let other_ro_queries_ms = (other_ro_queries_nanos / 1_000_000) as u64;
+    counter!("corro.db.query.ms", "query" => other_queries_name , "readonly" => "true")
+        .increment(other_ro_queries_ms);
+    counter!("corro.db.query.count", "query" => other_queries_name, "readonly" => "true")
+        .increment(other_ro_queries_count);
+    let other_rw_queries_ms = (other_rw_queries_nanos / 1_000_000) as u64;
     counter!("corro.db.query.ms", "query" => other_queries_name , "readonly" => "false")
-        .increment(other_queries_ms);
+        .increment(other_rw_queries_ms);
     counter!("corro.db.query.count", "query" => other_queries_name, "readonly" => "false")
-        .increment(other_queries_count);
+        .increment(other_rw_queries_count);
 }
 
 fn tracing_callback_ro(ev: rusqlite::trace::TraceEvent) {
