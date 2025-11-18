@@ -64,9 +64,11 @@ fn handle_query_metrics(elapsed: Duration) {
         }
     }
 
-    for ((query_raw, readonly), (total_count, total_nanos)) in aggregated.into_iter() {
-        let total_ms = (total_nanos / 1_000_000) as u64;
-        let ms_per_second = total_ms as f64 / elapsed.as_secs_f64();
+    let mut other_queries_count = 0u64;
+    let mut other_queries_nanos = 0u128;
+    for ((query_raw, readonly), (total_query_count, total_query_nanos)) in aggregated.into_iter() {
+        let total_query_ms = (total_query_nanos / 1_000_000) as u64;
+        let ms_per_second = total_query_ms as f64 / elapsed.as_secs_f64();
         if ms_per_second > IMPACTFUL_QUERY_THRESHOLD_MS_PER_SECOND {
             // For too long queries, truncate them to cap the label length
             // and append a hash to avoid collisions
@@ -84,10 +86,20 @@ fn handle_query_metrics(elapsed: Duration) {
             } else {
                 query_raw.clone()
             };
-            counter!("corro.db.query.ms", "query" => query.clone() , "readonly" => readonly.to_string()).increment(total_ms);
-            counter!("corro.db.query.count", "query" => query.clone(), "readonly" => readonly.to_string()).increment(total_count);
+            counter!("corro.db.query.ms", "query" => query.clone() , "readonly" => readonly.to_string()).increment(total_query_ms);
+            counter!("corro.db.query.count", "query" => query.clone(), "readonly" => readonly.to_string()).increment(total_query_count);
+        } else {
+            // For all other queries let's just sum them up
+            other_queries_count += total_query_count;
+            other_queries_nanos += total_query_nanos;
         }
     }
+    let other_queries_ms = (other_queries_nanos / 1_000_000) as u64;
+    let other_queries_name = "OTHER";
+    counter!("corro.db.query.ms", "query" => other_queries_name , "readonly" => "false")
+        .increment(other_queries_ms);
+    counter!("corro.db.query.count", "query" => other_queries_name, "readonly" => "false")
+        .increment(other_queries_count);
 }
 
 fn tracing_callback_ro(ev: rusqlite::trace::TraceEvent) {
