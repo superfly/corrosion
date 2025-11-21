@@ -1642,8 +1642,13 @@ impl Matcher {
                 ))?;
 
                 for (change_type, mut prepped) in [
-                    (None, insert_prepped),
+                    // For inner joins updates on joined tables change the PK in the query table
+                    // For apps relaying on the row data instead of our rowid it's important to
+                    // first delete the changed row, then insert the new one
+                    // Apps generally should not relay on row data but we can't prevent it
+                    // and this will limit user confussion
                     (Some(ChangeType::Delete), delete_prepped),
+                    (None, insert_prepped),
                 ] {
                     let col_count = prepped.column_count();
 
