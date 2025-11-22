@@ -9,7 +9,7 @@ use corro_types::updates::Handle;
 use corro_types::{
     agent::Agent,
     api::{ChangeId, QueryEvent, QueryEventMeta, Statement},
-    pubsub::{MatcherCreated, MatcherError, MatcherHandle, NormalizeStatementError, SubsManager},
+    pubsub::{MatcherCreated, MatcherError, MatcherHandle, SubsManager},
     sqlite::SqlitePoolError,
 };
 use rusqlite::Connection;
@@ -282,8 +282,6 @@ pub enum MatcherUpsertError {
     #[error("could not expand sql statement")]
     CouldNotExpand,
     #[error(transparent)]
-    NormalizeStatement(#[from] Box<NormalizeStatementError>),
-    #[error(transparent)]
     Matcher(#[from] MatcherError),
     #[error("a `from` query param was supplied, but no existing subscription found")]
     SubFromWithoutMatcher,
@@ -298,7 +296,6 @@ impl MatcherUpsertError {
             | MatcherUpsertError::CouldNotExpand
             | MatcherUpsertError::MissingBroadcaster => StatusCode::INTERNAL_SERVER_ERROR,
             MatcherUpsertError::Sqlite(_)
-            | MatcherUpsertError::NormalizeStatement(_)
             | MatcherUpsertError::Matcher(_)
             | MatcherUpsertError::SubFromWithoutMatcher => StatusCode::BAD_REQUEST,
         }

@@ -2240,38 +2240,6 @@ impl MatcherError {
 }
 
 #[derive(Debug, thiserror::Error)]
-pub enum NormalizeStatementError {
-    #[error(transparent)]
-    Parse(#[from] sqlite3_parser::lexer::sql::Error),
-    #[error("unexpected statement: {0}")]
-    UnexpectedStatement(Box<Cmd>),
-    #[error("only 1 statement is supported")]
-    Multiple,
-    #[error("at least 1 statement is required")]
-    NoStatement,
-}
-
-pub fn normalize_sql(sql: &str) -> Result<String, NormalizeStatementError> {
-    let mut parser = Parser::new(sql.as_bytes());
-
-    let stmt = match parser.next()? {
-        Some(Cmd::Stmt(stmt)) => stmt,
-        Some(cmd) => {
-            return Err(NormalizeStatementError::UnexpectedStatement(Box::new(cmd)));
-        }
-        None => {
-            return Err(NormalizeStatementError::NoStatement);
-        }
-    };
-
-    if parser.next()?.is_some() {
-        return Err(NormalizeStatementError::Multiple);
-    }
-
-    Ok(Cmd::Stmt(stmt).to_string())
-}
-
-#[derive(Debug, thiserror::Error)]
 pub enum PackError {
     #[error("abort")]
     Abort,
