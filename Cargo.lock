@@ -1166,6 +1166,7 @@ dependencies = [
  "corro-base-types",
  "corro-tests",
  "deadpool",
+ "disjoint-hash-set",
  "enquote",
  "fallible-iterator 0.3.0",
  "foca",
@@ -1615,6 +1616,12 @@ dependencies = [
  "crypto-common",
  "subtle",
 ]
+
+[[package]]
+name = "disjoint-hash-set"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "25f329577683c11ed8ca39e000e632f42032f29686c2e0e9ce29071954d5bc13"
 
 [[package]]
 name = "displaydoc"

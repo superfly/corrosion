@@ -36,7 +36,7 @@ use crate::{
     agent::SplitPool,
     api::QueryEvent,
     change::Change,
-    matcher::sql_analyzer::{MatcherStmt, ParsedSelect, SqlAnalysisError, analyze_sql},
+    matcher::sql_analyzer::{analyze_sql, MatcherStmt, ParsedSelect, SqlAnalysisError},
     schema::Schema,
     sqlite::CrConn,
     updates::HandleMetrics,
@@ -314,10 +314,20 @@ impl Handle for MatcherHandle {
         if !self
             .inner
             .parsed
-            .table_columns
+            .table_by_real_name
             .get(change.table.as_str())
-            .map(|cols| change.column.is_crsql_sentinel() || cols.contains(change.column.as_str()))
-            .unwrap_or_default()
+            .unwrap_or(&vec![])
+            .iter()
+            .any(|table_def| {
+                self.inner
+                    .parsed
+                    .tables
+                    .get(table_def)
+                    .map(|cols| {
+                        change.column.is_crsql_sentinel() || cols.contains(change.column.as_str())
+                    })
+                    .unwrap_or_default()
+            })
         {
             trace!("could not match against parsed query table and columns");
             return false;
@@ -354,7 +364,7 @@ impl MatcherHandle {
     }
 
     pub fn parsed_columns(&self) -> &[ResultColumn] {
-        &self.inner.parsed.columns
+        &self.inner.parsed.result_columns
     }
 
     pub fn col_names(&self) -> &[ColumnName] {
@@ -618,7 +628,7 @@ impl Matcher {
 
         // metrics counters
         let mut counter_map = HashMap::new();
-        for table in analysis.parsed.table_columns.keys() {
+        for table in analysis.parsed.table_by_real_name.keys() {
             counter_map.insert(table.clone(), HandleMetrics{
                 matched_count: counter!("corro.subs.changes.matched.count", "sql_hash" => sql_hash.clone(), "table" => table.to_string()),
             });
@@ -764,7 +774,7 @@ impl Matcher {
 
         let mut query_cols = vec![];
 
-        for i in 0..(matcher.parsed.columns.len()) {
+        for i in 0..(matcher.parsed.result_columns.len()) {
             let col_name = format!("col_{i}");
             all_cols.push(col_name.clone());
             query_cols.push(col_name);
@@ -825,16 +835,16 @@ impl Matcher {
             }
             trace!("created query indexes");
 
-            for (table, columns) in matcher.parsed.table_columns.iter() {
+            for (table, columns) in matcher.parsed.tables.iter() {
                 tx.execute(
                     r#"INSERT INTO columns ("table", cid) VALUES (?, '-1')"#,
-                    [table.as_str()],
+                    [table.alias.as_str()],
                 )?;
                 for column in columns.iter() {
-                    trace!("inserting sub column {} => {}", table, column);
+                    trace!("inserting sub column {} => {}", table.alias, column);
                     tx.execute(
                         r#"INSERT INTO columns ("table", cid) VALUES (?, ?)"#,
-                        [table.as_str(), column.as_str()],
+                        [table.alias.as_str(), column.as_str()],
                     )?;
                 }
             }
@@ -1117,7 +1127,7 @@ impl Matcher {
         }
 
         let mut query_cols = vec![];
-        for i in 0..(self.parsed.columns.len()) {
+        for i in 0..(self.parsed.result_columns.len()) {
             query_cols.push(format!("col_{i}"));
         }
 
@@ -1134,7 +1144,7 @@ impl Matcher {
                 .cloned()
                 .collect::<Vec<String>>();
 
-            for i in 0..(self.parsed.columns.len()) {
+            for i in 0..(self.parsed.result_columns.len()) {
                 let col_name = format!("col_{i}");
                 all_cols.push(col_name.clone());
             }
@@ -1346,7 +1356,7 @@ impl Matcher {
             .collect::<Vec<String>>();
 
         let mut all_cols = pk_cols.clone();
-        for i in 0..(self.parsed.columns.len()) {
+        for i in 0..(self.parsed.result_columns.len()) {
             let col_name = format!("col_{i}");
             all_cols.push(col_name.clone());
             query_cols.push(col_name);
@@ -1422,11 +1432,11 @@ impl Matcher {
                     insert_cols = all_cols.join(","),
                     query_query = stmt.temp_query,
                     conflict_clause = coalesced_pks,
-                    excluded = (0..(self.parsed.columns.len()))
+                    excluded = (0..(self.parsed.result_columns.len()))
                         .map(|i| format!("col_{i} = excluded.col_{i}"))
                         .collect::<Vec<_>>()
                         .join(","),
-                    excluded_not_same = (0..(self.parsed.columns.len()))
+                    excluded_not_same = (0..(self.parsed.result_columns.len()))
                         .map(|i| format!("col_{i} IS NOT excluded.col_{i}"))
                         .collect::<Vec<_>>()
                         .join(" OR "),
