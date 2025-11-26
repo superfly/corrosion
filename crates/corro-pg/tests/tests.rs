@@ -8,7 +8,8 @@ use corro_types::{
     config::{PgConfig, PgTlsConfig},
     tls::{generate_ca, generate_client_cert, generate_server_cert},
 };
-use postgres_types::ToSql;
+use pgwire::types::ToSqlText;
+use postgres_types::{Format, IsNull, ToSql, Type};
 use rcgen::Certificate;
 use rustls::pki_types::pem::PemObject;
 use spawn::wait_for_all_pending_handles;
@@ -805,6 +806,43 @@ async fn test_unnest_typing() {
     wait_for_all_pending_handles().await;
 }
 
+// wrapper so we can easily switch between text and binary formats
+#[derive(Debug)]
+struct SqlVec<'a, T> {
+    inner: &'a Vec<T>,
+    format: Format,
+}
+
+// test text encoding/decoding
+impl<'a, T: ToSqlText + ToSql> ToSql for SqlVec<'a, T> {
+    fn to_sql(
+        &self,
+        ty: &Type,
+        out: &mut bytes::BytesMut,
+    ) -> Result<IsNull, Box<dyn std::error::Error + Sync + Send>> {
+        match self.format {
+            Format::Text => self.inner.to_sql_text(ty, out),
+            Format::Binary => self.inner.to_sql(ty, out),
+        }
+    }
+
+    fn accepts(ty: &postgres_types::Type) -> bool
+    where
+        Self: Sized,
+    {
+        match ty.kind() {
+            postgres_types::Kind::Array(_) => true,
+            _ => false,
+        }
+    }
+
+    fn encode_format(&self, _ty: &Type) -> Format {
+        self.format
+    }
+
+    postgres_types::to_sql_checked!();
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn test_unnest_max_parameters() {
     let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
@@ -925,39 +963,53 @@ async fn test_unnest_vtab() {
 
         // Test single array unnest with text type
         {
-            let col1 = vec!["a", "b", "c", "d", "e", "f"];
-            let rows = client
-                .query(
-                    "SELECT CAST(value0 AS text) FROM unnest(CAST($1 AS text[]))",
-                    &[&col1],
-                )
-                .await
-                .unwrap();
-            for (i, row) in rows.iter().enumerate() {
-                let val: String = row.get(0);
-                assert_eq!(val, col1[i]);
+            for format in [Format::Text, Format::Binary] {
+                let col1 = vec!["a", "b", "c", "d", "e", "f"];
+                let sql_vec = SqlVec {
+                    inner: &col1,
+                    format,
+                };
+                let rows = client
+                    .query(
+                        "SELECT CAST(value0 AS text) FROM unnest(CAST($1 AS text[]))",
+                        &[&sql_vec],
+                    )
+                    .await
+                    .unwrap();
+                for (i, row) in rows.iter().enumerate() {
+                    let val: String = row.get(0);
+                    assert_eq!(val, col1[i]);
+                }
             }
         }
 
         // Test single array unnest with float type
         {
             let col1 = vec![1.0, 2.0, 3.0, 4.0, 1337.0, 12312312312.0];
-            let rows = client
-                .query(
-                    "SELECT CAST(value0 AS float) FROM unnest(CAST($1 AS float[]))",
-                    &[&col1],
-                )
-                .await
-                .unwrap();
-            for (i, row) in rows.iter().enumerate() {
-                let val: f64 = row.get(0);
-                assert_eq!(val, col1[i]);
+            for format in [Format::Text, Format::Binary] {
+                let sql_vec = SqlVec {
+                    inner: &col1,
+                    format,
+                };
+                let rows = client
+                    .query(
+                        "SELECT CAST(value0 AS float) FROM unnest(CAST($1 AS float[]))",
+                        &[&sql_vec],
+                    )
+                    .await
+                    .unwrap();
+                for (i, row) in rows.iter().enumerate() {
+                    let val: f64 = row.get(0);
+                    assert_eq!(val, col1[i]);
+                }
             }
         }
 
         // Test single array unnest with blob type
+
         {
             let col1 = vec![b"a", b"b", b"c", b"d", b"e", b"f"];
+            // pgwire's text encoding for blob[] is currently broken but we would work fine for a proper client
             let rows = client
                 .query(
                     "SELECT CAST(value0 AS blob) FROM unnest(CAST($1 AS blob[]))",
@@ -971,7 +1023,7 @@ async fn test_unnest_vtab() {
             }
         }
 
-        // Now try all at once with different types
+        // Now try all at once with different types, use corro_unnest
         {
             let col1 = vec![1i64, 2, 3, 4, 1337, 12312312312];
             let col2 = vec!["a", "b", "c", "d", "e", "f"];
@@ -980,7 +1032,7 @@ async fn test_unnest_vtab() {
             let rows = client
                 .query(
                     "SELECT
-                    CAST(value0 AS int), CAST(value1 AS text), CAST(value2 AS float), CAST(value3 AS blob) FROM unnest(CAST($1 AS int[]), CAST($2 AS text[]), CAST($3 AS float[]), CAST($4 AS blob[]))",
+                    CAST(value0 AS int), CAST(value1 AS text), CAST(value2 AS float), CAST(value3 AS blob) FROM corro_unnest(CAST($1 AS int[]), CAST($2 AS text[]), CAST($3 AS float[]), CAST($4 AS blob[]))",
                     &[&col1, &col2, &col3, &col4],
                 )
                 .await

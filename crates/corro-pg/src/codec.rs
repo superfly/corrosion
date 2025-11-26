@@ -5,7 +5,9 @@ use pgwire::{
     api::{self, ClientInfo},
     error::PgWireError,
     messages as msg,
+    types::FromSqlText,
 };
+use postgres_types::Type;
 use std::{collections::HashMap, io};
 use tokio_util::codec;
 
@@ -168,4 +170,103 @@ where
             Self::Right(r) => r.set_state(state),
         }
     }
+}
+
+pub trait VecFromSqlText: Sized {
+    fn from_vec_sql_text(
+        ty: &Type,
+        input: &[u8],
+    ) -> Result<Self, Box<dyn std::error::Error + Sync + Send>>;
+}
+
+// Re-implementation of the ToSqlText trait from pg_wire to make it generic over different types.
+// Implemented as a macro in pgwire
+// https://github.com/sunng87/pgwire/blob/6cbce9d444cc86a01d992f6b35f84c024f10ceda/src/types/from_sql_text.rs#L402
+impl<T: FromSqlText> VecFromSqlText for Vec<T> {
+    fn from_vec_sql_text(
+        ty: &Type,
+        input: &[u8],
+    ) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        // PostgreSQL array text format: {elem1,elem2,elem3}
+        // Remove the outer braces
+        let input_str = std::str::from_utf8(input)?;
+
+        if input_str.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Check if it's an array format
+        if !input_str.starts_with('{') || !input_str.ends_with('}') {
+            return Err("Invalid array format: must start with '{' and end with '}'".into());
+        }
+
+        let inner = &input_str[1..input_str.len() - 1];
+
+        if inner.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let elements = extract_array_elements(inner)?;
+        let mut result = Vec::new();
+
+        for element_str in elements {
+            let element = T::from_sql_text(ty, element_str.as_bytes())?;
+            result.push(element);
+        }
+
+        Ok(result)
+    }
+}
+
+// Helper function to extract array elements
+// https://github.com/sunng87/pgwire/blob/6cbce9d444cc86a01d992f6b35f84c024f10ceda/src/types/from_sql_text.rs#L402
+fn extract_array_elements(
+    input: &str,
+) -> Result<Vec<String>, Box<dyn std::error::Error + Sync + Send>> {
+    if input.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut elements = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    let mut escape_next = false;
+    let mut depth = 0; // For nested arrays
+
+    for ch in input.chars() {
+        match ch {
+            '\\' if !escape_next => {
+                escape_next = true;
+            }
+            '"' if !escape_next => {
+                in_quotes = !in_quotes;
+                // Don't include the quotes in the output
+            }
+            '{' if !in_quotes && !escape_next => {
+                depth += 1;
+                current.push(ch);
+            }
+            '}' if !in_quotes && !escape_next => {
+                depth -= 1;
+                current.push(ch);
+            }
+            ',' if !in_quotes && depth == 0 && !escape_next => {
+                // End of current element
+                if !current.trim().eq_ignore_ascii_case("NULL") {
+                    elements.push(std::mem::take(&mut current));
+                }
+            }
+            _ => {
+                current.push(ch);
+                escape_next = false;
+            }
+        }
+    }
+
+    // Process the last element
+    if !current.is_empty() && !current.trim().eq_ignore_ascii_case("NULL") {
+        elements.push(current);
+    }
+
+    Ok(elements)
 }

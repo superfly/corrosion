@@ -4,6 +4,7 @@ mod ssl;
 pub mod utils;
 mod vtab;
 
+use codec::VecFromSqlText;
 use eyre::WrapErr;
 use std::{
     collections::{BTreeSet, HashMap, VecDeque},
@@ -42,6 +43,7 @@ use pgwire::{
         startup::ParameterStatus,
         PgWireBackendMessage, PgWireFrontendMessage,
     },
+    types::FromSqlText,
 };
 use postgres_types::{FromSql, Type};
 use rusqlite::{
@@ -2647,13 +2649,13 @@ fn from_type_and_format<'a, E, T: FromSql<'a> + FromStr<Err = E>>(
     })
 }
 
-fn from_array_type_and_format<'a, T: FromSql<'a>>(
+fn from_array_type_and_format<'a, T: FromSql<'a> + FromSqlText>(
     t: &Type,
     b: &'a [u8],
     format_code: FormatCode,
 ) -> Result<Vec<T>, ToParamError<String>> {
     Ok(match format_code {
-        FormatCode::Text => panic!("Impossible - arrays are only sent in binary format"),
+        FormatCode::Text => Vec::<T>::from_vec_sql_text(t, b).map_err(ToParamError::FromSql)?,
         FormatCode::Binary => Vec::<T>::from_sql(t, b).map_err(ToParamError::FromSql)?,
     })
 }
@@ -2675,7 +2677,7 @@ impl From<UnsupportedSqliteToPostgresType> for ErrorResponse {
 }
 
 #[derive(Debug, thiserror::Error)]
-#[error("Untyped array argument for unnest(), please use CAST($N AS T) where T is one of: TEXT[] BLOB[] INT[] INTEGER[] BIGINT[] REAL[] FLOAT[] DOUBLE[]")]
+#[error("Untyped array argument for unnest() (or corro_unnest()), please use CAST($N AS T) where T is one of: TEXT[] BLOB[] INT[] INTEGER[] BIGINT[] REAL[] FLOAT[] DOUBLE[]")]
 struct UntypedUnnestParameter;
 
 impl From<UntypedUnnestParameter> for PgWireBackendMessage {
@@ -3105,7 +3107,8 @@ fn handle_table_call_params<'schema, 'stmt>(
     params: &mut ParamsList<'stmt, 'schema>,
 ) -> Result<(), UntypedUnnestParameter> {
     if let Some(exprs) = args {
-        let is_unnest = qname.name.0.eq_ignore_ascii_case("UNNEST");
+        let is_unnest = qname.name.0.eq_ignore_ascii_case("CORRO_UNNEST")
+            || qname.name.0.eq_ignore_ascii_case("UNNEST");
 
         for expr in exprs.iter() {
             // If not unnest, just extract params
