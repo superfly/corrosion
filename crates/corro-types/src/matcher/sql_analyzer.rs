@@ -1,5 +1,8 @@
 use fallible_iterator::FallibleIterator;
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    ops::{Deref, DerefMut},
+};
 
 use enquote::unquote;
 use indexmap::IndexMap;
@@ -95,6 +98,36 @@ struct ParsingScope<'a> {
     parsed: ParsedSelect,
     parent_scope: Option<&'a ParsingScope<'a>>,
     depth: u32,
+    // When going down the AST and encountering an OR or NOT we can't gurantee that an = operator down the line will hold globally
+    // For ex. (foo.id = 2) OR (bar.id = 2)
+    // For ex. NOT (foo.id = 2)
+    suppress_eq_constraints: bool,
+}
+
+#[derive(Debug)]
+struct SuppressedEqConstraintsGuard<'a, 'b> {
+    scope: &'a mut ParsingScope<'b>,
+    prev: bool,
+}
+
+impl<'a, 'b> Deref for SuppressedEqConstraintsGuard<'a, 'b> {
+    type Target = ParsingScope<'b>;
+
+    fn deref(&self) -> &Self::Target {
+        self.scope
+    }
+}
+
+impl<'a, 'b> DerefMut for SuppressedEqConstraintsGuard<'a, 'b> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.scope
+    }
+}
+
+impl<'a, 'b> Drop for SuppressedEqConstraintsGuard<'a, 'b> {
+    fn drop(&mut self) {
+        self.scope.suppress_eq_constraints = self.prev;
+    }
 }
 
 impl<'a> ParsingScope<'a> {
@@ -104,6 +137,8 @@ impl<'a> ParsingScope<'a> {
             parsed: Default::default(),
             parent_scope: None,
             depth: 0,
+            // In the top scope = operators are guranteed to hold globally
+            suppress_eq_constraints: false,
         }
     }
 
@@ -113,6 +148,13 @@ impl<'a> ParsingScope<'a> {
             parsed: Default::default(),
             parent_scope: Some(self),
             depth: self.depth + 1,
+            // Note: We don't want to suppress eq constraints in subqueries
+            // While such queries will generate constrains in the child scope
+            // ... WHERE NOT EXISTS (SELECT 1 FROM foo WHERE foo.id = bar.id)
+            // ... FROM baz WHERE EXISTS (SELECT 1 FROM foo WHERE foo.id = baz.foo_id AND foo.random = 2) OR EXISTS (SELECT 1 FROM bar WHERE bar.id = baz.bar_id)
+            // We need to determine in the parent scope if the child constraints on parent references hold globally
+            // For ex constraints in WHERE ... AND EXISTS subqueries or JOIN (subquery ...) can get propagated IF they only reffer to parent scope columns
+            suppress_eq_constraints: false,
         }
     }
 
@@ -124,6 +166,7 @@ impl<'a> ParsingScope<'a> {
             parsed: Default::default(),
             parent_scope: None,
             depth: self.depth,
+            suppress_eq_constraints: false,
         }
     }
 
@@ -133,7 +176,18 @@ impl<'a> ParsingScope<'a> {
             parsed: self.parsed.clone(),
             parent_scope: None,
             depth: self.depth,
+            suppress_eq_constraints: self.suppress_eq_constraints,
         }
+    }
+
+    fn maybe_suppress_eq_constraints<'b>(
+        &'b mut self,
+        suppress: bool,
+    ) -> SuppressedEqConstraintsGuard<'b, 'a> {
+        // Once we suppress eq constraints, the only way to unsuppress them is to drop the guard
+        let prev = self.suppress_eq_constraints;
+        self.suppress_eq_constraints = prev || suppress;
+        SuppressedEqConstraintsGuard { scope: self, prev }
     }
 
     // Called when a table is first encountered in FROM or JOIN clause
@@ -187,6 +241,7 @@ impl<'a> ParsingScope<'a> {
         column_name: &String,
     ) -> Result<ExprColumnRef, SqlAnalysisError> {
         // If it's a double-quoted column name, let's unquote it
+        // This also applies to qualified names. foo."id" is the same as foo.id
         let check_col_name = unquote(column_name).ok().unwrap_or(column_name.clone());
 
         // Look for the table in the current scope
@@ -265,10 +320,16 @@ impl<'a> ParsingScope<'a> {
     }
 
     fn register_eq_constraint(&mut self, left: &ExprColumnRef, right: &ExprColumnRef) {
+        if self.suppress_eq_constraints {
+            return;
+        }
         self.parsed.equal_columns.link(left.clone(), right.clone());
     }
 
     fn register_constant_constraint(&mut self, constant_id: String, column: &ExprColumnRef) {
+        if self.suppress_eq_constraints {
+            return;
+        }
         self.parsed
             .constant_columns
             .entry(constant_id)
@@ -443,28 +504,48 @@ impl<'a> ParsingScope<'a> {
                 }
             }
 
-            Expr::Between { lhs, start, end, .. } => {
-                self.visit_expr(lhs)?;
-                self.visit_expr(start)?;
-                self.visit_expr(end)?;
+            Expr::Between {
+                lhs, start, end, ..
+            } => {
+                let mut scope = self.maybe_suppress_eq_constraints(true);
+                scope.visit_expr(lhs)?;
+                scope.visit_expr(start)?;
+                scope.visit_expr(end)?;
                 Ok(ExprKind::Complex)
             }
             Expr::Binary(lhs, op, rhs) => {
-                match (op, self.visit_expr(lhs)?, self.visit_expr(rhs)?) {
-                    //TODO: Don't add the constrains when OR and friends are on toplevel
+                let suppress_eq_constraints = match op {
+                    // This is always fine: WHERE ... AND ... AND ... AND
+                    Operator::And => false,
+                    // Be very conservative here
+                    // U know false = (foo.id = bar.id) should ignore the inner eq constraint
+                    _ => true,
+                };
+                let (left, right) = {
+                    let mut scope = self.maybe_suppress_eq_constraints(suppress_eq_constraints);
+                    (scope.visit_expr(lhs)?, scope.visit_expr(rhs)?)
+                };
+                match (op, left, right) {
+                    // Any binary operator on constants is a constant
+                    (_, ExprKind::Constant(_), ExprKind::Constant(_)) => {
+                        Ok(ExprKind::Constant("".to_string()))
+                    }
+                    // Column eq column
                     (Operator::Equals, ExprKind::Column(left), ExprKind::Column(right)) => {
                         self.register_eq_constraint(&left, &right);
                         Ok(ExprKind::Complex)
                     }
+                    // Column eq constant
                     (Operator::Equals, ExprKind::Column(column), ExprKind::Constant(cid)) => {
                         self.register_constant_constraint(cid, &column);
                         Ok(ExprKind::Complex)
                     }
+                    // Constant eq column
                     (Operator::Equals, ExprKind::Constant(cid), ExprKind::Column(column)) => {
                         self.register_constant_constraint(cid, &column);
                         Ok(ExprKind::Complex)
                     }
-                    
+
                     _ => Ok(ExprKind::Complex),
                 }
             }
@@ -473,75 +554,118 @@ impl<'a> ParsingScope<'a> {
                 when_then_pairs,
                 else_expr,
             } => {
+                let mut scope = self.maybe_suppress_eq_constraints(true);
                 if let Some(expr) = base {
-                    self.visit_expr(expr)?;
+                    scope.visit_expr(expr)?;
                 }
                 for (when_expr, then_expr) in when_then_pairs.iter() {
-                    self.visit_expr(when_expr)?;
-                    self.visit_expr(then_expr)?;
+                    scope.visit_expr(when_expr)?;
+                    scope.visit_expr(then_expr)?;
                 }
                 if let Some(expr) = else_expr {
-                    self.visit_expr(expr)?;
+                    scope.visit_expr(expr)?;
                 }
                 Ok(ExprKind::Complex)
             }
-            Expr::Cast { expr, .. } => match self.visit_expr(expr)? {
-                c @ ExprKind::Constant(_) => Ok(c),
-                // Assume casting a column is too complex for eq constrains
-                _ => Ok(ExprKind::Complex),
-            },
-            Expr::Collate(expr, _) => match self.visit_expr(expr)? {
-                c @ ExprKind::Constant(_) => Ok(c),
-                // Assume collating a column is too complex for eq constrains
-                _ => Ok(ExprKind::Complex),
-            },
+            Expr::Cast { expr, .. } => {
+                match self.maybe_suppress_eq_constraints(true).visit_expr(expr)? {
+                    c @ ExprKind::Constant(_) => Ok(c),
+                    // Assume casting a column is too complex for eq constrains
+                    _ => Ok(ExprKind::Complex),
+                }
+            }
+            Expr::Collate(expr, _) => {
+                match self.maybe_suppress_eq_constraints(true).visit_expr(expr)? {
+                    c @ ExprKind::Constant(_) => Ok(c),
+                    // Assume collating a column is too complex for eq constrains
+                    _ => Ok(ExprKind::Complex),
+                }
+            }
             Expr::Exists(select) => {
                 self.visit_subquery(select)?;
+                // TODO: propagate eq constraints
                 Ok(ExprKind::Complex)
             }
-            Expr::FunctionCall { args, .. } => {
-                if let Some(args) = args {
-                    for expr in args.iter() {
-                        self.visit_expr(expr)?;
+            expr@ Expr::FunctionCall { name, args, .. } => {
+                let name = name.0.to_lowercase();
+                if name == "unlikely" || name == "likely" {
+                    if let Some(args) = args {
+                        if args.len() == 1 {
+                            return self.visit_expr(&args[0])
+                        }
                     }
+                    Err(SqlAnalysisError::UnsupportedExpr { expr: expr.clone() })
+                } else if name == "likelihood" {
+                    if let Some(args) = args {
+                        if args.len() == 2 {
+                            let prob = self.maybe_suppress_eq_constraints(true).visit_expr(&args[1])?;
+                            if let ExprKind::Constant(_) = prob {
+                                return self.visit_expr(&args[0])
+                            }
+                        }
+                    }
+                    Err(SqlAnalysisError::UnsupportedExpr { expr: expr.clone() })
+                } else {
+                    let mut scope = self.maybe_suppress_eq_constraints(true);
+                    if let Some(args) = args {
+                        for expr in args.iter() {
+                            scope.visit_expr(expr)?;
+                        }
+                    }
+                    Ok(ExprKind::Complex)
                 }
-                Ok(ExprKind::Complex)
             }
             Expr::InList { lhs, rhs, .. } => {
-                self.visit_expr(lhs)?;
+                let mut scope = self.maybe_suppress_eq_constraints(true);
+                scope.visit_expr(lhs)?;
                 if let Some(rhs) = rhs {
                     for expr in rhs.iter() {
-                        self.visit_expr(expr)?;
+                        scope.visit_expr(expr)?;
                     }
                 }
                 Ok(ExprKind::Complex)
             }
             Expr::InSelect { lhs, rhs, .. } => {
-                self.visit_expr(lhs)?;
-                self.visit_subquery(rhs)?;
+                let mut scope = self.maybe_suppress_eq_constraints(true);
+                scope.visit_expr(lhs)?;
+                scope.visit_subquery(rhs)?;
                 Ok(ExprKind::Complex)
             }
             expr @ Expr::InTable { .. } => {
                 return Err(SqlAnalysisError::UnsupportedExpr { expr: expr.clone() })
             }
             Expr::IsNull(expr) => {
-                self.visit_expr(expr)?;
+                self.maybe_suppress_eq_constraints(true).visit_expr(expr)?;
                 // PK's can never be null, therefore nullability does not give us any information
                 Ok(ExprKind::Complex)
             }
             Expr::Like { lhs, rhs, .. } => {
-                self.visit_expr(lhs)?;
-                self.visit_expr(rhs)?;
+                let mut scope = self.maybe_suppress_eq_constraints(true);
+                scope.visit_expr(lhs)?;
+                scope.visit_expr(rhs)?;
                 Ok(ExprKind::Complex)
             }
             Expr::NotNull(expr) => {
-                self.visit_expr(expr)?;
+                self.maybe_suppress_eq_constraints(true).visit_expr(expr)?;
                 // PK's can never be null, therefore nullability does not give us any information
                 Ok(ExprKind::Complex)
             }
             Expr::Parenthesized(parens) => {
+                // TODO: Return a list of ExprKind here so stuff like this can work:
+                // SELECT * FROM foo WHERE (foo.id, foo.parent) = (1, 3);
+                // SELECT * FROM foo JOIN bar WHERE (foo.id, foo.parent) = (bar.id, bar.parent);
+
+                // Some edge cases to think about:
+                // false = (foo.id = bar.id);
+                // (foo.id = bar.id)
+                // true = (foo.id = bar.id)
+                // (foo.id = bar.id) > 0
+                // (foo.id = bar.id) = false
+                // (true, true) = (foo.id = bar.id, baz.id = bar.id)
+                // For now assume if there are more than 1 element in the paranthesis then ignore eq constraints
+                let mut scope = self.maybe_suppress_eq_constraints(parens.len() > 1);
                 for expr in parens.iter() {
-                    let r = self.visit_expr(expr)?;
+                    let r = scope.visit_expr(expr)?;
                     if parens.len() == 1 {
                         // Parenthesised column or constant is ok
                         return Ok(r);
@@ -555,13 +679,37 @@ impl<'a> ParsingScope<'a> {
                 if child.tables.len() == 0 && child.result_columns.len() == 1 {
                     let (kind, _col) = child.result_columns.first().unwrap();
                     // The funny thing is that such subquery can select a parent column :D
+                    // For example: SELECT * FROM foo WHERE 2 = (SELECT id)
+                    // Is equivalent to: SELECT * FROM foo WHERE 2 = foo.id
                     return Ok(kind.clone());
                 }
                 Ok(ExprKind::Complex)
             }
-            Expr::Unary(_, expr) => {
-                self.visit_expr(expr)?;
-                Ok(ExprKind::Complex)
+            Expr::Unary(op, expr) => {
+                let suppress = match op {
+                    // In ON/where clauses sqlite treats stuff as true if it evaluates to smth != 0
+                    // This means -1 is true
+                    // SELECT * FROM foo WHERE +(foo.id = 2) -- OK
+                    // SELECT * FROM foo WHERE -(foo.id = 2) -- OK, because all true values are still true, all false values are still false
+                    // SELECT * FROM foo WHERE ~(foo.id = 2) -- NOPE
+                    // SELECT * FROM foo WHERE NOT (foo.id = 2) -- NOPE
+                    UnaryOperator::Positive | UnaryOperator::Negative => false,
+                    UnaryOperator::BitwiseNot | UnaryOperator::Not => true,
+                };
+                match (
+                    op,
+                    self.maybe_suppress_eq_constraints(suppress)
+                        .visit_expr(expr)?,
+                ) {
+                    // The unary operator + is a no-op. It can be applied to strings, numbers, blobs or NULL and it always returns a result with the same value as the operand
+                    (UnaryOperator::Positive, e) => Ok(e),
+                    // ~ and - on a constant is still a constant but a different one
+                    (
+                        UnaryOperator::Negative | UnaryOperator::BitwiseNot,
+                        ExprKind::Constant(_),
+                    ) => Ok(ExprKind::Constant("".into())),
+                    _ => Ok(ExprKind::Complex),
+                }
             }
 
             Expr::Literal(lit) => match lit {
@@ -584,23 +732,31 @@ impl<'a> ParsingScope<'a> {
             },
             Expr::Variable(variable_name) => Ok(ExprKind::Constant(variable_name.clone())),
 
-            // Expr::FunctionCallStar { name, filter_over } => todo!(),
-            // Expr::Raise(_, _) => todo!(),
+            // Raise is only valid inside triggers
+            expr @ Expr::Raise { .. } => {
+                return Err(SqlAnalysisError::UnsupportedExpr { expr: expr.clone() })
+            }
+
+            // TODO: This is an aggregate over the group
+            //Expr::FunctionCallStar { name, filter_over } => todo!(),
             _ => Ok(ExprKind::Complex),
         }
     }
 
     fn visit_return_columns(&mut self, columns: &[ResultColumn]) -> Result<(), SqlAnalysisError> {
+        // SELECT foo.id = bar.foo_id FROM foo, bar; -- doesn't constrain anything
+        let prev_suppress_eq_constraints = self.suppress_eq_constraints;
+        self.suppress_eq_constraints = true;
         let mut i = 0;
         for col in columns.iter() {
             match col {
                 ResultColumn::Expr(expr, _) => {
                     // println!("extracting col: {expr:?} (as: {maybe_as:?})");
                     let kind = self.visit_expr(expr)?;
-                    self.parsed.result_columns.push((kind, ResultColumn::Expr(
-                        expr.clone(),
-                        Some(As::As(Name(format!("col_{i}")))),
-                    )));
+                    self.parsed.result_columns.push((
+                        kind,
+                        ResultColumn::Expr(expr.clone(), Some(As::As(Name(format!("col_{i}"))))),
+                    ));
                     i += 1;
                 }
                 ResultColumn::Star => {
@@ -623,10 +779,16 @@ impl<'a> ParsingScope<'a> {
                                 continue;
                             }
                             referenced_columns.insert(col.clone());
-                            self.parsed.result_columns.push((ExprKind::Column(resolved_col), ResultColumn::Expr(
-                                Expr::Qualified(Name(table_def.alias.clone()), Name(col.clone())),
-                                Some(As::As(Name(format!("col_{i}")))),
-                            )));
+                            self.parsed.result_columns.push((
+                                ExprKind::Column(resolved_col),
+                                ResultColumn::Expr(
+                                    Expr::Qualified(
+                                        Name(table_def.alias.clone()),
+                                        Name(col.clone()),
+                                    ),
+                                    Some(As::As(Name(format!("col_{i}")))),
+                                ),
+                            ));
                             i += 1;
                         }
                     }
@@ -649,20 +811,24 @@ impl<'a> ParsingScope<'a> {
                     // Now with the table schema resolved we need to add all columns from this table
                     for col in table_schema.columns.keys() {
                         let resolved_col = ExprColumnRef {
-                                table: table_def.clone(),
-                                table_scope_depth: self.depth,
-                                column_name: col.clone(),
-                            };
+                            table: table_def.clone(),
+                            table_scope_depth: self.depth,
+                            column_name: col.clone(),
+                        };
                         referenced_columns.insert(col.clone());
-                        self.parsed.result_columns.push((ExprKind::Column(resolved_col), ResultColumn::Expr(
-                            Expr::Qualified(Name(table_def.alias.clone()), Name(col.clone())),
-                            Some(As::As(Name(format!("col_{i}")))),
-                        )));
+                        self.parsed.result_columns.push((
+                            ExprKind::Column(resolved_col),
+                            ResultColumn::Expr(
+                                Expr::Qualified(Name(table_def.alias.clone()), Name(col.clone())),
+                                Some(As::As(Name(format!("col_{i}")))),
+                            ),
+                        ));
                         i += 1;
                     }
                 }
             }
         }
+        self.suppress_eq_constraints = prev_suppress_eq_constraints;
         Ok(())
     }
 }
@@ -739,7 +905,13 @@ pub fn analyze_sql(
                     .flatten()
                     .collect::<Vec<_>>();
 
-                new_cols.append(&mut parsed.result_columns.iter().map(|(_, col)| col.clone()).collect());
+                new_cols.append(
+                    &mut parsed
+                        .result_columns
+                        .iter()
+                        .map(|(_, col)| col.clone())
+                        .collect(),
+                );
                 *columns = new_cols;
             }
             _ => unreachable!(),
@@ -984,7 +1156,7 @@ mod tests {
         .unwrap();
         let analysis = analyze_sql(
             Uuid::new_v4(),
-            "SELECT * FROM foo LEFT JOIN bar ON foo.id = bar.foo_id WHERE EXISTS (SELECT 1 FROM baz WHERE bar_id = bar.id) AND foo.name = 'test'",
+            "SELECT * FROM foo LEFT JOIN bar ON foo.id = bar.foo_id WHERE EXISTS (SELECT 1 FROM baz WHERE bar_id = bar.id) AND UNLIKELY(foo.name = 'test')",
             &schema,
         )
         .unwrap();
