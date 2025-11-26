@@ -1115,7 +1115,7 @@ mod tests {
         }
 
         /// Prepares a statement that can be executed multiple times with different parameters
-        fn prepare_statement(&self, sql: &'static str) -> PreparedStatement {
+        fn prepare_statement(&self, sql: &'static str) -> PreparedStatement <'_>{
             PreparedStatement { agent: self, sql }
         }
 

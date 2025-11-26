@@ -20,7 +20,7 @@ hex = { workspace = true }
 itertools = { workspace = true }
 metrics = { workspace = true }
 parking_lot.workspace = true
-pgwire = { version = "0.32", default-features = false, features = ["server-api-ring"] }
+pgwire = { version = "0.37", default-features = false, features = ["server-api-ring", "server-api", "client-api", "pg-type-chrono"] }
 pin-project-lite.workspace = true
 postgres-types = { version = "0.2", features = ["with-time-0_3"] }
 rand = { workspace = true }
