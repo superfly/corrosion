@@ -36,7 +36,7 @@ use crate::{
     agent::SplitPool,
     api::QueryEvent,
     change::Change,
-    matcher::sql_analyzer::{analyze_sql, MatcherStmt, ParsedSelect, SqlAnalysisError},
+    matcher::sql_analyzer::{ExprKind, MatcherStmt, ParsedSelect, SqlAnalysisError, analyze_sql},
     schema::Schema,
     sqlite::CrConn,
     updates::HandleMetrics,
@@ -363,7 +363,7 @@ impl MatcherHandle {
         &self.inner.hash
     }
 
-    pub fn parsed_columns(&self) -> &[ResultColumn] {
+    pub fn parsed_columns(&self) -> &[(ExprKind, ResultColumn)] {
         &self.inner.parsed.result_columns
     }
 

@@ -46,12 +46,14 @@ pub struct ParsedSelect {
     pub table_by_alias: HashMap<String, TableDef>,
     // Multiple real tables can be used at the same time under different aliasses
     pub table_by_real_name: HashMap<String, Vec<TableDef>>,
+    // Column references from parent scopes
+    pub parent_column_references: Vec<ExprColumnRef>,
     // That's a quirk with how USING constrains work
     // The columns referenced on the right side of the USING clause are not returned by * and are not resolvable without a namespace
     // This makes usually ambiguous column references valid .-.
     pub column_omissions: HashSet<ExprColumnRef>,
     // The columns returned by this query
-    pub result_columns: Vec<ResultColumn>,
+    pub result_columns: Vec<(ExprKind, ResultColumn)>,
     // Subqueries and stuff, currently mostly ignored
     // They are included when querying for changes but not used for matching
     // For ex. SELECT * FROM ... WHERE EXISTS (SELECT * FROM other_table WHERE ...)
@@ -70,6 +72,7 @@ impl Default for ParsedSelect {
             tables: IndexMap::new(),
             table_by_alias: HashMap::new(),
             table_by_real_name: HashMap::new(),
+            parent_column_references: Vec::new(),
             column_omissions: HashSet::new(),
             result_columns: Vec::new(),
             children: Vec::new(),
@@ -79,15 +82,25 @@ impl Default for ParsedSelect {
     }
 }
 
+#[derive(Debug, Clone)]
+pub enum ExprKind {
+    Constant(String),
+    Column(ExprColumnRef),
+    Complex,
+}
+
+#[derive(Debug)]
 struct ParsingScope<'a> {
+    schema: &'a Schema,
     parsed: ParsedSelect,
     parent_scope: Option<&'a ParsingScope<'a>>,
     depth: u32,
 }
 
 impl<'a> ParsingScope<'a> {
-    fn root_scope<'b>() -> ParsingScope<'b> {
+    fn root_scope(schema: &'a Schema) -> ParsingScope<'a> {
         ParsingScope {
+            schema,
             parsed: Default::default(),
             parent_scope: None,
             depth: 0,
@@ -96,14 +109,18 @@ impl<'a> ParsingScope<'a> {
 
     fn child_scope(&'a self) -> ParsingScope<'a> {
         ParsingScope {
+            schema: self.schema,
             parsed: Default::default(),
             parent_scope: Some(self),
             depth: self.depth + 1,
         }
     }
 
+    // An empty scope with the same schema and depth
+    // Column references from this scope can be used in the source scope if the table is present in the source
     fn isolated_scope(&'a self) -> ParsingScope<'a> {
         ParsingScope {
+            schema: self.schema,
             parsed: Default::default(),
             parent_scope: None,
             depth: self.depth,
@@ -112,6 +129,7 @@ impl<'a> ParsingScope<'a> {
 
     fn without_parent(&self) -> ParsingScope<'a> {
         ParsingScope {
+            schema: self.schema,
             parsed: self.parsed.clone(),
             parent_scope: None,
             depth: self.depth,
@@ -121,13 +139,12 @@ impl<'a> ParsingScope<'a> {
     // Called when a table is first encountered in FROM or JOIN clause
     fn add_table_to_scope<'b>(
         &mut self,
-        schema: &'b Schema,
         table_name: &'b QualifiedName,
         alias: &'b Option<As>,
     ) -> Result<TableDef, SqlAnalysisError> {
         let real_table_name = &table_name.name;
         // Check if such table exists in the schema
-        if !schema.tables.contains_key(&real_table_name.0) {
+        if !self.schema.tables.contains_key(&real_table_name.0) {
             return Err(SqlAnalysisError::TableNotFound(real_table_name.0.clone()));
         }
         // Assume that if we have no alias, the table name is the alias
@@ -166,7 +183,6 @@ impl<'a> ParsingScope<'a> {
 
     fn resolve_column_reference(
         &self,
-        schema: &Schema,
         namespace: Option<&str>,
         column_name: &String,
     ) -> Result<ExprColumnRef, SqlAnalysisError> {
@@ -177,7 +193,7 @@ impl<'a> ParsingScope<'a> {
         if let Some(namespace) = namespace {
             if let Some(table_def) = self.parsed.table_by_alias.get(namespace) {
                 // Ok the table is defined in this scope, it must exist in the schema
-                let table = schema.tables.get(&table_def.real_table).unwrap();
+                let table = self.schema.tables.get(&table_def.real_table).unwrap();
                 if !table.columns.contains_key(&check_col_name) {
                     return Err(SqlAnalysisError::NoSuchColumn {
                         table: table_def.alias.clone(),
@@ -194,7 +210,7 @@ impl<'a> ParsingScope<'a> {
             // Without an explicit namespace let's try to see if an column name matches
             let mut found = None;
             for table_def in self.parsed.tables.keys() {
-                if let Some(tbl) = schema.tables.get(&table_def.real_table) {
+                if let Some(tbl) = self.schema.tables.get(&table_def.real_table) {
                     if tbl.columns.contains_key(&check_col_name) {
                         // Using clause columns are not returned by * and are not resolvable without a namespace
                         if self.parsed.column_omissions.contains(&ExprColumnRef {
@@ -225,7 +241,7 @@ impl<'a> ParsingScope<'a> {
 
         // If not found look for the table in parent scopes
         if let Some(parent_scope) = self.parent_scope {
-            return parent_scope.resolve_column_reference(schema, namespace, column_name);
+            return parent_scope.resolve_column_reference(namespace, column_name);
         }
 
         return Err(SqlAnalysisError::TableForColumnNotFound {
@@ -233,25 +249,421 @@ impl<'a> ParsingScope<'a> {
         });
     }
 
-    fn register_column_reference(&mut self, schema: &Schema, column: &ExprColumnRef) {
-        insert_col(
-            self.parsed.tables.get_mut(&column.table).unwrap(),
-            schema,
-            &column.table.real_table,
-            &column.column_name,
-        );
+    fn register_column_reference(&mut self, column: &ExprColumnRef) {
+        if column.table_scope_depth == self.depth {
+            insert_col(
+                self.parsed.tables.get_mut(&column.table).unwrap(),
+                self.schema,
+                &column.table.real_table,
+                &column.column_name,
+            );
+        } else if column.table_scope_depth < self.depth {
+            self.parsed.parent_column_references.push(column.clone());
+        } else {
+            panic!("column table scope depth is greater than current scope depth");
+        }
     }
 
     fn register_eq_constraint(&mut self, left: &ExprColumnRef, right: &ExprColumnRef) {
         self.parsed.equal_columns.link(left.clone(), right.clone());
     }
 
-    fn register_constant_constaint(&mut self, constant_id: String, column: &ExprColumnRef) {
+    fn register_constant_constraint(&mut self, constant_id: String, column: &ExprColumnRef) {
         self.parsed
             .constant_columns
             .entry(constant_id)
             .or_default()
             .insert(column.clone());
+    }
+
+    fn visit_select(mut self, select: &Select) -> Result<ParsedSelect, SqlAnalysisError> {
+        if select.with.is_some() {
+            return Err(SqlAnalysisError::CTENotAllowed);
+        }
+
+        if select.order_by.is_some() {
+            return Err(SqlAnalysisError::OrderByNotAllowed);
+        }
+
+        if select.limit.is_some() {
+            return Err(SqlAnalysisError::LimitNotAllowed);
+        }
+
+        if let OneSelect::Select {
+            ref from,
+            ref columns,
+            ref where_clause,
+            ..
+        } = select.body.select
+        {
+            match from {
+                Some(from) => {
+                    let from_table = match &from.select {
+                        Some(table) => match table.as_ref() {
+                            SelectTable::Table(name, alias, _) => {
+                                self.add_table_to_scope(name, alias)?;
+                            }
+                            // TODO: add support for:
+                            // TableCall(QualifiedName, Option<Vec<Expr>>, Option<As>),
+                            // Select(Select, Option<As>),
+                            // Sub(FromClause, Option<As>),
+                            t => {
+                                warn!("ignoring {t:?}");
+                            }
+                        },
+                        _ => {
+                            // according to the sqlite3-parser docs, this can't really happen
+                            // ignore!
+                            unreachable!()
+                        }
+                    };
+                    if let Some(ref joins) = from.joins {
+                        for join in joins.iter() {
+                            // let mut tbl_name = None;
+                            let (tbl_name, tbl_alias) = match &join.table {
+                                SelectTable::Table(name, alias, _) => {
+                                    // Using is tricky so defer until we've seen the constraints
+                                    (name, alias)
+                                }
+                                // TODO: add support for:
+                                // TableCall(QualifiedName, Option<Vec<Expr>>, Option<As>),
+                                // Select(Select, Option<As>),
+                                // Sub(FromClause, Option<As>),
+                                t => {
+                                    warn!("ignoring JOIN's non-SelectTable::Table:  {t:?}");
+                                    continue;
+                                }
+                            };
+                            // ON or USING
+                            if let Some(constraint) = &join.constraint {
+                                match constraint {
+                                    JoinConstraint::On(expr) => {
+                                        // Simple on clause - add table to scope and extract columns
+                                        self.add_table_to_scope(tbl_name, tbl_alias)?;
+                                        self.visit_expr(expr)?;
+                                    }
+                                    // For each pair of columns identified by a USING clause, the column from the right-hand dataset is omitted from the joined dataset.
+                                    // This is the only difference between a USING clause and its equivalent ON constraint.
+                                    JoinConstraint::Using(names) => {
+                                        let mut isolated_scope = self.isolated_scope();
+                                        let tbl_def = isolated_scope
+                                            .add_table_to_scope(tbl_name, tbl_alias)?;
+                                        let mut eq_columns = Vec::new();
+                                        for col_name in names.iter() {
+                                            // USING is very special - the name must exist on both sides of the join directly in this scope
+                                            let left = self
+                                                .without_parent()
+                                                .resolve_column_reference(None, &col_name.0)?;
+                                            let right = isolated_scope.resolve_column_reference(
+                                                Some(&tbl_def.alias),
+                                                &col_name.0,
+                                            )?;
+                                            eq_columns.push((left, right));
+                                        }
+                                        // Great! All columns are resolvable on both sides of the join
+                                        self.add_table_to_scope(tbl_name, tbl_alias)?;
+                                        for (left, right) in eq_columns {
+                                            self.register_column_reference(&left);
+                                            self.register_column_reference(&right);
+                                            self.register_eq_constraint(&left, &right);
+                                            self.parsed.column_omissions.insert(right.clone());
+                                        }
+                                    }
+                                }
+                            } else {
+                                // No constrains - just add the table to the scope
+                                self.add_table_to_scope(tbl_name, tbl_alias)?;
+                            }
+                        }
+                    }
+                    if let Some(expr) = where_clause {
+                        self.visit_expr(expr)?;
+                    }
+                    from_table
+                }
+                _ => (),
+            };
+
+            // Determine which columns will be returned by this query
+            self.visit_return_columns(columns.as_slice())?;
+        }
+
+        Ok(self.parsed)
+    }
+
+    fn visit_subquery(&mut self, subquery: &Select) -> Result<&ParsedSelect, SqlAnalysisError> {
+        let child = self.child_scope().visit_select(subquery)?;
+        // If the subquery reffers to columns from the parent scope, we need to register them
+        for reference in &child.parent_column_references {
+            self.register_column_reference(reference);
+        }
+        self.parsed.children.push(child);
+        Ok(self.parsed.children.last().unwrap())
+    }
+
+    fn visit_expr(&mut self, expr: &Expr) -> Result<ExprKind, SqlAnalysisError> {
+        match expr {
+            // simplest case
+            Expr::Qualified(tblname, colname) => {
+                let column = self.resolve_column_reference(Some(&tblname.0), &colname.0)?;
+                self.register_column_reference(&column);
+                Ok(ExprKind::Column(column))
+            }
+            // simplest case but also mentioning the schema
+            Expr::DoublyQualified(schema_name, tblname, colname) if schema_name.0 == "main" => {
+                let column = self.resolve_column_reference(Some(&tblname.0), &colname.0)?;
+                self.register_column_reference(&column);
+                Ok(ExprKind::Column(column))
+            }
+            Expr::DoublyQualified(schema_name, _, _) => Err(SqlAnalysisError::UnknownSchema {
+                schema_name: schema_name.0.clone(),
+            }),
+
+            Expr::Name(colname) => {
+                let column = self.resolve_column_reference(None, &colname.0)?;
+                self.register_column_reference(&column);
+                Ok(ExprKind::Column(column))
+            }
+
+            Expr::Id(colname) => {
+                match self.resolve_column_reference(None, &colname.0) {
+                    Err(e) => {
+                        // https://www.sqlite.org/quirks.html#double_quoted_string_literals_are_accepted
+                        // This is a double quoted string literal, not a column reference
+                        if colname.0.starts_with('"') {
+                            Ok(ExprKind::Constant("".to_string()))
+                        } else {
+                            Err(e)
+                        }
+                    }
+                    Ok(column) => {
+                        self.register_column_reference(&column);
+                        Ok(ExprKind::Column(column))
+                    }
+                }
+            }
+
+            Expr::Between { lhs, start, end, .. } => {
+                self.visit_expr(lhs)?;
+                self.visit_expr(start)?;
+                self.visit_expr(end)?;
+                Ok(ExprKind::Complex)
+            }
+            Expr::Binary(lhs, op, rhs) => {
+                match (op, self.visit_expr(lhs)?, self.visit_expr(rhs)?) {
+                    //TODO: Don't add the constrains when OR and friends are on toplevel
+                    (Operator::Equals, ExprKind::Column(left), ExprKind::Column(right)) => {
+                        self.register_eq_constraint(&left, &right);
+                        Ok(ExprKind::Complex)
+                    }
+                    (Operator::Equals, ExprKind::Column(column), ExprKind::Constant(cid)) => {
+                        self.register_constant_constraint(cid, &column);
+                        Ok(ExprKind::Complex)
+                    }
+                    (Operator::Equals, ExprKind::Constant(cid), ExprKind::Column(column)) => {
+                        self.register_constant_constraint(cid, &column);
+                        Ok(ExprKind::Complex)
+                    }
+                    
+                    _ => Ok(ExprKind::Complex),
+                }
+            }
+            Expr::Case {
+                base,
+                when_then_pairs,
+                else_expr,
+            } => {
+                if let Some(expr) = base {
+                    self.visit_expr(expr)?;
+                }
+                for (when_expr, then_expr) in when_then_pairs.iter() {
+                    self.visit_expr(when_expr)?;
+                    self.visit_expr(then_expr)?;
+                }
+                if let Some(expr) = else_expr {
+                    self.visit_expr(expr)?;
+                }
+                Ok(ExprKind::Complex)
+            }
+            Expr::Cast { expr, .. } => match self.visit_expr(expr)? {
+                c @ ExprKind::Constant(_) => Ok(c),
+                // Assume casting a column is too complex for eq constrains
+                _ => Ok(ExprKind::Complex),
+            },
+            Expr::Collate(expr, _) => match self.visit_expr(expr)? {
+                c @ ExprKind::Constant(_) => Ok(c),
+                // Assume collating a column is too complex for eq constrains
+                _ => Ok(ExprKind::Complex),
+            },
+            Expr::Exists(select) => {
+                self.visit_subquery(select)?;
+                Ok(ExprKind::Complex)
+            }
+            Expr::FunctionCall { args, .. } => {
+                if let Some(args) = args {
+                    for expr in args.iter() {
+                        self.visit_expr(expr)?;
+                    }
+                }
+                Ok(ExprKind::Complex)
+            }
+            Expr::InList { lhs, rhs, .. } => {
+                self.visit_expr(lhs)?;
+                if let Some(rhs) = rhs {
+                    for expr in rhs.iter() {
+                        self.visit_expr(expr)?;
+                    }
+                }
+                Ok(ExprKind::Complex)
+            }
+            Expr::InSelect { lhs, rhs, .. } => {
+                self.visit_expr(lhs)?;
+                self.visit_subquery(rhs)?;
+                Ok(ExprKind::Complex)
+            }
+            expr @ Expr::InTable { .. } => {
+                return Err(SqlAnalysisError::UnsupportedExpr { expr: expr.clone() })
+            }
+            Expr::IsNull(expr) => {
+                self.visit_expr(expr)?;
+                // PK's can never be null, therefore nullability does not give us any information
+                Ok(ExprKind::Complex)
+            }
+            Expr::Like { lhs, rhs, .. } => {
+                self.visit_expr(lhs)?;
+                self.visit_expr(rhs)?;
+                Ok(ExprKind::Complex)
+            }
+            Expr::NotNull(expr) => {
+                self.visit_expr(expr)?;
+                // PK's can never be null, therefore nullability does not give us any information
+                Ok(ExprKind::Complex)
+            }
+            Expr::Parenthesized(parens) => {
+                for expr in parens.iter() {
+                    let r = self.visit_expr(expr)?;
+                    if parens.len() == 1 {
+                        // Parenthesised column or constant is ok
+                        return Ok(r);
+                    }
+                }
+                Ok(ExprKind::Complex)
+            }
+            Expr::Subquery(select) => {
+                let child = self.visit_subquery(select)?;
+                // If it returns a single column and does not reference any tables, it might be a constant
+                if child.tables.len() == 0 && child.result_columns.len() == 1 {
+                    let (kind, _col) = child.result_columns.first().unwrap();
+                    // The funny thing is that such subquery can select a parent column :D
+                    return Ok(kind.clone());
+                }
+                Ok(ExprKind::Complex)
+            }
+            Expr::Unary(_, expr) => {
+                self.visit_expr(expr)?;
+                Ok(ExprKind::Complex)
+            }
+
+            Expr::Literal(lit) => match lit {
+                Literal::Numeric(_) | Literal::String(_) | Literal::Blob(_) => {
+                    Ok(ExprKind::Constant("".into()))
+                }
+                Literal::Keyword(keyword) => {
+                    let l = keyword.to_string().to_lowercase();
+                    if l == "false" || l == "true" {
+                        Ok(ExprKind::Constant("".into()))
+                    } else {
+                        Ok(ExprKind::Complex)
+                    }
+                }
+                // thing = NULL doesn't make sense as it's always false
+                Literal::Null => Ok(ExprKind::Complex),
+                Literal::CurrentDate => Ok(ExprKind::Complex),
+                Literal::CurrentTime => Ok(ExprKind::Complex),
+                Literal::CurrentTimestamp => Ok(ExprKind::Complex),
+            },
+            Expr::Variable(variable_name) => Ok(ExprKind::Constant(variable_name.clone())),
+
+            // Expr::FunctionCallStar { name, filter_over } => todo!(),
+            // Expr::Raise(_, _) => todo!(),
+            _ => Ok(ExprKind::Complex),
+        }
+    }
+
+    fn visit_return_columns(&mut self, columns: &[ResultColumn]) -> Result<(), SqlAnalysisError> {
+        let mut i = 0;
+        for col in columns.iter() {
+            match col {
+                ResultColumn::Expr(expr, _) => {
+                    // println!("extracting col: {expr:?} (as: {maybe_as:?})");
+                    let kind = self.visit_expr(expr)?;
+                    self.parsed.result_columns.push((kind, ResultColumn::Expr(
+                        expr.clone(),
+                        Some(As::As(Name(format!("col_{i}")))),
+                    )));
+                    i += 1;
+                }
+                ResultColumn::Star => {
+                    // A star is a star - it will select everything which is in the current scope including joins
+                    for (table_def, referenced_columns) in &mut self.parsed.tables {
+                        let table_schema = self.schema.tables.get(&table_def.real_table).ok_or(
+                            SqlAnalysisError::TableStarNotFound {
+                                tbl_name: table_def.real_table.clone(),
+                            },
+                        )?;
+                        // Now with the table schema resolved we need to add all columns from this table
+                        for col in table_schema.columns.keys() {
+                            let resolved_col = ExprColumnRef {
+                                table: table_def.clone(),
+                                table_scope_depth: self.depth,
+                                column_name: col.clone(),
+                            };
+                            // Unless they are omitted
+                            if self.parsed.column_omissions.contains(&resolved_col) {
+                                continue;
+                            }
+                            referenced_columns.insert(col.clone());
+                            self.parsed.result_columns.push((ExprKind::Column(resolved_col), ResultColumn::Expr(
+                                Expr::Qualified(Name(table_def.alias.clone()), Name(col.clone())),
+                                Some(As::As(Name(format!("col_{i}")))),
+                            )));
+                            i += 1;
+                        }
+                    }
+                }
+                ResultColumn::TableStar(tbl_name) => {
+                    let (table_def, table_schema, referenced_columns) = self
+                        .parsed
+                        .table_by_alias
+                        .get(tbl_name.0.as_str())
+                        .and_then(|table_def| {
+                            Some((
+                                table_def,
+                                self.schema.tables.get(&table_def.real_table)?,
+                                self.parsed.tables.get_mut(table_def)?,
+                            ))
+                        })
+                        .ok_or(SqlAnalysisError::TableStarNotFound {
+                            tbl_name: tbl_name.0.clone(),
+                        })?;
+                    // Now with the table schema resolved we need to add all columns from this table
+                    for col in table_schema.columns.keys() {
+                        let resolved_col = ExprColumnRef {
+                                table: table_def.clone(),
+                                table_scope_depth: self.depth,
+                                column_name: col.clone(),
+                            };
+                        referenced_columns.insert(col.clone());
+                        self.parsed.result_columns.push((ExprKind::Column(resolved_col), ResultColumn::Expr(
+                            Expr::Qualified(Name(table_def.alias.clone()), Name(col.clone())),
+                            Some(As::As(Name(format!("col_{i}")))),
+                        )));
+                        i += 1;
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -274,7 +686,9 @@ pub fn analyze_sql(
     let (mut stmt, parsed) = match parser.next()?.ok_or(SqlAnalysisError::StatementRequired)? {
         Cmd::Stmt(stmt) => {
             let parsed = match stmt {
-                Stmt::Select(ref select) => extract_select_columns(select, schema, None)?,
+                Stmt::Select(ref select) => {
+                    ParsingScope::root_scope(schema).visit_select(select)?
+                }
                 _ => return Err(SqlAnalysisError::UnsupportedStatement),
             };
 
@@ -325,7 +739,7 @@ pub fn analyze_sql(
                     .flatten()
                     .collect::<Vec<_>>();
 
-                new_cols.append(&mut parsed.result_columns.clone());
+                new_cols.append(&mut parsed.result_columns.iter().map(|(_, col)| col.clone()).collect());
                 *columns = new_cols;
             }
             _ => unreachable!(),
@@ -436,128 +850,6 @@ pub fn analyze_sql(
     })
 }
 
-fn extract_select_columns<'a>(
-    select: &Select,
-    schema: &Schema,
-    scope: Option<ParsingScope<'a>>,
-) -> Result<ParsedSelect, SqlAnalysisError> {
-    let mut scope = scope.unwrap_or(ParsingScope::root_scope());
-
-    if select.with.is_some() {
-        return Err(SqlAnalysisError::CTENotAllowed);
-    }
-
-    if select.order_by.is_some() {
-        return Err(SqlAnalysisError::OrderByNotAllowed);
-    }
-
-    if select.limit.is_some() {
-        return Err(SqlAnalysisError::LimitNotAllowed);
-    }
-
-    if let OneSelect::Select {
-        ref from,
-        ref columns,
-        ref where_clause,
-        ..
-    } = select.body.select
-    {
-        match from {
-            Some(from) => {
-                let from_table = match &from.select {
-                    Some(table) => match table.as_ref() {
-                        SelectTable::Table(name, alias, _) => {
-                            scope.add_table_to_scope(schema, name, alias)?;
-                        }
-                        // TODO: add support for:
-                        // TableCall(QualifiedName, Option<Vec<Expr>>, Option<As>),
-                        // Select(Select, Option<As>),
-                        // Sub(FromClause, Option<As>),
-                        t => {
-                            warn!("ignoring {t:?}");
-                        }
-                    },
-                    _ => {
-                        // according to the sqlite3-parser docs, this can't really happen
-                        // ignore!
-                        unreachable!()
-                    }
-                };
-                if let Some(ref joins) = from.joins {
-                    for join in joins.iter() {
-                        // let mut tbl_name = None;
-                        let (tbl_name, tbl_alias) = match &join.table {
-                            SelectTable::Table(name, alias, _) => {
-                                // Using is tricky so defer until we've seen the constraints
-                                (name, alias)
-                            }
-                            // TODO: add support for:
-                            // TableCall(QualifiedName, Option<Vec<Expr>>, Option<As>),
-                            // Select(Select, Option<As>),
-                            // Sub(FromClause, Option<As>),
-                            t => {
-                                warn!("ignoring JOIN's non-SelectTable::Table:  {t:?}");
-                                continue;
-                            }
-                        };
-                        // ON or USING
-                        if let Some(constraint) = &join.constraint {
-                            match constraint {
-                                JoinConstraint::On(expr) => {
-                                    // Simple on clause - add table to scope and extract columns
-                                    scope.add_table_to_scope(schema, tbl_name, tbl_alias)?;
-                                    extract_expr_columns(expr, schema, &mut scope)?;
-                                }
-                                // For each pair of columns identified by a USING clause, the column from the right-hand dataset is omitted from the joined dataset.
-                                // This is the only difference between a USING clause and its equivalent ON constraint.
-                                JoinConstraint::Using(names) => {
-                                    let mut isolated_scope = scope.isolated_scope();
-                                    let tbl_def = isolated_scope
-                                        .add_table_to_scope(schema, tbl_name, tbl_alias)?;
-                                    let mut eq_columns = Vec::new();
-                                    for col_name in names.iter() {
-                                        // USING is very special - the name must exist on both sides of the join directly in this scope
-                                        let left = scope
-                                            .without_parent()
-                                            .resolve_column_reference(schema, None, &col_name.0)?;
-                                        let right = isolated_scope.resolve_column_reference(
-                                            schema,
-                                            Some(&tbl_def.alias),
-                                            &col_name.0,
-                                        )?;
-                                        eq_columns.push((left, right));
-                                    }
-                                    // Great! All columns are resolvable on both sides of the join
-                                    scope.add_table_to_scope(schema, tbl_name, tbl_alias)?;
-                                    for (left, right) in eq_columns {
-                                        scope.register_column_reference(schema, &left);
-                                        scope.register_column_reference(schema, &right);
-                                        scope.register_eq_constraint(&left, &right);
-                                        scope.parsed.column_omissions.insert(right.clone());
-                                    }
-                                }
-                            }
-                        } else {
-                            // No constrains - just add the table to the scope
-                            scope.add_table_to_scope(schema, tbl_name, tbl_alias)?;
-                        }
-                    }
-                }
-                if let Some(expr) = where_clause {
-                    extract_expr_columns(expr, schema, &mut scope)?;
-                }
-                from_table
-            }
-            _ => (),
-        };
-
-        // Determine which columns will be returned by this query
-        extract_columns(columns.as_slice(), schema, &mut scope)?;
-    }
-
-    Ok(scope.parsed)
-}
-
 fn insert_col(set: &mut HashSet<String>, schema: &Schema, tbl_name: &str, name: &str) {
     let table = schema.tables.get(tbl_name);
     if let Some(generated) =
@@ -570,222 +862,6 @@ fn insert_col(set: &mut HashSet<String>, schema: &Schema, tbl_name: &str, name: 
     } else {
         set.insert(name.to_owned());
     }
-}
-
-#[derive(Debug)]
-enum ExtractExprResult {
-    Constant(String),
-    Column(ExprColumnRef),
-}
-fn extract_expr_columns<'a>(
-    expr: &Expr,
-    schema: &Schema,
-    scope: &mut ParsingScope<'a>,
-) -> Result<(), SqlAnalysisError> {
-    match expr {
-        // simplest case
-        Expr::Qualified(tblname, colname) => {
-            let column = scope.resolve_column_reference(schema, Some(&tblname.0), &colname.0)?;
-            scope.register_column_reference(schema, &column);
-        }
-        // simplest case but also mentioning the schema
-        Expr::DoublyQualified(schema_name, tblname, colname) if schema_name.0 == "main" => {
-            let column = scope.resolve_column_reference(schema, Some(&tblname.0), &colname.0)?;
-            scope.register_column_reference(schema, &column);
-        }
-        Expr::DoublyQualified(schema_name, _, _) => {
-            return Err(SqlAnalysisError::UnknownSchema {
-                schema_name: schema_name.0.clone(),
-            });
-        }
-
-        Expr::Name(colname) => {
-            let column = scope.resolve_column_reference(schema, None, &colname.0)?;
-            scope.register_column_reference(schema, &column)
-        }
-
-        Expr::Id(colname) => {
-            let res = scope.resolve_column_reference(schema, None, &colname.0);
-            if let Err(e) = res {
-                // https://www.sqlite.org/quirks.html#double_quoted_string_literals_are_accepted
-                // This is a double quoted string literal, not a column reference
-                if colname.0.starts_with('"') {
-                    return Ok(());
-                }
-                return Err(e);
-            }
-            if let Ok(column) = res {
-                scope.register_column_reference(schema, &column);
-            }
-        }
-
-        Expr::Between { lhs, .. } => extract_expr_columns(lhs, schema, scope)?,
-        Expr::Binary(lhs, _, rhs) => {
-            extract_expr_columns(lhs, schema, scope)?;
-            extract_expr_columns(rhs, schema, scope)?;
-        }
-        Expr::Case {
-            base,
-            when_then_pairs,
-            else_expr,
-        } => {
-            if let Some(expr) = base {
-                extract_expr_columns(expr, schema, scope)?;
-            }
-            for (when_expr, _then_expr) in when_then_pairs.iter() {
-                // NOTE: should we also parse the then expr?
-                extract_expr_columns(when_expr, schema, scope)?;
-            }
-            if let Some(expr) = else_expr {
-                extract_expr_columns(expr, schema, scope)?;
-            }
-        }
-        Expr::Cast { expr, .. } => extract_expr_columns(expr, schema, scope)?,
-        Expr::Collate(expr, _) => extract_expr_columns(expr, schema, scope)?,
-        Expr::Exists(select) => {
-            scope.parsed.children.push(extract_select_columns(
-                select,
-                schema,
-                Some(scope.child_scope()),
-            )?);
-        }
-        Expr::FunctionCall { args, .. } => {
-            if let Some(args) = args {
-                for expr in args.iter() {
-                    extract_expr_columns(expr, schema, scope)?;
-                }
-            }
-        }
-        Expr::InList { lhs, rhs, .. } => {
-            extract_expr_columns(lhs, schema, scope)?;
-            if let Some(rhs) = rhs {
-                for expr in rhs.iter() {
-                    extract_expr_columns(expr, schema, scope)?;
-                }
-            }
-        }
-        Expr::InSelect { lhs, rhs, .. } => {
-            extract_expr_columns(lhs, schema, scope)?;
-            scope.parsed.children.push(extract_select_columns(
-                rhs,
-                schema,
-                Some(scope.child_scope()),
-            )?);
-        }
-        expr @ Expr::InTable { .. } => {
-            return Err(SqlAnalysisError::UnsupportedExpr { expr: expr.clone() })
-        }
-        Expr::IsNull(expr) => {
-            extract_expr_columns(expr, schema, scope)?;
-        }
-        Expr::Like { lhs, rhs, .. } => {
-            extract_expr_columns(lhs, schema, scope)?;
-            extract_expr_columns(rhs, schema, scope)?;
-        }
-
-        Expr::NotNull(expr) => {
-            extract_expr_columns(expr, schema, scope)?;
-        }
-        Expr::Parenthesized(parens) => {
-            for expr in parens.iter() {
-                extract_expr_columns(expr, schema, scope)?;
-            }
-        }
-        Expr::Subquery(select) => {
-            scope.parsed.children.push(extract_select_columns(
-                select,
-                schema,
-                Some(scope.child_scope()),
-            )?);
-        }
-        Expr::Unary(_, expr) => {
-            extract_expr_columns(expr, schema, scope)?;
-        }
-
-        // no column names in there...
-        // Expr::FunctionCallStar { name, filter_over } => todo!(),
-        // Expr::Id(_) => todo!(),
-        // Expr::Literal(_) => todo!(),
-        // Expr::Raise(_, _) => todo!(),
-        // Expr::Variable(_) => todo!(),
-        _ => {}
-    }
-
-    Ok(())
-}
-
-fn extract_columns(
-    columns: &[ResultColumn],
-    schema: &Schema,
-    scope: &mut ParsingScope<'_>,
-) -> Result<(), SqlAnalysisError> {
-    let mut i = 0;
-    for col in columns.iter() {
-        match col {
-            ResultColumn::Expr(expr, _) => {
-                // println!("extracting col: {expr:?} (as: {maybe_as:?})");
-                extract_expr_columns(expr, schema, scope)?;
-                scope.parsed.result_columns.push(ResultColumn::Expr(
-                    expr.clone(),
-                    Some(As::As(Name(format!("col_{i}")))),
-                ));
-                i += 1;
-            }
-            ResultColumn::Star => {
-                // A star is a star - it will select everything which is in the current scope including joins
-                for (table_def, referenced_columns) in &mut scope.parsed.tables {
-                    let table_schema = schema.tables.get(&table_def.real_table).ok_or(
-                        SqlAnalysisError::TableStarNotFound {
-                            tbl_name: table_def.real_table.clone(),
-                        },
-                    )?;
-                    // Now with the table schema resolved we need to add all columns from this table
-                    for col in table_schema.columns.keys() {
-                        // Unless they are omitted
-                        if scope.parsed.column_omissions.contains(&ExprColumnRef {
-                            table: table_def.clone(),
-                            table_scope_depth: scope.depth,
-                            column_name: col.clone(),
-                        }) {
-                            continue;
-                        }
-                        referenced_columns.insert(col.clone());
-                        scope.parsed.result_columns.push(ResultColumn::Expr(
-                            Expr::Qualified(Name(table_def.alias.clone()), Name(col.clone())),
-                            Some(As::As(Name(format!("col_{i}")))),
-                        ));
-                        i += 1;
-                    }
-                }
-            }
-            ResultColumn::TableStar(tbl_name) => {
-                let (table_def, table_schema, referenced_columns) = scope
-                    .parsed
-                    .table_by_alias
-                    .get(tbl_name.0.as_str())
-                    .and_then(|table_def| {
-                        Some((
-                            table_def,
-                            schema.tables.get(&table_def.real_table)?,
-                            scope.parsed.tables.get_mut(table_def)?,
-                        ))
-                    })
-                    .ok_or(SqlAnalysisError::TableStarNotFound {
-                        tbl_name: tbl_name.0.clone(),
-                    })?;
-                // Now with the table schema resolved we need to add all columns from this table
-                for col in table_schema.columns.keys() {
-                    referenced_columns.insert(col.clone());
-                    scope.parsed.result_columns.push(ResultColumn::Expr(
-                        Expr::Qualified(Name(table_def.alias.clone()), Name(col.clone())),
-                        Some(As::As(Name(format!("col_{i}")))),
-                    ));
-                    i += 1;
-                }
-            }
-        }
-    }
-    Ok(())
 }
 
 fn expr_filter_query_by_table_pk(
@@ -809,78 +885,6 @@ fn expr_filter_query_by_table_pk(
     );
 
     Ok(expr)
-}
-
-// Check if an expression resolves to a constant single value
-// This is used to look for patterns like col_name = constant
-// As in such cases we can assume col_name is unique within the query result set
-// and thus we can treat the column as uniquely identifiable for the purpose of subscription matching
-// This is especially important if col_name is part of a table PK for example
-// SELECT * FROM foo JOIN bar ON foo.random_key = bar.random_key WHERE bar.id = ?
-// Normally we would use (foo.id, bar.id) to identify the result row uniquely but due to the WHERE clause,
-// we can safely use (foo.id) as bar.id => bar.random_key so bar.random_key is constant so the result depends only on foo.id
-// NULLS are not considered constant single values
-//
-// Returns Some if that's the case. None otherwise.
-// The returned string identifies the constant value, if the string is empty
-// then assume it's a new identity not seen before
-fn is_constant_single_value(expr: &Expr) -> Option<String> {
-    match expr {
-        Expr::Literal(lit) => match lit {
-            Literal::Numeric(_) | Literal::String(_) | Literal::Blob(_) => Some("".into()),
-            Literal::Keyword(keyword) => {
-                let l = keyword.to_string().to_lowercase();
-                if l == "false" || l == "true" {
-                    Some("".into())
-                } else {
-                    None
-                }
-            }
-            // thing = NULL doesn't make sense
-            Literal::Null => None,
-            Literal::CurrentDate => None,
-            Literal::CurrentTime => None,
-            Literal::CurrentTimestamp => None,
-        },
-        Expr::Variable(variable_name) => Some(variable_name.clone()),
-        Expr::Cast { expr, .. } => is_constant_single_value(expr),
-        Expr::Collate(expr, ..) => is_constant_single_value(expr),
-        Expr::Parenthesized(exprs) => {
-            // For parenthesized expressions, check if they contain only a single constant
-            // For ex SELECT (2);
-            if exprs.len() == 1 {
-                is_constant_single_value(&exprs[0])
-            } else {
-                None
-            }
-        }
-        // (SELECT constant)
-        Expr::Subquery(sub) => match sub.as_ref() {
-            Select {
-                with: None,
-                body:
-                    SelectBody {
-                        select:
-                            OneSelect::Select {
-                                distinctness: None,
-                                ref columns,
-                                from: None,
-                                where_clause: None,
-                                group_by: None,
-                                window_clause: None,
-                            },
-                        compounds: None,
-                    },
-                order_by: None,
-                limit: None,
-            } => match columns.as_slice() {
-                [ResultColumn::Expr(expr, _)] => is_constant_single_value(expr),
-                _ => None,
-            },
-            _ => None,
-        },
-        _ => None,
-    }
 }
 
 #[derive(Debug, thiserror::Error)]
