@@ -237,9 +237,6 @@ fn extract_array_elements(
         match ch {
             '\\' if !escape_next => {
                 escape_next = true;
-                if in_quotes {
-                    current.push(ch);
-                }
             }
             '"' if !escape_next => {
                 in_quotes = !in_quotes;
