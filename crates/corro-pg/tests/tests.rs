@@ -830,10 +830,7 @@ impl<'a, T: ToSqlText + ToSql> ToSql for SqlVec<'a, T> {
     where
         Self: Sized,
     {
-        match ty.kind() {
-            postgres_types::Kind::Array(_) => true,
-            _ => false,
-        }
+        matches!(ty.kind(), postgres_types::Kind::Array(_))
     }
 
     fn encode_format(&self, _ty: &Type) -> Format {
