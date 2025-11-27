@@ -1009,7 +1009,6 @@ async fn test_unnest_vtab() {
         // TODO: pgwire's text encoding for blob[] is currently broken but we'd work for proper clients
         {
             let col1 = vec![b"a", b"b", b"c", b"d", b"e", b"f"];
-            // pgwire's text encoding for blob[] is currently broken but we would work fine for a proper client
             let rows = client
                 .query(
                     "SELECT CAST(value0 AS blob) FROM unnest(CAST($1 AS blob[]))",
