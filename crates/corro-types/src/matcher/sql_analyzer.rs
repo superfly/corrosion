@@ -862,8 +862,8 @@ pub struct QueryTableMatcherStmt {
     // Otherwise subscriptions are not faster than running a full query from time to time
     pub query_pk: Vec<String>,
     // pub pk_remapper: Option<PkMapper> // TODO :D
-    pub(crate) new_query: String,
-    pub(crate) temp_query: String,
+    pub new_query: String,
+    pub temp_query: String,
 }
 
 impl QueryTableMatcherStmt {
@@ -918,40 +918,60 @@ pub fn prepare_subscription_sql(
 
     // Now after we've parsed the query we can generate the main table queries
     let mut real_tables = IndexMap::default();
+    let mut query_tables = IndexMap::default();
     for (table_def, cols) in parsed.tables {
-        real_tables
-            .entry(table_def.real_table)
-            .or_insert_with(|| {
-                let schema_table = schema.tables.get(&table_def.real_table).unwrap();
-                let sub_table_name = format!("main_pks_{}", table_def.real_table);
-                let pk_sql = schema_table.pk.iter().cloned().collect::<Vec<_>>().join(", ");
-                RealTableMatcherStmt {
-                    table_pk: schema_table.pk.iter().cloned().collect(),
-                    subscribed_cols: Vec::new(),
-                    main_table_name: table_def.real_table.clone(),
-                    sub_table_name: sub_table_name.clone(),
-                    create_table_stmt: format!(
-                        "CREATE TEMP TABLE {} ({})",
-                        sub_table_name, pk_sql
-                    ),
-                    // https://sqlite.org/lang_delete.html
-                    // When the WHERE clause and RETURNING clause are both omitted from a DELETE statement and the table being deleted has no triggers, SQLite uses an optimization to erase the entire table content without having to visit each row of the table individually. 
-                    // This "truncate" optimization makes the delete run much faster
-                    clean_table_stmt: format!("DELETE FROM {}", sub_table_name),
-                    insert_pks_stmt: format!(
-                        "INSERT INTO {} ({}) VALUES ({})",
-                        sub_table_name,
-                        schema_table.pk.join(", "),
-                        schema_table.pk.join(", ")
-                    ),
-                }
-            })
-            .subscribed_cols
-            .extend(cols.iter().cloned());
+        let real_table = real_tables.entry(table_def.real_table).or_insert_with(|| {
+            let schema_table = schema.tables.get(&table_def.real_table).unwrap();
+            let sub_table_name = format!("main_pks_{}", table_def.real_table);
+            let pk_sql = schema_table
+                .pk
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ");
+            // value0, value1, ..., valueN
+            let values_sql = schema_table
+                .pk
+                .iter()
+                .enumerate()
+                .map(|(i, _)| format!("value{}", i))
+                .collect::<Vec<_>>()
+                .join(", ");
+            // ?, ?, ..., ?
+            let unnest_args_sql = schema_table
+                .pk
+                .iter()
+                .map(|_| "?")
+                .collect::<Vec<_>>()
+                .join(", ");
+            RealTableMatcherStmt {
+                table_pk: schema_table.pk.iter().cloned().collect(),
+                subscribed_cols: Vec::new(),
+                main_table_name: table_def.real_table.clone(),
+                sub_table_name: sub_table_name.clone(),
+                create_table_stmt: format!("CREATE TEMP TABLE {} ({})", sub_table_name, pk_sql),
+                // https://sqlite.org/lang_delete.html
+                // When the WHERE clause and RETURNING clause are both omitted from a DELETE statement and the table being deleted has no triggers, SQLite uses an optimization to erase the entire table content without having to visit each row of the table individually.
+                // This "truncate" optimization makes the delete run much faster
+                clean_table_stmt: format!("DELETE FROM {}", sub_table_name),
+                insert_pks_stmt: format!(
+                    "INSERT INTO {} ({}) SELECT {} FROM unnest({})",
+                    sub_table_name, pk_sql, values_sql, unnest_args_sql
+                ),
+            }
+        });
+        real_table.subscribed_cols.extend(cols.iter().cloned());
+        query_tables.insert(table_def.alias.clone(), QueryTableMatcherStmt {
+            table_def: table_def.clone(),
+            // For now assume the PK of the query table is the same as the PK of the real table
+            // For group by queries this is not true
+            query_pk: real_table.table_pk.clone(),
+            new_query: String::new(),
+            temp_query: String::new(),
+        });
     }
 
     let mut statements = HashMap::new();
-
     let mut pks = IndexMap::default();
 
     // Appends the PKs to the result columns
@@ -1098,10 +1118,11 @@ pub fn prepare_subscription_sql(
     }
 
     Ok(PreparedSubscriptionSql {
-        stmt,
-        pks,
+        initial_query: stmt,
+        row_pk: pks,
+        minimal_pk: pks,
         parsed,
-        statements,
+        query_tables,
         real_tables,
     })
 }
