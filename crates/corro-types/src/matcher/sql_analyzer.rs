@@ -14,18 +14,6 @@ use uuid::Uuid;
 
 use crate::schema::{Schema, Table};
 
-#[derive(Debug, Clone)]
-pub struct MatcherStmt {
-    pub(crate) new_query: String,
-    pub(crate) temp_query: String,
-}
-
-impl MatcherStmt {
-    pub fn new_query(&self) -> &String {
-        &self.new_query
-    }
-}
-
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct ExprColumnRef {
     pub table: TableDef,
@@ -330,9 +318,15 @@ impl<'a> ParsingScope<'a> {
         if self.suppress_eq_constraints {
             return;
         }
+        // Unnamed constants mean "this value is unique"
+        let cid = if constant_id.is_empty() {
+            format!("constant_{}", rand::random::<u64>())
+        } else {
+            constant_id
+        };
         self.parsed
             .constant_columns
-            .entry(constant_id)
+            .entry(cid)
             .or_default()
             .insert(column.clone());
     }
@@ -586,21 +580,23 @@ impl<'a> ParsingScope<'a> {
                 // TODO: propagate eq constraints
                 Ok(ExprKind::Complex)
             }
-            expr@ Expr::FunctionCall { name, args, .. } => {
+            expr @ Expr::FunctionCall { name, args, .. } => {
                 let name = name.0.to_lowercase();
                 if name == "unlikely" || name == "likely" {
                     if let Some(args) = args {
                         if args.len() == 1 {
-                            return self.visit_expr(&args[0])
+                            return self.visit_expr(&args[0]);
                         }
                     }
                     Err(SqlAnalysisError::UnsupportedExpr { expr: expr.clone() })
                 } else if name == "likelihood" {
                     if let Some(args) = args {
                         if args.len() == 2 {
-                            let prob = self.maybe_suppress_eq_constraints(true).visit_expr(&args[1])?;
+                            let prob = self
+                                .maybe_suppress_eq_constraints(true)
+                                .visit_expr(&args[1])?;
                             if let ExprKind::Constant(_) = prob {
-                                return self.visit_expr(&args[0])
+                                return self.visit_expr(&args[0]);
                             }
                         }
                     }
@@ -833,19 +829,69 @@ impl<'a> ParsingScope<'a> {
     }
 }
 
-#[derive(Debug)]
-pub struct SqlAnalysis {
-    pub(crate) stmt: Stmt,
-    pub(crate) pks: IndexMap<String, Vec<String>>,
-    pub(crate) parsed: ParsedSelect,
-    pub(crate) statements: HashMap<String, MatcherStmt>,
+// Statements used for incomming table changes
+// Before any reconciliation is done were inserting changed pks into such table
+#[derive(Debug, Clone)]
+pub struct RealTableMatcherStmt {
+    // What are the names of the primary keys of the table
+    pub table_pk: Vec<String>,
+    // On which columns we are matching
+    pub subscribed_cols: Vec<String>,
+    // How is the table named in the main database
+    pub main_table_name: String,
+    // How is the table named in the subscription database
+    pub sub_table_name: String,
+    // Statement used to create the table in the subscription database
+    pub create_table_stmt: String,
+    // Statement used to drop the table in the subscription database
+    pub drop_table_stmt: String,
+    // Statement used to insert the primary keys of the table in the subscription database
+    pub insert_pks_stmt: String,
 }
 
-pub fn analyze_sql(
+// For each referenced table we get a 2 way mapping from the sub query to the real table
+#[derive(Debug, Clone)]
+pub struct QueryTableMatcherStmt {
+    pub table_def: TableDef,
+    // In order for a subscription to be incrementally maintainable
+    // each referenced table in the main schema must have a mapping from
+    // it's source table PK to a subset of the row_pk we use to match
+    // Otherwise subscriptions are not faster than running a full query from time to time
+    pub query_pk: Vec<String>,
+    // pub pk_remapper: Option<PkMapper> // TODO :D
+    pub(crate) new_query: String,
+    pub(crate) temp_query: String,
+}
+
+impl QueryTableMatcherStmt {
+    pub fn new_query(&self) -> &String {
+        &self.new_query
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PreparedSubscriptionSql {
+    // The query which will get executed to get the initial subscription rows
+    pub(crate) initial_query: Stmt,
+    // The PK of a result row
+    pub(crate) row_pk: Vec<String>,
+    // The minimal PK of a result row
+    // It's a subset of row_pk with this FD: minimal_pk => row_pk
+    // We could use only minimal_pk but that would entail a bit of ID remapping
+    pub(crate) minimal_pk: Vec<String>,
+    // The parsed query
+    pub(crate) parsed: ParsedSelect,
+    // real_name -> real_table
+    pub(crate) real_tables: IndexMap<String, RealTableMatcherStmt>,
+    // alias -> query_table
+    pub(crate) query_tables: IndexMap<String, QueryTableMatcherStmt>,
+}
+
+pub fn prepare_subscription_sql(
     sub_id: Uuid,
     sql: &str,
     schema: &Schema,
-) -> Result<SqlAnalysis, SqlAnalysisError> {
+) -> Result<PreparedSubscriptionSql, SqlAnalysisError> {
     let sql_hash = hex::encode(seahash::hash(sql.as_bytes()).to_be_bytes());
     let mut parser = Parser::new(sql.as_bytes());
 
@@ -865,6 +911,48 @@ pub fn analyze_sql(
 
     if parsed.tables.is_empty() {
         return Err(SqlAnalysisError::TableRequired);
+    }
+
+    // Now after we've parsed the query we can generate the main table queries
+    let mut real_tables = IndexMap::default();
+    for (table_def, cols) in parsed.tables {
+        real_tables
+            .entry(table_def.real_table)
+            .or_insert_with(|| {
+                let schema_table = schema.tables.get(&table_def.real_table).unwrap();
+                let sub_table_name = format!("main_pks_{}", table_def.real_table);
+                RealTableMatcherStmt {
+                    table_pk: schema_table.pk.iter().cloned().collect(),
+                    subscribed_cols: Vec::new(),
+                    main_table_name: table_def.real_table.clone(),
+                    sub_table_name: sub_table_name.clone(),
+                    create_table_stmt: String::new(),
+                    drop_table_stmt: String::new(),
+                    insert_pks_stmt: String::new(),
+                }
+            })
+            .subscribed_cols
+            .extend(cols.iter().cloned());
+
+        let table =
+            schema
+                .tables
+                .get(&table_def.real_table)
+                .ok_or(SqlAnalysisError::TableNotFound {
+                    table_name: table_def.real_table.clone(),
+                })?;
+        let table_alias = &table_def.alias;
+        let table_pk = table.pk.clone();
+        let table_name = table_def.real_table.clone();
+        let table_sub_name = table_def.alias.clone();
+        let table_create_stmt = format!("CREATE TABLE {} ({})", table_alias, table_pk.join(", "));
+        let table_drop_stmt = format!("DROP TABLE {}", table_alias);
+        let table_insert_pks_stmt = format!(
+            "INSERT INTO {} ({}) VALUES ({})",
+            table_alias,
+            table_pk.join(", "),
+            table_pk.join(", ")
+        );
     }
 
     let mut statements = HashMap::new();
@@ -1014,11 +1102,12 @@ pub fn analyze_sql(
         );
     }
 
-    Ok(SqlAnalysis {
+    Ok(PreparedSubscriptionSql {
         stmt,
         pks,
         parsed,
         statements,
+        real_tables,
     })
 }
 
@@ -1110,14 +1199,14 @@ mod tests {
         .unwrap();
 
         assert!(matches!(
-            analyze_sql(Uuid::new_v4(), "SELECT * FROM tree JOIN tree", &schema).unwrap_err(),
+            prepare_subscription_sql(Uuid::new_v4(), "SELECT * FROM tree JOIN tree", &schema).unwrap_err(),
             SqlAnalysisError::AmbigousTableReference {
                 real_table: ref rt,
                 alias: ref a
             } if rt == "tree" && a == "tree",
         ));
         assert!(matches!(
-            analyze_sql(Uuid::new_v4(), "SELECT * FROM tree, tree", &schema).unwrap_err(),
+            prepare_subscription_sql(Uuid::new_v4(), "SELECT * FROM tree, tree", &schema).unwrap_err(),
             SqlAnalysisError::AmbigousTableReference {
                 real_table: ref rt,
                 alias: ref a
@@ -1132,7 +1221,7 @@ mod tests {
         // This should fail due to ambiguity as id might reffer both to a and rec
         // SELECT a.*, rec.* FROM rec AS a JOIN rec ON a.id = rec.parent WHERE EXISTS (SELECT 1 WHERE id = 2);
 
-        let analysis = analyze_sql(
+        let analysis = prepare_subscription_sql(
             Uuid::new_v4(),
             "SELECT * FROM tree as a JOIN tree as b ON b.parent_id = a.id",
             &schema,
@@ -1154,7 +1243,7 @@ mod tests {
         ",
         )
         .unwrap();
-        let analysis = analyze_sql(
+        let analysis = prepare_subscription_sql(
             Uuid::new_v4(),
             "SELECT * FROM foo LEFT JOIN bar ON foo.id = bar.foo_id WHERE EXISTS (SELECT 1 FROM baz WHERE bar_id = bar.id) AND UNLIKELY(foo.name = 'test')",
             &schema,

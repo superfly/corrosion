@@ -36,7 +36,7 @@ use crate::{
     agent::SplitPool,
     api::QueryEvent,
     change::Change,
-    matcher::sql_analyzer::{ExprKind, MatcherStmt, ParsedSelect, SqlAnalysisError, analyze_sql},
+    matcher::sql_analyzer::{ExprKind, ParsedSelect, PreparedSubscriptionSql, SqlAnalysisError, prepare_subscription_sql},
     schema::Schema,
     sqlite::CrConn,
     updates::HandleMetrics,
@@ -261,7 +261,7 @@ struct InnerMatcherHandle {
     sql: String,
     hash: String,
     pool: sqlite_pool::RusqlitePool,
-    parsed: ParsedSelect,
+    prepared_subscription: PreparedSubscriptionSql,
     col_names: Vec<ColumnName>,
     cancel: CancellationToken,
     changes_tx: mpsc::Sender<MatchCandidates>,
@@ -269,7 +269,6 @@ struct InnerMatcherHandle {
     purge_tx: mpsc::Sender<oneshot::Sender<rusqlite::Result<usize>>>,
     // some state from the matcher so we can take a look later
     subs_path: String,
-    cached_statements: HashMap<String, MatcherStmt>,
     metrics: HashMap<String, HandleMetrics>,
 }
 
@@ -551,10 +550,7 @@ type StateLock = Arc<(Mutex<MatcherState>, Condvar)>;
 pub struct Matcher {
     pub id: Uuid,
     pub hash: String,
-    pub query: Stmt,
-    pub cached_statements: HashMap<String, MatcherStmt>,
-    pub pks: IndexMap<String, Vec<String>>,
-    pub parsed: ParsedSelect,
+    pub prepared_subscription: PreparedSubscriptionSql,
     pub evt_tx: mpsc::Sender<QueryEvent>,
     pub col_names: Vec<ColumnName>,
     pub last_rowid: u64,
@@ -612,7 +608,7 @@ impl Matcher {
             "#,
         )?;
 
-        let analysis = analyze_sql(id, sql, schema)?;
+        let prepared_subscription = prepare_subscription_sql(id, sql, schema)?;
 
         let cancel = CancellationToken::new();
 
@@ -644,13 +640,12 @@ impl Matcher {
                     .read_only()
                     .create_pool()
                     .expect("could not build pool, this can't fail because we specified a runtime"),
-                parsed: analysis.parsed.clone(),
+                prepared_subscription: prepared_subscription.clone(),
                 col_names: col_names.clone(),
                 cancel: cancel.clone(),
                 last_change_rx,
                 changes_tx,
                 purge_tx,
-                cached_statements: analysis.statements.clone(),
                 subs_path: sub_path.to_string(),
                 metrics: counter_map,
             }),
@@ -660,10 +655,7 @@ impl Matcher {
         let matcher = Self {
             id,
             hash: sql_hash,
-            query: analysis.stmt.clone(),
-            cached_statements: analysis.statements.clone(),
-            pks: analysis.pks,
-            parsed: analysis.parsed,
+            prepared_subscription,
             evt_tx,
             col_names,
             last_rowid: 0,
@@ -804,9 +796,10 @@ impl Matcher {
 
                 CREATE TABLE columns (
                     "table" TEXT NOT NULL,
-                    cid TEXT,
+                    alias TEXT NOT NULL,
+                    cid TEXT NOT NULL,
 
-                    PRIMARY KEY ("table", cid)
+                    PRIMARY KEY ("table", alias, cid)
                 );
             "#,
                 columns = all_cols.join(","),
@@ -837,14 +830,14 @@ impl Matcher {
 
             for (table, columns) in matcher.parsed.tables.iter() {
                 tx.execute(
-                    r#"INSERT INTO columns ("table", cid) VALUES (?, '-1')"#,
-                    [table.alias.as_str()],
+                    r#"INSERT INTO columns ("table", alias, cid) VALUES (?, ?, '-1')"#,
+                    [table.real_table.as_str(), table.alias.as_str()],
                 )?;
                 for column in columns.iter() {
                     trace!("inserting sub column {} => {}", table.alias, column);
                     tx.execute(
-                        r#"INSERT INTO columns ("table", cid) VALUES (?, ?)"#,
-                        [table.alias.as_str(), column.as_str()],
+                        r#"INSERT INTO columns ("table", alias, cid) VALUES (?, ?, ?)"#,
+                        [table.real_table.as_str(), table.alias.as_str(), column.as_str()],
                     )?;
                 }
             }
