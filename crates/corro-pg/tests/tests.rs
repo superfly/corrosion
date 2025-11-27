@@ -1006,7 +1006,7 @@ async fn test_unnest_vtab() {
         }
 
         // Test single array unnest with blob type
-
+        // TODO: pgwire's text encoding for blob[] is currently broken but we'd work for proper clients
         {
             let col1 = vec![b"a", b"b", b"c", b"d", b"e", b"f"];
             // pgwire's text encoding for blob[] is currently broken but we would work fine for a proper client
