@@ -14,6 +14,9 @@ use uuid::Uuid;
 
 use crate::schema::{Schema, Table};
 
+// The schema name used to attach the main database to the subscription db in RO mode
+pub const MAIN_DB_IN_SUB_DB_SCHEMA_NAME: &str = "corro_main";
+
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct ExprColumnRef {
     pub table: TableDef,
@@ -843,8 +846,8 @@ pub struct RealTableMatcherStmt {
     pub sub_table_name: String,
     // Statement used to create the table in the subscription database
     pub create_table_stmt: String,
-    // Statement used to drop the table in the subscription database
-    pub drop_table_stmt: String,
+    // Statement used to cleanup the table in the subscription database
+    pub clean_table_stmt: String,
     // Statement used to insert the primary keys of the table in the subscription database
     pub insert_pks_stmt: String,
 }
@@ -921,38 +924,30 @@ pub fn prepare_subscription_sql(
             .or_insert_with(|| {
                 let schema_table = schema.tables.get(&table_def.real_table).unwrap();
                 let sub_table_name = format!("main_pks_{}", table_def.real_table);
+                let pk_sql = schema_table.pk.iter().cloned().collect::<Vec<_>>().join(", ");
                 RealTableMatcherStmt {
                     table_pk: schema_table.pk.iter().cloned().collect(),
                     subscribed_cols: Vec::new(),
                     main_table_name: table_def.real_table.clone(),
                     sub_table_name: sub_table_name.clone(),
-                    create_table_stmt: String::new(),
-                    drop_table_stmt: String::new(),
-                    insert_pks_stmt: String::new(),
+                    create_table_stmt: format!(
+                        "CREATE TEMP TABLE {} ({})",
+                        sub_table_name, pk_sql
+                    ),
+                    // https://sqlite.org/lang_delete.html
+                    // When the WHERE clause and RETURNING clause are both omitted from a DELETE statement and the table being deleted has no triggers, SQLite uses an optimization to erase the entire table content without having to visit each row of the table individually. 
+                    // This "truncate" optimization makes the delete run much faster
+                    clean_table_stmt: format!("DELETE FROM {}", sub_table_name),
+                    insert_pks_stmt: format!(
+                        "INSERT INTO {} ({}) VALUES ({})",
+                        sub_table_name,
+                        schema_table.pk.join(", "),
+                        schema_table.pk.join(", ")
+                    ),
                 }
             })
             .subscribed_cols
             .extend(cols.iter().cloned());
-
-        let table =
-            schema
-                .tables
-                .get(&table_def.real_table)
-                .ok_or(SqlAnalysisError::TableNotFound {
-                    table_name: table_def.real_table.clone(),
-                })?;
-        let table_alias = &table_def.alias;
-        let table_pk = table.pk.clone();
-        let table_name = table_def.real_table.clone();
-        let table_sub_name = table_def.alias.clone();
-        let table_create_stmt = format!("CREATE TABLE {} ({})", table_alias, table_pk.join(", "));
-        let table_drop_stmt = format!("DROP TABLE {}", table_alias);
-        let table_insert_pks_stmt = format!(
-            "INSERT INTO {} ({}) VALUES ({})",
-            table_alias,
-            table_pk.join(", "),
-            table_pk.join(", ")
-        );
     }
 
     let mut statements = HashMap::new();
