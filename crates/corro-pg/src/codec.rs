@@ -264,7 +264,7 @@ fn extract_array_elements(
     }
 
     // Process the last element
-    if !current.is_empty() && !current.trim().eq_ignore_ascii_case("NULL") {
+    if !current.trim().eq_ignore_ascii_case("NULL") {
         elements.push(current);
     }
 
