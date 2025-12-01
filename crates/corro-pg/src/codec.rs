@@ -198,7 +198,10 @@ impl<T: FromSqlText> VecFromSqlText for Vec<T> {
 
         // Check if it's an array format
         if !input_str.starts_with('{') || !input_str.ends_with('}') {
-            return Err("Invalid array format: must start with '{' and end with '}'".into());
+            return Err(format!(
+                "Invalid array format: must start with '{{' and end with '}}', input: {input_str}"
+            )
+            .into());
         }
 
         let inner = &input_str[1..input_str.len() - 1];
