@@ -952,6 +952,7 @@ async fn test_unnest_vtab() {
                 )
                 .await
                 .unwrap();
+            assert_eq!(rows.len(), col1.len());
             for (i, row) in rows.iter().enumerate() {
                 let val: i64 = row.get(0);
                 assert_eq!(val, col1[i]);
@@ -961,7 +962,7 @@ async fn test_unnest_vtab() {
         // Test single array unnest with text type
         {
             for format in [Format::Text, Format::Binary] {
-                let col1 = vec!["a", "b", "c", "d", "e", "f"];
+                let col1 = vec!["a", "b", "c", "d", "e", "f", ""];
                 let sql_vec = SqlVec {
                     inner: &col1,
                     format,
@@ -973,6 +974,7 @@ async fn test_unnest_vtab() {
                     )
                     .await
                     .unwrap();
+                assert_eq!(rows.len(), col1.len());
                 for (i, row) in rows.iter().enumerate() {
                     let val: String = row.get(0);
                     assert_eq!(val, col1[i]);

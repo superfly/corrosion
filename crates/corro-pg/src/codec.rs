@@ -10,6 +10,7 @@ use pgwire::{
 use postgres_types::Type;
 use std::{collections::HashMap, io};
 use tokio_util::codec;
+use tracing::debug;
 
 pub struct Client {
     pub socket_addr: std::net::SocketAddr,
@@ -232,6 +233,7 @@ fn extract_array_elements(
     let mut in_quotes = false;
     let mut escape_next = false;
     let mut depth = 0; // For nested arrays
+    let mut seen_content = false; // helpful for tracking when the last element is an empty string
 
     for ch in input.chars() {
         match ch {
@@ -240,6 +242,10 @@ fn extract_array_elements(
             }
             '"' if !escape_next => {
                 in_quotes = !in_quotes;
+                // we have seen a new element surrounded by quotes
+                if !in_quotes {
+                    seen_content = true;
+                }
                 // Don't include the quotes in the output
             }
             '{' if !in_quotes && !escape_next => {
@@ -255,6 +261,7 @@ fn extract_array_elements(
                 if !current.trim().eq_ignore_ascii_case("NULL") {
                     elements.push(std::mem::take(&mut current));
                 }
+                seen_content = false;
             }
             _ => {
                 current.push(ch);
@@ -264,9 +271,13 @@ fn extract_array_elements(
     }
 
     // Process the last element
-    if !current.trim().eq_ignore_ascii_case("NULL") {
+    if seen_content && !current.trim().eq_ignore_ascii_case("NULL") {
         elements.push(current);
     }
 
+    debug!(
+        "extracted elements: {elements:?} from input: {input}, lenght: {}",
+        elements.len()
+    );
     Ok(elements)
 }
