@@ -260,12 +260,13 @@ fn extract_array_elements(
                 // End of current element
                 if !current.trim().eq_ignore_ascii_case("NULL") {
                     elements.push(std::mem::take(&mut current));
+                    seen_content = false;
                 }
-                seen_content = false;
             }
             _ => {
                 current.push(ch);
                 escape_next = false;
+                seen_content = true;
             }
         }
     }
