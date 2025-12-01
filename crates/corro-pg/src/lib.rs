@@ -3355,7 +3355,11 @@ fn parameter_types<'schema, 'stmt>(
 
                 let mut tables = HashMap::new();
                 if let Some(tbl) = schema.tables.get(&tbl_name.name.0) {
-                    tables.insert(tbl_name.name.0.clone(), tbl);
+                    if let Some(alias) = &tbl_name.alias {
+                        tables.insert(alias.0.clone(), tbl);
+                    } else {
+                        tables.insert(tbl_name.name.0.clone(), tbl);
+                    }
                 }
                 if let Some(where_clause) = where_clause {
                     extract_params(schema, where_clause, &tables, &mut params)?;
