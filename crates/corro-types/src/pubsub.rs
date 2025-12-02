@@ -1,7 +1,6 @@
 use std::{
     cmp,
     collections::{BTreeMap, HashMap},
-    os::unix::ffi::OsStrExt,
     path::Path,
     sync::Arc,
     time::{Duration, Instant},
@@ -10,7 +9,7 @@ use std::{
 use async_trait::async_trait;
 use bytes::{Buf, BufMut};
 use camino::{Utf8Path, Utf8PathBuf};
-use compact_str::{format_compact, ToCompactString};
+use compact_str::ToCompactString;
 use corro_api_types::{
     ChangeId, ColumnName, ColumnType, RowId, SqliteValue, SqliteValueRef, TableName,
 };
@@ -23,7 +22,7 @@ use rusqlite::{
     Connection, OpenFlags, OptionalExtension,
 };
 use spawn::spawn_counted;
-use sqlite3_parser::ast::{Cmd, ResultColumn, Stmt};
+use sqlite3_parser::ast::{Cmd, ResultColumn};
 use sqlite_pool::RusqlitePool;
 use tokio::{
     sync::{mpsc, oneshot, watch, AcquireError},
@@ -39,11 +38,10 @@ use crate::{
     api::QueryEvent,
     change::Change,
     matcher::sql_analyzer::{
-        prepare_subscription_sql, ExprKind, ParsedSelect, PreparedSubscriptionSql,
+        prepare_subscription_sql, ExprKind, PreparedSubscriptionSql, QueryTableMatcherStmt,
         SqlAnalysisError, MAIN_DB_IN_SUB_DB_SCHEMA_NAME,
     },
     schema::Schema,
-    sqlite::CrConn,
     updates::HandleMetrics,
 };
 
@@ -317,6 +315,7 @@ impl Handle for MatcherHandle {
         // don't consider changes that don't have both the table + col in the matcher query
         if !self
             .inner
+            .prepared_subscription
             .parsed
             .table_by_real_name
             .get(change.table.as_str())
@@ -324,6 +323,7 @@ impl Handle for MatcherHandle {
             .iter()
             .any(|table_def| {
                 self.inner
+                    .prepared_subscription
                     .parsed
                     .tables
                     .get(table_def)
@@ -368,7 +368,7 @@ impl MatcherHandle {
     }
 
     pub fn parsed_columns(&self) -> &[(ExprKind, ResultColumn)] {
-        &self.inner.parsed.result_columns
+        &self.inner.prepared_subscription.parsed.result_columns
     }
 
     pub fn col_names(&self) -> &[ColumnName] {
@@ -379,8 +379,8 @@ impl MatcherHandle {
         &self.inner.subs_path
     }
 
-    pub fn cached_stmts(&self) -> &HashMap<String, MatcherStmt> {
-        &self.inner.cached_statements
+    pub fn cached_stmts(&self) -> &IndexMap<String, QueryTableMatcherStmt> {
+        &self.inner.prepared_subscription.query_tables
     }
 
     pub fn pool(&self) -> &RusqlitePool {
@@ -593,7 +593,7 @@ impl Matcher {
         let sub_db_path = sub_path.join(SUB_DB_PATH);
 
         let conn = Connection::open_with_flags(
-            sub_db_path,
+            &sub_db_path,
             OpenFlags::SQLITE_OPEN_READ_WRITE
                 | OpenFlags::SQLITE_OPEN_CREATE
                 | OpenFlags::SQLITE_OPEN_NO_MUTEX
@@ -656,7 +656,7 @@ impl Matcher {
 
         // metrics counters
         let mut counter_map = HashMap::new();
-        for table in analysis.parsed.table_by_real_name.keys() {
+        for table in prepared_subscription.parsed.table_by_real_name.keys() {
             counter_map.insert(table.clone(), HandleMetrics{
                 matched_count: counter!("corro.subs.changes.matched.count", "sql_hash" => sql_hash.clone(), "table" => table.to_string()),
             });
@@ -789,18 +789,13 @@ impl Matcher {
     ) -> Result<MatcherHandle, MatcherError> {
         let (mut matcher, handle) = Self::new(id, subs_path, schema, main_db_path, evt_tx, sql)?;
 
-        let pk_cols = matcher
-            .pks
-            .values()
-            .flatten()
-            .cloned()
-            .collect::<Vec<String>>();
+        let pk_cols = &matcher.prepared_subscription.row_pk;
 
         let mut all_cols = pk_cols.clone();
 
         let mut query_cols = vec![];
 
-        for i in 0..(matcher.parsed.result_columns.len()) {
+        for i in 0..(matcher.prepared_subscription.parsed.result_columns.len()) {
             let col_name = format!("col_{i}");
             all_cols.push(col_name.clone());
             query_cols.push(col_name);
@@ -849,20 +844,20 @@ impl Matcher {
             tx.execute_batch(&create_temp_table)?;
             trace!("created sub tables");
 
-            for (table, pks) in matcher.pks.iter() {
+            for (table_name, real_table) in matcher.prepared_subscription.real_tables.iter() {
                 tx.execute(
                     &format!(
                         "CREATE INDEX index_{id}_{table}_pk ON query ({pks})",
                         id = id.as_simple(),
-                        table = table,
-                        pks = pks.to_vec().join(","),
+                        table = table_name,
+                        pks = real_table.table_pk.join(","),
                     ),
                     [],
                 )?;
             }
             trace!("created query indexes");
 
-            for (table, columns) in matcher.parsed.tables.iter() {
+            for (table, columns) in matcher.prepared_subscription.parsed.tables.iter() {
                 tx.execute(
                     r#"INSERT INTO columns ("table", alias, cid) VALUES (?, ?, '-1')"#,
                     [table.real_table.as_str(), table.alias.as_str()],
@@ -947,16 +942,14 @@ impl Matcher {
         Ok(())
     }
 
-    fn setup(&self) -> Result<(), MatcherError> {
-        for (tbl_name, pks) in &self.pks {
+    fn setup(&mut self) -> Result<(), MatcherError> {
+        for (tbl_name, query_table) in &self.prepared_subscription.query_tables {
+            let real_table_name = &query_table.table_def.real_table;
+            let pks = &query_table.query_pk;
             if let Ok(plan) = dump_query_plan(
-                &self.conn,
-                &self
-                    .cached_statements
-                    .get(tbl_name)
-                    .ok_or(SqlAnalysisError::StatementRequired)?
-                    .new_query,
-                tbl_name,
+                &mut self.conn,
+                &query_table.new_query,
+                real_table_name,
                 pks,
             ) {
                 info!(sub_id = %self.id, sql_hash = %self.hash, "query plan for table '{tbl_name}':\n{plan}");
@@ -1169,7 +1162,7 @@ impl Matcher {
                 let mut rows = tx.prepare(&full_query)?;
                 let start = Instant::now();
                 let mut select_rows = {
-                    let guard = interrupt_deadline_guard(&tx, Duration::from_secs(15));
+                    let _guard = interrupt_deadline_guard(&tx, Duration::from_secs(15));
                     rows.query(())?
                 };
                 let elapsed = start.elapsed();
@@ -1293,10 +1286,11 @@ impl Matcher {
                     //       from the state db
                     &format!(
                         "CREATE TABLE IF NOT EXISTS {tmp_table_name} ({})",
-                        self.pks
+                        self.prepared_subscription
+                            .real_tables
                             .get(table.as_str())
                             .ok_or(SqlAnalysisError::MissingPrimaryKeys)?
-                            .to_vec()
+                            .table_pk
                             .join(",")
                     ),
                 )?
@@ -1320,15 +1314,10 @@ impl Matcher {
 
         let mut query_cols = vec![];
 
-        let pk_cols = self
-            .pks
-            .values()
-            .flatten()
-            .cloned()
-            .collect::<Vec<String>>();
+        let pk_cols = &self.prepared_subscription.row_pk;
 
         let mut all_cols = pk_cols.clone();
-        for i in 0..(self.parsed.result_columns.len()) {
+        for i in 0..(self.prepared_subscription.parsed.result_columns.len()) {
             let col_name = format!("col_{i}");
             all_cols.push(col_name.clone());
             query_cols.push(col_name);
@@ -1346,8 +1335,6 @@ impl Matcher {
         let mut new_last_rowid = self.last_rowid;
 
         {
-            // read-only!
-            let state_tx = state_conn.transaction()?;
             let mut tmp_insert_prepped = tx.prepare_cached(&format!(
                 "INSERT INTO state_results VALUES ({})",
                 (0..all_cols.len())
@@ -1358,7 +1345,7 @@ impl Matcher {
 
             for table in tables.iter() {
                 let start = Instant::now();
-                let stmt = match self.cached_statements.get(table.as_str()) {
+                let stmt = match self.prepared_subscription.query_tables.values().find(|q| &q.table_def.real_table == table.as_str()) {
                     Some(stmt) => stmt,
                     None => {
                         warn!(sub_id = %self.id, "no statements pre-computed for table {table}");
@@ -1368,7 +1355,7 @@ impl Matcher {
 
                 trace!("SELECT SQL: {}", stmt.new_query);
 
-                let mut prepped = state_tx.prepare_cached(&stmt.new_query)?;
+                let mut prepped = tx.prepare_cached(&stmt.new_query)?;
 
                 let col_count = prepped.column_count();
 
@@ -1404,11 +1391,11 @@ impl Matcher {
                     insert_cols = all_cols.join(","),
                     query_query = stmt.temp_query,
                     conflict_clause = coalesced_pks,
-                    excluded = (0..(self.parsed.result_columns.len()))
+                    excluded = (0..(self.prepared_subscription.parsed.result_columns.len()))
                         .map(|i| format!("col_{i} = excluded.col_{i}"))
                         .collect::<Vec<_>>()
                         .join(","),
-                    excluded_not_same = (0..(self.parsed.result_columns.len()))
+                    excluded_not_same = (0..(self.prepared_subscription.parsed.result_columns.len()))
                         .map(|i| format!("col_{i} IS NOT excluded.col_{i}"))
                         .collect::<Vec<_>>()
                         .join(" OR "),
