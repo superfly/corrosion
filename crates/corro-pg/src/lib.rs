@@ -2904,10 +2904,16 @@ fn extract_params<'schema, 'stmt>(
         Expr::FunctionCall {
             name: _,
             distinctness: _,
-            args: _,
+            args,
             filter_over: _,
             order_by: _,
-        } => {}
+        } => {
+            if let Some(args) = args {
+                for expr in args.iter() {
+                    extract_params(schema, expr, tables, params)?
+                }
+            }
+        }
 
         Expr::FunctionCallStar {
             name: _,
