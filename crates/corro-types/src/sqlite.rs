@@ -309,6 +309,7 @@ pub fn setup_conn(conn: &Connection) -> Result<(), rusqlite::Error> {
 
     // Register unnest for PostgreSQL-style multi-array unnesting
     conn.create_module("unnest", eponymous_only_module::<UnnestTab>(), None)?;
+    conn.create_module("corro_unnest", eponymous_only_module::<UnnestTab>(), None)?;
 
     Ok(())
 }
