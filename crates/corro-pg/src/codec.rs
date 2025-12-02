@@ -250,10 +250,10 @@ fn extract_array_elements(
                 }
                 // Don't include the quotes in the output
             }
-            '{' if !in_quotes && !escape_next => {
+            '{' if !in_quotes => {
                 return Err("Nested arrays are not supported".into());
             }
-            '}' if !in_quotes && !escape_next => {
+            '}' if !in_quotes => {
                 return Err("Nested arrays are not supported".into());
             }
             ',' if !in_quotes && !escape_next => {
