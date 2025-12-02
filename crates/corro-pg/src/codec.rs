@@ -235,7 +235,6 @@ fn extract_array_elements(
     let mut current = String::new();
     let mut in_quotes = false;
     let mut escape_next = false;
-    let mut depth = 0; // For nested arrays
     let mut seen_content = false; // helpful for tracking when the last element is an empty string
 
     for ch in input.chars() {
@@ -252,14 +251,12 @@ fn extract_array_elements(
                 // Don't include the quotes in the output
             }
             '{' if !in_quotes && !escape_next => {
-                depth += 1;
-                current.push(ch);
+                return Err("Nested arrays are not supported".into());
             }
             '}' if !in_quotes && !escape_next => {
-                depth -= 1;
-                current.push(ch);
+                return Err("Nested arrays are not supported".into());
             }
-            ',' if !in_quotes && depth == 0 && !escape_next => {
+            ',' if !in_quotes && !escape_next => {
                 // End of current element
                 if !current.trim().eq_ignore_ascii_case("NULL") {
                     elements.push(std::mem::take(&mut current));

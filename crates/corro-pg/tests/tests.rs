@@ -945,39 +945,49 @@ async fn test_unnest_vtab() {
         // Test single array unnest with int type
         {
             let col1 = vec![1i64, 2, 3, 4, 1337, 12312312312];
-            let rows = client
-                .query(
-                    "SELECT CAST(value0 AS int) FROM unnest(CAST($1 AS int[]))",
-                    &[&col1],
-                )
-                .await
-                .unwrap();
-            assert_eq!(rows.len(), col1.len());
-            for (i, row) in rows.iter().enumerate() {
-                let val: i64 = row.get(0);
-                assert_eq!(val, col1[i]);
+            for format in [Format::Text, Format::Binary] {
+                for func in ["unnest", "corro_unnest"] {
+                    let sql_vec = SqlVec {
+                        inner: &col1,
+                        format,
+                    };
+                    let rows = client
+                        .query(
+                            &format!("SELECT CAST(value0 AS int) FROM {func}(CAST($1 AS int[]))"),
+                            &[&sql_vec],
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(rows.len(), col1.len());
+                    for (i, row) in rows.iter().enumerate() {
+                        let val: i64 = row.get(0);
+                        assert_eq!(val, col1[i]);
+                    }
+                }
             }
         }
 
         // Test single array unnest with text type
         {
             for format in [Format::Text, Format::Binary] {
-                let col1 = vec!["a", "b", "c", "d", "e", "f", ""];
-                let sql_vec = SqlVec {
-                    inner: &col1,
-                    format,
-                };
-                let rows = client
-                    .query(
-                        "SELECT CAST(value0 AS text) FROM unnest(CAST($1 AS text[]))",
-                        &[&sql_vec],
-                    )
-                    .await
-                    .unwrap();
-                assert_eq!(rows.len(), col1.len());
-                for (i, row) in rows.iter().enumerate() {
-                    let val: String = row.get(0);
-                    assert_eq!(val, col1[i]);
+                for func in ["unnest", "corro_unnest"] {
+                    let col1 = vec!["a", "b", "c", "d", "e", "f", ""];
+                    let sql_vec = SqlVec {
+                        inner: &col1,
+                        format,
+                    };
+                    let rows = client
+                        .query(
+                            &format!("SELECT CAST(value0 AS text) FROM {func}(CAST($1 AS text[]))"),
+                            &[&sql_vec],
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(rows.len(), col1.len());
+                    for (i, row) in rows.iter().enumerate() {
+                        let val: String = row.get(0);
+                        assert_eq!(val, col1[i]);
+                    }
                 }
             }
         }
@@ -986,20 +996,24 @@ async fn test_unnest_vtab() {
         {
             let col1 = vec![1.0, 2.0, 3.0, 4.0, 1337.0, 12312312312.0];
             for format in [Format::Text, Format::Binary] {
-                let sql_vec = SqlVec {
-                    inner: &col1,
-                    format,
-                };
-                let rows = client
-                    .query(
-                        "SELECT CAST(value0 AS float) FROM unnest(CAST($1 AS float[]))",
-                        &[&sql_vec],
-                    )
-                    .await
-                    .unwrap();
-                for (i, row) in rows.iter().enumerate() {
-                    let val: f64 = row.get(0);
-                    assert_eq!(val, col1[i]);
+                for func in ["unnest", "corro_unnest"] {
+                    let sql_vec = SqlVec {
+                        inner: &col1,
+                        format,
+                    };
+                    let rows = client
+                        .query(
+                            &format!(
+                                "SELECT CAST(value0 AS float) FROM {func}(CAST($1 AS float[]))"
+                            ),
+                            &[&sql_vec],
+                        )
+                        .await
+                        .unwrap();
+                    for (i, row) in rows.iter().enumerate() {
+                        let val: f64 = row.get(0);
+                        assert_eq!(val, col1[i]);
+                    }
                 }
             }
         }
@@ -1008,16 +1022,18 @@ async fn test_unnest_vtab() {
         // TODO: pgwire's text encoding for blob[] is currently broken but we'd work for proper clients
         {
             let col1 = vec![b"a", b"b", b"c", b"d", b"e", b"f"];
-            let rows = client
-                .query(
-                    "SELECT CAST(value0 AS blob) FROM unnest(CAST($1 AS blob[]))",
-                    &[&col1],
-                )
-                .await
-                .unwrap();
-            for (i, row) in rows.iter().enumerate() {
-                let val: Vec<u8> = row.get(0);
-                assert_eq!(val, col1[i]);
+            for func in ["unnest", "corro_unnest"] {
+                let rows = client
+                    .query(
+                        &format!("SELECT CAST(value0 AS blob) FROM {func}(CAST($1 AS blob[]))"),
+                        &[&col1],
+                    )
+                    .await
+                    .unwrap();
+                for (i, row) in rows.iter().enumerate() {
+                    let val: Vec<u8> = row.get(0);
+                    assert_eq!(val, col1[i]);
+                }
             }
         }
 
