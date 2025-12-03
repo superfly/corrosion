@@ -397,10 +397,10 @@ pub async fn handle_notifications(
                 counter!("corro.swim.notification", "type" => "memberdown").increment(1);
             }
             OwnedNotification::Rename(a, b) => {
-                info!("Member Rename {a:?} to {b:?}");
                 let mut lock = agent.members().write();
-                lock.remove_member(&a);
-                lock.add_member(&b);
+                let del_res = lock.remove_member(&a);
+                let add_res = lock.add_member(&b);
+                info!("Member Rename {a:?} to {b:?} (del_res: {del_res:?}, add_res: {add_res:?})");
             }
             OwnedNotification::Active => {
                 info!("Current node is considered ACTIVE");
