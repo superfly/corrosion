@@ -2,7 +2,7 @@ use std::{collections::BTreeMap, net::SocketAddr, ops::Range, time::Duration};
 
 use circular_buffer::CircularBuffer;
 use serde::{Deserialize, Serialize};
-use tracing::{debug, trace};
+use tracing::{debug, info, trace};
 
 use crate::{
     actor::{Actor, ActorId, ClusterId, MemberId},
@@ -90,6 +90,11 @@ impl Members {
         let mut ret = MemberAddedResult::Ignored;
 
         if actor.member_id() != self.member_id {
+            info!(
+                "Removing member, {actor_id:?} has member_id {:?} but and our member_id is {:?}",
+                actor.member_id(),
+                self.member_id
+            );
             let removed = self.states.remove(&actor_id).is_some();
             self.by_addr.remove(&actor.addr());
             return if removed {
