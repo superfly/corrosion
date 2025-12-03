@@ -13,7 +13,7 @@ use sqlite3_parser::{ast::*, lexer::sql::Parser};
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use crate::schema::{Schema, Table};
+use crate::schema::Schema;
 
 // The schema name used to attach the main database to the subscription db in RO mode
 pub const MAIN_DB_IN_SUB_DB_SCHEMA_NAME: &str = "corro_main";
@@ -72,6 +72,18 @@ pub struct PkEntry {
     // This is mainly here due to the cursed case of SELECT DISTINCT ... GROUP BY ...
     // Where the PK contains all columns from the result set but we can only filter on the group keys
     pub usable_for_maintenance: bool,
+}
+
+impl AsRef<ReturnExpr> for ReturnExpr {
+    fn as_ref(&self) -> &ReturnExpr {
+        self
+    }
+}
+
+impl AsRef<ReturnExpr> for PkEntry {
+    fn as_ref(&self) -> &ReturnExpr {
+        &self.expr
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -890,6 +902,7 @@ impl<'a> ParsingScope<'a> {
         // Returned columns without an explicit alias are given the name __col_{depth}_{col_idx}
         let depth = self.depth;
         let mut col_idx = 0;
+        let mut used_aliasses = HashSet::new();
         for col in columns.iter() {
             match col {
                 ResultColumn::Expr(expr, alias) => {
@@ -903,6 +916,17 @@ impl<'a> ParsingScope<'a> {
                     } else {
                         Name(format!("__corro_col_{depth}_{col_idx}"))
                     };
+                    // SQlite is very liberal and allows stuff like this:
+                    // SELECT 1 as foo, 2 as foo WHERE foo = 1;
+                    // Sqlite will bind the foo in the where clause to the first select column
+                    // Let's be a bit strict and error on non unique aliases within the same scope
+                    // This way we may use this alias safely for reffering to exactly this returned column
+                    if used_aliasses.contains(&alias.0) {
+                        return Err(SqlAnalysisError::AliasAmbigousInReturnList {
+                            alias: alias.0.clone(),
+                        });
+                    }
+                    used_aliasses.insert(alias.0.clone());
                     // println!("extracting col: {expr:?} (as: {maybe_as:?})");
                     let (kind, sources) = self.visit_expr_with_sources(expr)?;
                     self.parsed.result_columns.push(ReturnExpr {
@@ -992,7 +1016,7 @@ pub struct RealTableMatcherStmt {
     // What are the names of the primary keys of the table
     pub table_pk: Vec<String>,
     // On which columns we are matching
-    pub subscribed_cols: Vec<String>,
+    pub subscribed_cols: HashSet<String>,
     // How is the table named in the main database
     pub main_table_name: String,
     // How is the table named in the subscription database
@@ -1009,11 +1033,10 @@ pub struct RealTableMatcherStmt {
 #[derive(Debug, Clone)]
 pub struct QueryTableMatcherStmt {
     pub table_def: TableDef,
-    // In order for a subscription to be incrementally maintainable
-    // each referenced table in the main schema must have a mapping from
-    // it's source table PK to a subset of the row_pk we use to match
-    // Otherwise subscriptions are not faster than running a full query from time to time
-    pub query_pk: Vec<String>,
+    // How real PKs map to query PKs
+    pub real_pks_to_row_pks: Vec<(String, Vec<PkEntry>)>,
+    // This will be a table where query PKs are calculated
+    // So when a row get's deleted we know what row Pks got affected
     // pub pk_remapper: Option<PkMapper> // TODO :D
     pub new_query: String,
     pub temp_query: String,
@@ -1033,15 +1056,16 @@ pub struct PreparedSubscriptionSql {
     pub(crate) parsed: ParsedSelect,
     // The PK of a result row
     pub(crate) pk: Vec<PkEntry>,
+    // The recommended indexes for the query
     pub(crate) recomended_indexes: Vec<Vec<PkEntry>>,
     // The result set of the query
-    pub(crate) result_set: Vec<ResultColumn>,
+    pub(crate) result_set: Vec<ReturnExpr>,
     // The result set of the query with the PKs added
     // Keep in mind that len(pk) + len(result_set) != len(result_set_with_pk)
     // As the result_set might have already requested the PKs we needed to add
     // instead of adding them again we use existing columns to reduce space usage
     // If the reused column was aliased, the original alias will be respected
-    pub(crate) result_set_with_pk: Vec<ResultColumn>,
+    pub(crate) result_set_with_pk: Vec<ReturnExpr>,
     // real_name -> real_table
     pub(crate) real_tables: IndexMap<String, RealTableMatcherStmt>,
     // alias -> query_table
@@ -1074,10 +1098,36 @@ pub fn prepare_subscription_sql(
         return Err(SqlAnalysisError::TableRequired);
     }
 
-    // Now it's time to establish the PK
-    let pk = derive_pk(&parsed, schema)?;
-    // Tweak the statement a bit so it returns results along with the PK
-    let (pk, result_set, result_set_with_pk) = establish_result_set(&parsed, pk);
+    // Tweak the statement a bit so it returns results along with the PKs
+    // This may reuse existing result_set entries for PK's
+    let (pks, result_set, result_set_with_pk) = {
+        // Now it's time to establish the PK
+        let initial_pks = derive_pks(&parsed, schema)?;
+        establish_result_set(&parsed, initial_pks)
+    };
+    // Sanity check the pks
+    if pks.is_empty() {
+        return Err(SqlAnalysisError::QueryNotIncrementallyMaintainable {
+            reason: "No row pk".to_string(),
+        });
+    }
+    if pks.iter().any(|x| match &x.expr.kind {
+        ExprKind::Constant(_) => true,
+        _ => false,
+    }) {
+        return Err(SqlAnalysisError::QueryNotIncrementallyMaintainable {
+            reason: "PK can't be a constant".to_string(),
+        });
+    }
+    // TODO: Add group mapping tables to support this
+    if pks.iter().any(|x| match &x.expr.kind {
+        ExprKind::Complex => true,
+        _ => false,
+    }) {
+        return Err(SqlAnalysisError::QueryNotIncrementallyMaintainable {
+            reason: "Group by is not supported yet".to_string(),
+        });
+    }
     match &mut stmt {
         Stmt::Select(select) => match &mut select.body.select {
             OneSelect::Select { columns, .. } => {
@@ -1091,11 +1141,13 @@ pub fn prepare_subscription_sql(
         _ => unreachable!(),
     }
 
-    // Now after we've parsed the query we can generate the main table queries
+    // Now after we've parsed the query we can generate queries
     let mut real_tables = IndexMap::default();
     let mut query_tables = IndexMap::default();
-    for (table_def, cols) in parsed.tables {
-        let real_table = real_tables.entry(table_def.real_table).or_insert_with(|| {
+    // For every aliassed source table
+    for (idx, (table_def, cols)) in parsed.tables.iter().enumerate() {
+        // Get the real table
+        let real_table = real_tables.entry(table_def.real_table.clone()).or_insert_with(|| {
             let schema_table = schema.tables.get(&table_def.real_table).unwrap();
             let sub_table_name = format!("main_pks_{}", table_def.real_table);
             let pk_sql = schema_table
@@ -1122,7 +1174,7 @@ pub fn prepare_subscription_sql(
                 .join(", ");
             RealTableMatcherStmt {
                 table_pk: schema_table.pk.iter().cloned().collect(),
-                subscribed_cols: Vec::new(),
+                subscribed_cols: HashSet::new(),
                 main_table_name: table_def.real_table.clone(),
                 sub_table_name: sub_table_name.clone(),
                 create_table_stmt: format!("CREATE TEMP TABLE {} ({})", sub_table_name, pk_sql),
@@ -1136,35 +1188,50 @@ pub fn prepare_subscription_sql(
                 ),
             }
         });
+        // Subscribe to all referenced columns in the data source
         real_table.subscribed_cols.extend(cols.iter().cloned());
-        query_tables.insert(
-            table_def.alias.clone(),
-            QueryTableMatcherStmt {
-                table_def: table_def.clone(),
-                // For now assume the PK of the query table is the same as the PK of the real table
-                // For group by queries this is not true
-                query_pk: real_table.table_pk.clone(),
-                new_query: String::new(),
-                temp_query: String::new(),
-            },
-        );
-    }
 
-    let mut statements = HashMap::new();
-    let mut pks = IndexMap::default();
+        // Now in order for this to be incrementally maintainable
+        // we need to have a mapping from the real_table_pks to our row pks
+        // TODO: Introduce a mapping table for GroupBy/Distinct/Exists support
+        //       For now let's only handle the case where there's an 1to1 mapping available
+        // Essentially find all row pks which depend on this real_table's PKs
+        let real_to_query_pks = real_table
+            .table_pk
+            .iter()
+            .map(|pk_col| {
+                let affected_row_pks = pks
+                    .iter()
+                    .filter(|x| {
+                        // TODO: For group by support check the sources of the expr, not the kind
+                        if let ExprKind::Column(col_ref) = &x.expr.kind {
+                            col_ref.table_scope_depth == 0
+                                && col_ref.column_name == *pk_col
+                                && col_ref.table.real_table == real_table.main_table_name
+                                && col_ref.table.alias == table_def.alias
+                        } else {
+                            false
+                        }
+                    })
+                    .cloned()
+                    .collect();
+                (pk_col.clone(), affected_row_pks)
+            })
+            .collect::<Vec<(String, Vec<PkEntry>)>>();
 
-    // Appends the PKs to the result columns
+        // TODO: Add mapping tables for group_by/distinct support
+        // This way we know how PKs map to groups :D
+        // create table as {table_name} AS SELECT {real_pks}, {row_pks} FROM {stmt}
+        // For now only support the identity mapping
+        for (_real_pk, query_pks) in &real_to_query_pks {
+            if query_pks.len() != 1 {
+                return Err(SqlAnalysisError::QueryNotIncrementallyMaintainable {
+                    reason: "Unable to map real PK to query PK".to_string(),
+                });
+            }
+        }
 
-    // Generate SQL for mapping the real schema into the subscription schema
-    // We need a mapping both ways filtered by the affected pks
-    for (idx, (tbl_def, _cols)) in parsed.tables.iter().enumerate() {
-        let limit_to_pks_expr = expr_filter_query_by_table_pk(
-            tbl_def,
-            schema
-                .tables
-                .get(&tbl_def.real_table)
-                .expect("this should not happen, missing table in schema"),
-        )?;
+        let limit_to_pks_expr = expr_filter_by_query_pks(real_table, &real_to_query_pks)?;
 
         let mut stmt = stmt.clone();
 
@@ -1217,33 +1284,40 @@ pub fn prepare_subscription_sql(
         }
 
         // Main DB -> Sub DB
+        // Remove trailing ;
         let mut new_query = Cmd::Stmt(stmt).to_string();
         new_query.pop();
 
         // Sub DB filtered by PKs
-        let mut all_cols = pks.values().flatten().cloned().collect::<Vec<String>>();
-        for i in 0..(parsed.result_columns.len()) {
-            all_cols.push(format!("col_{i}"));
-        }
+        let all_cols = result_set_with_pk
+            .iter()
+            .map(|x| x.alias.0.clone())
+            .collect::<Vec<_>>()
+            .join(",");
 
-        let tbl_name = tbl_def.real_table.clone();
-        let temp_query = format!(
-            "SELECT {} FROM query WHERE ({}) IN temp_{tbl_name}",
-            all_cols.join(","),
-            pks.get(&tbl_name)
-                .cloned()
-                .ok_or(SqlAnalysisError::MissingPrimaryKeys)?
-                .into_iter()
-                .map(|pk| format!("coalesce({pk}, \"\")"))
+        let temp_query: String = format!(
+            "SELECT {} FROM query WHERE ({}) IN temp.{}",
+            all_cols,
+            real_to_query_pks
+                .iter()
+                .map(|(_, row_pks)| row_pks
+                    .first()
+                    .map(|pk| format!("coalesce({}, \"\")", pk.expr.alias.0.clone()))
+                    .unwrap())
                 .collect::<Vec<_>>()
                 .join(","),
+            real_table.sub_table_name
         );
 
-        info!(%sql_hash, %sub_id, "modified query for table '{tbl_name}': {new_query}");
+        let real_table_name = &table_def.real_table;
+        let table_alias = &table_def.alias;
+        info!(%sql_hash, %sub_id, "modified query for table '{real_table_name}' AS '{table_alias}': {new_query}");
 
-        statements.insert(
-            tbl_name.clone(),
-            MatcherStmt {
+        query_tables.insert(
+            table_def.alias.clone(),
+            QueryTableMatcherStmt {
+                table_def: table_def.clone(),
+                real_pks_to_row_pks: real_to_query_pks,
                 new_query,
                 temp_query,
             },
@@ -1252,8 +1326,10 @@ pub fn prepare_subscription_sql(
 
     Ok(PreparedSubscriptionSql {
         initial_query: stmt,
-        row_pk: pks,
-        minimal_pk: pks,
+        pk: pks,
+        result_set,
+        result_set_with_pk,
+        recomended_indexes: Vec::new(),
         parsed,
         query_tables,
         real_tables,
@@ -1274,23 +1350,19 @@ fn insert_col(set: &mut HashSet<String>, schema: &Schema, tbl_name: &str, name: 
     }
 }
 
-fn expr_filter_query_by_table_pk(
-    table_def: &TableDef,
-    table_schema: &Table,
+fn expr_filter_by_query_pks(
+    real_table: &RealTableMatcherStmt,
+    real_to_query_pks: &Vec<(String, Vec<PkEntry>)>,
 ) -> Result<Expr, SqlAnalysisError> {
     let expr = Expr::in_table(
         Expr::Parenthesized(
-            table_schema
-                .pk
+            real_to_query_pks
                 .iter()
-                .map(|pk| Expr::Qualified(Name(table_def.alias.clone()), Name(pk.to_owned())))
+                .map(|(_, row_pks)| row_pks.first().unwrap().expr.expr.clone())
                 .collect(),
         ),
         false,
-        QualifiedName::fullname(
-            Name("__corro_sub".into()),
-            Name(format!("temp_{}", table_def.real_table)),
-        ),
+        QualifiedName::fullname(Name("temp".into()), Name(real_table.sub_table_name.clone())),
         None,
     );
 
@@ -1298,7 +1370,7 @@ fn expr_filter_query_by_table_pk(
 }
 
 // Establish the primary key of a result row of the parsed query
-fn derive_pk(parsed: &ParsedSelect, schema: &Schema) -> Result<Vec<PkEntry>, SqlAnalysisError> {
+fn derive_pks(parsed: &ParsedSelect, schema: &Schema) -> Result<Vec<PkEntry>, SqlAnalysisError> {
     // This is not exactly a check that this is top level but good enough
     assert!(parsed.parent_column_references.is_empty());
     let pk = if parsed.is_distinct {
@@ -1314,48 +1386,15 @@ fn derive_pk(parsed: &ParsedSelect, schema: &Schema) -> Result<Vec<PkEntry>, Sql
             // SELECT DISTINCT foo.continent, count(*) AS c FROM foo GROUP BY foo.region, foo.continent
             // In such cases we can update incrementally the query using foo.continent like this:
             // SELECT DISTINCT foo.continent, count(*) AS c FROM foo WHERE foo.continent in (...) GROUP BY foo.region, foo.continent
-            let group_by_ast = group_by
-                .iter()
-                .map(|x| (x.expr.to_string(), x))
-                .collect::<HashMap<String, &ReturnExpr>>();
-            let group_by_col_ref = group_by
-                .iter()
-                .filter_map(|x| {
-                    if let ExprKind::Column(col_ref) = &x.kind {
-                        Some((col_ref, x))
-                    } else {
-                        None
-                    }
-                })
-                .collect::<HashMap<&ExprColumnRef, &ReturnExpr>>();
+            let group_exprs = ReturnExprAliasHelper::new(group_by);
             let r = parsed
                 .result_columns
                 .iter()
                 .map(|x| {
-                    // Look if this expr is in the group by list by comparing the AST's and checking if they both
-                    // resolve to the same column reference
-                    let in_group_by = group_by_ast.get(&x.expr.to_string()).or_else(|| {
-                        if let ExprKind::Column(col_ref) = &x.kind {
-                            group_by_col_ref.get(col_ref)
-                        } else {
-                            None
-                        }
-                    });
-                    let renamable = x.is_internal_alias();
+                    // We could run this check later when establishing aliases
+                    let in_group_by = group_exprs.find(x);
                     PkEntry {
-                        expr: ReturnExpr {
-                            sources: x.sources.clone(),
-                            kind: x.kind.clone(),
-                            expr: x.expr.clone(),
-                            // If the returned expr can get renamed just use the group by alias as
-                            // __corro_gk_... is more descriptive than __corro_col_...
-                            // if an explicit name was placed then just use that explicit name
-                            alias: if renamable && in_group_by.is_some() {
-                                in_group_by.unwrap().alias.clone()
-                            } else {
-                                x.alias.clone()
-                            },
-                        },
+                        expr: x.clone(),
                         fully_dependent: false,
                         // SELECT DISTINCT ... GROUP BY ... - only group by expressions are usable for maintenance
                         usable_for_maintenance: in_group_by.is_some(),
@@ -1431,40 +1470,42 @@ fn derive_pk(parsed: &ParsedSelect, schema: &Schema) -> Result<Vec<PkEntry>, Sql
 // Helper struct to get the most specific alias for a return expression
 // And to determine if an PK was already in the result set
 // Result Expressions are compared by their AST and Column Reference
-// user_alias > __corro_pk/__corro_gk > __corro_col
-struct ReturnExprAliasHelper<'a> {
-    by_ast: HashMap<String, &'a ReturnExpr>,
-    by_col_ref: HashMap<&'a ExprColumnRef, &'a ReturnExpr>,
+struct ReturnExprAliasHelper<'a, T> {
+    by_ast: HashMap<String, &'a T>,
+    by_col_ref: HashMap<&'a ExprColumnRef, &'a T>,
 }
 
-impl<'a> ReturnExprAliasHelper<'a> {
-    fn new<I, T>(return_exprs: I) -> Self
+impl<'a, T> ReturnExprAliasHelper<'a, T> {
+    fn new<I, K>(return_exprs: I) -> Self
     where
-        I: IntoIterator<Item = T> + Copy,
-        T: Borrow<&'a ReturnExpr>,
+        I: IntoIterator<Item = K> + Copy,
+        K: Borrow<&'a T>,
+        T: AsRef<ReturnExpr>,
     {
         let by_ast = return_exprs
             .into_iter()
             .map(|x| {
-                let r: &'a ReturnExpr = *x.borrow();
-                (r.expr.to_string(), r)
+                let data = *x.borrow();
+                let r: &ReturnExpr = data.as_ref();
+                (r.expr.to_string(), data)
             })
-            .collect::<HashMap<String, &'a ReturnExpr>>();
+            .collect::<HashMap<String, &'a T>>();
         let by_col_ref = return_exprs
             .into_iter()
             .filter_map(|v| {
-                let r: &'a ReturnExpr = *v.borrow();
+                let data = *v.borrow();
+                let r: &ReturnExpr = data.as_ref();
                 if let ExprKind::Column(col_ref) = &r.kind {
-                    Some((col_ref, r))
+                    Some((col_ref, data))
                 } else {
                     None
                 }
             })
-            .collect::<HashMap<&ExprColumnRef, &ReturnExpr>>();
+            .collect::<HashMap<&ExprColumnRef, &T>>();
         Self { by_ast, by_col_ref }
     }
 
-    fn find(&self, expr: &ReturnExpr) -> Option<&&ReturnExpr> {
+    fn find(&self, expr: &ReturnExpr) -> Option<&&T> {
         // Direct AST match
         self.by_ast.get(&expr.expr.to_string()).or_else(|| {
             // AST differs but resolves to the same column reference
@@ -1482,15 +1523,83 @@ impl<'a> ReturnExprAliasHelper<'a> {
 // parsed.result_columns.len + pk.len() != new_result_columns.len()
 // pk.len() == new_pk.len()
 // The returned PKs are the same as the input PKs but might be differently named
+// Will use the most specific alias for expressions
+// user_alias > __corro_gk > __corro_pk > __corro_col
 fn establish_result_set(
     parsed: &ParsedSelect,
-    pk: Vec<PkEntry>,
+    pks: Vec<PkEntry>,
 ) -> (Vec<PkEntry>, Vec<ReturnExpr>, Vec<ReturnExpr>) {
-    let group_exprs = ReturnExprAliasHelper::new(parsed.group_by.as_ref().unwrap_or(&vec![]));
-    let return_exprs = ReturnExprAliasHelper::new(&parsed.result_columns);
-    let pk_exprs = ReturnExprAliasHelper::new(&pk.iter().map(|x| &x.expr).collect::<Vec<&ReturnExpr>>());
-    let new_pks = Vec::with_capacity(pk.len());
-    let new_result_set_with_pk = Vec::with_capacity(parsed.result_columns.len() + pk.len());
+    let empty_vec = vec![];
+    let group_exprs =
+        ReturnExprAliasHelper::new(parsed.group_by.as_ref().unwrap_or(&empty_vec).as_slice());
+    let return_exprs = ReturnExprAliasHelper::new(parsed.result_columns.as_slice());
+    let pk_exprs = ReturnExprAliasHelper::new(pks.as_slice());
+    let mut new_pks = Vec::with_capacity(pks.len());
+    let mut new_result_set = Vec::with_capacity(parsed.result_columns.len());
+    let mut new_result_set_with_pk = Vec::with_capacity(parsed.result_columns.len() + pks.len());
+
+    // SELECT foo.id, foo.id, ... FROM foo;
+    // We check for alias uniqueness earlier so we can be sure that all input aliasses are unique
+    // When reusing an result column as a PK we only need to use 1 result column for that
+    // So in the above query the final aliasses should look like this:
+    // SELECT foo.id AS __corro_pk_foo_id, foo.id AS __corro_col_1, ... FROM foo;
+    // Not like this:
+    // SELECT foo.id AS __corro_pk_foo_id, foo.id AS __corro_pk_foo_id, ... FROM foo;
+    let mut used_aliases: HashSet<String> = HashSet::new();
+    let mut reused_pks: HashSet<String> = HashSet::new();
+
+    for pk in &pks {
+        // Only prepend PKs which are not already in the result set
+        if let None = return_exprs.find(&pk.expr) {
+            // Try using the most specific alias for it
+            let mut new_pk = pk.clone();
+            if pk.expr.is_internal_alias() {
+                if let Some(group_expr) = group_exprs.find(&pk.expr) {
+                    // Use the group by expr alias if it's more specific and wasn't used before
+                    if !used_aliases.contains(&group_expr.alias.0) {
+                        new_pk.expr.alias = group_expr.alias.clone()
+                    }
+                }
+            }
+            assert!(used_aliases.insert(new_pk.expr.alias.0.clone())); // Important sanity check
+            new_result_set_with_pk.push(new_pk.expr.clone());
+            new_pks.push(new_pk);
+        }
+    }
+
+    for res in &parsed.result_columns {
+        let pk_expr = pk_exprs.find(&res);
+        let mut new_res = res.clone();
+
+        if res.is_internal_alias() {
+            // Try using the most specific alias for it
+            if let Some(group_expr) = group_exprs.find(&res) {
+                // Use the group by expr alias if it wasn't used before
+                if !used_aliases.contains(&group_expr.alias.0) {
+                    new_res.alias = group_expr.alias.clone()
+                }
+            } else if let Some(pk_expr) = pk_expr {
+                // Or use the pk alias if it wasn't used before
+                if !used_aliases.contains(&pk_expr.expr.alias.0) {
+                    new_res.alias = pk_expr.expr.alias.clone();
+                }
+            }
+        }
+
+        assert!(used_aliases.insert(new_res.alias.0.clone())); // Important sanity check
+        new_result_set.push(new_res.clone());
+        new_result_set_with_pk.push(new_res.clone());
+        if let Some(old_pk) = pk_expr {
+            // Ok this column might get reused as a PK
+            if reused_pks.insert(old_pk.expr.alias.0.clone()) {
+                new_pks.push(PkEntry {
+                    expr: new_res,
+                    fully_dependent: old_pk.fully_dependent,
+                    usable_for_maintenance: old_pk.usable_for_maintenance,
+                });
+            }
+        }
+    }
 
     (new_pks, new_result_set, new_result_set_with_pk)
 }
@@ -1513,6 +1622,10 @@ pub enum SqlAnalysisError {
     TableStarNotFound { tbl_name: String },
     #[error("{real_table} AS {alias} is ambiguous in scope, please disambiguate")]
     AmbigousTableReference { real_table: String, alias: String },
+    #[error(
+        "SELECT ... AS {alias} - The alias is ambigous in the return list, please disambiguate"
+    )]
+    AliasAmbigousInReturnList { alias: String },
     #[error("ORDER BY is not allowed in matcher expressions")]
     OrderByNotAllowed,
     #[error("LIMIT is not allowed in matcher expressions")]
@@ -1580,9 +1693,9 @@ mod tests {
             &schema,
         )
         .unwrap();
-        println!("Stmt: {:#?}", Cmd::Stmt(analysis.stmt).to_string());
-        println!("Statements: {:#?}", analysis.statements);
-        println!("Pks: {:#?}", analysis.pks);
+        println!("Stmt: {:#?}", Cmd::Stmt(analysis.initial_query).to_string());
+        println!("Query Tables: {:#?}", analysis.query_tables);
+        println!("Pks: {:#?}", analysis.pk);
         println!("Parsed: {:#?}", analysis.parsed);
     }
 
@@ -1602,9 +1715,9 @@ mod tests {
             &schema,
         )
         .unwrap();
-        println!("Stmt: {:#?}", Cmd::Stmt(analysis.stmt).to_string());
-        println!("Statements: {:#?}", analysis.statements);
-        println!("Pks: {:#?}", analysis.pks);
+        println!("Stmt: {:#?}", Cmd::Stmt(analysis.initial_query).to_string());
+        println!("Query Tables: {:#?}", analysis.query_tables);
+        println!("Pks: {:#?}", analysis.pk);
         println!("Parsed: {:#?}", analysis.parsed);
     }
 }

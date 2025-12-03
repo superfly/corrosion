@@ -22,7 +22,7 @@ use rusqlite::{
     Connection, OpenFlags, OptionalExtension,
 };
 use spawn::spawn_counted;
-use sqlite3_parser::ast::{Cmd, ResultColumn};
+use sqlite3_parser::ast::Cmd;
 use sqlite_pool::RusqlitePool;
 use tokio::{
     sync::{mpsc, oneshot, watch, AcquireError},
@@ -38,8 +38,8 @@ use crate::{
     api::QueryEvent,
     change::Change,
     matcher::sql_analyzer::{
-        prepare_subscription_sql, ExprKind, PreparedSubscriptionSql, QueryTableMatcherStmt,
-        SqlAnalysisError, MAIN_DB_IN_SUB_DB_SCHEMA_NAME,
+        prepare_subscription_sql, PreparedSubscriptionSql, QueryTableMatcherStmt,
+        ReturnExpr, SqlAnalysisError, MAIN_DB_IN_SUB_DB_SCHEMA_NAME,
     },
     schema::Schema,
     updates::HandleMetrics,
@@ -367,8 +367,8 @@ impl MatcherHandle {
         &self.inner.hash
     }
 
-    pub fn parsed_columns(&self) -> &[(ExprKind, ResultColumn)] {
-        &self.inner.prepared_subscription.parsed.result_columns
+    pub fn parsed_columns(&self) -> &[ReturnExpr] {
+        &self.inner.prepared_subscription.result_set
     }
 
     pub fn col_names(&self) -> &[ColumnName] {
@@ -789,7 +789,10 @@ impl Matcher {
     ) -> Result<MatcherHandle, MatcherError> {
         let (mut matcher, handle) = Self::new(id, subs_path, schema, main_db_path, evt_tx, sql)?;
 
-        let pk_cols = &matcher.prepared_subscription.row_pk;
+        let pk_cols: Vec<String> = matcher.prepared_subscription.pk
+            .iter()
+            .map(|pk| pk.expr.alias.0.clone())
+            .collect();
 
         let mut all_cols = pk_cols.clone();
 
@@ -945,13 +948,13 @@ impl Matcher {
     fn setup(&mut self) -> Result<(), MatcherError> {
         for (tbl_name, query_table) in &self.prepared_subscription.query_tables {
             let real_table_name = &query_table.table_def.real_table;
-            let pks = &query_table.query_pk;
-            if let Ok(plan) = dump_query_plan(
-                &mut self.conn,
-                &query_table.new_query,
-                real_table_name,
-                pks,
-            ) {
+            let pks: Vec<String> = query_table.real_pks_to_row_pks
+                .iter()
+                .flat_map(|(_, pk_entries)| pk_entries.iter().map(|pk| pk.expr.alias.0.clone()))
+                .collect();
+            if let Ok(plan) =
+                dump_query_plan(&mut self.conn, &query_table.new_query, real_table_name, &pks)
+            {
                 info!(sub_id = %self.id, sql_hash = %self.hash, "query plan for table '{tbl_name}':\n{plan}");
             }
         }
@@ -1166,7 +1169,7 @@ impl Matcher {
                     rows.query(())?
                 };
                 let elapsed = start.elapsed();
-                
+
                 info!(sub_id = %self.id, "Initial query+insert done in {elapsed:?}");
 
                 loop {
@@ -1314,7 +1317,10 @@ impl Matcher {
 
         let mut query_cols = vec![];
 
-        let pk_cols = &self.prepared_subscription.row_pk;
+        let pk_cols: Vec<String> = self.prepared_subscription.pk
+            .iter()
+            .map(|pk| pk.expr.alias.0.clone())
+            .collect();
 
         let mut all_cols = pk_cols.clone();
         for i in 0..(self.prepared_subscription.parsed.result_columns.len()) {
@@ -1345,7 +1351,12 @@ impl Matcher {
 
             for table in tables.iter() {
                 let start = Instant::now();
-                let stmt = match self.prepared_subscription.query_tables.values().find(|q| &q.table_def.real_table == table.as_str()) {
+                let stmt = match self
+                    .prepared_subscription
+                    .query_tables
+                    .values()
+                    .find(|q| &q.table_def.real_table == table.as_str())
+                {
                     Some(stmt) => stmt,
                     None => {
                         warn!(sub_id = %self.id, "no statements pre-computed for table {table}");
@@ -1395,10 +1406,11 @@ impl Matcher {
                         .map(|i| format!("col_{i} = excluded.col_{i}"))
                         .collect::<Vec<_>>()
                         .join(","),
-                    excluded_not_same = (0..(self.prepared_subscription.parsed.result_columns.len()))
-                        .map(|i| format!("col_{i} IS NOT excluded.col_{i}"))
-                        .collect::<Vec<_>>()
-                        .join(" OR "),
+                    excluded_not_same =
+                        (0..(self.prepared_subscription.parsed.result_columns.len()))
+                            .map(|i| format!("col_{i} IS NOT excluded.col_{i}"))
+                            .collect::<Vec<_>>()
+                            .join(" OR "),
                     return_cols = query_cols.join(",")
                 );
 
@@ -2104,7 +2116,7 @@ mod tests {
             let mut rx = maybe_created.unwrap().evt_rx;
 
             println!("matcher created w/ id: {}", matcher.id().as_simple());
-            println!("parsed: {:?}", matcher.inner.parsed);
+            println!("parsed: {:?}", matcher.inner.prepared_subscription.parsed);
 
             assert!(matches!(rx.recv().await.unwrap(), QueryEvent::Columns(_)));
 
