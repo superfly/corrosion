@@ -13,13 +13,11 @@ use compact_str::ToCompactString;
 use corro_api_types::{
     ChangeId, ColumnName, ColumnType, RowId, SqliteValue, SqliteValueRef, TableName,
 };
-use indexmap::{IndexMap, IndexSet};
+use indexmap::IndexMap;
 use metrics::{counter, histogram};
 use parking_lot::{Condvar, Mutex, RwLock};
 use rusqlite::{
-    params_from_iter,
-    types::{FromSqlError, ValueRef},
-    Connection, OpenFlags, OptionalExtension,
+    Connection, OpenFlags, OptionalExtension, types::{FromSqlError, ValueRef}, vtab::eponymous_only_module
 };
 use spawn::spawn_counted;
 use sqlite3_parser::ast::Cmd;
@@ -38,11 +36,13 @@ use crate::{
     api::QueryEvent,
     change::Change,
     matcher::sql_analyzer::{
-        prepare_subscription_sql, PreparedSubscriptionSql, QueryTableMatcherStmt,
-        ReturnExpr, SqlAnalysisError, MAIN_DB_IN_SUB_DB_SCHEMA_NAME,
+        prepare_subscription_sql, PreparedSubscriptionSql, QueryTableMatcherStmt, ReturnExpr,
+        SqlAnalysisError, MAIN_DB_IN_SUB_DB_SCHEMA_NAME,
     },
     schema::Schema,
+    sqlite::unnest_param,
     updates::HandleMetrics,
+    vtab::unnest::UnnestTab
 };
 
 use crate::updates::{Handle, Manager};
@@ -316,22 +316,13 @@ impl Handle for MatcherHandle {
         if !self
             .inner
             .prepared_subscription
-            .parsed
-            .table_by_real_name
+            .real_tables
             .get(change.table.as_str())
-            .unwrap_or(&vec![])
-            .iter()
-            .any(|table_def| {
-                self.inner
-                    .prepared_subscription
-                    .parsed
-                    .tables
-                    .get(table_def)
-                    .map(|cols| {
-                        change.column.is_crsql_sentinel() || cols.contains(change.column.as_str())
-                    })
-                    .unwrap_or_default()
+            .map(|table_def| {
+                change.column.is_crsql_sentinel()
+                    || table_def.subscribed_cols.contains(change.column.as_str())
             })
+            .unwrap_or_default()
         {
             trace!("could not match against parsed query table and columns");
             return false;
@@ -449,14 +440,10 @@ impl MatcherHandle {
                 "subscription already deleted older changes, min change id: {min_change_id}",
             )));
         }
-
-        let mut query_cols = vec![];
-        for i in 0..(self.parsed_columns().len()) {
-            query_cols.push(format!("col_{i}"));
-        }
+        
         let mut prepped = conn.prepare_cached(&format!(
             "SELECT id, type, __corro_rowid, {} FROM changes WHERE id > ? ORDER BY id ASC",
-            query_cols.join(",")
+            self.inner.prepared_subscription.return_column_names()
         ))?;
 
         let col_count = prepped.column_count();
@@ -498,13 +485,9 @@ impl MatcherHandle {
         tx: mpsc::Sender<QueryEvent>,
     ) -> Result<ChangeId, MatcherError> {
         self.wait_for_running_state();
-        let mut query_cols = vec![];
-        for i in 0..(self.parsed_columns().len()) {
-            query_cols.push(format!("col_{i}"));
-        }
         let mut prepped = conn.prepare_cached(&format!(
             "SELECT __corro_rowid, {} FROM query",
-            query_cols.join(",")
+            self.inner.prepared_subscription.return_column_names()
         ))?;
 
         let col_count = prepped.column_count();
@@ -609,6 +592,7 @@ impl Matcher {
                 PRAGMA mmap_size = 536870912; -- 512MB
             "#,
         )?;
+        conn.create_module("unnest", eponymous_only_module::<UnnestTab>(), None)?;
         conn.execute(
             format!(
                 "ATTACH DATABASE 'file:{}?mode=ro' AS {};",
@@ -641,6 +625,20 @@ impl Matcher {
         };
 
         let prepared_subscription = prepare_subscription_sql(id, sql, schema)?;
+
+        // This means we have an sqlite parser bug
+        if col_names.len() != prepared_subscription.result_set.len() {
+            return Err(MatcherError::ColumnCountMismatch);
+        }
+
+        // Create all required temp tables
+        conn.execute_batch(&format!(
+            "CREATE TEMP TABLE IF NOT EXISTS state_results ({})",
+            prepared_subscription.return_column_names_with_pks()
+        ))?;
+        for table in prepared_subscription.real_tables.values() {
+            conn.execute(&table.create_table_stmt, [])?;
+        }
 
         let cancel = CancellationToken::new();
 
@@ -788,37 +786,21 @@ impl Matcher {
         tripwire: Tripwire,
     ) -> Result<MatcherHandle, MatcherError> {
         let (mut matcher, handle) = Self::new(id, subs_path, schema, main_db_path, evt_tx, sql)?;
-
-        let pk_cols: Vec<String> = matcher.prepared_subscription.pk
-            .iter()
-            .map(|pk| pk.expr.alias.0.clone())
-            .collect();
-
-        let mut all_cols = pk_cols.clone();
-
-        let mut query_cols = vec![];
-
-        for i in 0..(matcher.prepared_subscription.parsed.result_columns.len()) {
-            let col_name = format!("col_{i}");
-            all_cols.push(col_name.clone());
-            query_cols.push(col_name);
-        }
-
         block_in_place(|| {
             let tx = matcher.conn.transaction()?;
 
             info!(sub_id = %id, "Creating subscription database schema");
             let create_temp_table = format!(
                 r#"
-                CREATE TABLE query (__corro_rowid INTEGER PRIMARY KEY AUTOINCREMENT, {columns});
+                CREATE TABLE query (__corro_rowid INTEGER PRIMARY KEY AUTOINCREMENT, {return_columns_with_pks});
 
-                CREATE UNIQUE INDEX index_{id}_pk ON query ({pks_coalesced});
+                CREATE UNIQUE INDEX {identity_index_name} ON query ({identity_index_columns});
 
                 CREATE TABLE changes (
                     {CHANGE_ID_COL} INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
                     __corro_rowid INTEGER NOT NULL,
                     {CHANGE_TYPE_COL} INTEGER NOT NULL,
-                    {actual_columns}
+                    {return_columns}
                 );
 
                 CREATE TABLE meta (
@@ -834,26 +816,24 @@ impl Matcher {
                     PRIMARY KEY ("table", alias, cid)
                 );
             "#,
-                columns = all_cols.join(","),
-                id = id.as_simple(),
-                pks_coalesced = pk_cols
-                    .iter()
-                    .map(|pk| format!("coalesce({pk}, \"\")"))
-                    .collect::<Vec<_>>()
-                    .join(","),
-                actual_columns = query_cols.join(","),
+                return_columns_with_pks =
+                    matcher.prepared_subscription.return_column_names_with_pks(),
+                return_columns = matcher.prepared_subscription.return_column_names(),
+                identity_index_name = matcher.prepared_subscription.identity_uniq_index.index_name,
+                identity_index_columns = matcher
+                    .prepared_subscription
+                    .identity_uniq_index
+                    .index_columns,
             );
 
             tx.execute_batch(&create_temp_table)?;
             trace!("created sub tables");
 
-            for (table_name, real_table) in matcher.prepared_subscription.real_tables.iter() {
+            for def in &matcher.prepared_subscription.required_query_indexes {
                 tx.execute(
                     &format!(
-                        "CREATE INDEX index_{id}_{table}_pk ON query ({pks})",
-                        id = id.as_simple(),
-                        table = table_name,
-                        pks = real_table.table_pk.join(","),
+                        "CREATE INDEX {} ON query ({})",
+                        def.index_name, def.index_columns
                     ),
                     [],
                 )?;
@@ -924,8 +904,8 @@ impl Matcher {
             return;
         }
 
-        if let Err(e) = block_in_place(|| self.setup()) {
-            error!(sub_id = %self.id, "could not setup connection: {e}");
+        if let Err(e) = block_in_place(|| self.dump_query_plans()) {
+            error!(sub_id = %self.id, "could not dump query plans: {e}");
             return;
         }
 
@@ -945,17 +925,15 @@ impl Matcher {
         Ok(())
     }
 
-    fn setup(&mut self) -> Result<(), MatcherError> {
-        for (tbl_name, query_table) in &self.prepared_subscription.query_tables {
-            let real_table_name = &query_table.table_def.real_table;
-            let pks: Vec<String> = query_table.real_pks_to_row_pks
-                .iter()
-                .flat_map(|(_, pk_entries)| pk_entries.iter().map(|pk| pk.expr.alias.0.clone()))
-                .collect();
-            if let Ok(plan) =
-                dump_query_plan(&mut self.conn, &query_table.new_query, real_table_name, &pks)
-            {
-                info!(sub_id = %self.id, sql_hash = %self.hash, "query plan for table '{tbl_name}':\n{plan}");
+    fn dump_query_plans(&mut self) -> Result<(), MatcherError> {
+        for (_tbl_name, query_table) in &self.prepared_subscription.query_tables {
+            let table_name = &query_table.table_def.real_table;
+            let table_alias = &query_table.table_def.alias;
+            if let Ok(plan) = dump_query_plan(&mut self.conn, &query_table.new_query) {
+                info!(sub_id = %self.id, sql_hash = %self.hash, "query plan for getting new changes for subset of changes on '{table_name}' as '{table_alias}':\n{plan}");
+            }
+            if let Ok(plan) = dump_query_plan(&mut self.conn, &query_table.temp_query) {
+                info!(sub_id = %self.id, sql_hash = %self.hash, "query plan for checking the current query result for subset of changes on '{table_name}' as '{table_alias}':\n{plan}");
             }
         }
 
@@ -1008,7 +986,7 @@ impl Matcher {
                     return;
                 }
                 Some(candidates) = self.changes_rx.recv() => {
-                    for (table, pks) in  candidates {
+                    for (table, pks) in candidates {
                         let buffed = buf.entry(table).or_default();
                         for (pk, cl) in pks {
                             if buffed.insert(pk, cl).is_none() {
@@ -1137,11 +1115,6 @@ impl Matcher {
             return;
         }
 
-        let mut query_cols = vec![];
-        for i in 0..(self.prepared_subscription.parsed.result_columns.len()) {
-            query_cols.push(format!("col_{i}"));
-        }
-
         let res = block_in_place(|| {
             let tx = self.conn.transaction()?;
 
@@ -1149,13 +1122,14 @@ impl Matcher {
                 Cmd::Stmt(self.prepared_subscription.initial_query.clone()).to_string();
             stmt_str.pop(); // remove trailing `;`
 
+            // Add NULL for the rowid so it will use the autoincrement
             let full_query = format!(
                 "
                 WITH initial_rows AS ({})
-                INSERT INTO query SELECT * FROM initial_rows RETURNING __corro_rowid,{}
+                INSERT INTO query SELECT NULL, * FROM initial_rows RETURNING __corro_rowid,{}
                 ",
                 stmt_str,
-                query_cols.join(","),
+                self.prepared_subscription.return_column_names(),
             );
 
             let mut last_rowid = 0;
@@ -1168,7 +1142,7 @@ impl Matcher {
                     let _guard = interrupt_deadline_guard(&tx, Duration::from_secs(15));
                     rows.query(())?
                 };
-                let elapsed = start.elapsed();
+                let elapsed: Duration = start.elapsed();
 
                 info!(sub_id = %self.id, "Initial query+insert done in {elapsed:?}");
 
@@ -1176,7 +1150,7 @@ impl Matcher {
                     match select_rows.next() {
                         Ok(Some(row)) => {
                             let rowid = row.get(0)?;
-                            let cells = (1..=query_cols.len())
+                            let cells = (1..=self.prepared_subscription.result_set.len())
                                 .map(|i| row.get::<_, SqliteValue>(i))
                                 .collect::<rusqlite::Result<Vec<_>>>()?;
 
@@ -1249,8 +1223,8 @@ impl Matcher {
             }
         };
 
-        if let Err(e) = block_in_place(|| self.setup()) {
-            error!(sub_id = %self.id, "could not setup connection: {e}");
+        if let Err(e) = block_in_place(|| self.dump_query_plans()) {
+            error!(sub_id = %self.id, "could not dump query plans: {e}");
             return;
         }
 
@@ -1262,8 +1236,6 @@ impl Matcher {
         candidates: MatchCandidates,
         skip_send: bool,
     ) -> Result<(), MatcherError> {
-        let mut tables = IndexSet::new();
-
         if candidates.is_empty() {
             return Ok(());
         }
@@ -1273,119 +1245,71 @@ impl Matcher {
             candidates.keys().collect::<Vec<_>>()
         );
 
+        let mut clean_pk_stmts = Vec::new();
+        let mut affected_query_tables = Vec::new();
         let tx = self.conn.transaction()?;
-        for (table, pks) in candidates {
-            let pks = pks
-                .iter()
-                .map(|(pk, _)| unpack_columns(pk))
-                .collect::<Result<Vec<Vec<SqliteValueRef>>, _>>()?;
-
-            let tmp_table_name = format!("temp_{table}");
-            if tables.insert(table.clone()) {
-                // create a temporary table to mix and match the data
-                tx.prepare_cached(
-                    // TODO: cache the statement's string somewhere, it's always the same!
-                    // NOTE: this can't be an actual CREATE TEMP TABLE or it won't be visible
-                    //       from the state db
-                    &format!(
-                        "CREATE TABLE IF NOT EXISTS {tmp_table_name} ({})",
-                        self.prepared_subscription
-                            .real_tables
-                            .get(table.as_str())
-                            .ok_or(SqlAnalysisError::MissingPrimaryKeys)?
-                            .table_pk
-                            .join(",")
-                    ),
-                )?
-                .execute(())?;
+        // Insert the affected pks into the temp tables
+        for (table_name, pks) in candidates {
+            let real_table = self
+                .prepared_subscription
+                .real_tables
+                .get(table_name.as_str())
+                .ok_or(MatcherError::TableMissing(table_name.0.into()))?;
+            clean_pk_stmts.push(&real_table.clean_table_stmt);
+            // Unpack the pks into columns
+            dbg!(&real_table.unnest_insert_pks_stmt);
+            let mut prepped = tx.prepare_cached(&real_table.unnest_insert_pks_stmt)?;
+            let parameter_count = real_table.table_pk.len();
+            let mut columns: Vec<Vec<SqliteValue>> = (1..=parameter_count)
+                .map(|_| Vec::with_capacity(pks.len()))
+                .collect::<Vec<_>>();
+            for (pk, _) in pks {
+                let pk_cols = unpack_columns(&pk)?;
+                if pk_cols.len() != parameter_count {
+                    return Err(MatcherError::MalformedPk);
+                }
+                for (i, col) in pk_cols.iter().enumerate() {
+                    columns[i].push(col.to_owned());
+                }
             }
+            // Bind the columns to the prepared statement
+            for idx in 1..=parameter_count {
+                prepped.raw_bind_parameter(idx, unnest_param(&columns[idx - 1]))?;
+            }
+            // And execute it
+            prepped.raw_execute()?;
 
-            for pks in pks {
-                tx.prepare_cached(&format!(
-                    "INSERT INTO {tmp_table_name} VALUES ({})",
-                    (0..pks.len())
-                        .map(|_i| "coalesce(?, \"\")")
-                        .collect::<Vec<_>>()
-                        .join(",")
-                ))?
-                .execute(params_from_iter(pks))?;
+            // See which aliased tables are affected by this change
+            for table_def in self
+                .prepared_subscription
+                .parsed
+                .table_by_real_name
+                .get(&real_table.main_table_name)
+                .unwrap()
+            {
+                affected_query_tables.push(table_def);
             }
         }
-        // commit so it is visible to the other db!
-        tx.commit()?;
-        trace!("committed temp pk tables");
-
-        let mut query_cols = vec![];
-
-        let pk_cols: Vec<String> = self.prepared_subscription.pk
-            .iter()
-            .map(|pk| pk.expr.alias.0.clone())
-            .collect();
-
-        let mut all_cols = pk_cols.clone();
-        for i in 0..(self.prepared_subscription.parsed.result_columns.len()) {
-            let col_name = format!("col_{i}");
-            all_cols.push(col_name.clone());
-            query_cols.push(col_name);
-        }
-
-        // start a new tx
-        let tx = self.conn.transaction()?;
-
-        // ensure drop and recreate
-        tx.execute_batch(&format!(
-            "CREATE TEMP TABLE IF NOT EXISTS state_results ({})",
-            all_cols.join(",")
-        ))?;
+        trace!("inserted temp pk tables");
 
         let mut new_last_rowid = self.last_rowid;
-
         {
-            let mut tmp_insert_prepped = tx.prepare_cached(&format!(
-                "INSERT INTO state_results VALUES ({})",
-                (0..all_cols.len())
-                    .map(|_| "?")
-                    .collect::<Vec<_>>()
-                    .join(",")
-            ))?;
-
-            for table in tables.iter() {
-                let start = Instant::now();
-                let stmt = match self
+            for table_def in &affected_query_tables {
+                let start: Instant = Instant::now();
+                let query_table = self
                     .prepared_subscription
                     .query_tables
-                    .values()
-                    .find(|q| &q.table_def.real_table == table.as_str())
-                {
-                    Some(stmt) => stmt,
-                    None => {
-                        warn!(sub_id = %self.id, "no statements pre-computed for table {table}");
-                        continue;
-                    }
-                };
+                    .get(&table_def.alias)
+                    .unwrap();
 
-                trace!("SELECT SQL: {}", stmt.new_query);
+                let sql = format!(
+                    "WITH change_batch AS ({})
+                    INSERT INTO state_results SELECT * FROM change_batch ",
+                    query_table.new_query,
+                );
+                trace!("SELECT SQL: {}", sql);
+                tx.prepare_cached(&sql)?.execute([])?;
 
-                let mut prepped = tx.prepare_cached(&stmt.new_query)?;
-
-                let col_count = prepped.column_count();
-
-                let mut rows = prepped.raw_query();
-
-                // insert each row in the other DB...
-                while let Some(row) = rows.next()? {
-                    for i in 0..col_count {
-                        tmp_insert_prepped
-                            .raw_bind_parameter(i + 1, SqliteValueRef::from(row.get_ref(i)?))?;
-                    }
-                    tmp_insert_prepped.raw_execute()?;
-                }
-
-                let coalesced_pks = pk_cols
-                    .iter()
-                    .map(|pk| format!("coalesce({pk},\"\")"))
-                    .collect::<Vec<_>>()
-                    .join(",");
                 let sql = format!(
                     "INSERT INTO query ({insert_cols})
                         SELECT * FROM (
@@ -1399,19 +1323,27 @@ impl Matcher {
                             WHERE {excluded_not_same}
                         RETURNING __corro_rowid,{return_cols}",
                     // insert into
-                    insert_cols = all_cols.join(","),
-                    query_query = stmt.temp_query,
-                    conflict_clause = coalesced_pks,
-                    excluded = (0..(self.prepared_subscription.parsed.result_columns.len()))
-                        .map(|i| format!("col_{i} = excluded.col_{i}"))
+                    insert_cols = self.prepared_subscription.return_column_names_with_pks(),
+                    query_query = query_table.temp_query,
+                    conflict_clause = self.prepared_subscription.identity_uniq_index.index_columns,
+                    excluded = self
+                        .prepared_subscription
+                        .result_set
+                        .iter()
+                        .map(|x| format!("{col_name} = excluded.{col_name}", col_name = x.alias))
                         .collect::<Vec<_>>()
                         .join(","),
-                    excluded_not_same =
-                        (0..(self.prepared_subscription.parsed.result_columns.len()))
-                            .map(|i| format!("col_{i} IS NOT excluded.col_{i}"))
-                            .collect::<Vec<_>>()
-                            .join(" OR "),
-                    return_cols = query_cols.join(",")
+                    excluded_not_same = self
+                        .prepared_subscription
+                        .result_set
+                        .iter()
+                        .map(|x| format!(
+                            "{col_name} IS NOT excluded.{col_name}",
+                            col_name = x.alias
+                        ))
+                        .collect::<Vec<_>>()
+                        .join(" OR "),
+                    return_cols = self.prepared_subscription.return_column_names()
                 );
 
                 trace!("INSERT SQL: {sql}");
@@ -1420,17 +1352,16 @@ impl Matcher {
 
                 let sql = format!(
                     "
-                    DELETE FROM query WHERE ({pks}) IN (SELECT {select_pks} FROM (
+                    DELETE FROM query WHERE ({pks}) IN (SELECT {pks} FROM (
                         {query_query}
                         EXCEPT
                         SELECT * FROM state_results
                     )) RETURNING __corro_rowid,{return_cols}
                 ",
                     // delete from
-                    pks = coalesced_pks,
-                    select_pks = coalesced_pks,
-                    query_query = stmt.temp_query,
-                    return_cols = query_cols.join(",")
+                    pks = self.prepared_subscription.identity_uniq_index.index_columns,
+                    query_query = query_table.temp_query,
+                    return_cols = self.prepared_subscription.return_column_names()
                 );
 
                 trace!("DELETE SQL: {sql}");
@@ -1439,8 +1370,8 @@ impl Matcher {
 
                 let mut change_insert_stmt = tx.prepare_cached(&format!(
                     "INSERT INTO changes (__corro_rowid, {CHANGE_TYPE_COL}, {}) VALUES (?, ?, {}) RETURNING {CHANGE_ID_COL}",
-                    query_cols.join(","),
-                    (0..query_cols.len())
+                    self.prepared_subscription.return_column_names(),
+                    (0..self.prepared_subscription.result_set.len())
                         .map(|_i| "?")
                         .collect::<Vec<_>>()
                         .join(",")
@@ -1508,19 +1439,16 @@ impl Matcher {
                         }
                     }
                 }
-                // clean that up
+                // Clean the temporary query result table
                 tx.execute_batch("DELETE FROM state_results")?;
 
                 let elapsed = start.elapsed();
-                histogram!("corro.subs.changes.processing.table.duration.seconds", "sql_hash" => self.hash.clone(), "table" => table.0.to_string()).record(elapsed);
+                histogram!("corro.subs.changes.processing.table.duration.seconds", "sql_hash" => self.hash.clone(), "table" => table_def.real_table.clone()).record(elapsed);
             }
 
-            // clean up temporary tables immediately
-            for table in tables {
-                // TODO: reduce mistakes by computing this table name once
-                tx.prepare_cached(&format!("DELETE FROM temp_{table}",))?
-                    .execute(())?;
-                trace!("cleaned up temp_{table}");
+            // Clean the PK tables
+            for stmt in clean_pk_stmts {
+                tx.prepare_cached(stmt)?.execute([])?;
             }
         }
 
@@ -1534,21 +1462,8 @@ impl Matcher {
     }
 }
 
-fn dump_query_plan(
-    conn: &mut Connection,
-    query: &str,
-    table_name: &str,
-    pks: &[String],
-) -> Result<String, MatcherError> {
-    let tx = conn.transaction()?;
-
-    tx.prepare_cached(&format!(
-        "CREATE TABLE IF NOT EXISTS __corro_sub.temp_{table_name} ({})",
-        pks.join(",")
-    ))?
-    .execute(())?;
-
-    let mut prepped = tx.prepare(&format!("EXPLAIN QUERY PLAN {query}"))?;
+fn dump_query_plan(conn: &mut Connection, query: &str) -> Result<String, MatcherError> {
+    let mut prepped = conn.prepare(&format!("EXPLAIN QUERY PLAN {query}"))?;
     let mut rows = prepped.query(())?;
 
     let mut output = String::new();
@@ -1619,6 +1534,12 @@ pub enum MatcherError {
     NotRunning,
     #[error("subscription restore is missing SQL query")]
     MissingSql,
+    #[error("corrosion disagrees with sqlite on the number of columns returned by the query. This is an corrosion bug, please report it")]
+    ColumnCountMismatch,
+    #[error("table {0} is missing from the prepared subscription")]
+    TableMissing(String),
+    #[error("malformed PK")]
+    MalformedPk,
 }
 
 impl MatcherError {

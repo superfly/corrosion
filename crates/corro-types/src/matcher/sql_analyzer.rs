@@ -1026,7 +1026,7 @@ pub struct RealTableMatcherStmt {
     // Statement used to cleanup the table in the subscription database
     pub clean_table_stmt: String,
     // Statement used to insert the primary keys of the table in the subscription database
-    pub insert_pks_stmt: String,
+    pub unnest_insert_pks_stmt: String,
 }
 
 // For each referenced table we get a 2 way mapping from the sub query to the real table
@@ -1049,6 +1049,12 @@ impl QueryTableMatcherStmt {
 }
 
 #[derive(Debug, Clone)]
+pub struct IndexDef {
+    pub index_name: String,
+    pub index_columns: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct PreparedSubscriptionSql {
     // The query which will get executed to get the initial subscription rows
     pub(crate) initial_query: Stmt,
@@ -1056,8 +1062,10 @@ pub struct PreparedSubscriptionSql {
     pub(crate) parsed: ParsedSelect,
     // The PK of a result row
     pub(crate) pk: Vec<PkEntry>,
-    // The recommended indexes for the query
-    pub(crate) recomended_indexes: Vec<Vec<PkEntry>>,
+    // The required non unique indexes for the query
+    // index_name => (index_columns)
+    pub(crate) required_query_indexes: Vec<IndexDef>,
+    pub(crate) identity_uniq_index: IndexDef,
     // The result set of the query
     pub(crate) result_set: Vec<ReturnExpr>,
     // The result set of the query with the PKs added
@@ -1070,6 +1078,23 @@ pub struct PreparedSubscriptionSql {
     pub(crate) real_tables: IndexMap<String, RealTableMatcherStmt>,
     // alias -> query_table
     pub(crate) query_tables: IndexMap<String, QueryTableMatcherStmt>,
+}
+
+impl PreparedSubscriptionSql {
+    pub fn return_column_names_with_pks(&self) -> String {
+        self.result_set_with_pk
+            .iter()
+            .map(|x| x.alias.0.clone())
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+    pub fn return_column_names(&self) -> String {
+        self.result_set
+            .iter()
+            .map(|x| x.alias.0.clone())
+            .collect::<Vec<_>>()
+            .join(",")
+    }
 }
 
 pub fn prepare_subscription_sql(
@@ -1144,50 +1169,59 @@ pub fn prepare_subscription_sql(
     // Now after we've parsed the query we can generate queries
     let mut real_tables = IndexMap::default();
     let mut query_tables = IndexMap::default();
+    let mut required_query_indexes = Vec::new();
     // For every aliassed source table
     for (idx, (table_def, cols)) in parsed.tables.iter().enumerate() {
         // Get the real table
-        let real_table = real_tables.entry(table_def.real_table.clone()).or_insert_with(|| {
-            let schema_table = schema.tables.get(&table_def.real_table).unwrap();
-            let sub_table_name = format!("main_pks_{}", table_def.real_table);
-            let pk_sql = schema_table
-                .pk
-                .iter()
-                .cloned()
-                .collect::<Vec<_>>()
-                .join(", ");
-            // TODO: keep track of nullable constraints
-            // coalesce(value0, ""), coalesce(value1, ""), ..., coalesce(valueN, "")
-            let values_sql = schema_table
-                .pk
-                .iter()
-                .enumerate()
-                .map(|(i, _)| format!("coalesce(value{}, \"\")", i))
-                .collect::<Vec<_>>()
-                .join(", ");
-            // ?, ?, ..., ?
-            let unnest_args_sql = schema_table
-                .pk
-                .iter()
-                .map(|_| "?")
-                .collect::<Vec<_>>()
-                .join(", ");
-            RealTableMatcherStmt {
-                table_pk: schema_table.pk.iter().cloned().collect(),
-                subscribed_cols: HashSet::new(),
-                main_table_name: table_def.real_table.clone(),
-                sub_table_name: sub_table_name.clone(),
-                create_table_stmt: format!("CREATE TEMP TABLE {} ({})", sub_table_name, pk_sql),
-                // https://sqlite.org/lang_delete.html
-                // When the WHERE clause and RETURNING clause are both omitted from a DELETE statement and the table being deleted has no triggers, SQLite uses an optimization to erase the entire table content without having to visit each row of the table individually.
-                // This "truncate" optimization makes the delete run much faster
-                clean_table_stmt: format!("DELETE FROM {}", sub_table_name),
-                insert_pks_stmt: format!(
-                    "INSERT INTO {} ({}) SELECT {} FROM unnest({})",
-                    sub_table_name, pk_sql, values_sql, unnest_args_sql
-                ),
-            }
-        });
+        let real_table = real_tables
+            .entry(table_def.real_table.clone())
+            .or_insert_with(|| {
+                let schema_table = schema.tables.get(&table_def.real_table).unwrap();
+                let sub_table_name = format!("main_pks_{}", table_def.real_table);
+                let pk_sql = schema_table
+                    .pk
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                // TODO: keep track of nullable constraints
+                // We need to convert NULLs into sentinel values because
+                // all the diffing which we're doing is based on the IN operator
+                // And `SELECT 1 WHERE (NULL, 1) IN ((NULL, 1));` will return 0 rows
+                // coalesce(value0, ""), coalesce(value1, ""), ..., coalesce(valueN, "")
+                let coalesced_values_sql: String = schema_table
+                    .pk
+                    .iter()
+                    .enumerate()
+                    .map(|(i, _)| format!("coalesce(value{}, \"\")", i))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                // ?, ?, ..., ?
+                let unnest_args_sql = schema_table
+                    .pk
+                    .iter()
+                    .map(|_| "?")
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                RealTableMatcherStmt {
+                    table_pk: schema_table.pk.iter().cloned().collect(),
+                    subscribed_cols: HashSet::new(),
+                    main_table_name: table_def.real_table.clone(),
+                    sub_table_name: sub_table_name.clone(),
+                    create_table_stmt: format!(
+                        "CREATE TEMP TABLE IF NOT EXISTS {} ({})",
+                        sub_table_name, pk_sql
+                    ),
+                    // https://sqlite.org/lang_delete.html
+                    // When the WHERE clause and RETURNING clause are both omitted from a DELETE statement and the table being deleted has no triggers, SQLite uses an optimization to erase the entire table content without having to visit each row of the table individually.
+                    // This "truncate" optimization makes the delete run much faster
+                    clean_table_stmt: format!("DELETE FROM {}", sub_table_name),
+                    unnest_insert_pks_stmt: format!(
+                        "INSERT INTO {} ({}) SELECT {} FROM unnest({})",
+                        sub_table_name, pk_sql, coalesced_values_sql, unnest_args_sql
+                    ),
+                }
+            });
         // Subscribe to all referenced columns in the data source
         real_table.subscribed_cols.extend(cols.iter().cloned());
 
@@ -1295,18 +1329,25 @@ pub fn prepare_subscription_sql(
             .collect::<Vec<_>>()
             .join(",");
 
-        let temp_query: String = format!(
-            "SELECT {} FROM query WHERE ({}) IN temp.{}",
-            all_cols,
-            real_to_query_pks
-                .iter()
-                .map(|(_, row_pks)| row_pks
+        let sub_coalesced_pk = real_to_query_pks
+            .iter()
+            .map(|(_, row_pks)| {
+                row_pks
                     .first()
                     .map(|pk| format!("coalesce({}, \"\")", pk.expr.alias.0.clone()))
-                    .unwrap())
-                .collect::<Vec<_>>()
-                .join(","),
-            real_table.sub_table_name
+                    .unwrap()
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+
+        let index_name = format!("index_{}_{}_subpk", table_def.alias, table_def.real_table);
+        required_query_indexes.push(IndexDef {
+            index_name: index_name.clone(),
+            index_columns: sub_coalesced_pk.clone(),
+        });
+        let temp_query: String = format!(
+            "SELECT {} FROM query INDEXED BY {} WHERE ({}) IN temp.{}",
+            all_cols, index_name, sub_coalesced_pk, real_table.sub_table_name
         );
 
         let real_table_name = &table_def.real_table;
@@ -1324,12 +1365,25 @@ pub fn prepare_subscription_sql(
         );
     }
 
+    // Use all non fully dependent columns as the identity index
+    let identity_index_columns = pks
+        .iter()
+        .filter_map(|pk| {
+            (!pk.fully_dependent).then(|| format!("coalesce({}, \"\")", pk.expr.alias.0.clone()))
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+
     Ok(PreparedSubscriptionSql {
         initial_query: stmt,
         pk: pks,
         result_set,
         result_set_with_pk,
-        recomended_indexes: Vec::new(),
+        identity_uniq_index: IndexDef {
+            index_name: "identity_uniq_index".to_string(),
+            index_columns: identity_index_columns.clone(),
+        },
+        required_query_indexes,
         parsed,
         query_tables,
         real_tables,
@@ -1358,7 +1412,16 @@ fn expr_filter_by_query_pks(
         Expr::Parenthesized(
             real_to_query_pks
                 .iter()
-                .map(|(_, row_pks)| row_pks.first().unwrap().expr.expr.clone())
+                .map(|(_, row_pks)| Expr::FunctionCall {
+                    name: Id("coalesce".to_string()),
+                    distinctness: None,
+                    args: Some(vec![
+                        row_pks.first().unwrap().expr.expr.clone(),
+                        Expr::Literal(Literal::String("\"\"".to_string())),
+                    ]),
+                    order_by: None,
+                    filter_over: None,
+                })
                 .collect(),
         ),
         false,
