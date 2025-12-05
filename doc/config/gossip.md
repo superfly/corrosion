@@ -48,6 +48,10 @@ The max idle timeout in seconds for QUIC connection.
 
 Defaults to 30 seconds.
 
+#### `gossip.member_id`
+
+Specifies a member_id which identify nodes of the same Corrosion cluster. Nodes with different member_id would be unable to share changes with each other.
+
 #### `gossip.max_mtu`
 
 Define the max MTU for QUIC. Instead of attempting to discover the best MTU value automatically, you can define this upper bound.
@@ -93,6 +97,8 @@ bootstrap = []
 plaintext = false  # optional
 max_mtu = 1200  # optional
 disable_gso = false  # optional
+
+member_id = 1 # optional
 
 [gossip.tls] # optional
 cert_file = "/path/to/server_cert.pem"
