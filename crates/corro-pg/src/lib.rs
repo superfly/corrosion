@@ -439,14 +439,10 @@ enum OpenTxKind {
     Explicit,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct PgTaskCancellation(Arc<TokioRwLock<HashMap<i32, CancellationToken>>>);
 
 impl PgTaskCancellation {
-    pub fn new() -> Self {
-        Self(Arc::new(TokioRwLock::new(HashMap::new())))
-    }
-
     pub async fn insert(&self, conn_id: i32, cancel: CancellationToken) {
         self.0.write().await.insert(conn_id, cancel);
     }
@@ -542,7 +538,7 @@ pub async fn start(
     "readonly" => readonly.to_string(),
     );
     let conn_counter = AtomicI32::new(0);
-    let task_cancellation = PgTaskCancellation::new();
+    let task_cancellation = PgTaskCancellation::default();
 
     spawn_counted(async move {
         let mut conn_tripwire = tripwire.clone();
