@@ -2107,7 +2107,7 @@ pub async fn start(
                 // Note that this should be the only reference of back_tx at this point:
                 // the one in frontend_task is weak, and the one cloned into the message-handling
                 // thread should have been dropped.
-                let _ = task_cancellation.remove(conn_id).await;
+                task_cancellation.remove(conn_id).await;
                 assert_eq!(back_tx.strong_count(), 1);
                 drop(back_tx);
 
