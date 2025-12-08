@@ -12,7 +12,10 @@ use std::{
     net::SocketAddr,
     rc::Rc,
     str::{FromStr, Utf8Error},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicI32, Ordering},
+        Arc,
+    },
     time::Duration,
 };
 
@@ -62,7 +65,7 @@ use tokio::{
     net::TcpListener,
     sync::{
         mpsc::{channel, Sender},
-        AcquireError, OwnedSemaphorePermit,
+        AcquireError, OwnedSemaphorePermit, RwLock as TokioRwLock,
     },
     time::timeout,
 };
@@ -436,6 +439,27 @@ enum OpenTxKind {
     Explicit,
 }
 
+#[derive(Debug, Clone)]
+pub struct PgTaskCancellation(Arc<TokioRwLock<HashMap<i32, CancellationToken>>>);
+
+impl PgTaskCancellation {
+    pub fn new() -> Self {
+        Self(Arc::new(TokioRwLock::new(HashMap::new())))
+    }
+
+    pub async fn insert(&self, conn_id: i32, cancel: CancellationToken) {
+        self.0.write().await.insert(conn_id, cancel);
+    }
+
+    pub async fn remove(&self, conn_id: i32) {
+        self.0.write().await.remove(&conn_id);
+    }
+
+    pub async fn get(&self, conn_id: &i32) -> Option<CancellationToken> {
+        self.0.read().await.get(&conn_id).cloned()
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum PgStartError {
     #[error(transparent)]
@@ -521,6 +545,8 @@ pub async fn start(
     "protocol" => "pg",
     "readonly" => readonly.to_string(),
     );
+    let conn_counter = AtomicI32::new(0);
+    let task_cancellation = PgTaskCancellation::new();
 
     spawn_counted(async move {
         let mut conn_tripwire = tripwire.clone();
@@ -540,6 +566,8 @@ pub async fn start(
             let tripwire = tripwire.clone();
             // Don't use spawn_counted here
             // Until the connection gets fully established we don't need to gracefully close it
+            let conn_id = conn_counter.fetch_add(1, Ordering::SeqCst);
+            let task_cancellation = task_cancellation.clone();
             tokio::spawn(async move {
                 conn.stream.set_nodelay(true)?;
                 {
@@ -601,6 +629,12 @@ pub async fn start(
                     PgWireFrontendMessage::Startup(startup) => {
                         debug!("received startup message: {startup:?}");
                     }
+                    PgWireFrontendMessage::CancelRequest(cancel_request) => {
+                        debug!("received cancel request: {cancel_request:?}");
+                        if let Some(cancel) = task_cancellation.get(&cancel_request.pid).await {
+                            cancel.cancel();
+                        }
+                    }
                     _ => {
                         framed
                             .send(PgWireBackendMessage::ErrorResponse(
@@ -631,6 +665,18 @@ pub async fn start(
                     )))
                     .await?;
 
+                let cancel = CancellationToken::new();
+                task_cancellation.insert(conn_id, cancel.clone()).await;
+
+                framed
+                    .feed(PgWireBackendMessage::BackendKeyData(
+                        pgwire::messages::startup::BackendKeyData::new(
+                            conn_id,
+                            pgwire::messages::startup::SecretKey::I32(0),
+                        ),
+                    ))
+                    .await?;
+
                 framed
                     .feed(PgWireBackendMessage::ReadyForQuery(ReadyForQuery::new(
                         TransactionStatus::Idle,
@@ -645,8 +691,6 @@ pub async fn start(
                 let (back_tx, mut back_rx) = channel(1024);
 
                 let (mut sink, mut stream) = framed.split();
-
-                let cancel = CancellationToken::new();
 
                 // If we're shutting down corrosion, both frontend and backend tasks will finish
                 let mut frontend_task = spawn_counted({
@@ -2034,11 +2078,13 @@ pub async fn start(
                 // The message-handling loop has completed, make sure we also abort the tasks
                 // handling the TCP connection
                 // Firstly we attempt a graceful shutdown -- dropping back_tx will cause
+
                 // backend_task to complete once it writes all content to the TCP socket
                 // Then, frontend_task will eventually receive an EOF if clients behave properly
                 // Note that this should be the only reference of back_tx at this point:
                 // the one in frontend_task is weak, and the one cloned into the message-handling
                 // thread should have been dropped.
+                let _ = task_cancellation.remove(conn_id).await;
                 assert_eq!(back_tx.strong_count(), 1);
                 drop(back_tx);
 
