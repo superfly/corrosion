@@ -451,12 +451,8 @@ impl PgTaskCancellation {
         self.0.write().await.insert(conn_id, cancel);
     }
 
-    pub async fn remove(&self, conn_id: i32) {
-        self.0.write().await.remove(&conn_id);
-    }
-
-    pub async fn get(&self, conn_id: &i32) -> Option<CancellationToken> {
-        self.0.read().await.get(&conn_id).cloned()
+    pub async fn remove(&self, conn_id: i32) -> Option<CancellationToken> {
+        self.0.write().await.remove(&conn_id)
     }
 }
 
@@ -631,9 +627,10 @@ pub async fn start(
                     }
                     PgWireFrontendMessage::CancelRequest(cancel_request) => {
                         debug!("received cancel request: {cancel_request:?}");
-                        if let Some(cancel) = task_cancellation.get(&cancel_request.pid).await {
+                        if let Some(cancel) = task_cancellation.remove(cancel_request.pid).await {
                             cancel.cancel();
                         }
+                        return Ok(());
                     }
                     _ => {
                         framed
@@ -1985,14 +1982,14 @@ pub async fn start(
                                     continue;
                                 }
                                 PgWireFrontendMessage::CancelRequest(_) => {
-                                    // cancel.cancel(); ?
+                                    // cancel should be sent as first message on a new connection.
                                     back_tx.blocking_send(
                                         (
                                             PgWireBackendMessage::ErrorResponse(
                                                 ErrorInfo::new(
                                                     "ERROR".into(),
                                                     "XX000".to_owned(),
-                                                    "Cancel is not implemented".into(),
+                                                    "Unexpected Cancel message".into(),
                                                 )
                                                 .into(),
                                             ),
