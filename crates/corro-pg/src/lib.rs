@@ -49,6 +49,7 @@ use pgwire::{
     types::FromSqlText,
 };
 use postgres_types::{FromSql, Type};
+use rand::{rngs::StdRng, Rng, SeedableRng};
 use rusqlite::{
     ffi::SQLITE_CONSTRAINT_UNIQUE, functions::FunctionFlags, types::ValueRef,
     vtab::eponymous_only_module, Connection, Statement,
@@ -439,16 +440,34 @@ enum OpenTxKind {
     Explicit,
 }
 
+#[derive(Debug, Clone)]
+struct CancelInfo {
+    cancel: CancellationToken,
+    secret_key: i32,
+}
+
 #[derive(Debug, Clone, Default)]
-pub struct PgTaskCancellation(Arc<TokioRwLock<HashMap<i32, CancellationToken>>>);
+pub struct PgTaskCancellation(Arc<TokioRwLock<HashMap<i32, CancelInfo>>>);
 
 impl PgTaskCancellation {
-    pub async fn insert(&self, conn_id: i32, cancel: CancellationToken) {
-        self.0.write().await.insert(conn_id, cancel);
+    pub async fn insert(&self, conn_id: i32, cancel: CancellationToken, secret_key: i32) {
+        self.0
+            .write()
+            .await
+            .insert(conn_id, CancelInfo { cancel, secret_key });
     }
 
-    pub async fn remove(&self, conn_id: i32) -> Option<CancellationToken> {
-        self.0.write().await.remove(&conn_id)
+    pub async fn remove(&self, conn_id: i32) {
+        self.0.write().await.remove(&conn_id);
+    }
+
+    pub async fn get_and_verify(&self, conn_id: i32, secret_key: i32) -> Option<CancellationToken> {
+        if let Some(cancel_info) = self.0.read().await.get(&conn_id).cloned() {
+            if cancel_info.secret_key == secret_key {
+                return Some(cancel_info.cancel);
+            }
+        }
+        None
     }
 }
 
@@ -623,8 +642,14 @@ pub async fn start(
                     }
                     PgWireFrontendMessage::CancelRequest(cancel_request) => {
                         debug!("received cancel request: {cancel_request:?}");
-                        if let Some(cancel) = task_cancellation.remove(cancel_request.pid).await {
-                            cancel.cancel();
+
+                        if let Some(secret_key) = cancel_request.secret_key.as_i32() {
+                            if let Some(cancel) = task_cancellation
+                                .get_and_verify(cancel_request.pid, secret_key)
+                                .await
+                            {
+                                cancel.cancel();
+                            }
                         }
                         return Ok(());
                     }
@@ -658,14 +683,19 @@ pub async fn start(
                     )))
                     .await?;
 
+                let mut rng = StdRng::from_os_rng();
+                let secret_key: i32 = rng.random::<i32>();
+
                 let cancel = CancellationToken::new();
-                task_cancellation.insert(conn_id, cancel.clone()).await;
+                task_cancellation
+                    .insert(conn_id, cancel.clone(), secret_key)
+                    .await;
 
                 framed
                     .feed(PgWireBackendMessage::BackendKeyData(
                         pgwire::messages::startup::BackendKeyData::new(
                             conn_id,
-                            pgwire::messages::startup::SecretKey::I32(0),
+                            pgwire::messages::startup::SecretKey::I32(secret_key),
                         ),
                     ))
                     .await?;

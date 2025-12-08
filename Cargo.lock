@@ -1087,6 +1087,7 @@ dependencies = [
  "pgwire",
  "pin-project-lite",
  "postgres-types",
+ "rand 0.9.2",
  "rcgen",
  "rusqlite",
  "rustls",
