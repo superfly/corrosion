@@ -12,7 +12,10 @@ use std::{
     net::SocketAddr,
     rc::Rc,
     str::{FromStr, Utf8Error},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicI32, Ordering},
+        Arc,
+    },
     time::Duration,
 };
 
@@ -46,6 +49,7 @@ use pgwire::{
     types::FromSqlText,
 };
 use postgres_types::{FromSql, Type};
+use rand::{rngs::StdRng, Rng, SeedableRng};
 use rusqlite::{
     ffi::SQLITE_CONSTRAINT_UNIQUE, functions::FunctionFlags, types::ValueRef,
     vtab::eponymous_only_module, Connection, Statement,
@@ -62,7 +66,7 @@ use tokio::{
     net::TcpListener,
     sync::{
         mpsc::{channel, Sender},
-        AcquireError, OwnedSemaphorePermit,
+        AcquireError, OwnedSemaphorePermit, RwLock as TokioRwLock,
     },
     time::timeout,
 };
@@ -436,6 +440,37 @@ enum OpenTxKind {
     Explicit,
 }
 
+#[derive(Debug, Clone)]
+struct CancelInfo {
+    cancel: CancellationToken,
+    secret_key: i32,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct PgTaskCancellation(Arc<TokioRwLock<HashMap<i32, CancelInfo>>>);
+
+impl PgTaskCancellation {
+    pub async fn insert(&self, conn_id: i32, cancel: CancellationToken, secret_key: i32) {
+        self.0
+            .write()
+            .await
+            .insert(conn_id, CancelInfo { cancel, secret_key });
+    }
+
+    pub async fn remove(&self, conn_id: i32) {
+        self.0.write().await.remove(&conn_id);
+    }
+
+    pub async fn get_and_verify(&self, conn_id: i32, secret_key: i32) -> Option<CancellationToken> {
+        if let Some(cancel_info) = self.0.read().await.get(&conn_id).cloned() {
+            if cancel_info.secret_key == secret_key {
+                return Some(cancel_info.cancel);
+            }
+        }
+        None
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum PgStartError {
     #[error(transparent)]
@@ -521,6 +556,8 @@ pub async fn start(
     "protocol" => "pg",
     "readonly" => readonly.to_string(),
     );
+    let conn_counter = AtomicI32::new(0);
+    let task_cancellation = PgTaskCancellation::default();
 
     spawn_counted(async move {
         let mut conn_tripwire = tripwire.clone();
@@ -540,6 +577,8 @@ pub async fn start(
             let tripwire = tripwire.clone();
             // Don't use spawn_counted here
             // Until the connection gets fully established we don't need to gracefully close it
+            let conn_id = conn_counter.fetch_add(1, Ordering::SeqCst);
+            let task_cancellation = task_cancellation.clone();
             tokio::spawn(async move {
                 conn.stream.set_nodelay(true)?;
                 {
@@ -601,6 +640,21 @@ pub async fn start(
                     PgWireFrontendMessage::Startup(startup) => {
                         debug!("received startup message: {startup:?}");
                     }
+                    PgWireFrontendMessage::CancelRequest(cancel_request) => {
+                        debug!("received cancel request: {cancel_request:?}");
+
+                        if let Some(secret_key) = cancel_request.secret_key.as_i32() {
+                            if let Some(cancel) = task_cancellation
+                                .get_and_verify(cancel_request.pid, secret_key)
+                                .await
+                            {
+                                cancel.cancel();
+                            } else {
+                                warn!("invalid secret key for cancel request");
+                            }
+                        }
+                        return Ok(());
+                    }
                     _ => {
                         framed
                             .send(PgWireBackendMessage::ErrorResponse(
@@ -631,6 +685,23 @@ pub async fn start(
                     )))
                     .await?;
 
+                let mut rng = StdRng::from_os_rng();
+                let secret_key: i32 = rng.random::<i32>();
+
+                let cancel = CancellationToken::new();
+                task_cancellation
+                    .insert(conn_id, cancel.clone(), secret_key)
+                    .await;
+
+                framed
+                    .feed(PgWireBackendMessage::BackendKeyData(
+                        pgwire::messages::startup::BackendKeyData::new(
+                            conn_id,
+                            pgwire::messages::startup::SecretKey::I32(secret_key),
+                        ),
+                    ))
+                    .await?;
+
                 framed
                     .feed(PgWireBackendMessage::ReadyForQuery(ReadyForQuery::new(
                         TransactionStatus::Idle,
@@ -645,8 +716,6 @@ pub async fn start(
                 let (back_tx, mut back_rx) = channel(1024);
 
                 let (mut sink, mut stream) = framed.split();
-
-                let cancel = CancellationToken::new();
 
                 // If we're shutting down corrosion, both frontend and backend tasks will finish
                 let mut frontend_task = spawn_counted({
@@ -1941,14 +2010,14 @@ pub async fn start(
                                     continue;
                                 }
                                 PgWireFrontendMessage::CancelRequest(_) => {
-                                    // cancel.cancel(); ?
+                                    // cancel should be sent as first message on a new connection.
                                     back_tx.blocking_send(
                                         (
                                             PgWireBackendMessage::ErrorResponse(
                                                 ErrorInfo::new(
                                                     "ERROR".into(),
                                                     "XX000".to_owned(),
-                                                    "Cancel is not implemented".into(),
+                                                    "Unexpected Cancel message".into(),
                                                 )
                                                 .into(),
                                             ),
@@ -2034,11 +2103,13 @@ pub async fn start(
                 // The message-handling loop has completed, make sure we also abort the tasks
                 // handling the TCP connection
                 // Firstly we attempt a graceful shutdown -- dropping back_tx will cause
+
                 // backend_task to complete once it writes all content to the TCP socket
                 // Then, frontend_task will eventually receive an EOF if clients behave properly
                 // Note that this should be the only reference of back_tx at this point:
                 // the one in frontend_task is weak, and the one cloned into the message-handling
                 // thread should have been dropped.
+                task_cancellation.remove(conn_id).await;
                 assert_eq!(back_tx.strong_count(), 1);
                 drop(back_tx);
 

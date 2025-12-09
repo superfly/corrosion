@@ -926,6 +926,46 @@ async fn test_unnest_max_parameters() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn test_request_cancellation() {
+    let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
+
+    let (_ta, server) = setup_pg_test_server(tripwire, None).await;
+
+    let conn_str = format!(
+        "host={} port={} user=testuser",
+        server.local_addr.ip(),
+        server.local_addr.port()
+    );
+
+    {
+        let (client, client_conn) = tokio_postgres::connect(&conn_str, NoTls).await.unwrap();
+        println!("client is ready!");
+        tokio::spawn(client_conn);
+
+        // cancel the query after 2 seconds
+        let cancel_token = client.cancel_token();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            cancel_token.cancel_query(NoTls).await.unwrap();
+        });
+
+        let res = client.query("WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM cnt WHERE x < 1000000000) SELECT MAX(x) FROM cnt", &[]).await;
+        assert!(res.is_err());
+        assert!(res
+            .err()
+            .unwrap()
+            .as_db_error()
+            .unwrap()
+            .message()
+            .contains("interrupted"));
+    }
+
+    tripwire_tx.send(()).await.ok();
+    tripwire_worker.await;
+    wait_for_all_pending_handles().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_unnest_vtab() {
     let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
 

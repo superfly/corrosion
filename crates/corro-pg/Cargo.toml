@@ -20,6 +20,7 @@ parking_lot.workspace = true
 pgwire = { version = "0.32", default-features = false, features = ["server-api-ring"] }
 pin-project-lite.workspace = true
 postgres-types = { version = "0.2", features = ["with-time-0_3"] }
+rand = { workspace = true }
 rusqlite = { workspace = true }
 rustls = { workspace = true }
 spawn = { path = "../spawn" }
