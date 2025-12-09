@@ -649,6 +649,8 @@ pub async fn start(
                                 .await
                             {
                                 cancel.cancel();
+                            } else {
+                                warn!("invalid secret key for cancel request");
                             }
                         }
                         return Ok(());
