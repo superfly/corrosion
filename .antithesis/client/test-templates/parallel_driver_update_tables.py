@@ -21,16 +21,18 @@ import helper
 
 def update_in_corrosion(address, port, table, id, new_data):
     """Attempts to update a user in the Corrosion node."""
-    columns = list(new_data.keys())
-    random_columns = random.choices(columns, k=random.randint(1, len(columns)))
+    try:
+        columns = list(new_data.keys())
+        random_columns = random.choices(columns, k=random.randint(1, len(columns)))
 
-    sql_clauses = []
-    for column in random_columns:
-        sql_clauses.append(f"{column} = '{new_data[column]}'")
-    sql_command = f"UPDATE {table} SET {', '.join(sql_clauses)} WHERE id = {id}"
-    conn = helper.get_db_connection(address, port)
-    helper.execute_psql(conn, sql_command)
-
+        sql_clauses = []
+        for column in random_columns:
+            sql_clauses.append(f"{column} = '{new_data[column]}'")
+        sql_command = f"UPDATE {table} SET {', '.join(sql_clauses)} WHERE id = {id}"
+        conn = helper.get_db_connection(address, port)
+        helper.execute_psql(conn, sql_command)
+    except Exception as e:
+        print(f"Error updating table {table}: {e}")
 
 def get_ids(address, port, table):
     ids = helper.query_sql(address, port, f"SELECT id FROM {table} ORDER BY RANDOM() LIMIT 100")
@@ -43,7 +45,7 @@ def do_updates(address, pg_port, http_port):
         for table in ["users", "teams", "deployments"]:
             table_ids = get_ids(address, http_port, table)
             if len(table_ids) == 0:
-                print(f"Not enough {table} in Corrosion.")
+                print(f"Not enough rows in {table}.")
                 continue
             for id in table_ids:
                 new_data = helper.random_data(table)

@@ -48,13 +48,14 @@ def insert_deployment(conn, team_id, net_id):
         print(f"Error inserting deployment: {e}")
 
 def do_inserts(address):
-    id = helper.get_random_cols(address, "teams", ["id"])
-
-    host, port = address.split(':')
-    conn = helper.get_db_connection(host, "5470")
-    if conn is not None:
+    try:
+        id = helper.get_random_cols(address, "teams", ["id"])
+        host, port = address.split(':')
+        conn = helper.get_db_connection(host, "5470")
         for j in range(helper.random_int(1, 10)):
             insert_deployment(conn, id[0], helper.random_int(1, 1000))
+    except Exception as e:
+        print(f"Error inserting deployment for {address}: {e}")
 
 def main():
     parser = argparse.ArgumentParser(description='Insert teams and users into corrosion databases')

@@ -13,30 +13,28 @@ import helper
 random = random.SystemRandom()
 
 def insert_team(address):
-    data = {
-        "id": random.randint(1, 10000000),
-        "name": helper.random_name(),
-        "net_id": random.randint(1, 1000),
-        "role": random.choice(["admin", "dev", "user", "viewer"]),
-        "settings": {},
-        "state": random.choice(["creating", "deliquent", "active", "inactive"]),
-        "balancer_ip": "127.0.0.1",
-        "created_at": time.time(),
-        "updated_at": time.time()
-    }
+    try:
+        data = {
+            "id": random.randint(1, 10000000),
+            "name": helper.random_name(),
+            "net_id": random.randint(1, 1000),
+            "role": random.choice(["admin", "dev", "user", "viewer"]),
+            "settings": {},
+            "state": random.choice(["creating", "deliquent", "active", "inactive"]),
+            "balancer_ip": "127.0.0.1",
+            "created_at": time.time(),
+            "updated_at": time.time()
+        }
 
-    sql_command = f"""INSERT INTO teams
-        (name, net_id, role, settings, state, balancer_ip, created_at, updated_at)
-    VALUES
-        ('{data['name']}', {data['net_id']}, '{data['role']}', '{data['settings']}', '{data['state']}', '{data['balancer_ip']}', {data['created_at']}, {data['updated_at']})
-    ON CONFLICT DO NOTHING"""
-    success, err = helper.execute_sql(address, sql_command)
-    if not success:
-        print(f"Error inserting team: {err}")
-        return None
+        sql_command = f"""INSERT INTO teams
+            (name, net_id, role, settings, state, balancer_ip, created_at, updated_at)
+        VALUES
+            ('{data['name']}', {data['net_id']}, '{data['role']}', '{data['settings']}', '{data['state']}', '{data['balancer_ip']}', {data['created_at']}, {data['updated_at']})
+        ON CONFLICT DO NOTHING"""
+        helper.execute_sql(address, sql_command)
+    except Exception as e:
+        print(f"Error inserting team for {address}: {e}")
 
-    # print(f"Inserted team {data['id']}")
-    return data['id']
 
 def main():
     parser = argparse.ArgumentParser(description='Insert teams and users into corrosion databases')

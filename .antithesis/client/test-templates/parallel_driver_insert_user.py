@@ -12,14 +12,14 @@ import helper
 random = random.SystemRandom()
 
 def insert_user(address, team_id):
-    name = helper.random_name()
-    status = random.choice(["active", "inactive", "blocked", "suspended", "admin"])
-    sql_command = f"INSERT INTO users (name, email, team_id, status, created_at) VALUES ('{name}', '{name}@email.com', {team_id}, '{status}', {time.time()}) ON CONFLICT DO NOTHING"
-    success, err = helper.execute_sql(address, sql_command)
-    if not success:
-        print(f"Error inserting user: {err}")
-    # else:
-    #     print(f"Inserted user {name} for team {team_id}")
+    try:
+        name = helper.random_name()
+        status = random.choice(["active", "inactive", "blocked", "suspended", "admin"])
+        sql_command = f"INSERT INTO users (name, email, team_id, status, created_at) VALUES ('{name}', '{name}@email.com', {team_id}, '{status}', {time.time()}) ON CONFLICT DO NOTHING"
+        helper.execute_sql(address, sql_command)
+    except Exception as e:
+        print(f"Error inserting user for {address}: {e}")
+
 
 def do_inserts(address):
     try:

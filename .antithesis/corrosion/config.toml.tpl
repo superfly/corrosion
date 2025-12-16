@@ -30,4 +30,4 @@ colors = false
 address = "localhost:8500"
 
 [perf]
-wal_threshold_mb = 5
+wal_threshold_mb = 50
