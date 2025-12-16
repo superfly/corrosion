@@ -535,7 +535,7 @@ pub fn spawn_handle_db_maintenance(agent: &Agent) {
         // large sleep right at the start to give node time to sync
         sleep(Duration::from_secs(60)).await;
 
-        let mut vacuum_interval = tokio::time::interval(Duration::from_secs(60 * 5));
+        let mut vacuum_interval = tokio::time::interval(Duration::from_secs(60 * 1));
 
         const MAX_DB_FREE_PAGES: u64 = 10000;
 

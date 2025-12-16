@@ -4,8 +4,8 @@ set -e
 
 check_shutdown() {
     if [ $? -ne 0 ]; then
-        supervisorctl status corrosion | grep "SHUTDOWN_STATE"
-        if [ $? -eq 0 ]; then
+        echo "Script failed, checking if corrosion is shutting down"
+        if [ ! -f /var/run/supervisor.sock ] || ! supervisorctl status corrosion | grep -q "RUNNING"; then
             echo "Corrosion is shutting down (container might be stopping)"
             exit 137
         fi
