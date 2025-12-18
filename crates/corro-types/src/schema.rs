@@ -900,6 +900,40 @@ fn extract_expr_columns(expr: &Expr, cols: &mut Vec<String>) {
         Expr::Id(colname) => {
             cols.push(unquote(&colname.0).ok().unwrap_or(colname.0.clone()));
         }
+        Expr::Binary(lhs, _, rhs) => {
+            extract_expr_columns(lhs, cols);
+            extract_expr_columns(rhs, cols);
+        }
+        Expr::Unary(_, expr) => {
+            extract_expr_columns(expr, cols);
+        }
+        Expr::Parenthesized(exprs) => {
+            for expr in exprs.iter() {
+                extract_expr_columns(expr, cols);
+            }
+        }
+        Expr::Like { lhs, rhs, .. } => {
+            extract_expr_columns(lhs, cols);
+            extract_expr_columns(rhs, cols);
+        }
+        Expr::InList { lhs, rhs, .. } => {
+            extract_expr_columns(lhs, cols);
+            if let Some(rhs) = rhs {
+                for expr in rhs.iter() {
+                    extract_expr_columns(expr, cols);
+                }
+            }
+        }
+        Expr::InSelect { lhs, rhs, .. } => {
+            extract_expr_columns(lhs, cols);
+            let _ = rhs;
+        }
+        Expr::IsNull(expr) => {
+            extract_expr_columns(expr, cols);
+        }
+        Expr::NotNull(expr) => {
+            extract_expr_columns(expr, cols);
+        }
         _ => {}
     }
 }
