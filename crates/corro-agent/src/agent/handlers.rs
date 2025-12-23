@@ -517,6 +517,13 @@ pub fn spawn_handle_db_maintenance(agent: &Agent) {
 
     let pool = agent.pool().clone();
 
+    // reduce interval if we are running in antithesis
+    let interval_minutes = if std::env::var("ANTITHESIS_OUTPUT_DIR").is_ok() {
+        1
+    } else {
+        5
+    };
+
     tokio::spawn(async move {
         let truncate_wal_threshold: u64 = wal_threshold * 1024 * 1024;
 
@@ -535,7 +542,7 @@ pub fn spawn_handle_db_maintenance(agent: &Agent) {
         // large sleep right at the start to give node time to sync
         sleep(Duration::from_secs(60)).await;
 
-        let mut vacuum_interval = tokio::time::interval(Duration::from_secs(60 * 5));
+        let mut vacuum_interval = tokio::time::interval(Duration::from_secs(60 * interval_minutes));
 
         const MAX_DB_FREE_PAGES: u64 = 10000;
 

@@ -15,17 +15,13 @@ from antithesis.random import (
 )
 
 def get_db_connection(host, port):
-    try:
-        return pg8000.dbapi.Connection(
-            host=host,
-            port=int(port),
-            database="corrosion",
-            user="corrosion",
-            password="corrosion"
-        )
-    except Exception as e:
-        print(f"Error connecting to database: {e}")
-        return None
+    return pg8000.dbapi.Connection(
+        host=host,
+        port=int(port),
+        database="corrosion",
+        user="corrosion",
+        password="corrosion"
+    )
 
 
 def execute_psql(conn, sql_command, params=None):
@@ -39,15 +35,10 @@ def execute_psql(conn, sql_command, params=None):
 
 def execute_sql(address, sql_command):
     headers = {'Content-Type': 'application/json'}
-    try:
-        result = requests.post(f"http://{address}/v1/transactions", headers=headers, json=[sql_command])
-        sometimes(result.status_code == 200, "Clients can make successful transactions to corrosion", {"status_code": result.status_code})
-        if result.status_code != 200:
-            return False, f"Unexpected status code: {result.status_code} - {result.text}"
-        else:
-            return True, None
-    except requests.exceptions.ConnectionError as e:
-        return False, e
+    result = requests.post(f"http://{address}/v1/transactions", headers=headers, json=[sql_command])
+    sometimes(result.status_code == 200, "Clients can make successful transactions to corrosion", {"status_code": result.status_code})
+    if result.status_code != 200:
+        raise Exception(f"Unexpected status code: {result.status_code} - {result.text} {result.request.body} for {address}")
 
 def query_sql(address, port, sql_command):
     headers = {'Content-Type': 'application/json'}

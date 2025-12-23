@@ -21,16 +21,17 @@ def random_name(length=6):
 def update_in_corrosion(address, op, id, encoded_id, status):
     """Attempts to update a user in the Corrosion node."""
 
-    if op == "update":
-        sql_command = f"UPDATE users SET encoded_id = '{encoded_id}', status = '{status}', updated_at = {time.time()} WHERE id = {id}"
-    elif op == "delete":
-        sql_command = f"DELETE FROM users WHERE id = {id}"
+    try:
+        if op == "update":
+            sql_command = f"UPDATE users SET encoded_id = '{encoded_id}', status = '{status}', updated_at = {time.time()} WHERE id = {id}"
+        elif op == "delete":
+            sql_command = f"DELETE FROM users WHERE id = {id}"
 
-    success, err = helper.execute_sql(address, sql_command)
-    if not success:
-        print(f"Error executing {op} for user {id}: {err}")
+        helper.execute_sql(address, sql_command)
+        print(f"Successfully {op}d user {id} in Corrosion node.")
+    except Exception as e:
+        print(f"Error executing {op} for user {id}: {e}")
         return
-    print(f"Successfully {op}d user {id} in Corrosion node.")
 
 def get_user_ids(address, http_port):
     data = helper.query_sql(address, http_port, "SELECT id FROM users ORDER BY RANDOM() LIMIT 100")
