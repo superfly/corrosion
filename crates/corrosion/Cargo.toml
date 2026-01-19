@@ -54,6 +54,7 @@ tripwire = { path = "../tripwire" }
 uuid = { workspace = true }
 shell-words = "1.1.0"
 metrics-util = { workspace = true }
+libsystemd = "0.7.0"
 
 [build-dependencies]
 build-info-build = { workspace = true }

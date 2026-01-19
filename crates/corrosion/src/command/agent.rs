@@ -15,6 +15,7 @@ use metrics_util::MetricKindMask;
 use spawn::wait_for_all_pending_handles;
 use tokio_metrics::RuntimeMonitor;
 use tracing::{error, info};
+use tripwire::{PreemptibleFutureExt, Tripwire};
 // use tracing_filter::{legacy::Filter, FilterLayer};
 // use tracing_subscriber::{reload::Handle, Registry};
 
@@ -26,6 +27,9 @@ pub async fn run(
     tracing_handle: Option<TracingHandle>,
 ) -> eyre::Result<()> {
     info!("Starting Corrosion Agent v{VERSION}");
+    let (tripwire, tripwire_worker) = tripwire::Tripwire::new_signals();
+
+    spawn_systemd_notifier_if_needed(tripwire.clone());
 
     if let Some(PrometheusConfig { bind_addr }) = config.telemetry.prometheus {
         setup_prometheus(bind_addr).expect("could not setup prometheus");
@@ -56,8 +60,6 @@ pub async fn run(
 
         start_tokio_runtime_reporter();
     }
-
-    let (tripwire, tripwire_worker) = tripwire::Tripwire::new_signals();
 
     let (agent, bookie, _, handles) =
         corro_agent::agent::start_with_config(config.clone(), tripwire.clone())
@@ -94,7 +96,9 @@ pub async fn run(
     }
 
     antithesis_init();
+    send_systemd_ready();
     tripwire_worker.await;
+    send_systemd_stopping();
 
     // wait for handles to finish
     for handle in handles {
@@ -194,3 +198,62 @@ fn start_tokio_runtime_reporter() {
         });
     }
 }
+
+#[cfg(target_os = "linux")]
+fn spawn_systemd_notifier_if_needed(tripwire: Tripwire) {
+    if !libsystemd::daemon::watchdog_enabled(false)
+        .unwrap_or(Duration::ZERO)
+        .is_zero()
+    {
+        send_systemd_keepalives(tripwire.clone());
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn send_systemd_keepalives(tripwire: Tripwire) {
+    // Send every second
+    tokio::spawn(async move {
+        async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(1));
+            loop {
+                interval.tick().await;
+                libsystemd::daemon::notify(false, &[libsystemd::daemon::NotifyState::Watchdog])
+                    .unwrap();
+            }
+        }
+        .preemptible(tripwire)
+        .await;
+
+        libsystemd::daemon::notify(
+            false,
+            &[
+                libsystemd::daemon::NotifyState::Watchdog,
+                // Don't set WATCHDOG_USEC=0 -- this won't stop the already existing watchdog on systemd 237 (on Ubuntu 18.04)
+                // Instead set it to a ridiculously large value to stop it from working.
+                libsystemd::daemon::NotifyState::WatchdogUsec(
+                    Duration::from_secs(1000).as_micros() as u64,
+                ),
+            ],
+        )
+        .unwrap();
+    });
+}
+
+#[cfg(target_os = "linux")]
+fn send_systemd_ready() {
+    libsystemd::daemon::notify(false, &[libsystemd::daemon::NotifyState::Ready]).unwrap();
+}
+
+#[cfg(target_os = "linux")]
+fn send_systemd_stopping() {
+    libsystemd::daemon::notify(false, &[libsystemd::daemon::NotifyState::Stopping]).unwrap();
+}
+
+#[cfg(not(target_os = "linux"))]
+fn spawn_systemd_notifier_if_needed(_tripwire: Tripwire) {}
+
+#[cfg(not(target_os = "linux"))]
+fn send_systemd_ready() {}
+
+#[cfg(not(target_os = "linux"))]
+fn send_systemd_stopping() {}
