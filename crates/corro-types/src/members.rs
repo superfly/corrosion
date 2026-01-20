@@ -40,6 +40,10 @@ impl MemberState {
     pub fn is_ring0(&self) -> bool {
         self.ring == Some(0)
     }
+
+    pub fn to_actor(&self, id: ActorId) -> Actor {
+        Actor::new(id, self.addr, self.ts, self.cluster_id, self.member_id)
+    }
 }
 
 const RING_BUCKETS: [Range<u64>; 6] = [0..6, 6..15, 15..50, 50..100, 100..200, 200..300];
