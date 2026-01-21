@@ -25,7 +25,7 @@ use corro_types::{
     channel::CorroReceiver,
     config::AuthzConfig,
     pubsub::SubsManager,
-    sqlite::{unnest_param, INSERT_CRSQL_CHANGES_QUERY},
+    sqlite::unnest_param,
     updates::{match_changes, match_changes_from_db_version},
 };
 
@@ -1288,7 +1288,15 @@ pub fn process_complete_version<T: Deref<Target = rusqlite::Connection> + Commit
 
     // Insert all the changes in a single statement
     // This will return a non zero rowid only if the change impacted the database
-    let mut stmt = sp.prepare_cached(INSERT_CRSQL_CHANGES_QUERY)?;
+    let mut stmt = sp.prepare_cached(
+        r#"
+    INSERT INTO crsql_changes ("table", pk, cid, val, col_version, db_version, site_id, cl, seq, ts)
+        SELECT value0, value1, value2, value3, value4, value5, value6, value7, value8, value9
+        FROM unnest(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        -- WARNING: This returns a row BEFORE inserting not after
+        RETURNING db_version, seq, last_insert_rowid()
+    "#,
+    )?;
     trace!("inserting {:?} changes into crsql_changes", changes);
     let params = params![
         unnest_param(changes.iter().map(|c| c.table.as_str())),
@@ -1306,52 +1314,7 @@ pub fn process_complete_version<T: Deref<Target = rusqlite::Connection> + Commit
         .query_map(params, |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
         .collect::<rusqlite::Result<Vec<(CrsqlDbVersion, CrsqlSeq, i64)>>>()?;
 
-    // Ignore this, it's just for debugging if we hit this very rare VDBE bug in production
     let last_rowids_len = last_rowids.len();
-    if last_rowids_len != len {
-        // This should never happen, but if it does, i need data for debugging
-        let query_plan = sp
-            .prepare(&format!("EXPLAIN QUERY PLAN {INSERT_CRSQL_CHANGES_QUERY}",))?
-            .query_map(params, |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
-            })?
-            // id, parent, notused, detail
-            .collect::<rusqlite::Result<Vec<(i32, i32, i32, String)>>>()?;
-        let vdbe_program = sp
-            .prepare(&format!("EXPLAIN {INSERT_CRSQL_CHANGES_QUERY}"))?
-            .query_map(params, |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                    row.get(5)?,
-                    row.get(6)?,
-                    row.get(7)?,
-                ))
-            })?
-            .collect::<rusqlite::Result<
-                Vec<(
-                    i32,            // addr
-                    String,         // opcode
-                    i32,            // p1
-                    i32,            // p2
-                    i32,            // p3
-                    Option<String>, // p4
-                    Option<i32>,    // p5
-                    Option<String>, // comment
-                )>,
-            >>()?;
-        let details = json!({
-            "changes_len": len,
-            "returned_rowids_len": last_rowids.len(),
-            "query_plan": query_plan,
-            "vdbe_program": vdbe_program,
-        });
-        error!("Possible returning statement BUG: {details}");
-        assert_unreachable!("Possible returning statement BUG:", &details);
-    }
 
     debug!("successfully inserted {len} changes into crsql_changes");
     trace!("last_rowids before shift: {last_rowids:?}");
@@ -1359,12 +1322,14 @@ pub fn process_complete_version<T: Deref<Target = rusqlite::Connection> + Commit
     // RETURNING returns rows BEFORE the insert, not after
     // so the rowids we get will be shifted by one
     // we need to shift them back
-    for i in 0..(last_rowids_len - 1) {
-        last_rowids[i].2 = last_rowids[i + 1].2;
+    if last_rowids_len > 0 {
+        for i in 0..(last_rowids_len - 1) {
+            last_rowids[i].2 = last_rowids[i + 1].2;
+        }
+        last_rowids[last_rowids_len - 1].2 = sp
+            .prepare_cached("SELECT last_insert_rowid()")?
+            .query_row(params![], |row| row.get(0))?;
     }
-    last_rowids[last_rowids_len - 1].2 = sp
-        .prepare_cached("SELECT last_insert_rowid()")?
-        .query_row(params![], |row| row.get(0))?;
 
     trace!("last_rowids after shift: {last_rowids:?}");
 
