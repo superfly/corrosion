@@ -7,12 +7,9 @@ use std::{
 use metrics::counter;
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
+use rusqlite::types::{ToSql, ToSqlOutput, Value};
 use rusqlite::{
-    params, trace::TraceEventCodes, vtab::eponymous_only_module, Connection, Transaction,
-};
-use rusqlite::{
-    types::{ToSql, ToSqlOutput, Value},
-    DatabaseName,
+    params, trace::TraceEventCodes, vtab::eponymous_only_module, Connection, Transaction, MAIN_DB,
 };
 use sqlite_pool::{Committable, SqliteConn};
 use std::rc::Rc;
@@ -148,7 +145,7 @@ fn handle_sql_tracing_event(ev: rusqlite::trace::TraceEvent, readonly: bool) {
 }
 
 pub fn trace_heavy_queries(conn: &Connection) -> rusqlite::Result<()> {
-    let readonly = conn.is_readonly(DatabaseName::Main)?;
+    let readonly = conn.is_readonly(MAIN_DB)?;
     conn.trace_v2(
         TraceEventCodes::SQLITE_TRACE_PROFILE,
         Some(if readonly {
