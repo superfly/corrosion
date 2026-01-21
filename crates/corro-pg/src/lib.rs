@@ -598,41 +598,50 @@ pub async fn start(
                 let negotiation =
                     ssl::negotiate_ssl(&mut tcp_socket, tls_acceptor.is_some()).await?;
 
-                let (mut framed, secured) = if matches!(negotiation, ssl::SslNegotiationType::None)
-                {
-                    if ssl_required {
-                        debug!("rejecting non-ssl connection");
+                let (mut framed, secured, maybe_next_msg) =
+                    if matches!(negotiation, ssl::SslNegotiationType::None(_)) {
+                        if ssl_required {
+                            debug!("rejecting non-ssl connection");
+                            return Ok(());
+                        }
+
+                        let maybe_next_msg = match negotiation {
+                            ssl::SslNegotiationType::None(Some(msg)) => Some(msg),
+                            _ => None,
+                        };
+
+                        (Either::Left(tcp_socket), false, maybe_next_msg)
+                    } else if let Some(tls) = tls_acceptor {
+                        let tls_socket = tls.accept(tcp_socket.into_inner()).await?;
+
+                        if matches!(negotiation, ssl::SslNegotiationType::Direct) {
+                            ssl::check_alpn_for_direct_ssl(&tls_socket)?;
+                        }
+
+                        let framed = Framed::new(
+                            tokio::io::BufStream::new(tls_socket),
+                            PgWireMessageServerCodec::new(codec::Client::new(local_addr, true)),
+                        );
+
+                        (Either::Right(framed), true, None)
+                    } else {
+                        trace!("received SSL connection attempt without a TLS acceptor configured");
                         return Ok(());
-                    }
-
-                    (Either::Left(tcp_socket), false)
-                } else if let Some(tls) = tls_acceptor {
-                    let tls_socket = tls.accept(tcp_socket.into_inner()).await?;
-
-                    if matches!(negotiation, ssl::SslNegotiationType::Direct) {
-                        ssl::check_alpn_for_direct_ssl(&tls_socket)?;
-                    }
-
-                    let framed = Framed::new(
-                        tokio::io::BufStream::new(tls_socket),
-                        PgWireMessageServerCodec::new(codec::Client::new(local_addr, true)),
-                    );
-
-                    (Either::Right(framed), true)
-                } else {
-                    trace!("received SSL connection attempt without a TLS acceptor configured");
-                    return Ok(());
-                };
+                    };
 
                 trace!("SSL ? {secured}");
 
                 use crate::codec::SetState;
-                framed.set_state(pgwire::api::PgWireConnectionState::AwaitingStartup);
 
-                let msg = match framed.next().await {
-                    Some(msg) => msg?,
+                trace!("maybe_next_msg: {maybe_next_msg:?}");
+                let msg = match maybe_next_msg {
+                    Some(msg) => msg,
                     None => {
-                        return Ok(());
+                        framed.set_state(pgwire::api::PgWireConnectionState::AwaitingStartup);
+                        match framed.next().await {
+                            Some(msg) => msg?,
+                            None => return Ok(()),
+                        }
                     }
                 };
 
