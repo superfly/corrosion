@@ -60,7 +60,7 @@ rangemap = { version = "1.5.1", features = ["serde1"] }
 rcgen = { version = "0.11.1", features = ["x509-parser"] }
 reqwest = { version = "0.12", default-features = false, features = ["http2", "rustls-tls", "rustls-tls-webpki-roots"] }
 rhai = { version = "1.15.1", features = ["sync"] }
-rusqlite = { version = "0.33.0", features = ["serde_json", "time", "bundled", "uuid", "array", "load_extension", "column_decltype", "vtab", "functions", "chrono", "series", "trace"] }
+rusqlite = { version = "0.38.0", features = ["serde_json", "time", "bundled", "uuid", "array", "load_extension", "column_decltype", "vtab", "functions", "chrono", "series", "trace", "cache", "fallible_uint"] }
 rustls = { version = "0.23.0", default-features = false, features = ["ring"] }
 seahash = "4.1.0"
 serde = "1.0.159"
