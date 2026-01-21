@@ -15,7 +15,7 @@ use metrics_util::MetricKindMask;
 use spawn::wait_for_all_pending_handles;
 use tokio_metrics::RuntimeMonitor;
 use tracing::{error, info};
-use tripwire::{PreemptibleFutureExt, Tripwire};
+use tripwire::Tripwire;
 // use tracing_filter::{legacy::Filter, FilterLayer};
 // use tracing_subscriber::{reload::Handle, Registry};
 
@@ -211,6 +211,7 @@ fn spawn_systemd_notifier_if_needed(tripwire: Tripwire) {
 
 #[cfg(target_os = "linux")]
 fn send_systemd_keepalives(tripwire: Tripwire) {
+    use tripwire::PreemptibleFutureExt;
     // Send every second
     tokio::spawn(async move {
         async move {
