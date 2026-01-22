@@ -1,6 +1,6 @@
 # Quick start
 
-This is a simple of starting a 2-node Corrosion cluster running on the same host and replicating data.
+This is a simple example of starting a 2-node Corrosion cluster running on the same host and replicating data.
 
 ## Node A
 
