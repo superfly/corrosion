@@ -128,8 +128,10 @@ impl codec::Decoder for PgWireMessageServerCodec {
             api::PgWireConnectionState::AwaitingSslRequest => {}
             api::PgWireConnectionState::AwaitingStartup => {
                 self.decode_context.awaiting_ssl = false;
+                self.decode_context.awaiting_startup = true;
             }
             _ => {
+                self.decode_context.awaiting_ssl = false;
                 self.decode_context.awaiting_startup = false;
             }
         }
