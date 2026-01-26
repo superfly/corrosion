@@ -1,0 +1,15 @@
+.DS_Store
+out.db
+.vscode
+a.out
+dist/
+bench/
+.ipynb_checkpoints/
+*.db
+__pycache__/
+node_modules/
+build/
+tsconfig.tsbuildinfo
+.turbo/
+target/
+py/correctness/.hypothesis/
