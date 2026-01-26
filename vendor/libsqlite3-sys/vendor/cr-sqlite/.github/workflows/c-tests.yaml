@@ -1,0 +1,34 @@
+on:
+  pull_request:
+name: "c-tests"
+jobs:
+  build:
+    name: Testing on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+          - os: windows-2022
+          - os: macos-latest
+    steps:
+      - uses: actions/checkout@v3
+        with:
+          submodules: true
+
+      - name: Load .env file
+        uses: xom9ikk/dotenv@v2
+        with:
+          path: ./
+
+      - name: Windows rust toolchain
+        if: runner.os == 'Windows'
+        run: |
+          rm core/rs/integration_check/rust-toolchain.toml
+          rustup component add rust-src --toolchain nightly-2023-10-05-x86_64-pc-windows-gnu
+          rustup default nightly-2023-10-05-x86_64-pc-windows-gnu
+
+      - name: Test
+        run: |
+          cd core
+          make test
