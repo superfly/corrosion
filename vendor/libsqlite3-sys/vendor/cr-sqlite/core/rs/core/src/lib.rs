@@ -1,5 +1,4 @@
 #![cfg_attr(not(test), no_std)]
-#![feature(vec_into_raw_parts)]
 
 // TODO: these pub mods are exposed for the integration testing
 // we should re-export in a `test` mod such that they do not become public apis

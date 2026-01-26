@@ -6,7 +6,6 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::ffi::{c_char, c_int, CStr};
 use core::mem;
-#[cfg(not(feature = "std"))]
 use num_traits::FromPrimitive;
 use sqlite_nostd::{sqlite3, Connection, ResultCode, StrRef};
 

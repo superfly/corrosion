@@ -12,7 +12,6 @@ use core::mem::{self, forget};
 use core::ptr::null_mut;
 
 use alloc::ffi::CString;
-#[cfg(not(feature = "std"))]
 use num_traits::FromPrimitive;
 use sqlite::{ColumnType, Connection, Context, Stmt, Value};
 use sqlite_nostd as sqlite;

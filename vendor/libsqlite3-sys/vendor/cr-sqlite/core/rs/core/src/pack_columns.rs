@@ -4,7 +4,6 @@ use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 use bytes::{Buf, BufMut};
-#[cfg(not(feature = "std"))]
 use num_traits::FromPrimitive;
 use sqlite_nostd as sqlite;
 use sqlite_nostd::{ColumnType, Context, ResultCode, Stmt, Value};

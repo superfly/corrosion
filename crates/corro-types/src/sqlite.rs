@@ -261,12 +261,12 @@ fn init_cr_conn(conn: &mut Connection) -> Result<(), rusqlite::Error> {
     );
     unsafe {
         trace!("enabled loading extension");
-        conn.load_extension_enable()?;
+        /*conn.load_extension_enable()?;
         conn.load_extension(
             ext_dir.path().join(CRSQL_EXT_GENERIC_NAME),
             Some("sqlite3_crsqlite_init"),
         )?;
-        conn.load_extension_disable()?;
+        conn.load_extension_disable()?;*/
     }
     trace!("loaded crsqlite extension");
 

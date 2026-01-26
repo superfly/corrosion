@@ -1,6 +1,4 @@
 #![no_std]
-#![feature(core_intrinsics)]
-#![feature(lang_items)]
 
 extern crate alloc;
 
@@ -26,11 +24,12 @@ static ALLOCATOR: SQLite3Allocator = SQLite3Allocator {};
 #[cfg(not(feature = "test"))]
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {
-    core::intrinsics::abort()
+    //core::intrinsics::abort()
+    loop {}
 }
 
 // Print panic info for tests
-#[cfg(feature = "test")]
+/*#[cfg(feature = "test")]
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     println!("PANIC!: {}", info);
@@ -45,7 +44,7 @@ extern "C" fn eh_personality() {}
 #[no_mangle]
 pub fn __rust_alloc_error_handler(_: Layout) -> ! {
     core::intrinsics::abort()
-}
+}*/
 
 #[no_mangle]
 pub extern "C" fn sqlite3_crsqlrustbundle_init(

@@ -116,9 +116,26 @@ mod build_bundled {
             "debug"
         };
         
+        // Determine the crsqlite commit SHA from the vendored cr-sqlite directory
+        let crsqlite_dir = PathBuf::from(manifest_dir).join("vendor/cr-sqlite");
+        let commit_sha = Command::new("git")
+            .args(["-C", crsqlite_dir.to_str().unwrap(), "log", "-1", "--format=%H"])
+            .output()
+            .ok()
+            .and_then(|output| {
+                if output.status.success() {
+                    String::from_utf8(output.stdout).ok()
+                } else {
+                    None
+                }
+            })
+            .map(|s| s.trim().to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        
         let mut cargo = Command::new("cargo");
         cargo
             .current_dir(&crsqlite_bundle_dir)
+            .env("CRSQLITE_COMMIT_SHA", &commit_sha)
             .arg("build")
             .arg("--target")
             .arg(&target)
@@ -188,6 +205,7 @@ mod build_bundled {
             .flag("-DSQLITE_USE_URI")
             .flag("-DHAVE_USLEEP=1")
             .flag("-DHAVE_ISNAN")
+            .flag("-DSQLITE_DEFAULT_AUTOVACUUM=2")
             .flag("-D_POSIX_THREAD_SAFE_FUNCTIONS") // cross compile with MinGW
             .warnings(false);
 

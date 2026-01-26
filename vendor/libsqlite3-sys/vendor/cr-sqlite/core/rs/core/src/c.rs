@@ -1,6 +1,5 @@
 extern crate alloc;
 use core::ffi::{c_char, c_int};
-#[cfg(not(feature = "std"))]
 use num_derive::FromPrimitive;
 
 // Structs that still exist in C but will eventually be moved to Rust
