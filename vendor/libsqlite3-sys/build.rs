@@ -97,8 +97,55 @@ mod build_bundled {
     use std::env;
     use std::ffi::OsString;
     use std::path::{Path, PathBuf};
+    use std::process::Command;
 
     use super::{is_compiler, win_target};
+
+    fn build_crsqlite_rust_lib(_out_dir: &str) -> PathBuf {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let crsqlite_bundle_dir = PathBuf::from(manifest_dir)
+            .join("vendor/cr-sqlite/core/rs/bundle_static");
+        
+        println!("cargo:rerun-if-changed={}", crsqlite_bundle_dir.join("src").display());
+        println!("cargo:rerun-if-changed={}", crsqlite_bundle_dir.join("Cargo.toml").display());
+        
+        let target = env::var("TARGET").unwrap();
+        let profile = if env::var("PROFILE").unwrap() == "release" {
+            "release"
+        } else {
+            "debug"
+        };
+        
+        let mut cargo = Command::new("cargo");
+        cargo
+            .current_dir(&crsqlite_bundle_dir)
+            .arg("build")
+            .arg("--target")
+            .arg(&target)
+            .arg("--features")
+            .arg("static,omit_load_extension");
+        
+        if profile == "release" {
+            cargo.arg("--release");
+        }
+        
+        let status = cargo.status().expect("Failed to build crsqlite Rust library");
+        if !status.success() {
+            panic!("Failed to build crsqlite Rust library");
+        }
+        
+        let lib_path = crsqlite_bundle_dir
+            .join("target")
+            .join(&target)
+            .join(profile)
+            .join("libcrsql_bundle_static.a");
+        
+        if !lib_path.exists() {
+            panic!("crsqlite Rust library not found at: {}", lib_path.display());
+        }
+        
+        lib_path
+    }
 
     #[expect(clippy::assertions_on_constants)] // https://github.com/rust-lang/rust-clippy/issues/16242
     pub fn main(out_dir: &str, out_path: &Path) {
@@ -305,7 +352,27 @@ mod build_bundled {
         }
         println!("cargo:rerun-if-env-changed=LIBSQLITE3_FLAGS");
 
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let crsqlite_src_dir = PathBuf::from(manifest_dir).join("vendor/cr-sqlite/core/src");
+        
+        let crsqlite_rust_lib = build_crsqlite_rust_lib(out_dir);
+        
+        cfg.file(crsqlite_src_dir.join("crsqlite.c"))
+            .file(crsqlite_src_dir.join("changes-vtab.c"))
+            .file(crsqlite_src_dir.join("ext-data.c"))
+            .file(crsqlite_src_dir.join("core_init.c"))
+            .include(&crsqlite_src_dir)
+            .flag("-DSQLITE_EXTRA_INIT=core_init");
+        
+        println!("cargo:rerun-if-changed={}", crsqlite_src_dir.join("crsqlite.c").display());
+        println!("cargo:rerun-if-changed={}", crsqlite_src_dir.join("changes-vtab.c").display());
+        println!("cargo:rerun-if-changed={}", crsqlite_src_dir.join("ext-data.c").display());
+        println!("cargo:rerun-if-changed={}", crsqlite_src_dir.join("core_init.c").display());
+
         cfg.compile(lib_name);
+        
+        println!("cargo:rustc-link-search=native={}", crsqlite_rust_lib.parent().unwrap().display());
+        println!("cargo:rustc-link-lib=static=crsql_bundle_static");
 
         println!("cargo:lib_dir={out_dir}");
     }
