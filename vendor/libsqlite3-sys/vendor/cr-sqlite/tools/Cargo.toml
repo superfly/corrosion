@@ -1,0 +1,12 @@
+[package]
+name = "cr-sqlite-tools"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rand = "0.8.5"
+rusqlite = { version = "0.32.1", features = ["load_extension", "bundled", "trace"] }
+tempfile = "3.14.0"
+
+[profile.release]
+debug = true

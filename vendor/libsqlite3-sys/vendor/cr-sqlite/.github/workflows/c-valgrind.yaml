@@ -1,0 +1,31 @@
+on:
+  pull_request:
+name: "c-valgrind"
+jobs:
+  build:
+    name: Testing on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+          #- os: windows-2022
+          #- os: macos-latest
+    steps:
+      - uses: actions/checkout@v3
+        with:
+          submodules: true
+
+      - name: Load .env file
+        uses: xom9ikk/dotenv@v2
+        with:
+          path: ./
+
+      - name: Install valgrind
+        run: sudo apt update && sudo apt install -y valgrind
+
+      - name: Valgrind Test
+        run: |
+          cd core
+          make test
+          valgrind --leak-check=full --show-leak-kinds=all --track-origins=yes -s dist/test
