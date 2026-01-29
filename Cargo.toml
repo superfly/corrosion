@@ -5,6 +5,12 @@ members = [ ".antithesis/client/rust-load-generator",
 ]
 resolver = "2"
 
+[workspace.package]
+license = "MIT"
+edition = "2024"
+repository = "https://github.com/superfly/corrosion"
+homepage = "https://superfly.github.io/corrosion/"
+
 [workspace.dependencies]
 arc-swap = { version = "1.6.0" }
 antithesis_sdk = { version = "0.2.5", default-features = false }

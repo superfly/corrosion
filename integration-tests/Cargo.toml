@@ -1,7 +1,10 @@
 [package]
 name = "integration-tests"
 version = "0.1.0"
-edition = "2021"
+edition.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
 
 [dependencies]
 assert_cmd = "2.0.12"
