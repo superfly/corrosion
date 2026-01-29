@@ -3,7 +3,6 @@ use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
 use crate::actor::MemberId;
 use camino::Utf8PathBuf;
 use serde::{Deserialize, Serialize};
-use serde_with::{formats::PreferOne, serde_as, OneOrMany};
 
 pub const DEFAULT_GOSSIP_PORT: u16 = 4001;
 const DEFAULT_GOSSIP_IDLE_TIMEOUT: u32 = 30;
@@ -138,17 +137,172 @@ impl DbConfig {
     }
 }
 
-#[serde_as]
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct ApiConfig {
-    #[serde(alias = "addr")]
-    #[serde_as(deserialize_as = "OneOrMany<_, PreferOne>")]
     pub bind_addr: Vec<SocketAddr>,
-    #[serde(alias = "authz", default)]
     pub authorization: Option<AuthzConfig>,
-    #[serde_as(deserialize_as = "Option<OneOrMany<_, PreferOne>>")]
-    #[serde(default)]
     pub pg: Option<Vec<PgConfig>>,
+}
+
+impl Serialize for ApiConfig {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(3))?;
+
+        map.serialize_key("addr")?;
+        if self.bind_addr.len() == 1 {
+            map.serialize_value(&self.bind_addr[0])?;
+        } else {
+            map.serialize_value(&self.bind_addr)?;
+        }
+
+        map.serialize_entry("authz", &self.authorization)?;
+
+        map.serialize_key("pg")?;
+
+        if let Some(pg) = &self.pg {
+            if pg.len() == 1 {
+                map.serialize_value(&pg[0])?;
+            } else {
+                map.serialize_value(&pg)?;
+            }
+        } else {
+            map.serialize_value(&Option::<&str>::None)?;
+        }
+
+        map.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for ApiConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct BindAddr;
+
+        impl<'de> serde::de::Visitor<'de> for BindAddr {
+            type Value = Vec<SocketAddr>;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("single or multiple socket addresses")
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                let mut v = Vec::with_capacity(seq.size_hint().unwrap_or(1));
+                while let Some(val) = seq.next_element()? {
+                    v.push(val);
+                }
+                Ok(v)
+            }
+
+            fn visit_borrowed_str<E>(self, v: &'de str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                let addr = v.parse().map_err(serde::de::Error::custom)?;
+                Ok(vec![addr])
+            }
+        }
+
+        struct BindAddrs(Vec<SocketAddr>);
+
+        impl<'de> Deserialize<'de> for BindAddrs {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                Ok(Self(deserializer.deserialize_any(BindAddr)?))
+            }
+        }
+
+        struct PgConfigs;
+
+        impl<'de> serde::de::Visitor<'de> for PgConfigs {
+            type Value = Vec<PgConfig>;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("single or multiple postgres configs")
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                let mut v = Vec::with_capacity(seq.size_hint().unwrap_or(1));
+                while let Some(val) = seq.next_element()? {
+                    v.push(val);
+                }
+                Ok(v)
+            }
+
+            fn visit_map<A>(self, map: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                let cfg =
+                    Deserialize::deserialize(serde::de::value::MapAccessDeserializer::new(map))?;
+                Ok(vec![cfg])
+            }
+        }
+
+        struct Pg(Vec<PgConfig>);
+
+        impl<'de> Deserialize<'de> for Pg {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                Ok(Self(deserializer.deserialize_any(PgConfigs)?))
+            }
+        }
+
+        struct Visitor;
+
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = ApiConfig;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("ApiConfig")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                let mut bind_addr = Vec::new();
+                let mut authorization = None;
+                let mut pg = None;
+
+                while let Some(key) = map.next_key()? {
+                    match key {
+                        "addr" => bind_addr = map.next_value::<BindAddrs>()?.0,
+                        "authz" => authorization = map.next_value()?,
+                        "pg" => pg = map.next_value::<Option<Pg>>()?.map(|pg| pg.0),
+                        _ => {}
+                    }
+                }
+
+                if bind_addr.is_empty() {
+                    return Err(serde::de::Error::missing_field("addr"));
+                }
+
+                Ok(ApiConfig {
+                    bind_addr,
+                    authorization,
+                    pg,
+                })
+            }
+        }
+
+        deserializer.deserialize_map(Visitor)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
