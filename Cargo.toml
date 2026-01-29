@@ -6,8 +6,8 @@ members = [ ".antithesis/client/rust-load-generator",
 resolver = "2"
 
 [workspace.package]
-license = "MIT"
-edition = "2024"
+license = "Apache-2.0"
+edition = "2021"
 repository = "https://github.com/superfly/corrosion"
 homepage = "https://superfly.github.io/corrosion/"
 
