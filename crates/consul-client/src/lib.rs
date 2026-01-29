@@ -5,8 +5,8 @@ use std::{
     fs::OpenOptions,
 };
 
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use serde_with::{serde_as, NoneAsEmptyString};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde_with::{NoneAsEmptyString, serde_as};
 
 use rusqlite::types::{FromSql, FromSqlError, ValueRef};
 

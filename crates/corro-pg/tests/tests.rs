@@ -2,8 +2,8 @@ use std::time::{Duration, Instant};
 
 use camino::Utf8PathBuf;
 use chrono::{DateTime, NaiveDateTime, Utc};
-use corro_pg::{start, PgServer};
-use corro_tests::{launch_test_agent, TestAgent};
+use corro_pg::{PgServer, start};
+use corro_tests::{TestAgent, launch_test_agent};
 use corro_types::{
     config::{PgConfig, PgTlsConfig},
     tls::{generate_ca, generate_client_cert, generate_server_cert},
@@ -135,7 +135,9 @@ async fn test_pg() {
 
         let (affected, exec_elapsed) = affected_res.unwrap();
 
-        println!("after execute, affected: {affected}, sema elapsed: {sema_elapsed:?}, exec elapsed: {exec_elapsed:?}");
+        println!(
+            "after execute, affected: {affected}, sema elapsed: {sema_elapsed:?}, exec elapsed: {exec_elapsed:?}"
+        );
 
         assert_eq!(affected, 1);
 
@@ -325,14 +327,16 @@ async fn test_pg_readonly() {
                 .get::<_, String>(1),
             "2"
         );
-        assert!(client
-            .execute("INSERT INTO tests VALUES (3,4)", &[])
-            .await
-            .unwrap_err()
-            .as_db_error()
-            .unwrap()
-            .message()
-            .contains("readonly database"));
+        assert!(
+            client
+                .execute("INSERT INTO tests VALUES (3,4)", &[])
+                .await
+                .unwrap_err()
+                .as_db_error()
+                .unwrap()
+                .message()
+                .contains("readonly database")
+        );
     }
 
     tripwire_tx.send(()).await.ok();
@@ -377,11 +381,12 @@ async fn test_pg_corrrosion_shutdown() {
         .unwrap();
     assert!(client.is_closed());
     assert!(e.as_db_error().unwrap().code().code().eq("57P01"));
-    assert!(e
-        .as_db_error()
-        .unwrap()
-        .message()
-        .contains("Corrosion is shutting down"));
+    assert!(
+        e.as_db_error()
+            .unwrap()
+            .message()
+            .contains("Corrosion is shutting down")
+    );
 }
 
 struct TestCertificates {
@@ -652,14 +657,16 @@ async fn test_unnest_typing() {
 
         // Untyped arrays should fail - I wasn't able to make the "anyarray" type work
         {
-            assert!(client
-                .query("SELECT value0 FROM unnest($1)", &[&vec![1i64, 2, 3]])
-                .await
-                .unwrap_err()
-                .as_db_error()
-                .unwrap()
-                .message()
-                .contains("Untyped array argument"));
+            assert!(
+                client
+                    .query("SELECT value0 FROM unnest($1)", &[&vec![1i64, 2, 3]])
+                    .await
+                    .unwrap_err()
+                    .as_db_error()
+                    .unwrap()
+                    .message()
+                    .contains("Untyped array argument")
+            );
         }
 
         // Arrays only work for specific types
@@ -692,41 +699,51 @@ async fn test_unnest_typing() {
                 vec![1u32, 2, 3],
                 vec![1u8, 2, 3],
             );
-            assert!(client
-                .query(
-                    "SELECT CAST(value0 AS int) FROM unnest(CAST($1 AS int[]))",
-                    &[&pedantic.0]
-                )
-                .await
-                .is_err());
-            assert!(client
-                .query(
-                    "SELECT CAST(value0 AS int) FROM unnest(CAST($1 AS int[]))",
-                    &[&pedantic.1]
-                )
-                .await
-                .is_err());
-            assert!(client
-                .query(
-                    "SELECT CAST(value0 AS int) FROM unnest(CAST($1 AS int[]))",
-                    &[&pedantic.2]
-                )
-                .await
-                .is_err());
-            assert!(client
-                .query(
-                    "SELECT CAST(value0 AS int) FROM unnest(CAST($1 AS int[]))",
-                    &[&pedantic.3]
-                )
-                .await
-                .is_err());
-            assert!(client
-                .query(
-                    "SELECT CAST(value0 AS int) FROM unnest(CAST($1 AS int[]))",
-                    &[&pedantic.4]
-                )
-                .await
-                .is_err());
+            assert!(
+                client
+                    .query(
+                        "SELECT CAST(value0 AS int) FROM unnest(CAST($1 AS int[]))",
+                        &[&pedantic.0]
+                    )
+                    .await
+                    .is_err()
+            );
+            assert!(
+                client
+                    .query(
+                        "SELECT CAST(value0 AS int) FROM unnest(CAST($1 AS int[]))",
+                        &[&pedantic.1]
+                    )
+                    .await
+                    .is_err()
+            );
+            assert!(
+                client
+                    .query(
+                        "SELECT CAST(value0 AS int) FROM unnest(CAST($1 AS int[]))",
+                        &[&pedantic.2]
+                    )
+                    .await
+                    .is_err()
+            );
+            assert!(
+                client
+                    .query(
+                        "SELECT CAST(value0 AS int) FROM unnest(CAST($1 AS int[]))",
+                        &[&pedantic.3]
+                    )
+                    .await
+                    .is_err()
+            );
+            assert!(
+                client
+                    .query(
+                        "SELECT CAST(value0 AS int) FROM unnest(CAST($1 AS int[]))",
+                        &[&pedantic.4]
+                    )
+                    .await
+                    .is_err()
+            );
         }
         // Test float types
         {
@@ -758,20 +775,24 @@ async fn test_unnest_typing() {
 
             // Array types are very pedantic - need f64 or else it won't work :(
             let pedantic = (vec![1.0f32, 2.0, 3.0], vec![1i64, 2, 3]);
-            assert!(client
-                .query(
-                    "SELECT CAST(value0 AS float) FROM unnest(CAST($1 AS float[]))",
-                    &[&pedantic.0]
-                )
-                .await
-                .is_err());
-            assert!(client
-                .query(
-                    "SELECT CAST(value0 AS float) FROM unnest(CAST($1 AS float[]))",
-                    &[&pedantic.1]
-                )
-                .await
-                .is_err());
+            assert!(
+                client
+                    .query(
+                        "SELECT CAST(value0 AS float) FROM unnest(CAST($1 AS float[]))",
+                        &[&pedantic.0]
+                    )
+                    .await
+                    .is_err()
+            );
+            assert!(
+                client
+                    .query(
+                        "SELECT CAST(value0 AS float) FROM unnest(CAST($1 AS float[]))",
+                        &[&pedantic.1]
+                    )
+                    .await
+                    .is_err()
+            );
         }
         // Test text types
         {
@@ -913,10 +934,12 @@ async fn test_unnest_max_parameters() {
                 .iter()
                 .map(|v| v as &(dyn tokio_postgres::types::ToSql + Sync))
                 .collect();
-            assert!(client
-                .query(&format!("SELECT {rets} FROM unnest({arrs})"), &params,)
-                .await
-                .is_err());
+            assert!(
+                client
+                    .query(&format!("SELECT {rets} FROM unnest({arrs})"), &params,)
+                    .await
+                    .is_err()
+            );
         }
     }
 
@@ -951,13 +974,14 @@ async fn test_request_cancellation() {
 
         let res = client.query("WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM cnt WHERE x < 1000000000) SELECT MAX(x) FROM cnt", &[]).await;
         assert!(res.is_err());
-        assert!(res
-            .err()
-            .unwrap()
-            .as_db_error()
-            .unwrap()
-            .message()
-            .contains("interrupted"));
+        assert!(
+            res.err()
+                .unwrap()
+                .as_db_error()
+                .unwrap()
+                .message()
+                .contains("interrupted")
+        );
     }
 
     tripwire_tx.send(()).await.ok();

@@ -15,10 +15,10 @@ use quinn::{
 };
 use quinn_proto::ConnectionStats;
 use tokio::{
-    sync::{mpsc, Mutex, RwLock},
+    sync::{Mutex, RwLock, mpsc},
     time::error::Elapsed,
 };
-use tracing::{debug, debug_span, info, trace, warn, Instrument};
+use tracing::{Instrument, debug, debug_span, info, trace, warn};
 
 use crate::api::peer::gossip_client_endpoint;
 

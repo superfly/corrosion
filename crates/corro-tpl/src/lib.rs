@@ -8,8 +8,8 @@ use std::ops::DerefMut;
 use std::sync::Arc;
 
 use compact_str::ToCompactString;
-use corro_client::sub::SubscriptionStream;
 use corro_client::CorrosionApiClient;
+use corro_client::sub::SubscriptionStream;
 use corro_types::api::{ColumnName, QueryEvent, RowId, SqliteParam, Statement};
 use corro_types::change::SqliteValue;
 use futures::StreamExt;
@@ -22,7 +22,7 @@ use rhai_tpl::Writer;
 use serde::ser::{SerializeSeq, Serializer};
 use serde_json::ser::Formatter;
 use tokio::sync::OnceCell;
-use tokio::sync::{mpsc, RwLock as TokioRwLock};
+use tokio::sync::{RwLock as TokioRwLock, mpsc};
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
 use tracing::error;

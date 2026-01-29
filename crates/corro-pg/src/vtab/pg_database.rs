@@ -1,7 +1,7 @@
 use std::{marker::PhantomData, os::raw::c_int, sync::Arc};
 
 use rusqlite::vtab::{
-    sqlite3_vtab, sqlite3_vtab_cursor, Filters, IndexInfo, VTab, VTabConnection, VTabCursor,
+    Filters, IndexInfo, VTab, VTabConnection, VTabCursor, sqlite3_vtab, sqlite3_vtab_cursor,
 };
 
 pub struct PgDatabase {

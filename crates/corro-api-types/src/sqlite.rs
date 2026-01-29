@@ -1,6 +1,6 @@
 use rusqlite::{
-    types::{FromSql, FromSqlError},
     ToSql,
+    types::{FromSql, FromSqlError},
 };
 use serde::{Deserialize, Serialize};
 use speedy::{Readable, Writable};

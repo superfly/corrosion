@@ -1,7 +1,7 @@
 use futures::{SinkExt, StreamExt};
 use pgwire::messages::{
-    response::{GssEncResponse, SslResponse},
     PgWireBackendMessage, PgWireFrontendMessage,
+    response::{GssEncResponse, SslResponse},
 };
 use tokio::io::{AsyncBufReadExt, BufStream};
 use tokio_util::codec::Framed;

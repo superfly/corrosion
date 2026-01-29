@@ -11,9 +11,8 @@ use std::{
 
 use crate::{
     agent::{
-        bi, bootstrap, uni,
+        ANNOUNCE_INTERVAL, SyncClientError, bi, bootstrap, uni,
         util::{log_at_pow_10, process_multiple_changes},
-        SyncClientError, ANNOUNCE_INTERVAL,
     },
     api::peer::parallel_sync,
     transport::Transport,
@@ -33,19 +32,19 @@ use corro_types::{
 use bytes::Bytes;
 use corro_types::broadcast::Timestamp;
 use foca::OwnedNotification;
-use indexmap::map::Entry;
 use indexmap::IndexMap;
+use indexmap::map::Entry;
 use metrics::{counter, gauge, histogram};
-use rand::{prelude::IteratorRandom, rngs::StdRng, SeedableRng};
+use rand::{SeedableRng, prelude::IteratorRandom, rngs::StdRng};
 use rangemap::RangeInclusiveSet;
 use spawn::spawn_counted;
 use tokio::time::sleep;
 use tokio::{
     sync::mpsc::Receiver as TokioReceiver,
-    task::{block_in_place, JoinSet},
+    task::{JoinSet, block_in_place},
 };
-use tokio_stream::{wrappers::ReceiverStream, StreamExt};
-use tracing::{debug, debug_span, error, info, trace, warn, Instrument};
+use tokio_stream::{StreamExt, wrappers::ReceiverStream};
+use tracing::{Instrument, debug, debug_span, error, info, trace, warn};
 use tripwire::{Outcome, PreemptibleFutureExt, TimeoutFutureExt, Tripwire};
 
 /// Spawn a tree of tasks that handles incoming gossip server
@@ -966,11 +965,11 @@ mod tests {
     use crate::api::public::api_v1_db_schema;
 
     use super::*;
-    use axum::{http::StatusCode, Extension, Json};
+    use axum::{Extension, Json, http::StatusCode};
     use corro_tests::TEST_SCHEMA;
     use corro_types::api::{ColumnName, TableName};
     use corro_types::{
-        base::{dbsr, dbvr, CrsqlDbVersion},
+        base::{CrsqlDbVersion, dbsr, dbvr},
         broadcast::Changeset,
         change::Change,
         config::Config,
@@ -979,7 +978,7 @@ mod tests {
     use rusqlite::Connection;
     use std::sync::Arc;
     use tokio::sync::Semaphore;
-    use tokio::time::{timeout, Duration};
+    use tokio::time::{Duration, timeout};
 
     #[test]
     fn ensure_truncate_works() -> eyre::Result<()> {

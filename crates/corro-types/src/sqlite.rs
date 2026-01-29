@@ -9,7 +9,7 @@ use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use rusqlite::types::{ToSql, ToSqlOutput, Value};
 use rusqlite::{
-    params, trace::TraceEventCodes, vtab::eponymous_only_module, Connection, Transaction, MAIN_DB,
+    Connection, MAIN_DB, Transaction, params, trace::TraceEventCodes, vtab::eponymous_only_module,
 };
 use sqlite_pool::{Committable, SqliteConn};
 use std::rc::Rc;
@@ -339,7 +339,10 @@ pub fn migrate(conn: &mut Connection, migrations: Vec<Box<dyn Migration>>) -> ru
     let skip_n = migration_version(&tx).unwrap_or_default();
 
     if skip_n > migrations.len() {
-        warn!("Skipping migrations, database is at migration version {skip_n} which is greater than {}", migrations.len());
+        warn!(
+            "Skipping migrations, database is at migration version {skip_n} which is greater than {}",
+            migrations.len()
+        );
         return Ok(());
     }
 
@@ -378,7 +381,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use futures::{stream::FuturesUnordered, TryStreamExt};
+    use futures::{TryStreamExt, stream::FuturesUnordered};
     use sqlite_pool::Config;
     use sqlite_pool::InterruptibleTransaction;
     use tokio::task::block_in_place;

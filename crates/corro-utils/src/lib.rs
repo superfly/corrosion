@@ -23,11 +23,7 @@ pub async fn read_files_from_paths<P: AsRef<Path>>(
                                 .into_iter()
                                 .filter_map(|entry| {
                                     entry.path().extension().and_then(|ext| {
-                                        if ext == "sql" {
-                                            Some(entry)
-                                        } else {
-                                            None
-                                        }
+                                        if ext == "sql" { Some(entry) } else { None }
                                     })
                                 })
                                 .collect();

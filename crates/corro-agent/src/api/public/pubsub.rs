@@ -1,9 +1,9 @@
 use std::{collections::HashMap, io::Write, sync::Arc, time::Duration};
 
 use crate::api::utils::{BodySender, CountedBody};
-use axum::{http::StatusCode, response::IntoResponse, Extension};
+use axum::{Extension, http::StatusCode, response::IntoResponse};
 use bytes::{BufMut, Bytes, BytesMut};
-use compact_str::{format_compact, ToCompactString};
+use compact_str::{ToCompactString, format_compact};
 use corro_types::persistent_gauge;
 use corro_types::updates::Handle;
 use corro_types::{
@@ -16,11 +16,11 @@ use rusqlite::Connection;
 use serde::Deserialize;
 use tokio::{
     sync::{
+        RwLock as TokioRwLock,
         broadcast::{self, error::RecvError},
         mpsc::{self, error::TryRecvError},
-        RwLock as TokioRwLock,
     },
-    task::{block_in_place, JoinError},
+    task::{JoinError, block_in_place},
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -42,14 +42,21 @@ pub async fn api_v1_sub_by_id(
     axum::extract::Path(id): axum::extract::Path<Uuid>,
     axum::extract::Query(params): axum::extract::Query<SubParams>,
 ) -> impl IntoResponse {
-    sub_by_id(agent.subs_manager(), id, params, &bcast_cache, tripwire).await
+    sub_by_id(
+        agent.subs_manager().clone(),
+        id,
+        params,
+        bcast_cache,
+        tripwire,
+    )
+    .await
 }
 
 async fn sub_by_id(
-    subs: &SubsManager,
+    subs: SubsManager,
     id: Uuid,
     params: SubParams,
-    bcast_cache: &SharedMatcherBroadcastCache,
+    bcast_cache: SharedMatcherBroadcastCache,
     tripwire: Tripwire,
 ) -> impl IntoResponse {
     let matcher_rx = bcast_cache.read().await.get(&id).and_then(|tx| {
@@ -451,7 +458,9 @@ pub async fn catch_up_sub(
 
                 if let QueryEventMeta::Change(change_id) = meta {
                     if let Err(_e) = queue_tx.try_send((buf, change_id)) {
-                        return Err(eyre::eyre!("catching up too slowly, gave up after buffering {MAX_EVENTS_BUFFER_SIZE} events"));
+                        return Err(eyre::eyre!(
+                            "catching up too slowly, gave up after buffering {MAX_EVENTS_BUFFER_SIZE} events"
+                        ));
                     }
                 }
             }
@@ -891,7 +900,7 @@ mod tests {
     use corro_types::actor::ActorId;
     use corro_types::api::{ColumnName, TableName};
     use corro_types::api::{NotifyEvent, SqliteValue};
-    use corro_types::base::{dbsr, CrsqlDbVersion, CrsqlSeq};
+    use corro_types::base::{CrsqlDbVersion, CrsqlSeq, dbsr};
     use corro_types::broadcast::{ChangeSource, ChangeV1, Changeset};
     use corro_types::change::Change;
     use corro_types::pubsub::pack_columns;
@@ -911,8 +920,8 @@ mod tests {
 
     use super::*;
     use crate::agent::process_multiple_changes;
-    use crate::api::public::update::{api_v1_updates, SharedUpdateBroadcastCache};
     use crate::api::public::TimeoutParams;
+    use crate::api::public::update::{SharedUpdateBroadcastCache, api_v1_updates};
     use crate::api::public::{api_v1_db_schema, api_v1_transactions};
     use corro_tests::launch_test_agent;
     use corro_types::api::SqliteValue::Integer;
@@ -2089,12 +2098,14 @@ mod tests {
                 NotifyEvent::Notify(ChangeType::Delete, pk) => {
                     assert_eq!(pk, vec!["service-id-5".into()]);
                     // check that we dont get an update after
-                    assert!(tokio::time::timeout(
-                        Duration::from_secs(2),
-                        notify_rows.recv::<NotifyEvent>()
-                    )
-                    .await
-                    .is_err());
+                    assert!(
+                        tokio::time::timeout(
+                            Duration::from_secs(2),
+                            notify_rows.recv::<NotifyEvent>()
+                        )
+                        .await
+                        .is_err()
+                    );
                 }
                 _ => panic!("expected notify event"),
             }
@@ -2456,7 +2467,7 @@ mod tests {
     /// - We never receive an insert for a row that's already inserted
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_subscription_interleaving() -> eyre::Result<()> {
-        use rand::{rngs::StdRng, Rng, SeedableRng};
+        use rand::{Rng, SeedableRng, rngs::StdRng};
         use std::collections::{HashSet, VecDeque};
 
         _ = tracing_subscriber::fmt::try_init();

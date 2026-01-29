@@ -19,19 +19,19 @@ use corro_types::{
     actor::{ActorId, ClusterId},
     api::{ExecResult, QueryEvent, Statement},
     base::CrsqlDbVersion,
-    config::{default_admin_path, Config, ConfigError, LogFormat, OtelConfig},
+    config::{Config, ConfigError, LogFormat, OtelConfig, default_admin_path},
     sqlite::CrConn,
 };
 use futures::StreamExt;
 use once_cell::sync::OnceCell;
-use opentelemetry::{global, KeyValue};
+use opentelemetry::{KeyValue, global};
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk as os;
 use rusqlite::{Connection, OptionalExtension};
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::{
-    fmt::format::Format, prelude::__tracing_subscriber_SubscriberExt, util::SubscriberInitExt,
-    EnvFilter,
+    EnvFilter, fmt::format::Format, prelude::__tracing_subscriber_SubscriberExt,
+    util::SubscriberInitExt,
 };
 use uuid::Uuid;
 
@@ -312,7 +312,9 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
 
                 if let Some(ordinal) = ordinal {
                     if ordinal == 0 {
-                        warn!("skipping clock table site_id rewrite: ordinal was 0 and therefore did not change");
+                        warn!(
+                            "skipping clock table site_id rewrite: ordinal was 0 and therefore did not change"
+                        );
                     } else {
                         info!("rewriting clock tables site_id");
                         let tables: Vec<String> = conn.prepare("SELECT name FROM sqlite_schema WHERE type = 'table' AND name LIKE '%__crsql_clock'")?.query_map([], |row| row.get(0))?.collect::<Result<Vec<_>, _>>()?;

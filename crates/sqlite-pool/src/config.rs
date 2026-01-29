@@ -4,8 +4,8 @@ use deadpool::managed::{QueueMode, Timeouts};
 use rusqlite::OpenFlags;
 
 use crate::{
-    noop_transform, CreatePoolError, Manager, Pool, PoolBuilder, PoolConfig, Runtime, RusqlitePool,
-    SqliteConn,
+    CreatePoolError, Manager, Pool, PoolBuilder, PoolConfig, Runtime, RusqlitePool, SqliteConn,
+    noop_transform,
 };
 
 /// Configuration object.

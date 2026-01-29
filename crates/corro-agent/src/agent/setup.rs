@@ -14,8 +14,8 @@ use std::{net::SocketAddr, ops::DerefMut, sync::Arc, time::Duration};
 use tokio::{
     net::TcpListener,
     sync::{
-        mpsc::{channel as tokio_channel, Receiver as TokioReceiver},
         RwLock as TokioRwLock, Semaphore,
+        mpsc::{Receiver as TokioReceiver, channel as tokio_channel},
     },
 };
 use tracing::{debug, error, info, trace, warn};
@@ -26,7 +26,7 @@ use crate::{
     api::{
         peer::gossip_server_endpoint,
         public::{
-            pubsub::{process_sub_channel, MatcherBroadcastCache, SharedMatcherBroadcastCache},
+            pubsub::{MatcherBroadcastCache, SharedMatcherBroadcastCache, process_sub_channel},
             update::SharedUpdateBroadcastCache,
         },
     },
@@ -35,15 +35,15 @@ use crate::{
 use corro_types::{
     actor::ActorId,
     agent::{
-        migrate, Agent, AgentConfig, Booked, BookedVersions, LockRegistry, LockState, SplitPool,
+        Agent, AgentConfig, Booked, BookedVersions, LockRegistry, LockState, SplitPool, migrate,
     },
     base::{CrsqlDbVersion, CrsqlDbVersionRange},
     broadcast::{BroadcastInput, ChangeSource, ChangeV1, FocaInput},
-    channel::{bounded, CorroReceiver},
+    channel::{CorroReceiver, bounded},
     config::Config,
     members::Members,
     pubsub::{Matcher, SubsManager},
-    schema::{init_schema, Schema},
+    schema::{Schema, init_schema},
     sqlite::CrConn,
     updates::UpdatesManager,
 };

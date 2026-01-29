@@ -8,7 +8,7 @@ use std::{
 use async_trait::async_trait;
 use bytes::{Buf, BufMut};
 use camino::{Utf8Path, Utf8PathBuf};
-use compact_str::{format_compact, ToCompactString};
+use compact_str::{ToCompactString, format_compact};
 use corro_api_types::{
     ChangeId, ColumnName, ColumnType, RowId, SqliteValue, SqliteValueRef, TableName,
 };
@@ -18,11 +18,11 @@ use indexmap::{IndexMap, IndexSet};
 use metrics::{counter, histogram};
 use parking_lot::{Condvar, Mutex, RwLock};
 use rusqlite::{
-    params_from_iter,
+    Connection, OptionalExtension, params_from_iter,
     types::{FromSqlError, ValueRef},
-    Connection, OptionalExtension,
 };
 use spawn::spawn_counted;
+use sqlite_pool::RusqlitePool;
 use sqlite3_parser::{
     ast::{
         As, Cmd, Expr, FromClause, JoinConstraint, JoinOperator, JoinType, JoinedSelectTable, Name,
@@ -30,9 +30,8 @@ use sqlite3_parser::{
     },
     lexer::sql::Parser,
 };
-use sqlite_pool::RusqlitePool;
 use tokio::{
-    sync::{mpsc, oneshot, watch, AcquireError},
+    sync::{AcquireError, mpsc, oneshot, watch},
     task::block_in_place,
 };
 use tokio_util::sync::{CancellationToken, DropGuard, WaitForCancellationFuture};
@@ -2045,7 +2044,7 @@ fn extract_expr_columns(
             parsed.children.push(extract_select_columns(rhs, schema)?);
         }
         expr @ Expr::InTable { .. } => {
-            return Err(MatcherError::UnsupportedExpr { expr: expr.clone() })
+            return Err(MatcherError::UnsupportedExpr { expr: expr.clone() });
         }
         Expr::IsNull(expr) => {
             extract_expr_columns(expr, schema, parsed)?;
@@ -2432,7 +2431,7 @@ mod tests {
     use std::net::Ipv4Addr;
 
     use camino::Utf8PathBuf;
-    use rusqlite::{params, Connection};
+    use rusqlite::{Connection, params};
     use spawn::wait_for_all_pending_handles;
     use tokio::sync::Semaphore;
 
@@ -2442,7 +2441,7 @@ mod tests {
         base::CrsqlDbVersion,
         change::row_to_change,
         schema::{apply_schema, parse_sql},
-        sqlite::{rusqlite_to_crsqlite, setup_conn, CrConn},
+        sqlite::{CrConn, rusqlite_to_crsqlite, setup_conn},
     };
     use corro_tests::tempdir::TempDir;
 

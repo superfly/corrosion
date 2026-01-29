@@ -8,7 +8,7 @@ use std::{
     io::{Read, Write},
     path::PathBuf,
     process::Command,
-    sync::mpsc::{channel, Sender},
+    sync::mpsc::{Sender, channel},
     thread,
     time::Duration,
 };
@@ -57,7 +57,9 @@ fn main() {
     {
         Some(dir) => dir,
         None => {
-            eprintln!("FAILED: either pass `--statedir` or set 'CORRO_DEVCLUSTER_STATE_DIR' environment variable!");
+            eprintln!(
+                "FAILED: either pass `--statedir` or set 'CORRO_DEVCLUSTER_STATE_DIR' environment variable!"
+            );
             std::process::exit(1);
         }
     };
@@ -70,7 +72,9 @@ fn main() {
     {
         Some(dir) => dir,
         None => {
-            eprintln!("FAILED: either pass `--statedir` or set 'CORRO_DEVCLUSTER_STATE_DIR' environment variable!");
+            eprintln!(
+                "FAILED: either pass `--statedir` or set 'CORRO_DEVCLUSTER_STATE_DIR' environment variable!"
+            );
             std::process::exit(1);
         }
     };

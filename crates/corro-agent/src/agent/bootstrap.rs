@@ -2,10 +2,10 @@ use crate::agent::RANDOM_NODES_CHOICES;
 use corro_types::{agent::SplitPool, config::DEFAULT_GOSSIP_PORT};
 
 use hickory_resolver::{
-    proto::rr::{RData, RecordType},
     ResolveErrorKind,
+    proto::rr::{RData, RecordType},
 };
-use rand::{rngs::StdRng, seq::IteratorRandom, SeedableRng};
+use rand::{SeedableRng, rngs::StdRng, seq::IteratorRandom};
 use std::{collections::HashSet, net::SocketAddr};
 use tokio::task::block_in_place;
 use tracing::{debug, error, warn};
@@ -60,8 +60,8 @@ async fn resolve_bootstrap(
     our_addr: SocketAddr,
 ) -> eyre::Result<HashSet<SocketAddr>> {
     use hickory_resolver::{
-        config::{NameServerConfigGroup, ResolverConfig},
         Resolver,
+        config::{NameServerConfigGroup, ResolverConfig},
     };
 
     let mut addrs = HashSet::new();

@@ -6,16 +6,16 @@ use std::{
 };
 
 use axum::Extension;
-use futures::{future, stream::FuturesUnordered, StreamExt, TryStreamExt};
+use futures::{StreamExt, TryStreamExt, future, stream::FuturesUnordered};
 use hyper::StatusCode;
-use rand::{prelude::Distribution, rngs::StdRng, seq::IteratorRandom, SeedableRng};
+use rand::{SeedableRng, prelude::Distribution, rngs::StdRng, seq::IteratorRandom};
 use rangemap::RangeInclusiveSet;
 use serde::Deserialize;
 use serde_json::json;
 use spawn::wait_for_all_pending_handles;
 use tokio::{
     sync::mpsc,
-    time::{sleep, timeout, MissedTickBehavior},
+    time::{MissedTickBehavior, sleep, timeout},
 };
 use tracing::{debug, info_span};
 use tripwire::Tripwire;
@@ -25,7 +25,7 @@ use crate::{
     agent::process_multiple_changes,
     api::{
         peer::parallel_sync,
-        public::{api_v1_db_schema, api_v1_transactions, TimeoutParams},
+        public::{TimeoutParams, api_v1_db_schema, api_v1_transactions},
     },
     transport::Transport,
 };
@@ -34,7 +34,7 @@ use corro_types::change::Change;
 use corro_types::{
     actor::{ActorId, MemberId},
     api::{ExecResponse, ExecResult, Statement},
-    base::{dbsr, dbsri, dbvri, CrsqlDbVersion, CrsqlDbVersionRange, CrsqlSeq},
+    base::{CrsqlDbVersion, CrsqlDbVersionRange, CrsqlSeq, dbsr, dbsri, dbvri},
     broadcast::{ChangeSource, ChangeV1, Changeset},
     sync::generate_sync,
 };
@@ -604,7 +604,9 @@ async fn large_tx_sync() -> eyre::Result<()> {
     ];
 
     for n in counts.iter() {
-        let req_body: Vec<Statement> = serde_json::from_value(json!([format!("INSERT INTO testsbool (id) WITH RECURSIVE    cte(id) AS (       SELECT random()       UNION ALL       SELECT random()         FROM cte        LIMIT {n}  ) SELECT id FROM cte;")]))?;
+        let req_body: Vec<Statement> = serde_json::from_value(json!([format!(
+            "INSERT INTO testsbool (id) WITH RECURSIVE    cte(id) AS (       SELECT random()       UNION ALL       SELECT random()         FROM cte        LIMIT {n}  ) SELECT id FROM cte;"
+        )]))?;
 
         let res = timeout(
             Duration::from_secs(5),

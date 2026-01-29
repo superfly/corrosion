@@ -1,6 +1,6 @@
 use corro_agent::api::public::api_v1_db_schema;
 use criterion::{
-    black_box, criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput,
+    BatchSize, BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main,
 };
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -14,13 +14,13 @@ use corro_types::{
     api::Statement,
     base::{CrsqlDbVersion, CrsqlSeq},
     broadcast::{ChangeSource, ChangeV1, Changeset},
-    change::{row_to_change, Change},
+    change::{Change, row_to_change},
 };
 use hyper::StatusCode;
 
 use corro_agent::{
     agent::process_multiple_changes,
-    api::public::{api_v1_transactions, TimeoutParams},
+    api::public::{TimeoutParams, api_v1_transactions},
 };
 
 /// Configuration for a benchark run
@@ -130,15 +130,28 @@ async fn generate_changesets(
                 // Insert - use high IDs to avoid conflicts
                 let id = config.initial_rows_per_table + tx_idx * 1000 + rng.random_range(0..1000);
                 Statement::WithParams(
-                    format!("INSERT OR REPLACE INTO {table_name} (id, value, counter, random) VALUES (?, ?, ?, ?)"),
-                    vec![(id as i64).into(), format!("value_{id}").into(), rng.random_range(0..100000).into(), 0.into()],
+                    format!(
+                        "INSERT OR REPLACE INTO {table_name} (id, value, counter, random) VALUES (?, ?, ?, ?)"
+                    ),
+                    vec![
+                        (id as i64).into(),
+                        format!("value_{id}").into(),
+                        rng.random_range(0..100000).into(),
+                        0.into(),
+                    ],
                 )
             } else if op_type < insert_pct + update_pct {
                 // Update - use existing IDs
                 let id = rng.random_range(1..=config.initial_rows_per_table.min(1000));
                 Statement::WithParams(
-                    format!("UPDATE {table_name} SET counter = counter + 1, value = ?, random = ? WHERE id = ?"),
-                    vec![format!("updated_{}", rng.random_range(0..1000)).into(), rng.random_range(0..100000).into(), (id as i64).into()],
+                    format!(
+                        "UPDATE {table_name} SET counter = counter + 1, value = ?, random = ? WHERE id = ?"
+                    ),
+                    vec![
+                        format!("updated_{}", rng.random_range(0..1000)).into(),
+                        rng.random_range(0..100000).into(),
+                        (id as i64).into(),
+                    ],
                 )
             } else {
                 // Delete

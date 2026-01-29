@@ -2,7 +2,7 @@ pub mod sub;
 
 use corro_api_types::{ChangeId, ExecResponse, ExecResult, SqliteValue, Statement};
 use hickory_resolver::{
-    name_server::TokioConnectionProvider, ResolveError, ResolveErrorKind, Resolver,
+    ResolveError, ResolveErrorKind, Resolver, name_server::TokioConnectionProvider,
 };
 use serde::de::DeserializeOwned;
 use std::{
@@ -665,13 +665,13 @@ mod tests {
     use crate::{CorrosionPooledClient, Error};
     use corro_api_types::SqliteValue;
     use hickory_resolver::Resolver;
-    use hyper::{header::HeaderValue, service::service_fn, Request, Response};
+    use hyper::{Request, Response, header::HeaderValue, service::service_fn};
     use std::{
         convert::Infallible,
         net::SocketAddr,
         sync::{
-            atomic::{AtomicBool, Ordering},
             Arc,
+            atomic::{AtomicBool, Ordering},
         },
         time::Duration,
     };

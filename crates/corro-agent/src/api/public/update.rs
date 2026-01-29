@@ -1,7 +1,7 @@
 use std::{collections::HashMap, io::Write, sync::Arc, time::Duration};
 
 use antithesis_sdk::assert_sometimes;
-use axum::{http::StatusCode, response::IntoResponse, Extension};
+use axum::{Extension, http::StatusCode, response::IntoResponse};
 use bytes::{BufMut, Bytes, BytesMut};
 use compact_str::ToCompactString;
 use corro_types::{
@@ -11,8 +11,9 @@ use corro_types::{
     updates::{Handle, UpdateCreated, UpdateHandle, UpdatesManager},
 };
 use tokio::sync::{
+    RwLock as TokioRwLock,
     broadcast::{self, error::RecvError},
-    mpsc, RwLock as TokioRwLock,
+    mpsc,
 };
 use tracing::{debug, info, warn};
 use tripwire::Tripwire;

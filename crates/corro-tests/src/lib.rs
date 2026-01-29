@@ -6,7 +6,7 @@ pub use corro_client::{CorrosionApiClient, CorrosionClient};
 use corro_types::{
     agent::{Agent, Bookie},
     config::{Config, ConfigBuilder, ConfigBuilderError},
-    sqlite::{rusqlite_to_crsqlite, SqlitePool},
+    sqlite::{SqlitePool, rusqlite_to_crsqlite},
 };
 use tripwire::Tripwire;
 

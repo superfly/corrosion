@@ -33,13 +33,13 @@ use std::ffi::c_int;
 use std::marker::PhantomData;
 use std::os::raw::c_char;
 
+use rusqlite::Result;
 use rusqlite::ffi;
 use rusqlite::types::Value;
 use rusqlite::vtab::Filters;
 use rusqlite::vtab::{
-    array::Array, Context, IndexConstraintOp, IndexInfo, VTab, VTabConnection, VTabCursor, Values,
+    Context, IndexConstraintOp, IndexInfo, VTab, VTabConnection, VTabCursor, Values, array::Array,
 };
-use rusqlite::Result;
 
 // The array type identifier used by rusqlite's array module
 // This must match rusqlite's internal ARRAY_TYPE constant
@@ -263,9 +263,9 @@ unsafe impl VTabCursor for UnnestTabCursor<'_> {
 
 #[cfg(test)]
 mod test {
+    use rusqlite::Result;
     use rusqlite::types::Value;
     use rusqlite::vtab::eponymous_only_module;
-    use rusqlite::Result;
 
     use crate::vtab::unnest::UnnestTab;
     use rusqlite::Connection;

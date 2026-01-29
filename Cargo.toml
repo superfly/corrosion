@@ -7,7 +7,7 @@ resolver = "2"
 
 [workspace.package]
 license = "Apache-2.0"
-edition = "2021"
+edition = "2024"
 repository = "https://github.com/superfly/corrosion"
 homepage = "https://superfly.github.io/corrosion/"
 

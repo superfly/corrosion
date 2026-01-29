@@ -1,4 +1,4 @@
-use rusqlite::{functions::FunctionFlags, Connection, Error, Result};
+use rusqlite::{Connection, Error, Result, functions::FunctionFlags};
 use serde_json::Value;
 
 /// Add custom Corrosion functions into SQLite connection.

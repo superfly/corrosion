@@ -1,13 +1,12 @@
-use metrics::{counter, gauge, histogram, Counter, Histogram};
+use metrics::{Counter, Histogram, counter, gauge, histogram};
 use std::{
     fmt::{self, Debug, Formatter},
     time::{Duration, Instant},
 };
 use tokio::{
     sync::mpsc::{
-        channel,
+        Receiver, Sender, channel,
         error::{SendError, SendTimeoutError, TryRecvError, TrySendError},
-        Receiver, Sender,
     },
     time::sleep,
 };

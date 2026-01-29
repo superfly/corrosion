@@ -5,8 +5,8 @@ use std::{
     fmt,
     ops::{Deref, DerefMut},
     sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc,
+        atomic::{AtomicUsize, Ordering},
     },
 };
 use tracing::warn;
@@ -14,7 +14,7 @@ use tracing::warn;
 use deadpool::managed::{self, Object};
 use metrics::counter;
 use rusqlite::{CachedStatement, InterruptHandle, Params, Transaction};
-use tokio::time::{sleep, Duration};
+use tokio::time::{Duration, sleep};
 use tokio_util::sync::CancellationToken;
 
 pub use deadpool::managed::reexports::*;
