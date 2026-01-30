@@ -5,8 +5,9 @@ use std::time::Instant;
 use crate::api::public::execute_schema;
 use crate::{
     agent::{
+        AgentOptions,
         handlers::{self, spawn_handle_db_maintenance},
-        metrics, setup, util, AgentOptions,
+        metrics, setup, util,
     },
     broadcast::runtime_loop,
     transport::Transport,

@@ -9,10 +9,10 @@ use std::{
 
 use bytes::{Buf, Bytes, BytesMut};
 use corro_api_types::{ChangeId, QueryEvent, TypedNotifyEvent, TypedQueryEvent};
-use futures::{ready, Future, Stream};
+use futures::{Future, Stream, ready};
 use pin_project_lite::pin_project;
 use serde::de::DeserializeOwned;
-use tokio::time::{sleep, Sleep};
+use tokio::time::{Sleep, sleep};
 use tokio_util::{
     codec::{Decoder, FramedRead, LinesCodecError},
     io::StreamReader,
@@ -206,7 +206,7 @@ where
                 return Err(SubscriptionError::MissedChange {
                     expected: id + 1,
                     got: change_id,
-                })
+                });
             }
             _ => (),
         }

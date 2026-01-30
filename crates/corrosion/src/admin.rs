@@ -4,7 +4,7 @@ use corro_admin::{Command, LogLevel, Response};
 use eyre::eyre;
 use futures::{SinkExt, TryStreamExt};
 use tokio::net::UnixStream;
-use tokio_serde::{formats::Json, Framed};
+use tokio_serde::{Framed, formats::Json};
 use tokio_util::codec::LengthDelimitedCodec;
 use tracing::{error, event};
 

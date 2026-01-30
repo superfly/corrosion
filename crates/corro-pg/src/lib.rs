@@ -13,8 +13,8 @@ use std::{
     rc::Rc,
     str::{FromStr, Utf8Error},
     sync::{
-        atomic::{AtomicI32, Ordering},
         Arc,
+        atomic::{AtomicI32, Ordering},
     },
     time::Duration,
 };
@@ -24,11 +24,11 @@ use codec::PgWireMessageServerCodec;
 use compact_str::CompactString;
 use corro_types::{
     agent::{Agent, ChangeError},
-    broadcast::{broadcast_changes, Timestamp},
-    change::{insert_local_changes, InsertChangesInfo},
+    broadcast::{Timestamp, broadcast_changes},
+    change::{InsertChangesInfo, insert_local_changes},
     config::PgConfig,
     persistent_gauge,
-    schema::{parse_sql, Column, Schema, SchemaError, SqliteType, Table},
+    schema::{Column, Schema, SchemaError, SqliteType, Table, parse_sql},
     sqlite::CrConn,
 };
 use fallible_iterator::FallibleIterator;
@@ -38,21 +38,21 @@ use pgwire::{
     api::results::{DataRowEncoder, FieldFormat, FieldInfo, Tag},
     error::{ErrorInfo, PgWireError},
     messages::{
+        PgWireBackendMessage, PgWireFrontendMessage,
         data::{NoData, ParameterDescription, RowDescription},
         extendedquery::{BindComplete, CloseComplete, ParseComplete, PortalSuspended},
         response::{
             CommandComplete, EmptyQueryResponse, ErrorResponse, ReadyForQuery, TransactionStatus,
         },
         startup::ParameterStatus,
-        PgWireBackendMessage, PgWireFrontendMessage,
     },
     types::FromSqlText,
 };
 use postgres_types::{FromSql, Type};
-use rand::{rngs::StdRng, Rng, SeedableRng};
+use rand::{Rng, SeedableRng, rngs::StdRng};
 use rusqlite::{
-    ffi::SQLITE_CONSTRAINT_UNIQUE, functions::FunctionFlags, types::ValueRef,
-    vtab::eponymous_only_module, Connection, Statement,
+    Connection, Statement, ffi::SQLITE_CONSTRAINT_UNIQUE, functions::FunctionFlags,
+    types::ValueRef, vtab::eponymous_only_module,
 };
 use rustls::ServerConfig;
 use socket2::{SockRef, TcpKeepalive};
@@ -65,8 +65,8 @@ use sqlparser::ast::Statement as PgStatement;
 use tokio::{
     net::TcpListener,
     sync::{
-        mpsc::{channel, Sender},
         AcquireError, OwnedSemaphorePermit, RwLock as TokioRwLock,
+        mpsc::{Sender, channel},
     },
     time::timeout,
 };
@@ -2490,7 +2490,7 @@ impl<'conn> Session<'conn> {
                         _ => {
                             return Err(
                                 UnsupportedSqliteToPostgresType(field.name().to_owned()).into()
-                            )
+                            );
                         }
                     }
                 }
@@ -2757,7 +2757,9 @@ impl From<UnsupportedSqliteToPostgresType> for ErrorResponse {
 }
 
 #[derive(Debug, thiserror::Error)]
-#[error("Untyped array argument for unnest() (or corro_unnest()), please use CAST($N AS T) where T is one of: TEXT[] BLOB[] INT[] INTEGER[] BIGINT[] REAL[] FLOAT[] DOUBLE[]")]
+#[error(
+    "Untyped array argument for unnest() (or corro_unnest()), please use CAST($N AS T) where T is one of: TEXT[] BLOB[] INT[] INTEGER[] BIGINT[] REAL[] FLOAT[] DOUBLE[]"
+)]
 struct UntypedUnnestParameter;
 
 impl From<UntypedUnnestParameter> for PgWireBackendMessage {
@@ -3653,7 +3655,9 @@ fn field_types(
                                 field_type_overrides.insert(col_name, type_override);
                             }
                             Err(e) => {
-                                error!("col index didn't exist at {i}, attempted to override type as: {type_override}: {e}");
+                                error!(
+                                    "col index didn't exist at {i}, attempted to override type as: {type_override}: {e}"
+                                );
                             }
                         }
                     }

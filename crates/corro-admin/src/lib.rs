@@ -14,7 +14,7 @@ use corro_types::{
     updates::Handle,
 };
 use futures::{SinkExt, TryStreamExt};
-use rusqlite::{named_params, params, OptionalExtension};
+use rusqlite::{OptionalExtension, named_params, params};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use spawn::spawn_counted;
@@ -24,11 +24,11 @@ use tokio::{
     sync::{mpsc, oneshot},
     task::block_in_place,
 };
-use tokio_serde::{formats::Json, Framed};
+use tokio_serde::{Framed, formats::Json};
 use tokio_util::codec::LengthDelimitedCodec;
 use tracing::{debug, error, info, warn};
-use tracing_filter::{legacy::Filter, FilterLayer};
-use tracing_subscriber::{reload::Handle as ReloadHandle, Registry};
+use tracing_filter::{FilterLayer, legacy::Filter};
+use tracing_subscriber::{Registry, reload::Handle as ReloadHandle};
 use tripwire::Tripwire;
 use uuid::Uuid;
 

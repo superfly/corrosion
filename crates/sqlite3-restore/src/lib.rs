@@ -7,8 +7,8 @@ use std::{
 };
 
 use nix::{
-    fcntl::{fcntl, FcntlArg},
-    libc::{flock, SEEK_SET},
+    fcntl::{FcntlArg, fcntl},
+    libc::{SEEK_SET, flock},
 };
 use tracing::info;
 

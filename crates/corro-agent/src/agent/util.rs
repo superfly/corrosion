@@ -6,7 +6,7 @@
 //! be pulled out of this file in future.
 
 use crate::{
-    agent::{handlers, CountedExecutor, TO_CLEAR_COUNT},
+    agent::{CountedExecutor, TO_CLEAR_COUNT, handlers},
     api::public::{
         api_v1_db_schema, api_v1_queries, api_v1_table_stats, api_v1_transactions,
         pubsub::{api_v1_sub_by_id, api_v1_subs},
@@ -33,21 +33,21 @@ use super::BcastCache;
 use crate::api::public::update::api_v1_updates;
 use antithesis_sdk::{assert_always, assert_unreachable};
 use axum::{
+    BoxError, Extension, Router,
     error_handling::HandleErrorLayer,
     extract::DefaultBodyLimit,
     routing::{get, post},
-    BoxError, Extension, Router,
 };
 use axum_extra::{
-    headers::{authorization::Bearer, Authorization},
     TypedHeader,
+    headers::{Authorization, authorization::Bearer},
 };
 use corro_types::broadcast::Timestamp;
 use foca::Member;
 use http::StatusCode;
 use metrics::{counter, histogram};
 use rangemap::{RangeInclusiveMap, RangeInclusiveSet};
-use rusqlite::{named_params, params, Connection};
+use rusqlite::{Connection, named_params, params};
 use serde_json::json;
 use spawn::spawn_counted;
 use sqlite_pool::{Committable, InterruptibleTransaction};
@@ -57,12 +57,12 @@ use std::{
     convert::Infallible,
     net::SocketAddr,
     ops::{Deref, RangeInclusive},
-    sync::{atomic::AtomicI64, Arc},
+    sync::{Arc, atomic::AtomicI64},
     time::{Duration, Instant},
 };
 use tokio::{
     net::TcpListener,
-    task::{block_in_place, JoinHandle},
+    task::{JoinHandle, block_in_place},
 };
 use tower::{limit::ConcurrencyLimitLayer, load_shed::LoadShedLayer};
 use tower_http::trace::TraceLayer;
@@ -102,7 +102,9 @@ pub async fn initialise_foca(agent: &Agent, states: Vec<(SocketAddr, Member<Acto
             .send(FocaInput::ApplyMany(foca_states.into_values().collect()))
             .await
         {
-            error!("Failed to queue initial foca state: {e:?}, cluster membership states will be broken!");
+            error!(
+                "Failed to queue initial foca state: {e:?}, cluster membership states will be broken!"
+            );
         }
 
         let agent = agent.clone();
@@ -912,7 +914,9 @@ pub async fn process_multiple_changes(
                                 }
                                 // the transaction was rolled back, so we need to return.
                                 if tx.is_autocommit() {
-                                    error!("error processing single version: {e} and transaction was rolled back");
+                                    error!(
+                                        "error processing single version: {e} and transaction was rolled back"
+                                    );
                                     return Err(ChangeError::Rusqlite {
                                         source: e,
                                         actor_id: None,
@@ -1062,7 +1066,9 @@ pub async fn process_multiple_changes(
                         let tx_apply = agent.tx_apply().clone();
                         tokio::spawn(async move {
                             if let Err(e) = tx_apply.send((actor_id, version)).await {
-                                error!("could not send trigger for applying fully buffered changes later: {e}");
+                                error!(
+                                    "could not send trigger for applying fully buffered changes later: {e}"
+                                );
                             }
                         });
                     } else {
@@ -1284,7 +1290,10 @@ pub fn process_complete_version<T: Deref<Target = rusqlite::Connection> + Commit
     //     "number of changes is equal to the seq len",
     //     &details
     // );
-    debug_assert!(len <= seqs.len(), "change from actor {actor_id} version {version} has len {len} but seqs range is {seqs:?} and last_seq is {last_seq}");
+    debug_assert!(
+        len <= seqs.len(),
+        "change from actor {actor_id} version {version} has len {len} but seqs range is {seqs:?} and last_seq is {last_seq}"
+    );
 
     // Insert all the changes in a single statement
     // This will return a non zero rowid only if the change impacted the database

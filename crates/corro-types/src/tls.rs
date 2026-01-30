@@ -2,7 +2,7 @@ use std::net::IpAddr;
 
 use rcgen::{
     BasicConstraints, Certificate, CertificateParams, DistinguishedName, DnType, DnValue, IsCa,
-    KeyIdMethod, KeyPair, KeyUsagePurpose, SanType, PKCS_ECDSA_P384_SHA384,
+    KeyIdMethod, KeyPair, KeyUsagePurpose, PKCS_ECDSA_P384_SHA384, SanType,
 };
 use time::OffsetDateTime;
 

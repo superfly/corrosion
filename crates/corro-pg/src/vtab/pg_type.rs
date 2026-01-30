@@ -2,7 +2,7 @@ use std::{marker::PhantomData, os::raw::c_int};
 
 use postgres_types::Type;
 use rusqlite::vtab::{
-    sqlite3_vtab, sqlite3_vtab_cursor, Filters, IndexInfo, VTab, VTabConnection, VTabCursor,
+    Filters, IndexInfo, VTab, VTabConnection, VTabCursor, sqlite3_vtab, sqlite3_vtab_cursor,
 };
 use tracing::debug;
 

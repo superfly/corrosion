@@ -94,7 +94,9 @@ pub fn spawn_bipayload_handler(
                                                         )
                                                         .await
                                                         {
-                                                            warn!("could not complete receiving sync: {e}");
+                                                            warn!(
+                                                                "could not complete receiving sync: {e}"
+                                                            );
                                                         }
                                                         break;
                                                     }
@@ -109,7 +111,9 @@ pub fn spawn_bipayload_handler(
                                 }
 
                                 Err(e) => {
-                                    error!("could not read framed payload from bidirectional stream: {e}");
+                                    error!(
+                                        "could not read framed payload from bidirectional stream: {e}"
+                                    );
                                 }
                             },
                         }

@@ -9,11 +9,11 @@ use camino::Utf8PathBuf;
 use clap::Args;
 use corro_client::CorrosionApiClient;
 use corro_tpl::{Dynamic, TemplateCommand, TemplateState};
-use futures::{stream::FuturesUnordered, StreamExt};
+use futures::{StreamExt, stream::FuturesUnordered};
 use notify::{RecommendedWatcher, RecursiveMode};
-use notify_debouncer_mini::{new_debouncer, DebounceEventResult, Debouncer};
+use notify_debouncer_mini::{DebounceEventResult, Debouncer, new_debouncer};
 use tokio::{
-    sync::mpsc::{self, channel, Receiver, Sender},
+    sync::mpsc::{self, Receiver, Sender, channel},
     task::block_in_place,
 };
 use tokio_util::sync::CancellationToken;

@@ -7,7 +7,7 @@ use std::{
 
 use crate::api::utils::CountedBody;
 use antithesis_sdk::assert_sometimes;
-use axum::{extract::ConnectInfo, response::IntoResponse, Extension};
+use axum::{Extension, extract::ConnectInfo, response::IntoResponse};
 use bytes::{BufMut, BytesMut};
 use compact_str::ToCompactString;
 use corro_types::{
@@ -18,14 +18,14 @@ use corro_types::{
     },
     base::CrsqlDbVersion,
     broadcast::Timestamp,
-    change::{insert_local_changes, InsertChangesInfo, SqliteValue},
+    change::{InsertChangesInfo, SqliteValue, insert_local_changes},
     persistent_gauge,
     schema::{apply_schema, parse_sql},
     sqlite::SqlitePoolError,
 };
 use hyper::StatusCode;
 use metrics::{counter, histogram};
-use rusqlite::{params_from_iter, ToSql, Transaction};
+use rusqlite::{ToSql, Transaction, params_from_iter};
 use serde::Deserialize;
 use spawn::spawn_counted;
 use sqlite_pool::{Committable, InterruptibleTransaction};
@@ -202,7 +202,7 @@ pub async fn api_v1_transactions(
     let res = make_broadcastable_changes(&agent, params.timeout, move |tx| {
         let mut total_rows_affected = 0;
 
-        let results = statements
+        statements
             .iter()
             .map(|stmt| {
                 let start = Instant::now();
@@ -223,9 +223,7 @@ pub async fn api_v1_transactions(
                     Err(e) => Err(e),
                 }
             })
-            .collect::<Result<Vec<ExecResult>, ChangeError>>();
-
-        results
+            .collect::<Result<Vec<ExecResult>, ChangeError>>()
     })
     .await;
 

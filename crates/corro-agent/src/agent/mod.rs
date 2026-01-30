@@ -20,13 +20,13 @@ mod tests;
 use bytes::Bytes;
 use corro_types::api::QueryEventMeta;
 use std::{collections::HashMap, sync::Arc, time::Duration};
-use tokio::sync::{broadcast::Sender, RwLock};
+use tokio::sync::{RwLock, broadcast::Sender};
 use uuid::Uuid;
 
 // Public exports
 pub use error::{SyncClientError, SyncRecvError};
 pub use run_root::start_with_config;
-pub use setup::{setup, AgentOptions};
+pub use setup::{AgentOptions, setup};
 pub use uni::spawn_unipayload_handler;
 pub use util::process_multiple_changes;
 

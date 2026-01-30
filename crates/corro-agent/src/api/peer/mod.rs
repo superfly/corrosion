@@ -12,11 +12,11 @@ use corro_types::base::{CrsqlDbVersion, CrsqlDbVersionRange, CrsqlSeq, CrsqlSeqR
 use corro_types::broadcast::{
     BiPayload, BiPayloadV1, ChangeSource, ChangeV1, Changeset, Timestamp,
 };
-use corro_types::change::{row_to_change, Change, ChunkedChanges};
+use corro_types::change::{Change, ChunkedChanges, row_to_change};
 use corro_types::config::GossipConfig;
 use corro_types::sync::{
-    generate_sync, SyncMessage, SyncMessageEncodeError, SyncMessageV1, SyncNeedV1, SyncRejectionV1,
-    SyncRequestV1, SyncStateV1, SyncTraceContextV1,
+    SyncMessage, SyncMessageEncodeError, SyncMessageV1, SyncNeedV1, SyncRejectionV1, SyncRequestV1,
+    SyncStateV1, SyncTraceContextV1, generate_sync,
 };
 use eyre::{ContextCompat, WrapErr};
 use futures::stream::FuturesUnordered;
@@ -25,19 +25,19 @@ use itertools::Itertools;
 use metrics::counter;
 use quinn::{RecvStream, SendStream, WriteError};
 use rangemap::RangeInclusiveSet;
-use rusqlite::{named_params, Connection};
+use rusqlite::{Connection, named_params};
 use rustls::pki_types::pem::PemObject as _;
 use speedy::Writable;
 use std::string::String;
 use tokio::io::AsyncWriteExt;
-use tokio::sync::mpsc::{self, unbounded_channel, Sender};
+use tokio::sync::mpsc::{self, Sender, unbounded_channel};
 use tokio::task::block_in_place;
 use tokio::time::timeout;
-use tokio_stream::wrappers::{ReceiverStream, UnboundedReceiverStream};
 use tokio_stream::StreamExt as TokioStreamExt;
+use tokio_stream::wrappers::{ReceiverStream, UnboundedReceiverStream};
 // use tokio_stream::StreamExt as TokioStreamExt;
 use tokio_util::codec::{Encoder, FramedRead, LengthDelimitedCodec};
-use tracing::{debug, error, info, info_span, trace, warn, Instrument};
+use tracing::{Instrument, debug, error, info, info_span, trace, warn};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use crate::agent::SyncRecvError;
@@ -1668,14 +1668,14 @@ mod tests {
     use crate::api::public::api_v1_transactions;
     use axum::{Extension, Json};
     use camino::Utf8PathBuf;
-    use corro_tests::launch_test_agent;
     use corro_tests::TEST_SCHEMA;
+    use corro_tests::launch_test_agent;
     use corro_types::api::Statement;
-    use corro_types::base::{dbsr, dbvr, CrsqlDbVersion};
+    use corro_types::base::{CrsqlDbVersion, dbsr, dbvr};
     use corro_types::{
         api::{ColumnName, TableName},
         broadcast::ChangesetPerTable,
-        config::{Config, TlsClientConfig, TlsConfig, DEFAULT_GOSSIP_CLIENT_ADDR},
+        config::{Config, DEFAULT_GOSSIP_CLIENT_ADDR, TlsClientConfig, TlsConfig},
         pubsub::pack_columns,
         tls::{generate_ca, generate_client_cert, generate_server_cert},
     };
@@ -1686,7 +1686,7 @@ mod tests {
 
     use crate::{
         agent::{process_multiple_changes, setup},
-        api::public::{api_v1_db_schema, TimeoutParams},
+        api::public::{TimeoutParams, api_v1_db_schema},
     };
 
     use super::*;

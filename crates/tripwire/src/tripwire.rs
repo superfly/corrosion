@@ -1,12 +1,12 @@
 use futures::stream::Stream;
-use futures_util::stream::{select, Select};
+use futures_util::stream::{Select, select};
 use std::{
     future::Future,
     pin::Pin,
     task::{Context, Poll},
 };
 use tokio::{
-    signal::unix::{signal, SignalKind},
+    signal::unix::{SignalKind, signal},
     sync::{mpsc, watch},
 };
 use tokio_stream::wrappers::{ReceiverStream, WatchStream};

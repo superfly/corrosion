@@ -8,8 +8,8 @@ use std::{
 
 use compact_str::CompactString;
 use rusqlite::{
-    types::{FromSql, FromSqlError, ToSqlOutput, Value, ValueRef},
     ToSql,
+    types::{FromSql, FromSqlError, ToSqlOutput, Value, ValueRef},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
@@ -490,7 +490,7 @@ impl SqliteValue {
     }
 
     pub fn as_str(&self) -> Option<&str> {
-        if let Self::Text(ref s) = self {
+        if let Self::Text(s) = self {
             Some(s)
         } else {
             None

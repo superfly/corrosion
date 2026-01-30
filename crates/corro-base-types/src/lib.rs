@@ -4,7 +4,7 @@ use std::{
 };
 
 use rangemap::StepLite;
-use rusqlite::{types::FromSql, ToSql};
+use rusqlite::{ToSql, types::FromSql};
 use serde::{Deserialize, Serialize};
 use speedy::{Context, Readable, Writable};
 
