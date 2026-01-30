@@ -65,7 +65,7 @@ pub fn spawn_reaper(agent: &Agent) -> eyre::Result<()> {
                 interval.tick().await;
 
                 for (table_name, retention) in tables.iter() {
-                    match reap_table(&agent.pool(), table_name, *retention, &clock).await {
+                    match reap_table(agent.pool(), table_name, *retention, clock).await {
                         Ok((clocks, pks)) => {
                             if clocks > 0 {
                                 info!(%table_name, clocks = clocks, "deleted clocks");
@@ -107,10 +107,9 @@ async fn reap_table(
     let (pks_to_delete, mut orphaned_pks): (Vec<u64>, Vec<u64>) = block_in_place(|| {
         let sentinel_pks = read_conn
             .prepare_cached(&format!(
-                "SELECT key FROM {}__crsql_clock 
+                "SELECT key FROM {table}__crsql_clock 
                 WHERE col_name = -1 AND col_version % 2 = 0
-                AND ts < ?  LIMIT 100",
-                table
+                AND ts < ?  LIMIT 100"
             ))?
             .query_map([&cutoff], |row| row.get::<_, u64>(0))?
             .collect::<Result<Vec<u64>, rusqlite::Error>>()?;
@@ -121,7 +120,6 @@ async fn reap_table(
                 WHERE NOT EXISTS 
                     (SELECT 1 FROM {table}__crsql_clock WHERE __crsql_key = key) 
                 LIMIT 100",
-                table = table
             ))?
             .query_map([], |row| row.get::<_, u64>(0))?
             .collect::<Result<Vec<u64>, rusqlite::Error>>()?;
@@ -144,23 +142,21 @@ async fn reap_table(
     let mut write_conn = pool
         .write_low()
         .await
-        .map_err(|e| ReaperError::WritePool(e))?;
+        .map_err(ReaperError::WritePool)?;
 
     let (clocks, pks) = block_in_place(|| {
         let tx = write_conn.immediate_transaction()?;
 
         let deleted_clocks = tx
             .prepare_cached(&format!(
-                "DELETE FROM {}__crsql_clock WHERE key IN (SELECT value0 FROM unnest(?))",
-                table
+                "DELETE FROM {table}__crsql_clock WHERE key IN (SELECT value0 FROM unnest(?))",
             ))?
             .execute(params![unnest_param(pks_to_delete.clone())])?;
 
         orphaned_pks.extend_from_slice(&pks_to_delete);
         let deleted_pks = tx
             .prepare_cached(&format!(
-                "DELETE FROM {}__crsql_pks WHERE __crsql_key IN (SELECT value0 FROM unnest(?))",
-                table
+                "DELETE FROM {table}__crsql_pks WHERE __crsql_key IN (SELECT value0 FROM unnest(?))",
             ))?
             .execute(params![unnest_param(orphaned_pks)])?;
 
