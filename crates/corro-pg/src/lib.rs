@@ -2040,8 +2040,26 @@ pub async fn start(
                                     continue;
                                 },
                                 PgWireFrontendMessage::SslNegotiation(_) => {
+                                    // SSL Negotiation should be sent as first message on a new connection.
+                                    back_tx.blocking_send(
+                                        (
+                                            PgWireBackendMessage::ErrorResponse(
+                                                ErrorInfo::new(
+                                                    "ERROR".into(),
+                                                    "XX000".to_owned(),
+                                                    "Unexpected SSL Negotiation message".into(),
+                                                )
+                                                .into(),
+                                            ),
+                                            true,
+                                        )
+                                            .into(),
+                                    )?;
+                                    continue;
+
                                 },
                                 PgWireFrontendMessage::PortalSuspended(_) => {
+                                    // this shouldn't happen, backend sends this msg.
                                 },
                             }
                         }
