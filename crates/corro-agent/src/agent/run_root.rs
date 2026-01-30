@@ -7,8 +7,8 @@ use crate::{
     agent::{
         handlers::{self, spawn_handle_db_maintenance},
         metrics,
-        setup, util, AgentOptions,
         reaper::spawn_reaper,
+        setup, util, AgentOptions,
     },
     broadcast::runtime_loop,
     transport::Transport,

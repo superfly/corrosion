@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use corro_types::{
-    agent::{Agent, PoolError},
+    agent::{Agent, PoolError, SplitPool},
     broadcast::Timestamp,
     sqlite::{unnest_param, SqlitePoolError},
 };
@@ -65,7 +65,7 @@ pub fn spawn_reaper(agent: &Agent) -> eyre::Result<()> {
                 interval.tick().await;
 
                 for (table_name, retention) in tables.iter() {
-                    match reap_table(&agent, table_name, *retention, &clock).await {
+                    match reap_table(&agent.pool(), table_name, *retention, &clock).await {
                         Ok((clocks, pks)) => {
                             if clocks > 0 {
                                 info!(%table_name, clocks = clocks, "deleted clocks");
@@ -93,12 +93,12 @@ pub fn spawn_reaper(agent: &Agent) -> eyre::Result<()> {
 }
 
 async fn reap_table(
-    agent: &Agent,
+    pool: &SplitPool,
     table: &str,
     retention: Duration,
     clock: &uhlc::HLC,
 ) -> Result<(usize, usize), ReaperError> {
-    let read_conn = agent.pool().read().await.map_err(ReaperError::ReadPool)?;
+    let read_conn = pool.read().await.map_err(ReaperError::ReadPool)?;
 
     let now = Timestamp::from(clock.new_timestamp()).to_ntp64();
     let cutoff = Timestamp::from(now - uhlc::NTP64::from(retention));
@@ -141,8 +141,7 @@ async fn reap_table(
     );
 
     // Delete the PKs
-    let mut write_conn = agent
-        .pool()
+    let mut write_conn = pool
         .write_low()
         .await
         .map_err(|e| ReaperError::WritePool(e))?;
@@ -152,7 +151,7 @@ async fn reap_table(
 
         let deleted_clocks = tx
             .prepare_cached(&format!(
-                "DELETE FROM {}__crsql_clock WHERE key IN (SELECT table0 FROM unnest(?))",
+                "DELETE FROM {}__crsql_clock WHERE key IN (SELECT value0 FROM unnest(?))",
                 table
             ))?
             .execute(params![unnest_param(pks_to_delete.clone())])?;
@@ -160,7 +159,7 @@ async fn reap_table(
         orphaned_pks.extend_from_slice(&pks_to_delete);
         let deleted_pks = tx
             .prepare_cached(&format!(
-                "DELETE FROM {}__crsql_pks WHERE __crsql_key IN (SELECT table0 FROM unnest(?))",
+                "DELETE FROM {}__crsql_pks WHERE __crsql_key IN (SELECT value0 FROM unnest(?))",
                 table
             ))?
             .execute(params![unnest_param(orphaned_pks)])?;
@@ -186,6 +185,35 @@ pub enum ReaperError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use corro_types::{agent::SplitPool, broadcast::Timestamp, sqlite::setup_conn};
+    use std::sync::Arc;
+    use tempfile::tempdir;
+    use tokio::sync::Semaphore;
+    use uhlc::HLCBuilder;
+
+    async fn setup_test_db(path: std::path::PathBuf) -> eyre::Result<SplitPool> {
+        let write_sema = Arc::new(Semaphore::new(1));
+        let pool = SplitPool::create(path, write_sema).await?;
+
+        // Create test table
+        let conn = pool.write_priority().await?;
+        block_in_place(|| {
+            setup_conn(&conn)?;
+            conn.execute_batch(
+                r#"
+                CREATE TABLE tests (
+                    id INTEGER NOT NULL PRIMARY KEY,
+                    text TEXT NOT NULL DEFAULT ""
+                ) WITHOUT ROWID;
+                SELECT crsql_as_crr('tests');
+                "#,
+            )?;
+            Ok::<_, rusqlite::Error>(())
+        })
+        .map_err(|e: rusqlite::Error| eyre::eyre!("{e}"))?;
+
+        Ok(pool)
+    }
 
     #[test]
     fn test_parse_duration() {
@@ -195,5 +223,99 @@ mod tests {
         assert_eq!(parse_duration("14d").unwrap(), Duration::from_secs(1209600));
         assert_eq!(parse_duration("1w").unwrap(), Duration::from_secs(604800));
         assert_eq!(parse_duration("1y").unwrap(), Duration::from_secs(31536000));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn test_reaper_deletes_old_sentinel_rows() -> eyre::Result<()> {
+        let tmpdir: tempfile::TempDir = tempdir()?;
+        let db_path = tmpdir.path().join("test.db");
+        _ = tracing_subscriber::fmt::try_init();
+        let pool = setup_test_db(db_path).await?;
+        let clock = HLCBuilder::default().build();
+
+        let table = "tests";
+
+        let now_ts = Timestamp::from(clock.new_timestamp());
+        let old_ts =
+            Timestamp::from(now_ts.to_ntp64() - uhlc::NTP64::from(parse_duration("1w").unwrap()));
+
+        // Insert rows with old timestamp and delete some
+        let recently_deleted: [u64; 2] = [4, 5];
+        let deleted: [u64; 2] = [1, 2];
+        {
+            let mut conn = pool.write_priority().await?;
+            block_in_place(|| {
+                let tx = conn.immediate_transaction()?;
+
+                tx.prepare_cached("SELECT crsql_set_ts(?)")?
+                    .query_row([&old_ts], |_| Ok(()))?;
+
+                // Insert rows
+                tx.execute("INSERT INTO tests (id, text) VALUES (1, 'test1')", [])?;
+                tx.execute("INSERT INTO tests (id, text) VALUES (2, 'test2')", [])?;
+                tx.execute("INSERT INTO tests (id, text) VALUES (3, 'test3')", [])?;
+                tx.execute("INSERT INTO tests (id, text) VALUES (4, 'test4')", [])?;
+                tx.execute("INSERT INTO tests (id, text) VALUES (5, 'test5')", [])?;
+
+                tx.commit()?;
+
+                let tx = conn.immediate_transaction()?;
+                tx.prepare_cached("SELECT crsql_set_ts(?)")?
+                    .query_row([&old_ts], |_| Ok(()))?;
+
+                tx.execute("DELETE FROM tests WHERE id IN (?, ?)", deleted)?;
+
+                tx.commit()?;
+                Ok::<_, rusqlite::Error>(())
+            })?;
+        }
+
+        // Delete some rows with a more recent timestamp
+        {
+            let mut conn = pool.write_priority().await?;
+            block_in_place(|| {
+                let tx = conn.immediate_transaction()?;
+                tx.prepare_cached("SELECT crsql_set_ts(?)")?
+                    .query_row([&now_ts], |_| Ok(()))?;
+                tx.execute("DELETE FROM tests WHERE id IN (?, ?)", recently_deleted)?;
+                tx.commit()?;
+                Ok::<_, rusqlite::Error>(())
+            })?;
+        }
+
+        let (clocks, pks) = reap_table(&pool, table, parse_duration("1w").unwrap(), &clock).await?;
+        assert_eq!(clocks, 2, "should delete 2 old clock entries");
+        assert_eq!(pks, 2, "should delete 2 old PKs");
+
+        let (clocks, pks) = reap_table(&pool, table, parse_duration("2d").unwrap(), &clock).await?;
+        assert_eq!(clocks, 0, "no more entries to delete");
+        assert_eq!(pks, 0, "no more entries to delete");
+
+        let read_conn = pool.read().await?;
+        let old_sentinel_count: i64 = read_conn.query_row(
+            "SELECT COUNT(*) FROM tests__crsql_clock WHERE key IN (?, ?)",
+            deleted,
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            old_sentinel_count, 0,
+            "old sentinel entries should be deleted"
+        );
+
+        let old_pk_count: i64 = read_conn.query_row(
+            "SELECT COUNT(*) FROM tests__crsql_pks WHERE __crsql_key IN (?, ?)",
+            deleted,
+            |row| row.get(0),
+        )?;
+        assert_eq!(old_pk_count, 0, "old PKs should be deleted");
+
+        let recent: i64 = read_conn.query_row(
+            "SELECT COUNT(*) FROM tests__crsql_clock WHERE key IN (?, ?)",
+            recently_deleted,
+            |row| row.get(0),
+        )?;
+        assert_eq!(recent, 2, "recent sentinel entries should still exist");
+
+        Ok(())
     }
 }

@@ -505,7 +505,7 @@ pub struct ConsulConfig {
     pub client: consul_client::Config,
 }
 
-// ReaperConfig specifies tables and the duration after which clock and pk records for deleted 
+// ReaperConfig specifies tables and the duration after which clock and pk records for deleted
 // primary keys can be deleted (i.e data in <table>__crsql_pks and <table>__crsql_clock).
 // WARNING: Specifying table to be reaped can cause inconsistencies if old primary keys come back
 // after specified duration. Use with caution.
