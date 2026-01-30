@@ -139,10 +139,7 @@ async fn reap_table(
     );
 
     // Delete the PKs
-    let mut write_conn = pool
-        .write_low()
-        .await
-        .map_err(ReaperError::WritePool)?;
+    let mut write_conn = pool.write_low().await.map_err(ReaperError::WritePool)?;
 
     let (clocks, pks) = block_in_place(|| {
         let tx = write_conn.immediate_transaction()?;
