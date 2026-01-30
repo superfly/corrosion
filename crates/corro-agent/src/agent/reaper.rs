@@ -186,7 +186,6 @@ pub enum ReaperError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use uhlc::system_time_clock;
 
     #[test]
     fn test_parse_duration() {
