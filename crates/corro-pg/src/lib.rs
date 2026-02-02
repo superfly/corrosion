@@ -1071,16 +1071,10 @@ pub async fn start(
                                             if param_types.len() != prepped.parameter_count() {
                                                 let extracted_types = parameter_types(&schema, &parsed_cmd);
 
-                                                if extracted_types.is_err() {
-                                                        let e = extracted_types.unwrap_err();
-                                                        back_tx.blocking_send(BackendResponse::Message {
-                                                            message: e.into(),
-                                                            flush: true,
-                                                        })?;
-                                                        discard_until_sync = true;
-                                                        continue;
-                                                    }
-                                                param_types = extracted_types.unwrap().params
+
+                                                param_types = match extracted_types {
+                                                    Ok(extracted_types) => {
+                                                        extracted_types.params
                                                     .into_iter()
                                                     .map(|param| {
                                                         trace!("got param: {param:?}");
@@ -1118,7 +1112,17 @@ pub async fn start(
                                                             },
                                                         }
                                                     })
-                                                    .collect();
+                                                    .collect()
+                                                    }
+                                                    Err(e) => {
+                                                        back_tx.blocking_send(BackendResponse::Message {
+                                                            message: e.into(),
+                                                            flush: true,
+                                                        })?;
+                                                        discard_until_sync = true;
+                                                        continue;
+                                                    }
+                                                };
                                             }
 
                                             let fields = match field_types(
