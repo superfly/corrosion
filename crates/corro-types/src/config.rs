@@ -138,6 +138,7 @@ impl DbConfig {
 }
 
 #[derive(Debug, Clone)]
+#[cfg_attr(test, derive(PartialEq))]
 pub struct ApiConfig {
     pub bind_addr: Vec<SocketAddr>,
     pub authorization: Option<AuthzConfig>,
@@ -203,6 +204,14 @@ impl<'de> Deserialize<'de> for ApiConfig {
             }
 
             fn visit_borrowed_str<E>(self, v: &'de str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                let addr = v.parse().map_err(serde::de::Error::custom)?;
+                Ok(vec![addr])
+            }
+
+            fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
             where
                 E: serde::de::Error,
             {
@@ -280,8 +289,8 @@ impl<'de> Deserialize<'de> for ApiConfig {
                 let mut authorization = None;
                 let mut pg = None;
 
-                while let Some(key) = map.next_key()? {
-                    match key {
+                while let Some(key) = map.next_key::<String>()? {
+                    match dbg!(key.as_str()) {
                         "addr" => bind_addr = map.next_value::<BindAddrs>()?.0,
                         "authz" => authorization = map.next_value()?,
                         "pg" => pg = map.next_value::<Option<Pg>>()?.map(|pg| pg.0),
@@ -306,6 +315,7 @@ impl<'de> Deserialize<'de> for ApiConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(test, derive(PartialEq))]
 pub struct PgConfig {
     #[serde(alias = "addr")]
     pub bind_addr: SocketAddr,
@@ -315,6 +325,7 @@ pub struct PgConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(test, derive(PartialEq))]
 pub struct PgTlsConfig {
     pub cert_file: Utf8PathBuf,
     pub key_file: Utf8PathBuf,
@@ -326,6 +337,7 @@ pub struct PgTlsConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
+#[cfg_attr(test, derive(PartialEq))]
 pub enum AuthzConfig {
     #[serde(alias = "bearer")]
     BearerToken(String),
@@ -643,4 +655,49 @@ pub enum LogFormat {
 #[serde(rename_all = "kebab-case")]
 pub struct ConsulConfig {
     pub client: consul_client::Config,
+}
+
+#[cfg(test)]
+mod test {
+    #[test]
+    fn deserializes_api_config() {
+        let cfg = r#"
+addr = "127.0.0.1:8081"
+
+[pg]
+addr = "127.0.0.1:5471"
+"#;
+
+        toml::from_str::<super::ApiConfig>(cfg).unwrap();
+
+        let cfg1 = r#"
+addr = "127.0.0.1:8082"
+
+[[pg]]
+addr = "127.0.0.1:5471"
+readonly = true
+
+[[pg]]
+addr = "127.0.0.1:5472"
+"#;
+
+        let de = toml::from_str::<super::ApiConfig>(cfg1).unwrap();
+        let se = toml::to_string(&de).unwrap();
+        let de2 = toml::from_str::<super::ApiConfig>(&se).unwrap();
+
+        assert_eq!(de, de2);
+
+        let cfg2 = r#"
+addr = ["127.0.0.1:8081", "127.0.0.1:8086"]
+
+[[pg]]
+addr = "127.0.0.1:5471"
+
+[[pg]]
+addr = "127.0.0.1:5476"
+readonly = true
+"#;
+
+        toml::from_str::<super::ApiConfig>(cfg2).unwrap();
+    }
 }
