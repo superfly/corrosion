@@ -12,6 +12,7 @@ use metrics::counter;
 use rusqlite::params;
 use tokio::{task::block_in_place, time::interval};
 use tracing::{debug, error, info, trace};
+use tripwire::{Outcome, PreemptibleFutureExt, Tripwire};
 
 /// Parse a time string like "14d", "1m", "2h", "30s" into a Duration
 fn parse_duration(s: &str) -> eyre::Result<Duration> {
@@ -38,7 +39,7 @@ fn parse_duration(s: &str) -> eyre::Result<Duration> {
 }
 
 /// Spawn the reaper background task
-pub fn spawn_reaper(agent: &Agent) -> eyre::Result<()> {
+pub fn spawn_reaper(agent: &Agent, mut tripwire: Tripwire) -> eyre::Result<()> {
     let config = agent.config().reaper.clone();
 
     if let Some(config) = config {
@@ -58,14 +59,30 @@ pub fn spawn_reaper(agent: &Agent) -> eyre::Result<()> {
 
         tokio::spawn(async move {
             let mut interval = interval(Duration::from_secs(config.check_interval as u64));
-            // skip first tikc
+            // skip first tick so we don't run reaper immediately
             interval.tick().await;
             let clock = agent.clock();
             loop {
-                interval.tick().await;
-
+                tokio::select! {
+                    biased;
+                    _ = &mut tripwire => {
+                        break;
+                    }
+                    _ = interval.tick() => {
+                    }
+                }
                 for (table_name, retention) in tables.iter() {
-                    match reap_table(agent.pool(), table_name, *retention, clock).await {
+                    let result = match reap_table(agent.pool(), table_name, *retention, clock)
+                        .preemptible(&mut tripwire)
+                        .await
+                    {
+                        Outcome::Preempted(_) => {
+                            return;
+                        }
+                        Outcome::Completed(res) => res,
+                    };
+
+                    match result {
                         Ok((clocks, pks)) => {
                             if clocks > 0 {
                                 info!(%table_name, clocks = clocks, "deleted clocks");
@@ -79,11 +96,9 @@ pub fn spawn_reaper(agent: &Agent) -> eyre::Result<()> {
                             }
                         }
                         Err(e) => {
-                            error!(%table_name, error = %e, "error during reaping");
+                            error!("error while reaping table {table_name}: {e}");
                         }
                     }
-
-                    tokio::time::sleep(Duration::from_secs(2)).await;
                 }
             }
         });

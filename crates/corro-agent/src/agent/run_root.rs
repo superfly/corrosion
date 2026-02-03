@@ -250,7 +250,7 @@ async fn run(
         .inspect(|_| info!("corrosion buffered changes loop is done")),
     );
 
-    if let Err(e) = spawn_reaper(&agent) {
+    if let Err(e) = spawn_reaper(&agent, tripwire.clone()) {
         error!("could not spawn reaper: {e}");
     }
 
