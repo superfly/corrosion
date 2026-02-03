@@ -27,13 +27,12 @@ const DEPLOY_STATS_QUERY: &str = r#"
 SELECT
     t.name as team_name,
     t.state as team_state,
-    COUNT(DISTINCT d.id) as active_deployments,
-    COUNT(DISTINCT cs.id) as active_services,
+    d.id as deployment,
+    cs.id as service,
     MAX(COALESCE(d.updated_at, cs.updated_at)) as last_deployment_update
 FROM teams t
 LEFT JOIN deployments d ON d.team_id = t.id
 LEFT JOIN consul_services cs ON cs.team_id = t.id
-GROUP BY t.id
 "#;
 
 const TEAM_QUERY: &str = r#"
