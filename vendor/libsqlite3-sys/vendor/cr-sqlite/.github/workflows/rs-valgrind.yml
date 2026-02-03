@@ -1,0 +1,37 @@
+on:
+  pull_request:
+name: "rs-valgrind"
+jobs:
+  build:
+    name: Testing on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+        with:
+          submodules: true
+
+      - name: Load .env file
+        uses: xom9ikk/dotenv@v2
+        with:
+          path: ./
+
+      - name: Install valgrind
+        run: sudo apt update && sudo apt install -y valgrind
+
+      - name: Install Cargo Valgrind
+        run: |
+          cargo install cargo-valgrind
+
+      - name: Test Fractindex
+        run: |
+          cd core/rs/fractindex-core
+          cargo valgrind test --features=loadable_extension
+
+      - name: Test Core
+        run: |
+          cd core/rs/core
+          cargo valgrind test --features=loadable_extension

@@ -3,6 +3,7 @@ members = [ ".antithesis/client/rust-load-generator",
 	"crates/*",
 	"integration-tests"
 ]
+exclude = ["vendor/libsqlite3-sys"]
 resolver = "2"
 
 [workspace.package]
@@ -95,6 +96,9 @@ thread_local = "1.1.9"
 uhlc = { version = "0.7", features = ["defmt"] }
 uuid = { version = "1.3.1", features = ["v4", "serde"] }
 webpki = { version = "0.22.0", default-features = false, features = ["std"] }
+
+[patch.crates-io]
+libsqlite3-sys = { path = "vendor/libsqlite3-sys" }
 
 [profile.release]
 debug = 1
