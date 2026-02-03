@@ -290,7 +290,7 @@ impl<'de> Deserialize<'de> for ApiConfig {
                 let mut pg = None;
 
                 while let Some(key) = map.next_key::<String>()? {
-                    match dbg!(key.as_str()) {
+                    match key.as_str() {
                         "addr" => bind_addr = map.next_value::<BindAddrs>()?.0,
                         "authz" => authorization = map.next_value()?,
                         "pg" => pg = map.next_value::<Option<Pg>>()?.map(|pg| pg.0),
