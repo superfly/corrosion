@@ -26,7 +26,7 @@ bytes = "1.4.0"
 camino = {version = "1.1.4", features = ["serde1"] }
 clap = { version = "4.2.4", features = ["derive"] }
 compact_str = { version = "0.7.0", "features" = ["serde"] }
-config = {version = "0.13.3", default-features = false, features = ["toml"] }
+config = { version = "0.15.3", default-features = false, features = ["toml"] }
 crc32fast = "1.3.2"
 enquote = "1.1.0"
 eyre = "0.6.8"
@@ -43,7 +43,7 @@ http = { version = "1.3" }
 hyper = { version = "1.7", features = ["http1", "http2", "server", "client"] }
 hyper-rustls = { version = "0.27.0", default-features = false, features = ["http2", "ring"] }
 hyper-util = "0.1"
-indexmap = { version = "2.1.0", features = ["serde"] }
+indexmap = { version = "2.13.0", features = ["serde"] }
 itertools = { version = "0.14" }
 lazy_static = "1.5.0"
 metrics = "0.24.0"
@@ -71,7 +71,6 @@ rustls = { version = "0.23.0", default-features = false, features = ["ring"] }
 seahash = "4.1.0"
 serde = "1.0.159"
 serde_json = { version = "1.0.95", features = ["raw_value"] }
-serde_with = "2.3.2"
 smallvec = { version = "1.11.0", features = ["serde", "write", "union"] }
 speedy = { version = "0.8.7", features = ["uuid", "smallvec", "indexmap", "indexmap_v2" ], package = "speedy" }
 sqlite3-parser = "0.12.0"
