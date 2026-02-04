@@ -67,7 +67,10 @@ COPY .antithesis/corrosion/config.toml.tpl /etc/corrosion/config.toml.tpl
 COPY .antithesis/corrosion/schemas /etc/corrosion/schemas
 COPY .antithesis/corrosion/templates /etc/corrosion/templates
 
-COPY .antithesis/corrosion/test-templates/* /opt/antithesis/test/v1/basic_test/
+COPY .antithesis/corrosion/test-templates/verify_subscription.py /opt/antithesis/py-resources/verify_subscription.py
+COPY .antithesis/corrosion/test-templates/eventually_* /opt/antithesis/test/v1/basic_test/
+COPY .antithesis/corrosion/test-templates/anytime_* /opt/antithesis/test/v1/basic_test/
+COPY .antithesis/corrosion/test-templates/parallel_* /opt/antithesis/test/v1/basic_test/
 
 # Create supervisor configuration directory
 RUN mkdir -p /etc/supervisor/conf.d
