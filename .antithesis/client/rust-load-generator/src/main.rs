@@ -1,11 +1,15 @@
+mod storage;
+
 use antithesis_sdk::random;
 use clap::Parser;
-use corro_api_types::{sqlite::ChangeType, Statement, TypedQueryEvent};
+use config::{Config, File};
+use corro_api_types::{SqliteValue, Statement, TypedQueryEvent};
 use corro_client::CorrosionClient;
 use eyre::{eyre, Result};
 use futures::StreamExt;
 use hickory_resolver::Resolver;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -17,10 +21,43 @@ use tripwire::Tripwire;
 #[derive(Parser)]
 pub(crate) struct App {
     /// Set the config file path
-    #[clap(long, short, default_value = "fly.toml")]
-    pub(crate) config: PathBuf,
+    #[clap(long, short, default_value = "config.toml")]
+    config: String,
+    corrosion_addr: Vec<String>,
+}
 
-    pub(crate) corrosion_addr: Vec<String>,
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct AppConfig {
+    corrosion_cfg: HashMap<String, CorrosionConfig>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct CorrosionConfig {
+    addr: String,
+    db_path: PathBuf,
+}
+
+impl CorrosionConfig {
+    fn new(addr: String, db_path: PathBuf) -> Self {
+        Self { addr, db_path }
+    }
+
+    async fn create_client(&self) -> Result<CorrosionClient> {
+        let mut host_port = self.addr.split(':');
+        let host_name = host_port.next().unwrap_or("localhost");
+
+        let system_resolver = Resolver::builder_tokio()?.build();
+        match system_resolver.lookup_ip(host_name).await?.iter().next() {
+            Some(ip_addr) => {
+                let addr = SocketAddr::from((
+                    ip_addr,
+                    host_port.next().unwrap_or("8080").parse().unwrap(),
+                ));
+                Ok(CorrosionClient::new(addr, self.db_path.clone())?)
+            }
+            None => Err(eyre!("could not resolve ip address for {}", self.addr)),
+        }
+    }
 }
 
 const DEPLOY_STATS_QUERY: &str = r#"
@@ -64,59 +101,52 @@ struct DeploymentStats {
 async fn main() -> eyre::Result<()> {
     let app = <App as clap::Parser>::parse();
 
+    let config: AppConfig = Config::builder()
+        .add_source(File::with_name(&app.config))
+        .build()?
+        .try_deserialize()?;
+
     let (tripwire, tripwire_worker) = tripwire::Tripwire::new_signals();
     tracing_subscriber::fmt::init();
 
-    // todo: Pass CorrosionClient to all functions instead of addresses
-    subscribe_all(app.corrosion_addr.clone(), tripwire.clone());
+    for (name, cfg) in config.corrosion_cfg {
+        spawn_all_tasks(name, cfg.clone(), tripwire.clone());
+    }
 
-    query_all(app.corrosion_addr.clone(), tripwire.clone());
-
-    table_updates_all(app.corrosion_addr, tripwire.clone());
-
-    println!("tripwire_worker.await");
+    info!("tripwire_worker.await");
     tripwire_worker.await;
     Ok(())
 }
 
-fn subscribe_all(corrosion_addrs: Vec<String>, tripwire: Tripwire) {
-    for addr in corrosion_addrs {
-        let new_tripwire: Tripwire = tripwire.clone();
-        tokio::spawn(async move {
-            if let Err(e) = subscribe(addr, new_tripwire).await {
-                error!("failed to subscribe: {e}");
-            }
-        });
-    }
+fn spawn_all_tasks(name: String, cfg: CorrosionConfig, tripwire: Tripwire) {
+    let cfg_clone = cfg.clone();
+    let tripwire_clone = tripwire.clone();
+    tokio::spawn(async move {
+        if let Err(e) = subscribe(name, cfg_clone, tripwire_clone).await {
+            error!("failed to subscribe: {e}");
+        }
+    });
+
+    let cfg_clone = cfg.clone();
+    let tripwire_clone = tripwire.clone();
+    tokio::spawn(async move {
+        if let Err(e) = query(cfg_clone, tripwire_clone).await {
+            error!("failed to query: {e}");
+        }
+    });
+
+    tokio::spawn(async move {
+        if let Err(e) = table_updates(cfg, tripwire).await {
+            error!("failed to table updates: {e}");
+        }
+    });
 }
 
-fn query_all(corrosion_addrs: Vec<String>, tripwire: Tripwire) {
-    for addr in corrosion_addrs {
-        let new_tripwire: Tripwire = tripwire.clone();
-        tokio::spawn(async move {
-            if let Err(e) = query(addr, new_tripwire).await {
-                error!("failed to query: {e}");
-            }
-        });
-    }
-}
-
-fn table_updates_all(corrosion_addrs: Vec<String>, tripwire: Tripwire) {
-    for addr in corrosion_addrs {
-        let new_tripwire: Tripwire = tripwire.clone();
-        tokio::spawn(async move {
-            if let Err(e) = table_updates(addr, new_tripwire).await {
-                error!("failed to table updates: {e}");
-            }
-        });
-    }
-}
-
-async fn table_updates(addr: String, tripwire: Tripwire) -> eyre::Result<()> {
-    info!("starting table updates for {addr}");
+async fn table_updates(cfg: CorrosionConfig, tripwire: Tripwire) -> eyre::Result<()> {
+    info!("starting table updates for {}", cfg.addr);
     let client = {
         loop {
-            match create_client(&addr).await {
+            match cfg.create_client().await {
                 Ok(client) => break client,
                 Err(e) => {
                     error!("could not create corrosion client: {e}");
@@ -161,7 +191,7 @@ async fn table_updates(addr: String, tripwire: Tripwire) -> eyre::Result<()> {
     Ok(())
 }
 
-async fn query(addr: String, tripwire: Tripwire) -> eyre::Result<()> {
+async fn query(cfg: CorrosionConfig, tripwire: Tripwire) -> eyre::Result<()> {
     let mut corro_client = None;
     loop {
         if tripwire.is_shutting_down() {
@@ -170,7 +200,7 @@ async fn query(addr: String, tripwire: Tripwire) -> eyre::Result<()> {
         }
 
         if corro_client.is_none() {
-            match create_client(&addr).await {
+            match cfg.create_client().await {
                 Ok(client) => {
                     corro_client = Some(client);
                 }
@@ -227,10 +257,11 @@ async fn query(addr: String, tripwire: Tripwire) -> eyre::Result<()> {
     Ok(())
 }
 
-async fn subscribe(addr: String, mut tripwire: Tripwire) -> eyre::Result<()> {
+async fn subscribe(name: String, cfg: CorrosionConfig, mut tripwire: Tripwire) -> eyre::Result<()> {
     let mut last_change_id = None;
-    let mut sub_id = None;
-    let mut corro_client = None;
+    let mut corro_client: Option<CorrosionClient> = None;
+    let mut storage: Option<storage::SubscriptionDb> = None;
+
     loop {
         if tripwire.is_shutting_down() {
             info!("tripped! Shutting down");
@@ -238,7 +269,7 @@ async fn subscribe(addr: String, mut tripwire: Tripwire) -> eyre::Result<()> {
         }
 
         if corro_client.is_none() {
-            match create_client(&addr).await {
+            match cfg.create_client().await {
                 Ok(client) => {
                     corro_client = Some(client);
                 }
@@ -251,42 +282,52 @@ async fn subscribe(addr: String, mut tripwire: Tripwire) -> eyre::Result<()> {
         }
 
         let client: &CorrosionClient = corro_client.as_ref().unwrap();
-        let mut sub: corro_client::sub::SubscriptionStream<DeploymentStats> =
-            match if let Some(sub_id) = sub_id {
-                client
-                    .subscription_typed::<DeploymentStats>(sub_id, true, last_change_id)
-                    .await
-            } else {
-                client
-                    .subscribe_typed::<DeploymentStats>(
-                        &Statement::WithParams(DEPLOY_STATS_QUERY.into(), vec![]),
-                        true,
-                        None,
-                    )
-                    .await
-            } {
-                Ok(sub) => {
-                    let id = sub.id();
-                    info!("Subscribed w/ id {id}");
-                    sub_id = Some(id);
-                    sub
+
+        // Use untyped subscription to get raw SqliteValue events
+        let mut sub: corro_client::sub::SubscriptionStream<Vec<SqliteValue>> = match client
+            .subscribe_typed::<Vec<SqliteValue>>(
+                &Statement::WithParams(DEPLOY_STATS_QUERY.into(), vec![]),
+                true,
+                last_change_id,
+            )
+            .await
+        {
+            Ok(sub) => {
+                let id = sub.id();
+                info!("Subscribed w/ id {id}");
+
+                // Initialize storage for this subscription (columns will be set when we receive them)
+                let subs_db_path = cfg
+                    .db_path
+                    .parent()
+                    .unwrap()
+                    .join(format!("load-gen/{id}.db"));
+                if storage.is_none() {
+                    let st = storage::SubscriptionDb::new(
+                        &subs_db_path,
+                        id,
+                        DEPLOY_STATS_QUERY,
+                        "query",
+                    )?;
+                    storage = Some(st);
                 }
-                Err(e) => {
-                    error!("could not subscribe: {e}");
-                    if !matches!(
-                        e,
-                        corro_client::Error::Reqwest(_)
-                            | corro_client::Error::Http(_)
-                            | corro_client::Error::InvalidUri(_)
-                    ) {
-                        // not a transient error, reset the subscription state
-                        last_change_id = None;
-                        sub_id = None;
-                    }
-                    sleep(Duration::from_secs(1)).await;
-                    continue;
+                sub
+            }
+            Err(e) => {
+                error!("could not subscribe: {e}");
+                if !matches!(
+                    e,
+                    corro_client::Error::Reqwest(_)
+                        | corro_client::Error::Http(_)
+                        | corro_client::Error::InvalidUri(_)
+                ) {
+                    last_change_id = None;
+                    storage = None;
                 }
-            };
+                sleep(Duration::from_secs(1)).await;
+                continue;
+            }
+        };
 
         loop {
             let msg_res = tokio::select! {
@@ -300,24 +341,48 @@ async fn subscribe(addr: String, mut tripwire: Tripwire) -> eyre::Result<()> {
                 },
             };
 
+            let storage_ref = storage.as_mut().unwrap();
             match msg_res {
-                Ok(TypedQueryEvent::Change(change_kind, _, stats, change_id)) => {
+                Ok(TypedQueryEvent::Columns(columns)) => {
+                    info!("Received columns: {:?}", columns);
+                    if let Err(e) = storage_ref.initialize_columns(columns) {
+                        error!("Failed to initialize columns: {e}");
+                    }
+                }
+                Ok(TypedQueryEvent::Row(row_id, values)) => {
+                    debug!("Received row: row_id={}, values={:?}", row_id.0, values);
+                    if let Err(e) = storage.as_mut().unwrap().insert_row(row_id, &values) {
+                        error!("Failed to insert row: {e}");
+                    }
+                }
+                Ok(TypedQueryEvent::Change(change_type, row_id, values, change_id)) => {
                     last_change_id = Some(change_id);
-                    if matches!(change_kind, ChangeType::Update | ChangeType::Insert) {
-                        // update some internal state that we can use to check later
-                        debug!("deployment stats: {stats:?}");
+                    debug!(
+                        "Received change: type={:?}, row_id={}, change_id={}",
+                        change_type, row_id.0, change_id.0
+                    );
+
+                    if let Err(e) =
+                        storage
+                            .as_mut()
+                            .unwrap()
+                            .handle_change(change_type, row_id, &values)
+                    {
+                        error!("Failed to handle change: {e}");
+                    }
+                }
+                Ok(TypedQueryEvent::EndOfQuery { change_id, .. }) => {
+                    if let Some(change_id) = change_id {
+                        last_change_id = Some(change_id);
+                        info!("End of query, last change_id: {}", change_id.0);
                     }
                 }
                 Ok(TypedQueryEvent::Error(e)) => {
                     error!("subscription error: {e}");
-                    sub_id = None;
                     last_change_id = None;
+                    storage = None;
                     break;
                 }
-                Ok(TypedQueryEvent::Row(_, stats)) => {
-                    debug!("deployment stats: {stats:?}");
-                }
-                Ok(_) => {}
                 Err(e) => {
                     error!("subscription client error: {e}");
                     break;
@@ -327,19 +392,4 @@ async fn subscribe(addr: String, mut tripwire: Tripwire) -> eyre::Result<()> {
     }
 
     Ok(())
-}
-
-async fn create_client(addr: &str) -> Result<CorrosionClient> {
-    let mut host_port = addr.split(':');
-    let host_name = host_port.next().unwrap_or("localhost");
-
-    let system_resolver = Resolver::builder_tokio()?.build();
-    match system_resolver.lookup_ip(host_name).await?.iter().next() {
-        Some(ip_addr) => {
-            let addr =
-                SocketAddr::from((ip_addr, host_port.next().unwrap_or("8080").parse().unwrap()));
-            Ok(CorrosionClient::new(addr, "/var/lib/corrosion2/state.db")?)
-        }
-        None => Err(eyre!("could not resolve ip address for {}", addr)),
-    }
 }

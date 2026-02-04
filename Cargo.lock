@@ -4316,16 +4316,19 @@ version = "0.1.0"
 dependencies = [
  "antithesis_sdk",
  "clap",
+ "config",
  "corro-api-types",
  "corro-client",
  "eyre",
  "futures",
  "hickory-resolver",
+ "rusqlite",
  "serde",
  "tokio",
  "tracing",
  "tracing-subscriber",
  "tripwire",
+ "uuid",
 ]
 
 [[package]]
