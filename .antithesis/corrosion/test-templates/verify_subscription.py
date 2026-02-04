@@ -21,7 +21,7 @@ from typing import List
 
 
 def get_subscription_db_path(state_db: Path, subscription: str) -> Path:
-if '/' in subscription:
+    if '/' in subscription:
         return Path(subscription)
     else:
         # Assume it's a UUID, construct path
