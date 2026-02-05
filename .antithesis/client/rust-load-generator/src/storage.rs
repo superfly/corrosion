@@ -27,11 +27,10 @@ impl SubscriptionDb {
              PRAGMA synchronous = NORMAL;",
         )?;
 
-        conn.execute_batch(
-            "CREATE TABLE meta (
-                key TEXT PRIMARY KEY NOT NULL,
-                value
-            );",
+        conn.execute("DROP TABLE IF EXISTS meta;", [])?;
+        conn.execute(
+            "CREATE TABLE meta (key TEXT PRIMARY KEY NOT NULL, value);",
+            [],
         )?;
 
         conn.execute("INSERT INTO meta (key, value) VALUES ('sql', ?)", [sql])?;

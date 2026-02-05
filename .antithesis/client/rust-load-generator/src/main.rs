@@ -9,7 +9,6 @@ use eyre::{eyre, Result};
 use futures::StreamExt;
 use hickory_resolver::Resolver;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -21,14 +20,14 @@ use tripwire::Tripwire;
 #[derive(Parser)]
 pub(crate) struct App {
     /// Set the config file path
-    #[clap(long, short, default_value = "config.toml")]
+    #[clap(long, short, default_value = "/etc/load-gen/config.toml")]
     config: String,
     corrosion_addr: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct AppConfig {
-    corrosion_cfg: HashMap<String, CorrosionConfig>,
+    servers: Vec<CorrosionConfig>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -38,10 +37,6 @@ struct CorrosionConfig {
 }
 
 impl CorrosionConfig {
-    fn new(addr: String, db_path: PathBuf) -> Self {
-        Self { addr, db_path }
-    }
-
     async fn create_client(&self) -> Result<CorrosionClient> {
         let mut host_port = self.addr.split(':');
         let host_name = host_port.next().unwrap_or("localhost");
@@ -109,8 +104,8 @@ async fn main() -> eyre::Result<()> {
     let (tripwire, tripwire_worker) = tripwire::Tripwire::new_signals();
     tracing_subscriber::fmt::init();
 
-    for (name, cfg) in config.corrosion_cfg {
-        spawn_all_tasks(name, cfg.clone(), tripwire.clone());
+    for cfg in config.servers {
+        spawn_all_tasks(cfg.clone(), tripwire.clone());
     }
 
     info!("tripwire_worker.await");
@@ -118,11 +113,11 @@ async fn main() -> eyre::Result<()> {
     Ok(())
 }
 
-fn spawn_all_tasks(name: String, cfg: CorrosionConfig, tripwire: Tripwire) {
+fn spawn_all_tasks(cfg: CorrosionConfig, tripwire: Tripwire) {
     let cfg_clone = cfg.clone();
     let tripwire_clone = tripwire.clone();
     tokio::spawn(async move {
-        if let Err(e) = subscribe(name, cfg_clone, tripwire_clone).await {
+        if let Err(e) = subscribe(cfg_clone, tripwire_clone).await {
             error!("failed to subscribe: {e}");
         }
     });
@@ -257,7 +252,7 @@ async fn query(cfg: CorrosionConfig, tripwire: Tripwire) -> eyre::Result<()> {
     Ok(())
 }
 
-async fn subscribe(name: String, cfg: CorrosionConfig, mut tripwire: Tripwire) -> eyre::Result<()> {
+async fn subscribe(cfg: CorrosionConfig, mut tripwire: Tripwire) -> eyre::Result<()> {
     let mut last_change_id = None;
     let mut corro_client: Option<CorrosionClient> = None;
     let mut storage: Option<storage::SubscriptionDb> = None;
@@ -287,7 +282,7 @@ async fn subscribe(name: String, cfg: CorrosionConfig, mut tripwire: Tripwire) -
         let mut sub: corro_client::sub::SubscriptionStream<Vec<SqliteValue>> = match client
             .subscribe_typed::<Vec<SqliteValue>>(
                 &Statement::WithParams(DEPLOY_STATS_QUERY.into(), vec![]),
-                true,
+                false,
                 last_change_id,
             )
             .await
@@ -302,6 +297,11 @@ async fn subscribe(name: String, cfg: CorrosionConfig, mut tripwire: Tripwire) -
                     .parent()
                     .unwrap()
                     .join(format!("load-gen/{id}.db"));
+
+                if let Some(path) = subs_db_path.parent() {
+                    info!("creating directory: {path:?}");
+                    tokio::fs::create_dir_all(path).await?;
+                }
                 if storage.is_none() {
                     let st = storage::SubscriptionDb::new(
                         &subs_db_path,

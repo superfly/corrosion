@@ -51,7 +51,7 @@ def do_inserts(address):
     try:
         id = helper.get_random_cols(address, "teams", ["id"])
         host, port = address.split(':')
-        conn = helper.get_db_connection(host, "5470")
+        conn = helper.get_db_connection(host, port)
         for j in range(helper.random_int(1, 10)):
             insert_deployment(conn, id[0], helper.random_int(1, 1000))
     except Exception as e:
@@ -59,13 +59,13 @@ def do_inserts(address):
 
 def main():
     parser = argparse.ArgumentParser(description='Insert teams and users into corrosion databases')
-    parser.add_argument('--addrs', nargs='+', help='List of corrosion addresses (e.g., --addresses corrosion1:8080 corrosion2:8080)')
+    parser.add_argument('--pg-addrs', nargs='+', help='List of corrosion addresses (e.g., --pg-addrs corrosion1:8080 corrosion2:8080)')
     args = parser.parse_args()
-    if args.addrs is None:
-        args.addrs = ["corrosion1:8080", "corrosion2:8080", "corrosion3:8080"]
+    if args.pg_addrs is None:
+        args.pg_addrs = ["corrosion1:5470", "corrosion2:5470", "corrosion3:5470"]
     threads = []
     for i in range(helper.random_int(1, 100)):
-        address = random.choice(args.addrs)
+        address = random.choice(args.pg_addrs)
         thread = threading.Thread(target=do_inserts, args=(address,))
         threads.append(thread)
         thread.start()

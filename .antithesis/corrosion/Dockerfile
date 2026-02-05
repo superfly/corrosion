@@ -64,6 +64,7 @@ COPY --from=builder /usr/src/app/rust-load-generator /symbols/rust-load-generato
 
 COPY .antithesis/corrosion/entrypoint.sh /entrypoint.sh
 COPY .antithesis/corrosion/config.toml.tpl /etc/corrosion/config.toml.tpl
+COPY .antithesis/corrosion/load_gen.toml /etc/load-gen/config.toml
 COPY .antithesis/corrosion/schemas /etc/corrosion/schemas
 COPY .antithesis/corrosion/templates /etc/corrosion/templates
 

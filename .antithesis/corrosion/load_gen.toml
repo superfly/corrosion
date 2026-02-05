@@ -1,0 +1,10 @@
+[servers]
+addr = "corrosion1:8080"
+db_path = "/var/lib/corrosion1/state.db"
+
+[servers]
+addr = "corrosion2:8080"
+db_path = "/var/lib/corrosion2/state.db"
+
+addr = "corrosion:8080"
+db_path = "/var/lib/corrosion3/state.db"
