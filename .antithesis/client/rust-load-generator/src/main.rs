@@ -61,7 +61,7 @@ SELECT
     t.state as team_state,
     d.id as deployment,
     cs.id as service,
-    MAX(COALESCE(d.updated_at, cs.updated_at)) as last_deployment_update
+    MAX(d.updated_at, cs.updated_at) as last_deployment_update
 FROM teams t
 LEFT JOIN deployments d ON d.team_id = t.id
 LEFT JOIN consul_services cs ON cs.team_id = t.id
