@@ -9,6 +9,10 @@ services:
     - RUST_BACKTRACE=full
     annotations:
       com.antithesis.exclude.faults: "all"
+    volumes:
+      - ./volumes/corrosion1:/var/lib/corrosion1
+      - ./volumes/corrosion2:/var/lib/corrosion2
+      - ./volumes/corrosion3:/var/lib/corrosion3
 
   corrosion1:
     container_name: corrosion1

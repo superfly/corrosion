@@ -41,7 +41,7 @@ def get_sql_from_meta(conn: sqlite3.Connection):
 
 def get_query_columns(conn: sqlite3.Connection) -> List[str]:
     cursor = conn.execute("PRAGMA table_info(query)")
-    columns = [row[1] for row in cursor.fetchall() if "col_" in row[1]]
+    columns = [row[1] for row in cursor.fetchall() if "__corro_" not in row[1]]
     return columns
 
 
