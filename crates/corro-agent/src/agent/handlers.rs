@@ -428,7 +428,7 @@ pub async fn handle_notifications(
 /// to schedule this task too often since it locks the whole DB.
 // TODO: can we get around the lock somehow?
 fn wal_checkpoint(conn: &rusqlite::Connection, timeout: u64) -> eyre::Result<()> {
-    debug!("handling db_cleanup (WAL truncation)");
+    debug!("handling db_cleanup (WAL truncation) with timeout: {timeout}");
     let start = Instant::now();
 
     assert_sometimes!(true, "Corrosion truncates WAL");
@@ -570,6 +570,7 @@ async fn wal_checkpoint_over_threshold(
     let wal_size = wal_path.metadata()?.len();
     let should_truncate = wal_size > threshold;
 
+    debug!("wal_size: {wal_size} bytes, threshold: {threshold} bytes, should_truncate: {should_truncate}");
     if should_truncate {
         let conn = if wal_size > (5 * threshold) {
             warn!("wal_size is over 5x the threshold, trying to get a priority conn");
