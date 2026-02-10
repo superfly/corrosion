@@ -38,7 +38,7 @@ def insert_team(address):
 
 def main():
     parser = argparse.ArgumentParser(description='Insert teams and users into corrosion databases')
-    parser.add_argument('--addrs', nargs='+', help='List of corrosion addresses (e.g., --addresses corrosion1:8080 corrosion2:8080)')
+    parser.add_argument('--addrs', nargs='+', help='List of corrosion addresses (e.g., --addrs corrosion1:8080 corrosion2:8080)')
     args = parser.parse_args()
     if args.addrs is None:
         args.addrs = ["corrosion1:8080", "corrosion2:8080", "corrosion3:8080"]
