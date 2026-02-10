@@ -20,7 +20,6 @@ use std::{
 };
 
 use chrono::NaiveDateTime;
-use codec::PgWireMessageServerCodec;
 use compact_str::CompactString;
 use corro_types::{
     agent::{Agent, ChangeError},
@@ -36,6 +35,7 @@ use futures::{SinkExt, StreamExt};
 use metrics::counter;
 use pgwire::{
     api::results::{DataRowEncoder, FieldFormat, FieldInfo, Tag},
+    api::DefaultClient,
     error::{ErrorInfo, PgWireError},
     messages::{
         data::{NoData, ParameterDescription, RowDescription},
@@ -46,7 +46,8 @@ use pgwire::{
         startup::ParameterStatus,
         PgWireBackendMessage, PgWireFrontendMessage,
     },
-    types::FromSqlText,
+    tokio::server::PgWireMessageServerCodec,
+    types::{format::FormatOptions, FromSqlText},
 };
 use postgres_types::{FromSql, Type};
 use rand::{rngs::StdRng, Rng, SeedableRng};
@@ -592,7 +593,7 @@ pub async fn start(
 
                 let mut tcp_socket = Framed::new(
                     tokio::io::BufStream::new(conn),
-                    PgWireMessageServerCodec::new(codec::Client::new(local_addr, false)),
+                    PgWireMessageServerCodec::<()>::new(DefaultClient::new(local_addr, false)),
                 );
 
                 let negotiation =
@@ -620,7 +621,9 @@ pub async fn start(
 
                         let framed = Framed::new(
                             tokio::io::BufStream::new(tls_socket),
-                            PgWireMessageServerCodec::new(codec::Client::new(local_addr, true)),
+                            PgWireMessageServerCodec::new(DefaultClient::<()>::new(
+                                local_addr, true,
+                            )),
                         );
 
                         (Either::Right(framed), true, None)
@@ -1068,16 +1071,10 @@ pub async fn start(
                                             if param_types.len() != prepped.parameter_count() {
                                                 let extracted_types = parameter_types(&schema, &parsed_cmd);
 
-                                                if extracted_types.is_err() {
-                                                        let e = extracted_types.unwrap_err();
-                                                        back_tx.blocking_send(BackendResponse::Message {
-                                                            message: e.into(),
-                                                            flush: true,
-                                                        })?;
-                                                        discard_until_sync = true;
-                                                        continue;
-                                                    }
-                                                param_types = extracted_types.unwrap().params
+
+                                                param_types = match extracted_types {
+                                                    Ok(extracted_types) => {
+                                                        extracted_types.params
                                                     .into_iter()
                                                     .map(|param| {
                                                         trace!("got param: {param:?}");
@@ -1115,7 +1112,17 @@ pub async fn start(
                                                             },
                                                         }
                                                     })
-                                                    .collect();
+                                                    .collect()
+                                                    }
+                                                    Err(e) => {
+                                                        back_tx.blocking_send(BackendResponse::Message {
+                                                            message: e.into(),
+                                                            flush: true,
+                                                        })?;
+                                                        discard_until_sync = true;
+                                                        continue;
+                                                    }
+                                                };
                                             }
 
                                             let fields = match field_types(
@@ -2035,22 +2042,16 @@ pub async fn start(
                                             .into(),
                                     )?;
                                     continue;
-                                }
-                                PgWireFrontendMessage::GssEncRequest(_) => {
-                                    back_tx.blocking_send(
-                                        (
-                                            PgWireBackendMessage::GssEncResponse(pgwire::messages::response::GssEncResponse::Refuse), false
-                                        ).into())?;
-                                    continue;
-                                }
-                                PgWireFrontendMessage::SslRequest(_) => {
+                                },
+                                PgWireFrontendMessage::SslNegotiation(_) => {
+                                    // SSL Negotiation should be sent as first message on a new connection.
                                     back_tx.blocking_send(
                                         (
                                             PgWireBackendMessage::ErrorResponse(
                                                 ErrorInfo::new(
                                                     "ERROR".into(),
                                                     "XX000".to_owned(),
-                                                    "SslRequest is not implemented".into(),
+                                                    "Unexpected SSL Negotiation message".into(),
                                                 )
                                                 .into(),
                                             ),
@@ -2059,7 +2060,11 @@ pub async fn start(
                                             .into(),
                                     )?;
                                     continue;
-                                }
+
+                                },
+                                PgWireFrontendMessage::PortalSuspended(_) => {
+                                    // this shouldn't happen, backend sends this msg.
+                                },
                             }
                         }
 
@@ -2277,7 +2282,7 @@ impl<'conn> Session<'conn> {
                         }
                     }
                 }
-                let data_row = encoder.finish()?;
+                let data_row = encoder.take_row();
                 back_tx
                     .blocking_send((PgWireBackendMessage::DataRow(data_row), false).into())
                     .map_err(|_| QueryError::BackendResponseSendFailed)?;
@@ -2401,6 +2406,7 @@ impl<'conn> Session<'conn> {
                 for (idx, field) in schema.iter().enumerate() {
                     trace!("processing field: {field:?}");
                     let format = field.format();
+                    let format_opts = field.format_options().as_ref();
                     match field.datatype() {
                         &Type::ANY => {
                             let data = row.get_ref_unwrap(idx);
@@ -2410,11 +2416,17 @@ impl<'conn> Session<'conn> {
                                         &None::<i8>,
                                         &Type::ANY,
                                         format,
+                                        format_opts,
                                     )
                                     .unwrap(),
                                 ValueRef::Integer(i) => {
                                     encoder
-                                        .encode_field_with_type_and_format(&i, &Type::INT8, format)
+                                        .encode_field_with_type_and_format(
+                                            &i,
+                                            &Type::INT8,
+                                            format,
+                                            format_opts,
+                                        )
                                         .unwrap();
                                 }
                                 ValueRef::Real(f) => {
@@ -2423,6 +2435,7 @@ impl<'conn> Session<'conn> {
                                             &f,
                                             &Type::FLOAT8,
                                             format,
+                                            format_opts,
                                         )
                                         .unwrap();
                                 }
@@ -2432,12 +2445,18 @@ impl<'conn> Session<'conn> {
                                             &String::from_utf8_lossy(t).as_ref(),
                                             &Type::TEXT,
                                             format,
+                                            format_opts,
                                         )
                                         .unwrap();
                                 }
                                 ValueRef::Blob(b) => {
                                     encoder
-                                        .encode_field_with_type_and_format(&b, &Type::BYTEA, format)
+                                        .encode_field_with_type_and_format(
+                                            &b,
+                                            &Type::BYTEA,
+                                            format,
+                                            format_opts,
+                                        )
                                         .unwrap();
                                 }
                             }
@@ -2448,6 +2467,7 @@ impl<'conn> Session<'conn> {
                                     &row.get::<_, Option<i64>>(idx)?,
                                     t,
                                     format,
+                                    format_opts,
                                 )
                                 .unwrap();
                         }
@@ -2457,6 +2477,7 @@ impl<'conn> Session<'conn> {
                                     &row.get::<_, Option<NaiveDateTime>>(idx)?,
                                     t,
                                     format,
+                                    format_opts,
                                 )
                                 .unwrap();
                         }
@@ -2466,6 +2487,7 @@ impl<'conn> Session<'conn> {
                                     &row.get::<_, Option<String>>(idx)?,
                                     t,
                                     format,
+                                    format_opts,
                                 )
                                 .unwrap();
                         }
@@ -2475,6 +2497,7 @@ impl<'conn> Session<'conn> {
                                     &row.get::<_, Option<Vec<u8>>>(idx)?,
                                     t,
                                     format,
+                                    format_opts,
                                 )
                                 .unwrap();
                         }
@@ -2484,6 +2507,7 @@ impl<'conn> Session<'conn> {
                                     &row.get::<_, Option<f64>>(idx)?,
                                     t,
                                     format,
+                                    format_opts,
                                 )
                                 .unwrap();
                         }
@@ -2495,7 +2519,7 @@ impl<'conn> Session<'conn> {
                     }
                 }
 
-                let data_row = encoder.finish()?;
+                let data_row = encoder.take_row();
                 back_tx
                     .blocking_send((PgWireBackendMessage::DataRow(data_row), false).into())
                     .map_err(|_| QueryError::BackendResponseSendFailed)?;
@@ -2729,13 +2753,19 @@ fn from_type_and_format<'a, E, T: FromSql<'a> + FromStr<Err = E>>(
     })
 }
 
-fn from_array_type_and_format<'a, T: FromSql<'a> + FromSqlText>(
+fn from_array_type_and_format<'a, T>(
     t: &Type,
     b: &'a [u8],
     format_code: FormatCode,
-) -> Result<Vec<T>, ToParamError<String>> {
+) -> Result<Vec<T>, ToParamError<String>>
+where
+    T: FromSql<'a> + for<'b> FromSqlText<'b>,
+{
+    let format_opts = FormatOptions::default();
     Ok(match format_code {
-        FormatCode::Text => Vec::<T>::from_vec_sql_text(t, b).map_err(ToParamError::FromSql)?,
+        FormatCode::Text => {
+            Vec::<T>::from_vec_sql_text(t, b, &format_opts).map_err(ToParamError::FromSql)?
+        }
         FormatCode::Binary => Vec::<T>::from_sql(t, b).map_err(ToParamError::FromSql)?,
     })
 }

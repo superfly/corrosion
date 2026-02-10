@@ -8,7 +8,7 @@ use corro_types::{
     config::{PgConfig, PgTlsConfig},
     tls::{generate_ca, generate_client_cert, generate_server_cert},
 };
-use pgwire::types::ToSqlText;
+use pgwire::types::{format::FormatOptions, ToSqlText};
 use postgres_types::{Format, IsNull, ToSql, Type};
 use rcgen::Certificate;
 use rustls::pki_types::pem::PemObject;
@@ -821,7 +821,7 @@ impl<'a, T: ToSqlText + ToSql> ToSql for SqlVec<'a, T> {
         out: &mut bytes::BytesMut,
     ) -> Result<IsNull, Box<dyn std::error::Error + Sync + Send>> {
         match self.format {
-            Format::Text => self.inner.to_sql_text(ty, out),
+            Format::Text => self.inner.to_sql_text(ty, out, &FormatOptions::default()),
             Format::Binary => self.inner.to_sql(ty, out),
         }
     }
