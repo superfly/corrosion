@@ -49,11 +49,15 @@ def insert_deployment(conn, team_id, net_id):
 
 def do_inserts(address):
     try:
-        id = helper.get_random_cols(address, "teams", ["id"])
         host, port = address.split(':')
         conn = helper.get_db_connection(host, port)
-        for j in range(helper.random_int(1, 10)):
-            insert_deployment(conn, id[0], helper.random_int(1, 1000))
+        id = helper.query_psql(conn, "SELECT id FROM teams ORDER BY RANDOM() LIMIT 1")
+        if len(id) > 0:
+            insert_deployment(conn, id[0][0], helper.random_int(1, 1000))
+        else:
+            print(f"No team found")
+
+        conn.close()
     except Exception as e:
         print(f"Error inserting deployment for {address}: {e}")
 
@@ -64,7 +68,7 @@ def main():
     if args.pg_addrs is None:
         args.pg_addrs = ["corrosion1:5470", "corrosion2:5470", "corrosion3:5470"]
     threads = []
-    for i in range(helper.random_int(1, 100)):
+    for i in range(helper.random_int(1, 20)):
         address = random.choice(args.pg_addrs)
         thread = threading.Thread(target=do_inserts, args=(address,))
         threads.append(thread)

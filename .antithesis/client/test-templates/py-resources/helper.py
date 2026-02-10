@@ -31,7 +31,16 @@ def execute_psql(conn, sql_command, params=None):
     else:
         cursor.execute(sql_command)
     conn.commit()
-    cursor.close()
+
+def query_psql(conn, sql_command, params=None):
+    cursor = conn.cursor()
+    if params:
+        cursor.execute(sql_command, params)
+    else:
+        cursor.execute(sql_command)
+    rows = cursor.fetchall()
+    # cursor.close()
+    return rows
 
 def execute_sql(address, sql_command):
     headers = {'Content-Type': 'application/json'}
@@ -54,6 +63,11 @@ def query_sql(address, port, sql_command):
             if 'row' in parsed:
                 res.append(parsed["row"][1])
         return res
+
+def query_pg(conn, sql_command):
+    cursor = conn.cursor()
+    cursor.execute(sql_command)
+    return cursor.fetchall()
 
 def random_name(length=6):
     return ''.join(random.choices(string.ascii_letters, k=length))
