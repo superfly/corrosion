@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use corro_types::{
     agent::{Agent, PoolError, SplitPool},
@@ -8,7 +8,7 @@ use corro_types::{
 };
 
 use eyre::eyre;
-use metrics::counter;
+use metrics::{counter, histogram};
 use rusqlite::params;
 use tokio::{task::block_in_place, time::interval};
 use tracing::{debug, error, info, trace};
@@ -72,6 +72,7 @@ pub fn spawn_reaper(agent: &Agent, mut tripwire: Tripwire) -> eyre::Result<()> {
                     _ = interval.tick() => {
                     }
                 }
+                let start = Instant::now();
                 for (table_name, retention) in tables.iter() {
                     let result = match reap_table(agent.pool(), table_name, *retention, clock)
                         .preemptible(&mut tripwire)
@@ -85,16 +86,14 @@ pub fn spawn_reaper(agent: &Agent, mut tripwire: Tripwire) -> eyre::Result<()> {
 
                     match result {
                         Ok((clocks, pks)) => {
-                            if clocks > 0 {
-                                info!(%table_name, "reaper deleted {} clocks", clocks);
-                                counter!("corro.agent.deleted.clocks", "table" => table_name.to_string())
-                                    .increment(clocks as u64);
-                            }
-                            if pks > 0 {
-                                info!(%table_name, "reaper deleted {} pks", pks);
-                                counter!("corro.agent.deleted.pks", "table" => table_name.to_string())
-                                    .increment(pks as u64);
-                            }
+                            let elapsed = start.elapsed();
+                            info!(%table_name, "reaper deleted {clocks} clocks and {pks} pks in {elapsed:?}");
+                            counter!("corro.reaper.deleted.clocks", "table" => table_name.to_string())
+                                .increment(clocks as u64);
+                            counter!("corro.reaper.deleted.pks", "table" => table_name.to_string())
+                                .increment(pks as u64);
+                            histogram!("corro.reaper.deletion.seconds")
+                                .record(elapsed.as_secs_f64());
                         }
                         Err(e) => {
                             error!("error while reaping table {table_name}: {e}");
