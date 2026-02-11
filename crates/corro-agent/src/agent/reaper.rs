@@ -85,12 +85,12 @@ pub fn spawn_reaper(agent: &Agent, mut tripwire: Tripwire) -> eyre::Result<()> {
                     match result {
                         Ok((clocks, pks)) => {
                             if clocks > 0 {
-                                info!(%table_name, clocks = clocks, "deleted clocks");
+                                info!(%table_name, "reaper deleted {} clocks", clocks);
                                 counter!("corro.agent.deleted.clocks", "table" => table_name.to_string())
                                     .increment(clocks as u64);
                             }
                             if pks > 0 {
-                                info!(%table_name, pks = pks, "deleted pks");
+                                info!(%table_name, "reaper deleted {} pks", pks);
                                 counter!("corro.agent.deleted.pks", "table" => table_name.to_string())
                                     .increment(pks as u64);
                             }
