@@ -284,7 +284,6 @@ pub fn migrate(clock: Arc<uhlc::HLC>, conn: &mut Connection) -> rusqlite::Result
     let migrations: Vec<Box<dyn Migration>> = vec![
         Box::new(init_migration as fn(&Transaction) -> rusqlite::Result<()>),
         Box::new(crsqlite_v0_17_migration(clock)),
-        Box::new(crsqlite_ts_index()),
     ];
 
     crate::sqlite::migrate(conn, migrations)
@@ -427,20 +426,21 @@ fn crsqlite_v0_17_migration(
     }
 }
 
-fn crsqlite_ts_index() -> impl Fn(&Transaction) -> rusqlite::Result<()> {
-    |tx: &Transaction| -> rusqlite::Result<()> {
-        let tables: Vec<String> = tx.prepare("SELECT tbl_name FROM sqlite_master WHERE type='table' AND tbl_name LIKE '%__crsql_clock'")?.query_map([], |row| row.get(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+// TODO: enable this down the line
+// fn crsqlite_ts_index() -> impl Fn(&Transaction) -> rusqlite::Result<()> {
+//     |tx: &Transaction| -> rusqlite::Result<()> {
+//         let tables: Vec<String> = tx.prepare("SELECT tbl_name FROM sqlite_master WHERE type='table' AND tbl_name LIKE '%__crsql_clock'")?.query_map([], |row| row.get(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
 
-        for table in tables {
-            tx.execute(
-                &format!("CREATE INDEX IF NOT EXISTS {table}_ts ON {table} (ts)"),
-                [],
-            )?;
-        }
+//         for table in tables {
+//             tx.execute(
+//                 &format!("CREATE INDEX IF NOT EXISTS {table}_ts ON {table} (ts)"),
+//                 [],
+//             )?;
+//         }
 
-        Ok(())
-    }
-}
+//         Ok(())
+//     }
+// }
 
 #[derive(Debug, Clone)]
 pub struct SplitPool(Arc<SplitPoolInner>);
