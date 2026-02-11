@@ -41,6 +41,7 @@ fn parse_duration(s: &str) -> eyre::Result<Duration> {
 /// Spawn the reaper background task
 pub fn spawn_reaper(agent: &Agent, mut tripwire: Tripwire) -> eyre::Result<()> {
     let config = agent.config().reaper.clone();
+    info!("spawning reaper with config: {config:?}");
 
     if let Some(config) = config {
         if config.tables.is_empty() {
