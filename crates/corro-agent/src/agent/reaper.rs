@@ -124,7 +124,7 @@ async fn reap_table(
             .prepare_cached(&format!(
                 "SELECT key FROM {table}__crsql_clock 
                 WHERE col_name = -1 AND col_version % 2 = 0
-                AND ts < ?  LIMIT 100"
+                AND ts < ?  LIMIT 200"
             ))?
             .query_map([&cutoff], |row| row.get::<_, u64>(0))?
             .collect::<Result<Vec<u64>, rusqlite::Error>>()?;
@@ -134,7 +134,7 @@ async fn reap_table(
                 "SELECT __crsql_key FROM {table}__crsql_pks
                 WHERE NOT EXISTS 
                     (SELECT 1 FROM {table}__crsql_clock WHERE __crsql_key = key) 
-                LIMIT 100",
+                LIMIT 200",
             ))?
             .query_map([], |row| row.get::<_, u64>(0))?
             .collect::<Result<Vec<u64>, rusqlite::Error>>()?;
