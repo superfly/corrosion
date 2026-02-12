@@ -426,6 +426,22 @@ fn crsqlite_v0_17_migration(
     }
 }
 
+// TODO: enable this down the line
+// fn crsqlite_ts_index() -> impl Fn(&Transaction) -> rusqlite::Result<()> {
+//     |tx: &Transaction| -> rusqlite::Result<()> {
+//         let tables: Vec<String> = tx.prepare("SELECT tbl_name FROM sqlite_master WHERE type='table' AND tbl_name LIKE '%__crsql_clock'")?.query_map([], |row| row.get(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+
+//         for table in tables {
+//             tx.execute(
+//                 &format!("CREATE INDEX IF NOT EXISTS {table}_ts ON {table} (ts)"),
+//                 [],
+//             )?;
+//         }
+
+//         Ok(())
+//     }
+// }
+
 #[derive(Debug, Clone)]
 pub struct SplitPool(Arc<SplitPoolInner>);
 

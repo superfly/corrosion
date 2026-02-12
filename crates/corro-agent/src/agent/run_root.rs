@@ -6,11 +6,14 @@ use crate::api::public::execute_schema;
 use crate::{
     agent::{
         handlers::{self, spawn_handle_db_maintenance},
-        metrics, setup, util, AgentOptions,
+        metrics,
+        reaper::spawn_reaper,
+        setup, util, AgentOptions,
     },
     broadcast::runtime_loop,
     transport::Transport,
 };
+
 use corro_types::{
     actor::ActorId,
     agent::{Agent, BookedVersions, Bookie},
@@ -246,6 +249,10 @@ async fn run(
         )
         .inspect(|_| info!("corrosion buffered changes loop is done")),
     );
+
+    if let Err(e) = spawn_reaper(&agent, tripwire.clone()) {
+        error!("could not spawn reaper: {e}");
+    }
 
     info!("Starting peer API on udp/{gossip_addr} (QUIC)");
 
