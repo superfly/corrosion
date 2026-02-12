@@ -510,7 +510,6 @@ pub struct ConsulConfig {
 // WARNING: Specifying table to be reaped can cause inconsistencies if old primary keys come back
 // after specified duration. Use with caution.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "kebab-case")]
 pub struct ReaperConfig {
     pub tables: HashMap<String, String>,
     #[serde(default = "default_reaper_interval")]
