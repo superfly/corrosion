@@ -1112,7 +1112,7 @@ pub fn process_empty_version<T: Deref<Target = rusqlite::Connection> + Committab
     }
 
     if check_buffered_meta_to_clear(tx, actor_id, versions)? {
-        if let Err(e) = agent.tx_clear_buf().try_send((actor_id, versions.clone())) {
+        if let Err(e) = agent.tx_clear_buf().try_send((actor_id, versions)) {
             error!("could not schedule buffered meta clear: {e}");
         }
     }
