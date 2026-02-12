@@ -873,19 +873,12 @@ pub async fn process_multiple_changes(
 
                 // optimizing this, insert later!
                 let known = if change.is_complete() && change.is_empty() {
-                    let versions = change.versions();
-                    let end = versions.end();
-                    // update db_version in db if it's greater than the max
-                    // since we aren't passing any changes to crsql
-                    if Some(end) > max {
-                        process_empty_version(&tx, change.actor_id, &end).map_err(|e| {
-                            ChangeError::Rusqlite {
-                                source: e,
-                                actor_id: Some(change.actor_id),
-                                version: Some(end),
-                            }
+                    process_empty_version(&agent, &tx, change.actor_id, &max, change.versions())
+                        .map_err(|e| ChangeError::Rusqlite {
+                            source: e,
+                            actor_id: Some(change.actor_id),
+                            version: Some(change.versions().end()),
                         })?;
-                    }
                     KnownDbVersion::Cleared
                 } else {
                     if let Some(seqs) = change.seqs() {
@@ -1101,15 +1094,27 @@ pub async fn process_multiple_changes(
     Ok(())
 }
 
-#[tracing::instrument(skip(tx), err)]
+#[tracing::instrument(skip(agent, tx), err)]
 pub fn process_empty_version<T: Deref<Target = rusqlite::Connection> + Committable>(
+    agent: &Agent,
     tx: &InterruptibleTransaction<T>,
     actor_id: ActorId,
-    end_version: &CrsqlDbVersion,
+    max: &Option<CrsqlDbVersion>,
+    versions: CrsqlDbVersionRange,
 ) -> rusqlite::Result<()> {
-    let _ = tx
-        .prepare_cached("SELECT crsql_set_db_version(?, ?)")?
-        .query_row((actor_id, end_version), |row| row.get::<_, String>(0))?;
+    // update db_version in db if it's greater than the max
+    // since we aren't passing any changes to crsql
+    if max.is_none_or(|max| versions.end() > max) {
+        let _ = tx
+            .prepare_cached("SELECT crsql_set_db_version(?, ?)")?
+            .query_row((actor_id, versions.end()), |row| row.get::<_, String>(0))?;
+    }
+
+    if check_buffered_meta_to_clear(tx, actor_id, versions)? {
+        if let Err(e) = agent.tx_clear_buf().try_send((actor_id, versions)) {
+            error!("could not schedule buffered meta clear: {e}");
+        }
+    }
 
     Ok(())
 }
