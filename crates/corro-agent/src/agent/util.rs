@@ -873,13 +873,12 @@ pub async fn process_multiple_changes(
 
                 // optimizing this, insert later!
                 let known = if change.is_complete() && change.is_empty() {
-                    process_empty_version(&agent, &tx, change.actor_id, &max, change.versions()).map_err(
-                        |e| ChangeError::Rusqlite {
+                    process_empty_version(&agent, &tx, change.actor_id, &max, change.versions())
+                        .map_err(|e| ChangeError::Rusqlite {
                             source: e,
                             actor_id: Some(change.actor_id),
                             version: Some(change.versions().end()),
-                        },
-                    )?;
+                        })?;
                     KnownDbVersion::Cleared
                 } else {
                     if let Some(seqs) = change.seqs() {
@@ -1105,7 +1104,7 @@ pub fn process_empty_version<T: Deref<Target = rusqlite::Connection> + Committab
 ) -> rusqlite::Result<()> {
     // update db_version in db if it's greater than the max
     // since we aren't passing any changes to crsql
-    if max.is_some_and(|max| versions.end() > max) {
+    if max.is_none_or(|max| versions.end() > max) {
         let _ = tx
             .prepare_cached("SELECT crsql_set_db_version(?, ?)")?
             .query_row((actor_id, versions.end()), |row| row.get::<_, String>(0))?;
