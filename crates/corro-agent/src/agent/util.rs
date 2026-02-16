@@ -8,7 +8,7 @@
 use crate::{
     agent::{handlers, CountedExecutor, TO_CLEAR_COUNT},
     api::public::{
-        api_v1_db_schema, api_v1_queries, api_v1_table_stats, api_v1_transactions,
+        api_v1_db_schema, api_v1_health, api_v1_queries, api_v1_table_stats, api_v1_transactions,
         pubsub::{api_v1_sub_by_id, api_v1_subs},
         update::SharedUpdateBroadcastCache,
     },
@@ -274,6 +274,20 @@ pub async fn setup_http_api_handler(
         .route(
             "/v1/table_stats",
             post(api_v1_table_stats).route_layer(
+                tower::ServiceBuilder::new()
+                    .layer(HandleErrorLayer::new(|_error: BoxError| async {
+                        Ok::<_, Infallible>((
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "max concurrency limit reached".to_string(),
+                        ))
+                    }))
+                    .layer(LoadShedLayer::new())
+                    .layer(ConcurrencyLimitLayer::new(4)),
+            ),
+        )
+        .route(
+            "/v1/health",
+            get(api_v1_health).route_layer(
                 tower::ServiceBuilder::new()
                     .layer(HandleErrorLayer::new(|_error: BoxError| async {
                         Ok::<_, Infallible>((
@@ -1017,6 +1031,7 @@ pub async fn process_multiple_changes(
             if let Some(ts) = changeset.ts() {
                 let dur = (agent.clock().new_timestamp().get_time() - ts.0).to_duration();
                 histogram!("corro.agent.changes.commit.lag.seconds").record(dur);
+                agent.lag_tracker().add(dur.as_secs_f64());
             }
         }
 

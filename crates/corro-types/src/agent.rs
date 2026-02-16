@@ -48,6 +48,7 @@ use crate::{
     broadcast::{BroadcastInput, ChangeSource, ChangeV1, FocaInput, Timestamp},
     channel::{bounded, CorroSender},
     config::Config,
+    lag_tracker::LagTracker,
     pubsub::SubsManager,
     schema::Schema,
     sqlite::{
@@ -100,6 +101,7 @@ pub struct AgentInner {
     external_addr: Option<SocketAddr>,
     api_addr: SocketAddr,
     members: RwLock<Members>,
+    lag_tracker: LagTracker,
     clock: Arc<uhlc::HLC>,
     booked: Booked,
     tx_bcast: CorroSender<BroadcastInput>,
@@ -130,6 +132,7 @@ impl Agent {
             external_addr: config.external_addr,
             api_addr: config.api_addr,
             members: config.members,
+            lag_tracker: LagTracker::new(),
             clock: config.clock,
             booked: config.booked,
             tx_bcast: config.tx_bcast,
@@ -229,6 +232,10 @@ impl Agent {
 
     pub fn schema(&self) -> &RwLock<Schema> {
         &self.0.schema
+    }
+
+    pub fn lag_tracker(&self) -> &LagTracker {
+        &self.0.lag_tracker
     }
 
     pub fn db_path(&self) -> Utf8PathBuf {

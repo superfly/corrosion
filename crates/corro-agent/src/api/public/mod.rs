@@ -7,14 +7,18 @@ use std::{
 
 use crate::api::utils::CountedBody;
 use antithesis_sdk::assert_sometimes;
-use axum::{extract::ConnectInfo, response::IntoResponse, Extension};
+use axum::{
+    extract::{ConnectInfo, Query},
+    response::IntoResponse,
+    Extension,
+};
 use bytes::{BufMut, BytesMut};
 use compact_str::ToCompactString;
 use corro_types::{
     agent::{Agent, ChangeError},
     api::{
-        ColumnName, ExecResponse, ExecResult, QueryEvent, Statement, TableStatRequest,
-        TableStatResponse,
+        ColumnName, ExecResponse, ExecResult, HealthQuery, HealthResponse, QueryEvent, Statement,
+        TableStatRequest, TableStatResponse,
     },
     base::CrsqlDbVersion,
     broadcast::Timestamp,
@@ -643,6 +647,63 @@ pub async fn api_v1_db_schema(
     )
 }
 
+pub async fn api_v1_health(
+    Extension(agent): Extension<Agent>,
+    Query(query): Query<HealthQuery>,
+) -> (StatusCode, axum::Json<HealthResponse>) {
+    match check_health(&agent).await {
+        Ok(health) => {
+            let res = health;
+            let status = if query.gaps.is_some_and(|max| res.gaps > max)
+                || query.p99_lag.is_some_and(|max| res.p99_lag > max)
+            {
+                StatusCode::SERVICE_UNAVAILABLE
+            } else {
+                StatusCode::OK
+            };
+            (status, axum::Json(res))
+        }
+        Err(e) => {
+            error!("could not check health: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(HealthResponse {
+                    gaps: 0,
+                    members: 0,
+                    p99_lag: 0.0,
+                    actor_id: agent.actor_id().to_string(),
+                }),
+            )
+        }
+    }
+}
+
+async fn check_health(agent: &Agent) -> eyre::Result<HealthResponse> {
+    let read_conn = match agent.pool().read().await {
+        Ok(conn) => conn,
+        Err(e) => {
+            error!("could not acquire read connection for health check: {e}");
+            return Err(eyre::eyre!("unable to grab write conn"));
+        }
+    };
+
+    let gaps_count = read_conn
+        .prepare_cached("SELECT SUM(end - start + 1) FROM __corro_bookkeeping_gaps")?
+        .query_row([], |row| row.get::<_, i64>(0))?;
+
+    let active_members = read_conn.prepare_cached(r#"
+            SELECT COUNT(*) FROM __corro_members WHERE json_extract(foca_state, "$.state") = "Alive""#)?
+        .query_row([], |row| row.get::<_, i64>(0))?;
+
+    let p99_lag: Option<f64> = agent.lag_tracker().p99();
+
+    Ok(HealthResponse {
+        gaps: gaps_count,
+        members: active_members,
+        p99_lag: p99_lag.unwrap_or(0.0),
+        actor_id: agent.actor_id().to_string(),
+    })
+}
 /// Query the table status of the current node
 ///
 /// Currently this endpoint only supports querying the row count for a

@@ -697,7 +697,6 @@ pub async fn handle_changes(
 
             _ = max_wait.tick() => {
                 // got a wait interval tick...
-
                 gauge!("corro.agent.changes.in_queue").set(buf_cost as f64);
                 gauge!("corro.agent.changesets.in_queue").set(queue.len() as f64);
                 gauge!("corro.agent.changes.processing.jobs").set(join_set.len() as f64);
