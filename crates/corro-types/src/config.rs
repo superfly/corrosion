@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
 
 use crate::actor::MemberId;
@@ -15,6 +16,10 @@ pub const DEFAULT_MAX_SYNC_BACKOFF: u32 = 15;
 
 const fn default_apply_queue() -> usize {
     100
+}
+
+const fn default_reaper_interval() -> usize {
+    3600
 }
 
 const fn default_wal_threshold() -> usize {
@@ -79,6 +84,8 @@ pub struct Config {
     pub log: LogConfig,
     #[serde(default)]
     pub consul: Option<ConsulConfig>,
+    #[serde(default)]
+    pub reaper: Option<ReaperConfig>,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -348,6 +355,7 @@ pub struct ConfigBuilder {
     schema_paths: Vec<Utf8PathBuf>,
     max_change_size: Option<i64>,
     consul: Option<ConsulConfig>,
+    reaper: Option<ReaperConfig>,
     tls: Option<TlsConfig>,
     perf: Option<PerfConfig>,
     member_id: Option<MemberId>,
@@ -401,6 +409,11 @@ impl ConfigBuilder {
 
     pub fn consul(mut self, config: ConsulConfig) -> Self {
         self.consul = Some(config);
+        self
+    }
+
+    pub fn reaper(mut self, config: ReaperConfig) -> Self {
+        self.reaper = Some(config);
         self
     }
 
@@ -461,6 +474,7 @@ impl ConfigBuilder {
             log: self.log.unwrap_or_default(),
 
             consul: self.consul,
+            reaper: self.reaper,
         })
     }
 }
@@ -489,4 +503,15 @@ pub enum LogFormat {
 #[serde(rename_all = "kebab-case")]
 pub struct ConsulConfig {
     pub client: consul_client::Config,
+}
+
+// ReaperConfig specifies tables and the duration after which clock and pk records for deleted
+// primary keys can be deleted (i.e data in <table>__crsql_pks and <table>__crsql_clock).
+// WARNING: Specifying table to be reaped can cause inconsistencies if old primary keys come back
+// after specified duration. Use with caution.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ReaperConfig {
+    pub tables: HashMap<String, String>,
+    #[serde(default = "default_reaper_interval")]
+    pub check_interval: usize,
 }
