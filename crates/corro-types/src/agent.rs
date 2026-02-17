@@ -132,7 +132,7 @@ impl Agent {
             external_addr: config.external_addr,
             api_addr: config.api_addr,
             members: config.members,
-            lag_tracker: LagTracker::new(Duration::from_secs(120), 10),
+            lag_tracker: LagTracker::new(Duration::from_secs(120), 5),
             clock: config.clock,
             booked: config.booked,
             tx_bcast: config.tx_bcast,
