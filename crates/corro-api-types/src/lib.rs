@@ -249,12 +249,15 @@ pub struct HealthQuery {
 
 /// Contains status information about the node
 #[derive(Debug, Serialize, Deserialize)]
-pub struct HealthResponse {
-    pub gaps: i64,
-    pub members: i64,
-    pub p99_lag: f64,
-    // pub queue_size: usize,
-    pub actor_id: String,
+#[serde(rename_all = "lowercase")]
+pub enum HealthResponse {
+    Response {
+        gaps: i64,
+        members: i64,
+        p99_lag: f64,
+        // actor_id: String,
+    },
+    Error(String),
 }
 
 #[derive(Debug, Copy, Clone, PartialEq)]

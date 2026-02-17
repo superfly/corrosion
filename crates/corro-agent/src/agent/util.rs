@@ -1031,7 +1031,7 @@ pub async fn process_multiple_changes(
             if let Some(ts) = changeset.ts() {
                 let dur = (agent.clock().new_timestamp().get_time() - ts.0).to_duration();
                 histogram!("corro.agent.changes.commit.lag.seconds").record(dur);
-                agent.lag_tracker().add(dur.as_secs_f64());
+                agent.lag_tracker().observe(dur.as_secs_f64());
             }
         }
 

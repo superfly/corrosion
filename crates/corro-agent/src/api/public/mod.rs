@@ -652,33 +652,36 @@ pub async fn api_v1_health(
     Query(query): Query<HealthQuery>,
 ) -> (StatusCode, axum::Json<HealthResponse>) {
     match check_health(&agent).await {
-        Ok(health) => {
-            let res = health;
-            let status = if query.gaps.is_some_and(|max| res.gaps > max)
-                || query.p99_lag.is_some_and(|max| res.p99_lag > max)
+        Ok((gaps, members)) => {
+            let p99_lag = agent.lag_tracker().quantile(0.99).unwrap_or(0.0);
+            let status = if query.gaps.is_some_and(|max| gaps > max)
+                || query.p99_lag.is_some_and(|max| p99_lag > max)
             {
                 StatusCode::SERVICE_UNAVAILABLE
             } else {
                 StatusCode::OK
             };
-            (status, axum::Json(res))
+            (
+                status,
+                axum::Json(HealthResponse::Response {
+                    gaps,
+                    members,
+                    p99_lag,
+                    // actor_id: agent.actor_id().to_string(),
+                }),
+            )
         }
         Err(e) => {
             error!("could not check health: {e}");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                axum::Json(HealthResponse {
-                    gaps: 0,
-                    members: 0,
-                    p99_lag: 0.0,
-                    actor_id: agent.actor_id().to_string(),
-                }),
+                axum::Json(HealthResponse::Error(e.to_string())),
             )
         }
     }
 }
 
-async fn check_health(agent: &Agent) -> eyre::Result<HealthResponse> {
+async fn check_health(agent: &Agent) -> eyre::Result<(i64, i64)> {
     let read_conn = match agent.pool().read().await {
         Ok(conn) => conn,
         Err(e) => {
@@ -687,22 +690,15 @@ async fn check_health(agent: &Agent) -> eyre::Result<HealthResponse> {
         }
     };
 
-    let gaps_count = read_conn
-        .prepare_cached("SELECT SUM(end - start + 1) FROM __corro_bookkeeping_gaps")?
+    let gaps = read_conn
+        .prepare_cached("SELECT COALESCE(SUM(end - start + 1), 0) FROM __corro_bookkeeping_gaps")?
         .query_row([], |row| row.get::<_, i64>(0))?;
 
-    let active_members = read_conn.prepare_cached(r#"
-            SELECT COUNT(*) FROM __corro_members WHERE json_extract(foca_state, "$.state") = "Alive""#)?
+    let members = read_conn.prepare_cached(r#"
+            SELECT COALESCE(COUNT(*), 0) FROM __corro_members WHERE json_extract(foca_state, "$.state") = "Alive""#)?
         .query_row([], |row| row.get::<_, i64>(0))?;
 
-    let p99_lag: Option<f64> = agent.lag_tracker().p99();
-
-    Ok(HealthResponse {
-        gaps: gaps_count,
-        members: active_members,
-        p99_lag: p99_lag.unwrap_or(0.0),
-        actor_id: agent.actor_id().to_string(),
-    })
+    Ok((gaps, members))
 }
 /// Query the table status of the current node
 ///
