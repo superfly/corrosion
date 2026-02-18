@@ -1,5 +1,9 @@
+use eyre::{bail, Result};
 use parking_lot::RwLock;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 use std::time::{Duration, Instant};
 
 pub const DEFAULT_BUCKETS: &[f64] = &[
@@ -164,8 +168,20 @@ impl RollingHistogram {
     /// `window` is the total time window (e.g. 5 minutes).
     /// `num_chunks` is how many chunks to split it into (e.g. 5 = one chunk per minute).
     /// `upper_bounds` are the bucket boundaries for each underlying histogram.
-    pub fn new(window: Duration, num_chunks: usize, upper_bounds: &[f64]) -> Self {
+    pub fn new(window: Duration, num_chunks: usize, upper_bounds: &[f64]) -> Result<Self> {
         assert!(num_chunks > 0, "num_chunks must be > 0");
+
+        if upper_bounds.is_empty() {
+            bail!("upper bounds must be non-empty");
+        }
+
+        let mut prev = upper_bounds[0];
+        for bound in upper_bounds.iter().skip(1) {
+            if *bound <= prev {
+                bail!("upper bounds must be in ascending order");
+            }
+            prev = *bound;
+        }
 
         let chunk_duration = window / num_chunks as u32;
         let now = Instant::now();
@@ -177,12 +193,12 @@ impl RollingHistogram {
             })
             .collect();
 
-        Self {
+        Ok(Self {
             chunks,
             chunk_duration,
             _upper_bounds: upper_bounds.to_vec(),
             created_at: now,
-        }
+        })
     }
 
     pub fn observe(&mut self, v: f64) {
@@ -237,29 +253,40 @@ impl RollingHistogram {
     }
 }
 
-pub struct LagTracker(Arc<RwLock<RollingHistogram>>);
+pub struct MetricsTracker(Arc<MetricsTrackerInner>);
 
-impl LagTracker {
-    pub fn new(window: Duration, num_chunks: usize) -> Self {
-        Self(Arc::new(RwLock::new(RollingHistogram::new(
-            window,
-            num_chunks,
-            DEFAULT_BUCKETS,
-        ))))
-    }
+pub struct MetricsTrackerInner {
+    rolling_histogram: RwLock<RollingHistogram>,
+    queue_size: AtomicU64,
 }
 
-impl LagTracker {
-    pub fn observe(&self, lag: f64) {
-        self.0.write().observe(lag);
+impl MetricsTracker {
+    pub fn new(window: Duration, num_chunks: usize) -> eyre::Result<Self> {
+        let rolling_his = RollingHistogram::new(window, num_chunks, DEFAULT_BUCKETS)?;
+        Ok(Self(Arc::new(MetricsTrackerInner {
+            rolling_histogram: RwLock::new(rolling_his),
+            queue_size: AtomicU64::new(0),
+        })))
     }
 
-    pub fn quantile(&self, q: f64) -> Option<f64> {
-        self.0.read().quantile(q)
+    pub fn observe_lag(&self, lag: f64) {
+        self.0.rolling_histogram.write().observe(lag);
     }
 
-    pub fn count(&self) -> u64 {
-        self.0.read().count()
+    pub fn observe_queue_size(&self, size: u64) {
+        self.0.queue_size.store(size, Ordering::Relaxed);
+    }
+
+    pub fn quantile_lag(&self, q: f64) -> Option<f64> {
+        self.0.rolling_histogram.read().quantile(q)
+    }
+
+    pub fn count_lag(&self) -> u64 {
+        self.0.rolling_histogram.read().count()
+    }
+
+    pub fn queue_size(&self) -> u64 {
+        self.0.queue_size.load(Ordering::Relaxed)
     }
 }
 

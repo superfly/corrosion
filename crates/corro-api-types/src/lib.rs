@@ -245,6 +245,7 @@ pub struct TableStatResponse {
 pub struct HealthQuery {
     pub gaps: Option<i64>,
     pub p99_lag: Option<f64>,
+    pub queue_size: Option<u64>,
 }
 
 /// Contains status information about the node
@@ -255,7 +256,7 @@ pub enum HealthResponse {
         gaps: i64,
         members: i64,
         p99_lag: f64,
-        // actor_id: String,
+        queue_size: u64,
     },
     Error(String),
 }

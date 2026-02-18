@@ -1113,6 +1113,7 @@ dependencies = [
  "corro-tests",
  "deadpool",
  "enquote",
+ "eyre",
  "fallible-iterator 0.3.0",
  "foca",
  "futures",

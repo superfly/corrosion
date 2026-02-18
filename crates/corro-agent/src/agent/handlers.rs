@@ -631,6 +631,7 @@ pub async fn handle_changes(
     ));
 
     let max_seen_cache_len: usize = max_queue_len;
+    let metrics_tracker = agent.metrics_tracker();
 
     // unlikely, but max_seen_cache_len can be less than 10, in that case we want to just clear the whole cache
     // (todo): put some validation in config instead
@@ -701,6 +702,7 @@ pub async fn handle_changes(
                 gauge!("corro.agent.changesets.in_queue").set(queue.len() as f64);
                 gauge!("corro.agent.changes.processing.jobs").set(join_set.len() as f64);
 
+                metrics_tracker.observe_queue_size(queue.len() as u64);
                 if buf_cost < max_changes_chunk && !queue.is_empty() && join_set.len() < MAX_CONCURRENT {
                     // we can process this right away
                     debug!(%buf_cost, "spawning processing multiple changes from max wait interval");

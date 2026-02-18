@@ -653,9 +653,14 @@ pub async fn api_v1_health(
 ) -> (StatusCode, axum::Json<HealthResponse>) {
     match check_health(&agent).await {
         Ok((gaps, members)) => {
-            let p99_lag = agent.lag_tracker().quantile(0.99).unwrap_or(0.0);
+            let p99_lag = agent.metrics_tracker().quantile_lag(0.99).unwrap_or(0.0);
+            let queue_size = agent.metrics_tracker().queue_size();
             let status = if query.gaps.is_some_and(|max| gaps > max)
-                || query.p99_lag.is_some_and(|max| p99_lag > max)
+                // we use queue size and p99 lag as a stronger metric for an unhealthy node
+                // so a different node that's slow to send out changes can cause worse commit lag
+                // even though the node is perfectly fine.
+                || (query.p99_lag.is_some_and(|max| p99_lag > max)
+                    && query.queue_size.is_some_and(|max| queue_size > max))
             {
                 StatusCode::SERVICE_UNAVAILABLE
             } else {
@@ -667,7 +672,7 @@ pub async fn api_v1_health(
                     gaps,
                     members,
                     p99_lag,
-                    // actor_id: agent.actor_id().to_string(),
+                    queue_size,
                 }),
             )
         }
