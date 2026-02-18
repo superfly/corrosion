@@ -657,7 +657,7 @@ pub async fn api_v1_health(
             let queue_size = agent.metrics_tracker().queue_size();
             let status = if query.gaps.is_some_and(|max| gaps > max)
                 // we use queue size and p99 lag as a stronger metric for an unhealthy node
-                // so a different node that's slow to send out changes can cause worse commit lag
+                // since a different node that is slow to send out changes can cause worse commit lag
                 // even though the node is perfectly fine.
                 || (query.p99_lag.is_some_and(|max| p99_lag > max)
                     && query.queue_size.is_some_and(|max| queue_size > max))
