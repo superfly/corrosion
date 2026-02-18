@@ -8,6 +8,7 @@ pub mod channel;
 pub mod config;
 pub mod gauge;
 pub mod members;
+pub mod metrics_tracker;
 pub mod pubsub;
 pub mod schema;
 pub mod sqlite;

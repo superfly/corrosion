@@ -48,6 +48,7 @@ use crate::{
     broadcast::{BroadcastInput, ChangeSource, ChangeV1, FocaInput, Timestamp},
     channel::{bounded, CorroSender},
     config::Config,
+    metrics_tracker::MetricsTracker,
     pubsub::SubsManager,
     schema::Schema,
     sqlite::{
@@ -89,6 +90,8 @@ pub struct AgentConfig {
 
     pub updates_manager: UpdatesManager,
 
+    pub metrics_tracker: MetricsTracker,
+
     pub tripwire: Tripwire,
 }
 
@@ -100,6 +103,7 @@ pub struct AgentInner {
     external_addr: Option<SocketAddr>,
     api_addr: SocketAddr,
     members: RwLock<Members>,
+    metrics_tracker: MetricsTracker,
     clock: Arc<uhlc::HLC>,
     booked: Booked,
     tx_bcast: CorroSender<BroadcastInput>,
@@ -130,6 +134,7 @@ impl Agent {
             external_addr: config.external_addr,
             api_addr: config.api_addr,
             members: config.members,
+            metrics_tracker: config.metrics_tracker,
             clock: config.clock,
             booked: config.booked,
             tx_bcast: config.tx_bcast,
@@ -229,6 +234,10 @@ impl Agent {
 
     pub fn schema(&self) -> &RwLock<Schema> {
         &self.0.schema
+    }
+
+    pub fn metrics_tracker(&self) -> &MetricsTracker {
+        &self.0.metrics_tracker
     }
 
     pub fn db_path(&self) -> Utf8PathBuf {

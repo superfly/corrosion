@@ -241,6 +241,26 @@ pub struct TableStatResponse {
     pub invalid_tables: Vec<String>,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct HealthQuery {
+    pub gaps: Option<i64>,
+    pub p99_lag: Option<f64>,
+    pub queue_size: Option<u64>,
+}
+
+/// Contains status information about the node
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HealthResponse {
+    Response {
+        gaps: i64,
+        members: i64,
+        p99_lag: f64,
+        queue_size: u64,
+    },
+    Error(String),
+}
+
 #[derive(Debug, Copy, Clone, PartialEq)]
 pub struct SqliteValueRef<'a>(pub ValueRef<'a>);
 

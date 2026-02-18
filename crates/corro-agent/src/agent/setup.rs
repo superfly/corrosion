@@ -42,6 +42,7 @@ use corro_types::{
     channel::{bounded, CorroReceiver},
     config::Config,
     members::Members,
+    metrics_tracker::MetricsTracker,
     pubsub::{Matcher, SubsManager},
     schema::{init_schema, Schema},
     sqlite::CrConn,
@@ -243,6 +244,8 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
         }
     });
 
+    let metrics_tracker = MetricsTracker::new(Duration::from_secs(120), 5)?;
+
     let opts = AgentOptions {
         gossip_server_endpoint,
         transport: transport.clone(),
@@ -280,6 +283,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
         cluster_id,
         subs_manager,
         updates_manager,
+        metrics_tracker,
         tripwire,
     });
 
