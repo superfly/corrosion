@@ -1,6 +1,6 @@
 #!/usr/bin/env -S python3 -u
 import argparse
-import random
+from antithesis.random import AntithesisRandom
 import time
 import threading
 
@@ -9,7 +9,7 @@ sys.path.append("/opt/antithesis/py-resources")
 import helper
 
 
-random = random.SystemRandom()
+random = AntithesisRandom()
 
 def insert_deployment(conn, team_id, net_id):
     try:

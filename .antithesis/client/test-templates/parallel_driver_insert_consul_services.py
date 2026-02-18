@@ -1,12 +1,12 @@
 #! /usr/bin/env python3
 
+from antithesis.random import AntithesisRandom
 import argparse
 import requests
-import random
 import string
 import json
 import threading
-random = random.SystemRandom()
+random = AntithesisRandom()
 
 import sys
 sys.path.append("/opt/antithesis/py-resources")
@@ -75,6 +75,6 @@ def main():
 
     for thread in threads:
         thread.join()
-        
+
 if __name__ == "__main__":
     main()

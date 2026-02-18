@@ -2,7 +2,7 @@
 
 import argparse
 import json
-import random
+from antithesis.random import AntithesisRandom
 import string
 import sys
 import time
@@ -14,6 +14,8 @@ from antithesis.assertions import (
     always,
     sometimes
 )
+
+random = AntithesisRandom()
 
 def random_name(length=6):
     return ''.join(random.choices(string.ascii_letters, k=length))
