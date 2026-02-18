@@ -15,7 +15,7 @@ pub const DEFAULT_MAX_SYNC_BACKOFF: u32 = 2;
 pub const DEFAULT_MAX_SYNC_BACKOFF: u32 = 15;
 
 const fn default_apply_queue() -> usize {
-    100
+    500
 }
 
 const fn default_reaper_interval() -> usize {
