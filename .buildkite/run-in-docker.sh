@@ -3,7 +3,7 @@
 set -e
 
 # ensure latest rust image
-docker pull flyio/docker-rust-cargo:main
+docker pull flyio/docker-rust-cargo:ubuntu-focal-2025-08-21
 
 docker run --rm -t \
     -e RUST_BACKTRACE=1 \
@@ -23,4 +23,4 @@ docker run --rm -t \
     -v "${SSH_AUTH_SOCK}:/ssh-agent" \
 		-v "${PWD}:/build_dir" \
 		-w /build_dir \
-		flyio/docker-rust-cargo:main /bin/bash -c "$@"
+		flyio/docker-rust-cargo:ubuntu-focal-2025-08-21 /bin/bash -c "$@"
