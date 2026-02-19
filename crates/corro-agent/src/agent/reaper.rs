@@ -48,13 +48,21 @@ pub fn spawn_reaper(agent: &Agent, mut tripwire: Tripwire) -> eyre::Result<()> {
             return Ok(());
         }
 
-        let tables = config
+        let tables: HashMap<String, (Duration, Option<String>)> = config
             .tables
             .into_iter()
-            .map(|(table_name, retention)| {
-                parse_duration(&retention).map(|duration| (table_name, duration))
+            .map(|(table_name, table_config)| {
+                parse_duration(&table_config.retention).map(|duration| {
+                    (
+                        table_name,
+                        (
+                            duration,
+                            table_config.match_filter.map(|f| format!(" AND ({f})")),
+                        ),
+                    )
+                })
             })
-            .collect::<Result<HashMap<String, Duration>, eyre::Error>>()?;
+            .collect::<Result<HashMap<String, (Duration, Option<String>)>, eyre::Error>>()?;
 
         let agent = agent.clone();
 
@@ -73,10 +81,16 @@ pub fn spawn_reaper(agent: &Agent, mut tripwire: Tripwire) -> eyre::Result<()> {
                     }
                 }
                 let start = Instant::now();
-                for (table_name, retention) in tables.iter() {
-                    let result = match reap_table(agent.pool(), table_name, *retention, clock)
-                        .preemptible(&mut tripwire)
-                        .await
+                for (table_name, (retention, filter)) in tables.iter() {
+                    let result = match reap_table(
+                        agent.pool(),
+                        table_name,
+                        *retention,
+                        filter.as_deref(),
+                        clock,
+                    )
+                    .preemptible(&mut tripwire)
+                    .await
                     {
                         Outcome::Preempted(_) => {
                             return;
@@ -111,6 +125,7 @@ async fn reap_table(
     pool: &SplitPool,
     table: &str,
     retention: Duration,
+    filter: Option<&str>,
     clock: &uhlc::HLC,
 ) -> Result<(usize, usize), ReaperError> {
     let read_conn = pool.read().await.map_err(ReaperError::ReadPool)?;
@@ -120,11 +135,13 @@ async fn reap_table(
 
     trace!("checking table {table} for deleted clocks older than {cutoff}");
     let (pks_to_delete, mut orphaned_pks): (Vec<u64>, Vec<u64>) = block_in_place(|| {
+        let filter_clause = filter.unwrap_or_default();
         let sentinel_pks = read_conn
             .prepare_cached(&format!(
-                "SELECT key FROM {table}__crsql_clock 
+                "SELECT key FROM {table}__crsql_clock
+                LEFT JOIN {table}__crsql_pks ON key = __crsql_key
                 WHERE col_name = -1 AND col_version % 2 = 0
-                AND ts < ?  LIMIT 200"
+                AND ts < ? {filter_clause} LIMIT 200"
             ))?
             .query_map([&cutoff], |row| row.get::<_, u64>(0))?
             .collect::<Result<Vec<u64>, rusqlite::Error>>()?;
@@ -248,8 +265,9 @@ mod tests {
             Timestamp::from(now_ts.to_ntp64() - uhlc::NTP64::from(parse_duration("1w").unwrap()));
 
         // Insert rows with old timestamp and delete some
-        let recently_deleted: [u64; 2] = [4, 5];
+        let match_filter: [u64; 2] = [101, 102];
         let deleted: [u64; 2] = [1, 2];
+        let recently_deleted: [u64; 2] = [4, 5];
         {
             let mut conn = pool.write_priority().await?;
             block_in_place(|| {
@@ -264,6 +282,8 @@ mod tests {
                 tx.execute("INSERT INTO tests (id, text) VALUES (3, 'test3')", [])?;
                 tx.execute("INSERT INTO tests (id, text) VALUES (4, 'test4')", [])?;
                 tx.execute("INSERT INTO tests (id, text) VALUES (5, 'test5')", [])?;
+                tx.execute("INSERT INTO tests (id, text) VALUES (101, 'test101')", [])?;
+                tx.execute("INSERT INTO tests (id, text) VALUES (102, 'test102')", [])?;
 
                 tx.commit()?;
 
@@ -271,6 +291,7 @@ mod tests {
                 tx.prepare_cached("SELECT crsql_set_ts(?)")?
                     .query_row([&old_ts], |_| Ok(()))?;
 
+                tx.execute("DELETE FROM tests WHERE id IN (?, ?)", match_filter)?;
                 tx.execute("DELETE FROM tests WHERE id IN (?, ?)", deleted)?;
 
                 tx.commit()?;
@@ -291,15 +312,47 @@ mod tests {
             })?;
         }
 
-        let (clocks, pks) = reap_table(&pool, table, parse_duration("1w").unwrap(), &clock).await?;
+        let filter = "AND id > 100";
+        let (clocks, pks) = reap_table(
+            &pool,
+            table,
+            parse_duration("1w").unwrap(),
+            Some(filter),
+            &clock,
+        )
+        .await?;
         assert_eq!(clocks, 2, "should delete 2 old clock entries");
         assert_eq!(pks, 2, "should delete 2 old PKs");
 
-        let (clocks, pks) = reap_table(&pool, table, parse_duration("2d").unwrap(), &clock).await?;
+        let read_conn = pool.read().await?;
+        let mut read_stmt = read_conn
+            .prepare_cached("SELECT COUNT(*) FROM tests__crsql_clock WHERE key IN (?, ?)")?;
+
+        let deleted_count: i64 = read_stmt.query_row(match_filter, |row| row.get(0))?;
+        assert_eq!(
+            deleted_count, 0,
+            "should delete 2 entries that match the filter"
+        );
+
+        let not_filtered_deleted: i64 = read_stmt.query_row(deleted, |row| row.get(0))?;
+        assert_eq!(
+            not_filtered_deleted, 2,
+            "should only delete filtered deleted entries"
+        );
+
+        let (clocks, pks) =
+            reap_table(&pool, table, parse_duration("1w").unwrap(), None, &clock).await?;
+        assert_eq!(
+            clocks, 2,
+            "should delete 2 old clock entries that are not filtered"
+        );
+        assert_eq!(pks, 2, "should delete 2 old PKs");
+
+        let (clocks, pks) =
+            reap_table(&pool, table, parse_duration("2d").unwrap(), None, &clock).await?;
         assert_eq!(clocks, 0, "no more entries to delete");
         assert_eq!(pks, 0, "no more entries to delete");
 
-        let read_conn = pool.read().await?;
         let old_sentinel_count: i64 = read_conn.query_row(
             "SELECT COUNT(*) FROM tests__crsql_clock WHERE key IN (?, ?)",
             deleted,

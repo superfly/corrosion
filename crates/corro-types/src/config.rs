@@ -509,9 +509,22 @@ pub struct ConsulConfig {
 // primary keys can be deleted (i.e data in <table>__crsql_pks and <table>__crsql_clock).
 // WARNING: Specifying table to be reaped can cause inconsistencies if old primary keys come back
 // after specified duration. Use with caution.
+//
+// Per-table config: retention duration and optional filter (WHERE clause fragment) to limit
+// which primary keys the reaper may remove. Filter is applied to the table's __crsql_pks columns.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ReaperConfig {
-    pub tables: HashMap<String, String>,
+    pub tables: HashMap<String, TableReapConfig>,
     #[serde(default = "default_reaper_interval")]
     pub check_interval: usize,
+}
+
+/// Per-table reaper config.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct TableReapConfig {
+    pub retention: String,
+    /// Optional WHERE clause fragment (without "WHERE") to only delete pks
+    /// that match the filter e.g "id LIKE 'throwaway-%'"
+    #[serde(default)]
+    pub match_filter: Option<String>,
 }
