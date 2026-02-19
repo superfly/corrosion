@@ -3,7 +3,7 @@
 set -eux
 
 # build all binaries, optimized
-cargo build --verbose --release \
+CFLAGS="--sysroot=/ubuntu-bionic-sysroot" cargo build --verbose --release \
 	--bin corrosion
 
 ls -lhA ${CARGO_TARGET_DIR}/release

@@ -4,6 +4,7 @@ rustflags = [
     "-C", "link-arg=-fuse-ld=mold",
     "-C", "force-frame-pointers",
     "-C", "symbol-mangling-version=v0",
+    "-C", "link-arg=--sysroot=/ubuntu-bionic-sysroot",
     "--cfg", "tokio_unstable"
 ]
 
