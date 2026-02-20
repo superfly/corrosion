@@ -511,7 +511,17 @@ pub struct ConsulConfig {
 // after specified duration. Use with caution.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ReaperConfig {
-    pub tables: HashMap<String, String>,
+    pub tables: HashMap<String, TableReapConfig>,
     #[serde(default = "default_reaper_interval")]
     pub check_interval: usize,
+}
+
+/// Per-table reaper config.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct TableReapConfig {
+    pub retention: String,
+    /// Optional WHERE clause fragment (without "WHERE") to only delete pks
+    /// that match the filter e.g "id LIKE 'throwaway-%'"
+    #[serde(default)]
+    pub match_filter: Option<String>,
 }
