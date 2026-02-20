@@ -38,6 +38,7 @@ use indexmap::IndexMap;
 use metrics::{counter, gauge, histogram};
 use rand::{prelude::IteratorRandom, rngs::StdRng, SeedableRng};
 use rangemap::RangeInclusiveSet;
+use serde_json::json;
 use spawn::spawn_counted;
 use tokio::time::sleep;
 use tokio::{
@@ -517,12 +518,10 @@ pub fn spawn_handle_db_maintenance(agent: &Agent) {
 
     let pool = agent.pool().clone();
 
+    let on_antithesis = std::env::var("ANTITHESIS_OUTPUT_DIR").is_ok();
+
     // reduce interval if we are running in antithesis
-    let interval_minutes = if std::env::var("ANTITHESIS_OUTPUT_DIR").is_ok() {
-        1
-    } else {
-        5
-    };
+    let interval_secs = if on_antithesis { 30 } else { 5 * 60 };
 
     tokio::spawn(async move {
         let truncate_wal_threshold: u64 = wal_threshold * 1024 * 1024;
@@ -540,9 +539,12 @@ pub fn spawn_handle_db_maintenance(agent: &Agent) {
         }
 
         // large sleep right at the start to give node time to sync
-        sleep(Duration::from_secs(60)).await;
 
-        let mut vacuum_interval = tokio::time::interval(Duration::from_secs(60 * interval_minutes));
+        if !on_antithesis {
+            sleep(Duration::from_secs(60)).await;
+        }
+
+        let mut vacuum_interval = tokio::time::interval(Duration::from_secs(interval_secs));
 
         const MAX_DB_FREE_PAGES: u64 = 10000;
 
@@ -570,6 +572,12 @@ async fn wal_checkpoint_over_threshold(
     let wal_size = wal_path.metadata()?.len();
     let should_truncate = wal_size > threshold;
 
+    let details = json!({
+        "wal_size": wal_size,
+        "threshold": threshold,
+        "should_truncate": should_truncate,
+    });
+    assert_sometimes!(true, "Corrosion attempts to truncate WAL", &details);
     if should_truncate {
         let conn = if wal_size > (5 * threshold) {
             warn!("wal_size is over 5x the threshold, trying to get a priority conn");
