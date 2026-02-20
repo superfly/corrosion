@@ -2,18 +2,14 @@
 
 import argparse
 import json
-import random
+from antithesis.random import AntithesisRandom
 import requests
 import string
 import threading
 import time
 
 
-from antithesis.random import (
-    random_choice
-)
-
-random = random.SystemRandom()
+random = AntithesisRandom()
 
 import sys
 sys.path.append("/opt/antithesis/py-resources")
@@ -38,7 +34,7 @@ def get_ids(address, port, table):
     ids = helper.query_sql(address, port, f"SELECT id FROM {table} ORDER BY RANDOM() LIMIT 100")
     print(f"Found {len(ids)} {table} ids in Corrosion.")
     return ids
- 
+
 
 def do_updates(address, pg_port, http_port):
     try:

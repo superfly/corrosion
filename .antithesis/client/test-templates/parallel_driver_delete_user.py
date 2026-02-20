@@ -1,6 +1,6 @@
 #!/usr/bin/env -S python3 -u
+from antithesis.random import AntithesisRandom
 import argparse
-import random
 import threading
 
 import sys
@@ -8,11 +8,11 @@ sys.path.append("/opt/antithesis/py-resources")
 import helper
 
 
-random = random.SystemRandom()
+random = AntithesisRandom()
 
 def do_deletes(address):
     try:
-        id = helper.get_random_cols(address, "users", ["id"]) 
+        id = helper.get_random_cols(address, "users", ["id"])
         host, port = address.split(':')
         print(f"deleting user {id} from {address}")
         conn = helper.get_db_connection(host, "5470")
