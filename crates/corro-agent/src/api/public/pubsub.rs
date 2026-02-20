@@ -9,7 +9,7 @@ use corro_types::updates::Handle;
 use corro_types::{
     agent::Agent,
     api::{ChangeId, QueryEvent, QueryEventMeta, Statement},
-    pubsub::{MatcherCreated, MatcherError, MatcherHandle, NormalizeStatementError, SubsManager},
+    pubsub::{MatcherCreated, MatcherError, MatcherHandle, SubsManager},
     sqlite::SqlitePoolError,
 };
 use rusqlite::Connection;
@@ -282,8 +282,6 @@ pub enum MatcherUpsertError {
     #[error("could not expand sql statement")]
     CouldNotExpand,
     #[error(transparent)]
-    NormalizeStatement(#[from] Box<NormalizeStatementError>),
-    #[error(transparent)]
     Matcher(#[from] MatcherError),
     #[error("a `from` query param was supplied, but no existing subscription found")]
     SubFromWithoutMatcher,
@@ -298,7 +296,6 @@ impl MatcherUpsertError {
             | MatcherUpsertError::CouldNotExpand
             | MatcherUpsertError::MissingBroadcaster => StatusCode::INTERNAL_SERVER_ERROR,
             MatcherUpsertError::Sqlite(_)
-            | MatcherUpsertError::NormalizeStatement(_)
             | MatcherUpsertError::Matcher(_)
             | MatcherUpsertError::SubFromWithoutMatcher => StatusCode::BAD_REQUEST,
         }
@@ -2384,6 +2381,227 @@ mod tests {
 
         Ok(())
     }
+
+    /*
+    TODO: Remap Pks on the test2 table into group keys
+          Then reconcile by the group key
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn test_subs_left_join() -> eyre::Result<()> {
+        _ = tracing_subscriber::fmt::try_init();
+
+        let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
+        let ta1 = launch_test_agent(|conf| conf.build(), tripwire.clone()).await?;
+        let agent = ta1.agent.clone();
+
+        let left_join_schema = "
+        create table test1 (
+            id text not null primary key,
+            text text not null default ''
+        );
+        create table test2 (
+            id text not null primary key,
+            test1_id text not null default '',
+            text text
+        );";
+
+        let (status_code, _body) = api_v1_db_schema(
+            Extension(agent.clone()),
+            axum::Json(vec![left_join_schema.into()]),
+        )
+        .await;
+
+        assert_eq!(status_code, StatusCode::OK);
+
+        let (status_code, body) = api_v1_transactions(
+            Extension(agent.clone()),
+            axum::extract::Query(TimeoutParams { timeout: None }),
+            axum::Json(vec![
+                Statement::WithParams(
+                    "insert into test1 (id, text) values (?,?)".into(),
+                    vec!["test1-id".into(), "service-name".into()],
+                ),
+                Statement::WithParams(
+                    "insert into test2 (id, test1_id, text) values (?, ?, ?)".into(),
+                    vec!["test2-id".into(), "test1-id".into(), "service-text".into()],
+                ),
+            ]),
+        )
+        .await;
+
+        assert_eq!(status_code, StatusCode::OK);
+
+        assert!(body.0.results.len() == 2);
+
+        let bcast_cache: SharedMatcherBroadcastCache = Default::default();
+
+        {
+            let res = api_v1_subs(
+                Extension(agent.clone()),
+                Extension(bcast_cache.clone()),
+                Extension(tripwire.clone()),
+                axum::extract::Query(SubParams::default()),
+                axum::Json(Statement::Simple(
+                    "select t1.id, t1.text, t2.text from test1 t1 left join test2 t2 on t1.id = t2.test1_id".into(),
+                )),
+            )
+            .await
+            .into_response();
+
+            let mut rows = RowsIter::new(assert_ok(res).await);
+
+            assert_eq!(
+                rows.recv::<QueryEvent>().await.unwrap().unwrap(),
+                QueryEvent::Columns(vec!["id".into(), "text".into(), "text".into()])
+            );
+
+            assert_eq!(
+                rows.recv::<QueryEvent>().await.unwrap().unwrap(),
+                QueryEvent::Row(
+                    RowId(1),
+                    vec![
+                        "test1-id".into(),
+                        "service-name".into(),
+                        "service-text".into()
+                    ]
+                )
+            );
+
+            tokio::time::sleep(Duration::from_secs(1)).await;
+
+            let evt = rows.recv::<QueryEvent>().await.unwrap().unwrap();
+            assert!(matches!(evt, QueryEvent::EndOfQuery { .. }));
+
+            let (status_code, _) = api_v1_transactions(
+                Extension(agent.clone()),
+                axum::extract::Query(TimeoutParams { timeout: None }),
+                axum::Json(vec![Statement::WithParams(
+                    "insert into test1 (id, text) values (?,?)".into(),
+                    vec!["test1-id-3".into(), "service-name-3".into()],
+                )]),
+            )
+            .await;
+
+            assert_eq!(status_code, StatusCode::OK);
+
+            match rows.recv::<QueryEvent>().await.unwrap().unwrap() {
+                QueryEvent::Change(ChangeType::Insert, RowId(2), vals, _change_id) => {
+                    assert_eq!(
+                        vals,
+                        vec![
+                            "test1-id-3".into(),
+                            "service-name-3".into(),
+                            SqliteValue::Null
+                        ]
+                    );
+                }
+                evt => panic!("expected insert change for new left-join row, got {evt:?}"),
+            }
+
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let (status_code, _) = api_v1_transactions(
+                Extension(agent.clone()),
+                axum::extract::Query(TimeoutParams { timeout: None }),
+                axum::Json(vec![Statement::WithParams(
+                    "delete from test2 where id = ?".into(),
+                    vec!["test2-id".into()],
+                )]),
+            )
+            .await;
+
+            assert_eq!(status_code, StatusCode::OK);
+
+            let evt1 = rows.recv::<QueryEvent>().await.unwrap().unwrap();
+            let evt2 = rows.recv::<QueryEvent>().await.unwrap().unwrap();
+            let mut got_insert = false;
+            let mut got_delete = false;
+            for evt in [evt1, evt2] {
+                match evt {
+                    QueryEvent::Change(ChangeType::Insert, RowId(3), vals, _change_id) => {
+                        assert_eq!(
+                            vals,
+                            vec![
+                                "test1-id".into(),
+                                "service-name".into(),
+                                SqliteValue::Null
+                            ]
+                        );
+                        got_insert = true;
+                    }
+                    QueryEvent::Change(ChangeType::Delete, RowId(1), vals, _change_id) => {
+                        assert_eq!(
+                            vals,
+                            vec![
+                                "test1-id".into(),
+                                "service-name".into(),
+                                "service-text".into()
+                            ]
+                        );
+                        got_delete = true;
+                    }
+                    other => panic!("unexpected left-join change event: {other:?}"),
+                }
+            }
+            assert!(got_insert);
+            assert!(got_delete);
+
+            //insert again
+            let (status_code, body) = api_v1_transactions(
+                Extension(agent.clone()),
+                axum::extract::Query(TimeoutParams { timeout: None }),
+                axum::Json(vec![Statement::WithParams(
+                    "insert into test2 (id, test1_id, text) values (?, ?, ?)".into(),
+                    vec!["test2-id".into(), "test1-id".into(), "service-text".into()],
+                )]),
+            )
+            .await;
+
+            assert_eq!(status_code, StatusCode::OK);
+            assert!(body.0.results.len() == 1);
+            println!("body: {:?}", body.0.results);
+
+            match rows.recv::<QueryEvent>().await.unwrap().unwrap() {
+                QueryEvent::Change(ChangeType::Insert, RowId(4), vals, _change_id) => {
+                    assert_eq!(
+                        vals,
+                        vec!["test1-id".into(), "service-name".into(), "service-text".into()]
+                    );
+                }
+                evt => panic!("expected insert change for restored left-join row, got {evt:?}"),
+            }
+
+            // let (status_code, body) = api_v1_transactions(
+            //     Extension(agent.clone()),
+            //     axum::extract::Query(TransactionParams { timeout: None }),
+            //     axum::Json(vec![
+            //         Statement::WithParams(
+            //             "insert into test1 (id, text) values (?,?)".into(),
+            //             vec!["test1-id2".into(), "service-name2".into()],
+            //         ),
+            //     ]),
+            // )
+            // .await;
+
+            // assert_eq!(status_code, StatusCode::OK);
+
+            // assert!(body.0.results.len() == 1);
+            // assert_eq!(
+            //     rows.recv::<QueryEvent>().await.unwrap().unwrap(),
+            //     QueryEvent::Change(
+            //         ChangeType::Insert,
+            //         RowId(7),
+            //         vec!["test1-id2".into(), "service-name2".into(), SqliteValue::Null],
+            //         ChangeId(6)
+            //     )
+            // );
+        }
+
+        tripwire_tx.send(()).await.ok();
+        tripwire_worker.await;
+        ta1.agent.subs_manager().drop_handles().await;
+        wait_for_all_pending_handles().await;
+
+        Ok(())
+    }*/
 
     #[derive(Debug)]
     struct RowsIter {

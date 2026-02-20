@@ -1,6 +1,7 @@
 use crate::actor::ActorId;
 use crate::agent::SplitPool;
 use crate::broadcast::Changeset;
+use crate::matcher::sql_analyzer::SqlAnalysisError;
 use crate::pubsub::{unpack_columns, MatchCandidates, MatchableChange, MatcherError};
 use crate::schema::Schema;
 use antithesis_sdk::assert_sometimes;
@@ -238,10 +239,10 @@ impl UpdateHandle {
         match schema.tables.get(tbl_name) {
             Some(table) => {
                 if table.pk.is_empty() {
-                    return Err(MatcherError::MissingPrimaryKeys);
+                    return Err(SqlAnalysisError::MissingPrimaryKeys.into());
                 }
             }
-            None => return Err(MatcherError::TableNotFound(tbl_name.to_string())),
+            None => return Err(SqlAnalysisError::TableNotFound(tbl_name.to_string()).into()),
         };
 
         let cancel = CancellationToken::new();
