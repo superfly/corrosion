@@ -73,7 +73,6 @@ COPY .antithesis/corrosion/test-templates/verify_subscription.py /opt/antithesis
 COPY .antithesis/corrosion/test-templates/eventually_* /opt/antithesis/test/v1/basic_test/
 COPY .antithesis/corrosion/test-templates/anytime_* /opt/antithesis/test/v1/basic_test/
 COPY .antithesis/corrosion/test-templates/parallel_* /opt/antithesis/test/v1/basic_test/
-COPY .antithesis/corrosion/test-templates/finally_* /opt/antithesis/test/v1/basic_test/
 
 # Create supervisor configuration directory
 RUN mkdir -p /etc/supervisor/conf.d
