@@ -660,7 +660,7 @@ pub async fn api_v1_health(
                 // since a different node that is slow to send out changes can cause worse commit lag
                 // even though the node is perfectly fine.
                 || (query.p99_lag.is_some_and(|max| p99_lag > max)
-                    && query.queue_size.is_some_and(|max| queue_size > max))
+                    && query.queue_size.is_none_or(|max| queue_size > max))
             {
                 StatusCode::SERVICE_UNAVAILABLE
             } else {
