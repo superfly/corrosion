@@ -296,7 +296,7 @@ async fn subscribe(cfg: CorrosionConfig, mut tripwire: Tripwire) -> eyre::Result
                     .db_path
                     .parent()
                     .unwrap()
-                    .join(format!("load-gen/{id}.db"));
+                    .join(format!("load-gen/{id}/sub.sqlite"));
 
                 if let Some(path) = subs_db_path.parent() {
                     info!("creating directory: {path:?}");

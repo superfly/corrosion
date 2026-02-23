@@ -56,35 +56,27 @@ def compare_with_except(
     sub_conn = sqlite3.connect(str(sub_db_path))
     sub_conn.execute(f"ATTACH DATABASE '{state_db_path}' AS corro_main")
 
-    # TODO: use count to do a quick chec
-    # sub_count = sub_conn.execute("SELECT COUNT(*) FROM query").fetchone()[0]
-    # sub_conn.close()
+    # TODO: use count to do a quick check
 
+    # Find rows in subscription that are NOT in executed query
+    except_sub_query = f"""
+        SELECT {columns_str} FROM query
+        EXCEPT
+        {sql} LIMIT 2
+    """
 
-    try:
-        # Find rows in subscription that are NOT in executed query
-        except_sub_query = f"""
-            SELECT {columns_str} FROM query
-            EXCEPT
-            {sql} LIMIT 2
-        """
-        
-        # Find rows in executed query that are NOT in subscription
-        except_state_query = f"""
-            {sql}
-            EXCEPT
-            SELECT {columns_str} FROM query
-            LIMIT 2
-        """
+    # Find rows in executed query that are NOT in subscription
+    except_state_query = f"""
+        {sql}
+        EXCEPT
+        SELECT {columns_str} FROM query
+        LIMIT 2
+    """
 
-        cursor = sub_conn.execute(except_sub_query)
-        rows_not_in_state = cursor.fetchall()
-        cursor = sub_conn.execute(except_state_query)
-        rows_not_in_sub = cursor.fetchall()
-    except sqlite3.OperationalError as e:
-        print(f"error comparing queries: {e}")
-        return [], []
-
+    cursor = sub_conn.execute(except_sub_query)
+    rows_not_in_state = cursor.fetchall()
+    cursor = sub_conn.execute(except_state_query)
+    rows_not_in_sub = cursor.fetchall()
     return rows_not_in_sub, rows_not_in_state
 
 def main():
