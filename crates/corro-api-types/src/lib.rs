@@ -245,6 +245,7 @@ pub struct TableStatResponse {
 pub struct HealthQuery {
     pub gaps: Option<i64>,
     pub p99_lag: Option<f64>,
+    pub max_queue: Option<u64>,
     pub queue_size: Option<u64>,
 }
 
