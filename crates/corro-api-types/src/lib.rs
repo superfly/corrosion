@@ -247,6 +247,7 @@ pub struct HealthQuery {
     pub p99_lag: Option<f64>,
     pub max_queue: Option<u64>,
     pub queue_size: Option<u64>,
+    pub failure_status: Option<u16>,
 }
 
 /// Contains status information about the node

@@ -663,7 +663,8 @@ pub async fn api_v1_health(
                 || (query.p99_lag.is_some_and(|max| p99_lag > max)
                     && query.queue_size.is_none_or(|max| queue_size > max))
             {
-                StatusCode::SERVICE_UNAVAILABLE
+                let status = query.failure_status.unwrap_or(503);
+                StatusCode::from_u16(status).unwrap_or(StatusCode::SERVICE_UNAVAILABLE)
             } else {
                 StatusCode::OK
             };
