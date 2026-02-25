@@ -458,6 +458,7 @@ pub struct SplitPool(Arc<SplitPoolInner>);
 struct SplitPoolInner {
     path: PathBuf,
     write_sema: Arc<Semaphore>,
+    cache_size_kib: i64,
 
     read: SqlitePool,
     write: SqlitePool,
@@ -511,10 +512,11 @@ impl SplitPool {
     pub async fn create<P: AsRef<Path>>(
         path: P,
         write_sema: Arc<Semaphore>,
+        cache_size_kib: i64,
     ) -> Result<Self, SplitPoolCreateError> {
         let rw_pool = sqlite_pool::Config::new(path.as_ref())
             .max_size(1)
-            .create_pool_transform(rusqlite_to_crsqlite_write)?;
+            .create_pool_transform(move |conn| rusqlite_to_crsqlite_write(conn, cache_size_kib))?;
 
         debug!("built RW pool");
 
@@ -527,12 +529,19 @@ impl SplitPool {
         Ok(Self::new(
             path.as_ref().to_owned(),
             write_sema,
+            cache_size_kib,
             ro_pool,
             rw_pool,
         ))
     }
 
-    fn new(path: PathBuf, write_sema: Arc<Semaphore>, read: SqlitePool, write: SqlitePool) -> Self {
+    fn new(
+        path: PathBuf,
+        write_sema: Arc<Semaphore>,
+        cache_size_kib: i64,
+        read: SqlitePool,
+        write: SqlitePool,
+    ) -> Self {
         let (priority_tx, mut priority_rx) = bounded(256, "priority");
         let (normal_tx, mut normal_rx) = bounded(512, "normal");
         let (low_tx, mut low_rx) = bounded(1024, "low");
@@ -554,6 +563,7 @@ impl SplitPool {
         Self(Arc::new(SplitPoolInner {
             path,
             write_sema,
+            cache_size_kib,
             read,
             write,
             priority_tx,
@@ -603,7 +613,7 @@ impl SplitPool {
     #[tracing::instrument(skip(self), level = "debug")]
     pub fn client_dedicated(&self) -> rusqlite::Result<CrConn> {
         let conn = rusqlite::Connection::open(&self.0.path)?;
-        let cr_conn = rusqlite_to_crsqlite_write(conn)?;
+        let cr_conn = rusqlite_to_crsqlite_write(conn, self.0.cache_size_kib)?;
         trace_heavy_queries(cr_conn.conn())?;
         Ok(cr_conn)
     }

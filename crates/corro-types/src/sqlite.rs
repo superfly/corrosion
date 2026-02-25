@@ -181,9 +181,19 @@ static CRSQL_EXT_DIR: Lazy<TempDir> = Lazy::new(|| {
     dir
 });
 
-pub fn rusqlite_to_crsqlite_write(conn: rusqlite::Connection) -> rusqlite::Result<CrConn> {
+pub fn rusqlite_to_crsqlite_write(
+    conn: rusqlite::Connection,
+    cache_size_kib: i64,
+) -> rusqlite::Result<CrConn> {
     let conn = rusqlite_to_crsqlite(conn)?;
-    conn.execute_batch("PRAGMA cache_size = -32000;")?;
+    conn.execute_batch(&format!(
+        "
+        PRAGMA cache_size = {};
+        PRAGMA temp_store = MEMORY;
+        PRAGMA cache_spill = FALSE;
+        ",
+        cache_size_kib
+    ))?;
 
     Ok(conn)
 }

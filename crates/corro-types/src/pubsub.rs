@@ -2524,7 +2524,7 @@ mod tests {
         let subscriptions_path: Utf8PathBuf =
             tmpdir.path().join("subs").display().to_string().into();
 
-        let pool = SplitPool::create(db_path, Arc::new(Semaphore::new(1))).await?;
+        let pool = SplitPool::create(db_path, Arc::new(Semaphore::new(1)), -1048576).await?;
         let clock = Arc::new(uhlc::HLC::default());
 
         {
@@ -2644,7 +2644,7 @@ mod tests {
         let subscriptions_path: Utf8PathBuf =
             tmpdir.path().join("subs").display().to_string().into();
 
-        let pool = SplitPool::create(&db_path, Arc::new(Semaphore::new(1)))
+        let pool = SplitPool::create(&db_path, Arc::new(Semaphore::new(1)), -1048576)
             .await
             .unwrap();
         let mut conn = pool.write_priority().await.unwrap();
