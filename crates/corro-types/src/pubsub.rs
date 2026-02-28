@@ -1035,39 +1035,42 @@ impl Matcher {
 
     async fn run_restore(mut self, mut state_conn: CrConn, tripwire: Tripwire) {
         info!(sub_id = %self.id, "Restoring subscription");
-        let init_res = block_in_place(|| {
-            self.last_rowid = self
-                .conn
-                .query_row(
-                    "SELECT COALESCE(MAX(__corro_rowid), 0) FROM query",
-                    (),
-                    |row| row.get(0),
-                )
-                .optional()?
-                .unwrap_or_default();
 
-            let max_change_id = self
-                .conn
-                .prepare_cached("SELECT COALESCE(MAX(id), 0) FROM changes")?
-                .query_row([], |row| row.get(0))?;
+        let setup_res: Result<(), MatcherError> = || -> Result<(), MatcherError> {
+            block_in_place(|| {
+                self.last_rowid = self
+                    .conn
+                    .query_row(
+                        "SELECT COALESCE(MAX(__corro_rowid), 0) FROM query",
+                        (),
+                        |row| row.get(0),
+                    )
+                    .optional()?
+                    .unwrap_or_default();
 
-            _ = self.last_change_tx.send(max_change_id);
+                let max_change_id = self
+                    .conn
+                    .prepare_cached("SELECT COALESCE(MAX(id), 0) FROM changes")?
+                    .query_row([], |row| row.get(0))?;
+
+                _ = self.last_change_tx.send(max_change_id);
+
+                Ok::<_, MatcherError>(())
+            })?;
+
+            block_in_place(|| self.setup(&mut state_conn))?;
+
+            self.set_status("running")?;
 
             Ok::<_, MatcherError>(())
-        });
+        }();
 
-        if let Err(e) = init_res {
-            error!(sub_id = %self.id, "could not re-initialize subscription: {e}");
-            return;
-        }
-
-        if let Err(e) = block_in_place(|| self.setup(&mut state_conn)) {
-            error!(sub_id = %self.id, "could not setup connection: {e}");
-            return;
-        }
-
-        if let Err(e) = self.set_status("running") {
-            error!(sub_id = %self.id, "could not set status: {e}");
+        if let Err(e) = setup_res {
+            error!(sub_id = %self.id, "could not setup subscription: {e}");
+            self.cancel.cancel();
+            if let Err(e) = Self::cleanup(self.id, self.base_path.clone()) {
+                error!(sub_id = %self.id, "could not handle cleanup: {e}");
+            }
             return;
         }
 
@@ -1281,23 +1284,16 @@ impl Matcher {
         info!(sub_id = %self.id, "matcher loop is done");
     }
 
-    async fn run(mut self, mut state_conn: CrConn, tripwire: Tripwire) {
-        info!(sub_id = %self.id, "Running initial query");
-        if let Err(e) = self
-            .evt_tx
-            .send(QueryEvent::Columns(self.col_names.clone()))
-            .await
-        {
-            error!(sub_id = %self.id, "could not send back columns, probably means no receivers! {e}");
-            return;
-        }
-
+    async fn send_initial_rows(
+        &mut self,
+        state_conn: &mut Connection,
+    ) -> Result<Duration, MatcherError> {
         let mut query_cols = vec![];
         for i in 0..(self.parsed.columns.len()) {
             query_cols.push(format!("col_{i}"));
         }
 
-        let res = block_in_place(|| {
+        block_in_place(|| {
             let tx = self.conn.transaction()?;
 
             let mut stmt_str = Cmd::Stmt(self.query.clone()).to_string();
@@ -1334,14 +1330,14 @@ impl Matcher {
                 let mut select = state_tx.prepare(&stmt_str)?;
                 let start = Instant::now();
                 let mut select_rows = {
-                    let _guard = interrupt_deadline_guard(&state_tx, Duration::from_secs(15));
+                    let _guard = interrupt_deadline_guard(&state_tx, Duration::from_secs(1));
                     select.query(())?
                 };
                 let elapsed = start.elapsed();
                 info!(sub_id = %self.id, "Initial query done in {elapsed:?}");
 
                 let insert_into = format!(
-                    "INSERT INTO query ({}) VALUES ({}) RETURNING __corro_rowid,{}",
+                    "INSERT INTO querys ({}) VALUES ({}) RETURNING __corro_rowid,{}",
                     all_cols.join(","),
                     all_cols
                         .iter()
@@ -1414,40 +1410,52 @@ impl Matcher {
             self.last_rowid = last_rowid;
 
             Ok::<_, MatcherError>(elapsed)
-        });
+        })
+    }
 
-        match res {
-            Ok(elapsed) => {
-                trace!(
-                    "done w/ block_in_place for initial query, elapsed: {:?}",
-                    elapsed
-                );
-                if let Err(e) = self
-                    .evt_tx
-                    .send(QueryEvent::EndOfQuery {
-                        time: elapsed.as_secs_f64(),
-                        change_id: Some(ChangeId(0)),
-                    })
-                    .await
-                {
-                    error!(sub_id = %self.id, "could not return end of query event: {e}");
-                    return;
-                }
-                // db_version
+    async fn run(mut self, mut state_conn: CrConn, tripwire: Tripwire) {
+        info!(sub_id = %self.id, "Running initial query");
+
+        let res: Result<Duration, MatcherError> = async {
+            if let Err(e) = self
+                .evt_tx
+                .send(QueryEvent::Columns(self.col_names.clone()))
+                .await
+            {
+                error!(sub_id = %self.id, "could not send back columns, probably means no receivers! {e}");
+                return Err(MatcherError::EventReceiverClosed);
             }
-            Err(e) => {
-                warn!(sub_id = %self.id, "could not complete initial query: {e}");
-                _ = self
-                    .evt_tx
-                    .send(QueryEvent::Error(e.to_compact_string()))
-                    .await;
 
-                return;
+            let elapsed = self.send_initial_rows(&mut state_conn).await?;
+            trace!(
+                "done w/ block_in_place for initial query, elapsed: {:?}",
+                elapsed
+            );
+            block_in_place(|| self.setup(&mut state_conn))?;
+
+            self.evt_tx
+                .send(QueryEvent::EndOfQuery {
+                    time: elapsed.as_secs_f64(),
+                    change_id: Some(ChangeId(0)),
+                })
+                .await
+                .map_err(|_| MatcherError::EventReceiverClosed)?;
+
+            Ok(elapsed)
+        }.await;
+
+        // if for any reason we weren't able to run,cmd_loop, cancel the subscription
+        // and cleanup the dir since it is unusable.
+        if let Err(e) = res {
+            _ = self
+                .evt_tx
+                .send(QueryEvent::Error(e.to_compact_string()))
+                .await;
+            warn!(sub_id = %self.id, "failed to start up cmd_loop: {e}");
+            self.cancel.cancel();
+            if let Err(e) = Self::cleanup(self.id, self.base_path.clone()) {
+                error!(sub_id = %self.id, "could not handle cleanup: {e}");
             }
-        };
-
-        if let Err(e) = block_in_place(|| self.setup(&mut state_conn)) {
-            error!(sub_id = %self.id, "could not setup connection: {e}");
             return;
         }
 
