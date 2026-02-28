@@ -638,6 +638,7 @@ pub async fn upsert_sub(
 ) -> Result<Uuid, MatcherUpsertError> {
     if let Some(created) = maybe_created {
         if params.from.is_some() {
+            warn!(sub_id = %handle.id(), "from query param was supplied, but no existing subscription found");
             return Err(MatcherUpsertError::SubFromWithoutMatcher);
         }
 
