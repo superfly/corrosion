@@ -164,7 +164,12 @@ pub async fn process_sub_channel(
 
         let query_evt = tokio::select! {
             biased;
-            Some(query_evt) = evt_rx.recv() => query_evt,
+            res = evt_rx.recv() => match res {
+                Some(query_evt) => query_evt,
+                None => {
+                    break;
+                },
+            },
             _ = deadline_check => {
                 if tx.receiver_count() == 0 {
                     info!(sub_id = %id, "All listeners for subscription are gone and didn't come back within {MAX_UNSUB_TIME:?}");
