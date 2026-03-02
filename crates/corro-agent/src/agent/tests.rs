@@ -406,45 +406,13 @@ pub async fn configurable_stress_test(
 
     println!("expecting {changes_count} ops");
 
-    // tokio::spawn({
-    //     let bookies = agents
-    //         .iter()
-    //         .map(|a| (a.agent.actor_id(), a.bookie.clone()))
-    //         .collect::<Vec<_>>();
-    //     async move {
-    //         loop {
-    //             tokio::time::sleep(Duration::from_secs(1)).await;
-    //             for (actor_id, bookie) in bookies.iter() {
-    //                 let registry = bookie.registry();
-    //                 let r = registry.map.read();
-
-    //                 for v in r.values() {
-    //                     debug!(%actor_id, "GOT A LOCK {v:?}");
-    //                 }
-    //             }
-    //         }
-    //     }
-    // });
-
     let start = Instant::now();
 
     let mut interval = tokio::time::interval(Duration::from_secs(1));
     interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
     loop {
         debug!("looping");
-        for ta in agents.iter() {
-            let registry = ta.bookie.registry();
-            let r = registry.map.read();
 
-            for v in r.values() {
-                println!(
-                    "{}: GOT A LOCK: {} has been locked for {:?}",
-                    ta.agent.actor_id(),
-                    v.label,
-                    v.started_at.elapsed()
-                );
-            }
-        }
         tokio::time::sleep(Duration::from_secs(1)).await;
         println!("checking status after {}s", start.elapsed().as_secs_f32());
         let mut v = vec![];
@@ -466,13 +434,7 @@ pub async fn configurable_stress_test(
 
             debug!(
                 "last version: {:?}",
-                ta.bookie
-                    .write::<&str, _>("test", None)
-                    .await
-                    .ensure(ta.agent.actor_id())
-                    .read::<&str, _>("test", None)
-                    .await
-                    .last()
+                ta.bookie.ensure(ta.agent.actor_id()).read().last()
             );
 
             let sync = generate_sync(&ta.bookie, ta.agent.actor_id()).await;
@@ -702,14 +664,7 @@ async fn large_tx_sync() -> eyre::Result<()> {
 
         println!(
             "{name}: bookie: {:?}",
-            ta.bookie
-                .read::<&str, _>("test", None)
-                .await
-                .get(&ta1.agent.actor_id())
-                .unwrap()
-                .read::<&str, _>("test", None)
-                .await
-                .deref()
+            ta.bookie.get(&ta1.agent.actor_id()).unwrap().read().deref()
         );
 
         if count as usize != expected_count {
@@ -1123,12 +1078,8 @@ async fn check_bookie_versions(
     cleared: Vec<RangeInclusive<CrsqlDbVersion>>,
 ) -> eyre::Result<()> {
     let conn = ta.agent.pool().read().await?;
-    let booked = ta
-        .bookie
-        .write::<&str, _>("test", None)
-        .await
-        .ensure(actor_id);
-    let bookedv = booked.read::<&str, _>("test", None).await;
+    let booked = ta.bookie.ensure(actor_id);
+    let bookedv = booked.read();
 
     for versions in complete {
         for version in CrsqlDbVersionRange::from(versions.clone()) {
