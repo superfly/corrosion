@@ -14,8 +14,24 @@ pub const DEFAULT_MAX_SYNC_BACKOFF: u32 = 2;
 #[cfg(not(test))]
 pub const DEFAULT_MAX_SYNC_BACKOFF: u32 = 15;
 
-const fn default_apply_queue() -> usize {
+const fn default_apply_batch_min() -> usize {
     100
+}
+
+const fn default_apply_batch_step() -> usize {
+    500
+}
+
+const fn default_apply_batch_max() -> usize {
+    16_000
+}
+
+const fn default_batch_threshold_ratio() -> f64 {
+    0.9
+}
+
+const fn default_cache_size_kib() -> i64 {
+    -1048576 // 1 GB (negative value means KiB)
 }
 
 const fn default_reaper_interval() -> usize {
@@ -129,6 +145,11 @@ pub struct DbConfig {
     pub schema_paths: Vec<Utf8PathBuf>,
     #[serde(default)]
     pub subscriptions_path: Option<Utf8PathBuf>,
+    /// SQLite page cache size in KiB for writes (negative value).
+    /// Default: -1048576 (1 GB). Larger values improve write performance but use more RAM.
+    /// WARNING: Setting this too low (<100MB) can severely degrade performance.
+    #[serde(default = "default_cache_size_kib")]
+    pub cache_size_kib: i64,
 }
 
 impl DbConfig {
@@ -227,20 +248,34 @@ pub struct PerfConfig {
     pub bcast_channel_len: usize,
     #[serde(default = "default_small_channel")]
     pub foca_channel_len: usize,
-    #[serde(default = "default_apply_timeout")]
-    pub apply_queue_timeout: usize,
-    #[serde(default = "default_apply_queue")]
-    pub apply_queue_len: usize,
     #[serde(default = "default_wal_threshold")]
     pub wal_threshold_mb: usize,
-    #[serde(default = "default_processing_queue")]
-    pub processing_queue_len: usize,
     #[serde(default = "default_sql_tx_timeout")]
     pub sql_tx_timeout: usize,
     #[serde(default = "default_min_sync_backoff")]
     pub min_sync_backoff: u32,
     #[serde(default = "default_max_sync_backoff")]
     pub max_sync_backoff: u32,
+    // How many unapplied changesets corrosion will buffer before starting to drop them
+    #[serde(default = "default_processing_queue")]
+    pub processing_queue_len: usize,
+    // How many ms corrosion will wait before proceeding to apply a batch of changes
+    // We wait either for apply_queue_timeout or untill at least apply_queue_min_batch_size changes accumulate
+    #[serde(default = "default_apply_timeout")]
+    pub apply_queue_timeout: usize,
+    // Minimum amount of changes corrosion will try to apply at once in the same transaction
+    #[serde(default = "default_apply_batch_min")]
+    pub apply_queue_min_batch_size: usize,
+    // batch_size = clamp(min_batch_size, step_base * 2 ** floor(log2(x/step_base)), max_batch_size)
+    #[serde(default = "default_apply_batch_step")]
+    pub apply_queue_step_base: usize,
+    // Maximum amount of changes corrosion will try to apply at once in the same transaction
+    #[serde(default = "default_apply_batch_max")]
+    pub apply_queue_max_batch_size: usize,
+    // Threshold ratio (0.0-1.0) for immediate batch spawning when queue reaches this fraction of batch size
+    // It's used to decide whether to wait for more changes for apply_queue_timeout ms or spawn a batch immediately
+    #[serde(default = "default_batch_threshold_ratio")]
+    pub apply_queue_batch_threshold_ratio: f64,
 }
 
 impl Default for PerfConfig {
@@ -255,13 +290,16 @@ impl Default for PerfConfig {
             clearbuf_channel_len: default_mid_channel(),
             bcast_channel_len: default_mid_channel(),
             foca_channel_len: default_small_channel(),
-            apply_queue_timeout: default_apply_timeout(),
-            apply_queue_len: default_apply_queue(),
             wal_threshold_mb: default_wal_threshold(),
-            processing_queue_len: default_processing_queue(),
             sql_tx_timeout: default_sql_tx_timeout(),
             min_sync_backoff: default_min_sync_backoff(),
             max_sync_backoff: default_max_sync_backoff(),
+            processing_queue_len: default_processing_queue(),
+            apply_queue_timeout: default_apply_timeout(),
+            apply_queue_min_batch_size: default_apply_batch_min(),
+            apply_queue_step_base: default_apply_batch_step(),
+            apply_queue_max_batch_size: default_apply_batch_max(),
+            apply_queue_batch_threshold_ratio: default_batch_threshold_ratio(),
         }
     }
 }
@@ -446,6 +484,7 @@ impl ConfigBuilder {
                 path: db_path,
                 schema_paths: self.schema_paths,
                 subscriptions_path: None,
+                cache_size_kib: default_cache_size_kib(),
             },
             api: ApiConfig {
                 bind_addr: self.api_addr,

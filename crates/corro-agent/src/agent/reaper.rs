@@ -218,7 +218,7 @@ mod tests {
 
     async fn setup_test_db(path: std::path::PathBuf) -> eyre::Result<SplitPool> {
         let write_sema = Arc::new(Semaphore::new(1));
-        let pool = SplitPool::create(path, write_sema).await?;
+        let pool = SplitPool::create(path, write_sema, -1048576).await?;
 
         // Create test table
         let conn = pool.write_priority().await?;
