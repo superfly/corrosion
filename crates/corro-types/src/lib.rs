@@ -7,6 +7,7 @@ pub mod change;
 pub mod channel;
 pub mod config;
 pub mod gauge;
+pub mod matcher;
 pub mod members;
 pub mod metrics_tracker;
 pub mod pubsub;
