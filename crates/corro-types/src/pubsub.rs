@@ -861,7 +861,7 @@ impl Matcher {
         subs_path.join(id.as_simple().to_string())
     }
 
-    pub fn sub_db_path(subs_path: &Utf8Path, id: Uuid) -> Utf8PathBuf {
+    pub fn sub_db_path(subs_path: &Utf8PathBuf, id: Uuid) -> Utf8PathBuf {
         Self::sub_path(subs_path, id).join(SUB_DB_PATH)
     }
 
@@ -915,7 +915,7 @@ impl Matcher {
         spawn_counted(async move {
             if let Err(e) = matcher.run_restore(state_conn, tripwire).await {
                 error!(sub_id = %id, "could not run restore: {e}");
-                if let Err(e) = Self::cleanup(id, subs_path) {
+                if let Err(e) = Self::cleanup(id, Matcher::sub_path(&subs_path, id)) {
                     error!(sub_id = %id, "could not cleanup: {e}");
                 }
             }
@@ -1038,7 +1038,7 @@ impl Matcher {
         spawn_counted(async move {
             if let Err(e) = matcher.run(state_conn, tripwire).await {
                 error!(sub_id = %id, "could not setup subscription: {e}");
-                if let Err(e) = Self::cleanup(id, subs_path.clone()) {
+                if let Err(e) = Self::cleanup(id, Matcher::sub_path(&subs_path, id)) {
                     error!(sub_id = %id, "could not cleanup: {e}");
                 }
             }
