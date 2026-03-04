@@ -138,12 +138,10 @@ fn handle_sql_tracing_event(ev: rusqlite::trace::TraceEvent, readonly: bool) {
             entry.1 += dur;
             drop(stats); // Release lock quickly
 
-            // if let Some(expanded_sql) = stmt_ref.expanded_sql() {
             let queries_mu = IN_FLIGHT_QUERIES.get_or_default();
             let mut inflight_queries = queries_mu.lock();
             inflight_queries.remove(&sql);
             drop(inflight_queries);
-            // }
 
             if duration >= SLOW_QUERY_THRESHOLD {
                 warn!(
@@ -153,19 +151,16 @@ fn handle_sql_tracing_event(ev: rusqlite::trace::TraceEvent, readonly: bool) {
                 );
             }
         }
-        rusqlite::trace::TraceEvent::Stmt(stmt_ref, sql) => {
+        rusqlite::trace::TraceEvent::Stmt(_, sql) => {
             // skip trigger for subprograms.
             if sql.starts_with("--") {
                 return;
             }
             let start_time = Instant::now();
             // expanded sql so we differentiate similar queries ??
-            let sql = stmt_ref.expanded_sql();
-            if let Some(sql) = sql {
-                let queries_mu = IN_FLIGHT_QUERIES.get_or_default();
-                let mut inflight_queries = queries_mu.lock();
-                inflight_queries.insert(sql, start_time);
-            }
+            let queries_mu = IN_FLIGHT_QUERIES.get_or_default();
+            let mut inflight_queries = queries_mu.lock();
+            inflight_queries.insert(sql.to_string(), start_time);
         }
         _ => {}
     }
