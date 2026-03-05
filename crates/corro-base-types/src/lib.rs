@@ -233,10 +233,11 @@ impl fmt::Display for CrsqlSeq {
 
 macro_rules! range {
     ($inner:ident, $name:ident, $iter:ident) => {
-        #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+        #[derive(Copy, Clone, PartialEq, Eq, Hash)]
         pub struct $name {
             start: u64,
-            end: Option<std::num::NonZeroU64>,
+            end: u64,
+            exhausted: bool,
         }
 
         impl $name {
@@ -245,16 +246,8 @@ macro_rules! range {
             pub fn new(start: $inner, end: $inner) -> Self {
                 Self {
                     start: start.0,
-                    end: std::num::NonZeroU64::new(end.0),
-                }
-            }
-
-            /// Creates an empty range
-            #[inline]
-            pub fn empty() -> Self {
-                Self {
-                    start: 0,
-                    end: None,
+                    end: end.0,
+                    exhausted: false,
                 }
             }
 
@@ -263,7 +256,8 @@ macro_rules! range {
             pub fn single(single: $inner) -> Self {
                 Self {
                     start: single.0,
-                    end: std::num::NonZeroU64::new(single.0),
+                    end: single.0,
+                    exhausted: false,
                 }
             }
 
@@ -276,7 +270,7 @@ macro_rules! range {
             /// The typed end of the range
             #[inline]
             pub fn end(&self) -> $inner {
-                $inner(self.end_int())
+                $inner(self.end)
             }
 
             /// The u64 at the beginning of the range
@@ -288,15 +282,15 @@ macro_rules! range {
             /// The u64 at the end of the range
             #[inline]
             pub fn end_int(&self) -> u64 {
-                self.end.map_or(0, |e| e.get())
+                self.end
             }
 
             /// The length of this range, ie the number of values
             /// that would be yielded on iteration
             #[inline]
             pub fn len(&self) -> usize {
-                let end = self.end.map_or(0, |e| e.get());
-                if end >= self.start {
+                let end = self.end;
+                if end >= self.start && !self.exhausted {
                     (end - self.start) as usize + 1
                 } else {
                     0
@@ -315,8 +309,18 @@ macro_rules! range {
                 let (start, end) = r.into_inner();
                 Self {
                     start: start.0,
-                    end: std::num::NonZeroU64::new(end.0),
+                    end: end.0,
+                    exhausted: false,
                 }
+            }
+        }
+
+        impl fmt::Debug for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.debug_struct(stringify!($name))
+                    .field("start", &self.start())
+                    .field("end", &self.end())
+                    .finish()
             }
         }
 
@@ -325,7 +329,8 @@ macro_rules! range {
             fn from(r: &'s RangeInclusive<$inner>) -> Self {
                 Self {
                     start: r.start().0,
-                    end: std::num::NonZeroU64::new(r.end().0),
+                    end: r.end().0,
+                    exhausted: false,
                 }
             }
         }
@@ -349,18 +354,17 @@ macro_rules! range {
 
             #[inline]
             fn next(&mut self) -> Option<Self::Item> {
-                let end = self.end?;
+                if self.exhausted || self.start > self.end {
+                    return None;
+                }
 
-                let next = if self.start < end.get() {
-                    let n = $inner(self.start);
+                let next = self.start;
+                if self.start < self.end {
                     self.start += 1;
-                    n
                 } else {
-                    self.end = None;
-                    $inner(self.start)
-                };
-
-                Some(next)
+                    self.exhausted = true;
+                }
+                Some($inner(next))
             }
 
             #[inline]
@@ -377,7 +381,8 @@ macro_rules! range {
                 let end: u64 = reader.read_value()?;
                 Ok(Self {
                     start,
-                    end: std::num::NonZeroU64::new(end),
+                    end,
+                    exhausted: false,
                 })
             }
 
@@ -394,7 +399,7 @@ macro_rules! range {
                 writer: &mut W,
             ) -> Result<(), C::Error> {
                 self.start.write_to(writer)?;
-                self.end.map_or(0, |e| e.get()).write_to(writer)
+                self.end.write_to(writer)
             }
 
             #[inline]
@@ -500,6 +505,30 @@ mod test {
     }
 
     #[test]
+    fn ranges_iterator() {
+        // if start > end, the range is empty
+        let empty = CrsqlDbVersionRange::new(CrsqlDbVersion(1), CrsqlDbVersion(0));
+        assert!(empty.into_iter().collect::<Vec<_>>().is_empty());
+
+        let zero = CrsqlDbVersionRange::single(CrsqlDbVersion(0));
+        assert_eq!(
+            zero.into_iter().collect::<Vec<_>>(),
+            vec![CrsqlDbVersion(0)]
+        );
+
+        let multiple = CrsqlDbVersionRange::new(CrsqlDbVersion(0), CrsqlDbVersion(3));
+        assert_eq!(
+            multiple.into_iter().collect::<Vec<_>>(),
+            vec![
+                CrsqlDbVersion(0),
+                CrsqlDbVersion(1),
+                CrsqlDbVersion(2),
+                CrsqlDbVersion(3)
+            ]
+        );
+    }
+
+    #[test]
     fn serialization() {
         #[track_caller]
         fn speedy(input: CrsqlDbVersionRange) {
@@ -509,7 +538,7 @@ mod test {
             assert_eq!(input, deser);
         }
 
-        speedy(CrsqlDbVersionRange::empty());
+        speedy(CrsqlDbVersionRange::single(CrsqlDbVersion(0)));
         speedy(CrsqlDbVersionRange::new(
             CrsqlDbVersion(0),
             CrsqlDbVersion(u64::MAX),

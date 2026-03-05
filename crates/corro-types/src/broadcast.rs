@@ -262,7 +262,7 @@ impl Changeset {
             Changeset::Empty { versions, .. } => *versions,
             // todo: this returns dummy version because empty set has an array of versions.
             // probably shouldn't be doing this
-            Changeset::EmptySet { .. } => CrsqlDbVersionRange::empty(),
+            Changeset::EmptySet { .. } => CrsqlDbVersionRange::single(CrsqlDbVersion(0)),
             Changeset::Full { version, .. } => CrsqlDbVersionRange::single(*version),
             Changeset::FullV2 { version, .. } => CrsqlDbVersionRange::single(*version),
         }
