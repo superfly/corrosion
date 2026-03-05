@@ -1052,6 +1052,94 @@ impl BookedVersions {
         Ok(bv)
     }
 
+    pub fn load_all_from_conn(conn: &Connection) -> rusqlite::Result<HashMap<ActorId, Self>> {
+        let mut map: HashMap<ActorId, Self> = HashMap::new();
+
+        // Collect all known site_ids: remote actors we have applied changes from,
+        // plus any we have buffered partial changes for, plus ourselves.
+        {
+            let mut prepped = conn.prepare(
+                "SELECT site_id FROM crsql_site_id WHERE ordinal > 0
+                        UNION
+                    SELECT DISTINCT site_id FROM __corro_seq_bookkeeping
+                        UNION 
+                    SELECT DISTINCT actor_id FROM __corro_bookkeeping_gaps",
+            )?;
+            let rows = prepped.query_map([], |row| row.get(0))?;
+            for actor_id in rows {
+                let actor_id: ActorId = actor_id?;
+                map.entry(actor_id).or_insert_with(|| Self::new(actor_id));
+            }
+        }
+
+        // Populate max from crsql_db_versions
+        {
+            let mut prepped = conn.prepare("SELECT site_id, db_version FROM crsql_db_versions")?;
+            let rows = prepped.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+            for row in rows {
+                let (actor_id, db_version): (ActorId, CrsqlDbVersion) = row?;
+                if let Some(bv) = map.get_mut(&actor_id) {
+                    bv.max = Some(db_version);
+                }
+            }
+        }
+
+        // Populate partials from __corro_seq_bookkeeping
+        {
+            let mut prepped = conn.prepare(
+                "SELECT site_id, db_version, start_seq, end_seq, last_seq, ts FROM __corro_seq_bookkeeping",
+            )?;
+            let rows = prepped.query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            })?;
+            for row in rows {
+                let (actor_id, version, start_seq, end_seq, last_seq, ts): (
+                    ActorId,
+                    CrsqlDbVersion,
+                    _,
+                    _,
+                    _,
+                    _,
+                ) = row?;
+                if let Some(bv) = map.get_mut(&actor_id) {
+                    bv.insert_partial(
+                        version,
+                        PartialVersion {
+                            seqs: RangeInclusiveSet::from_iter(vec![start_seq..=end_seq]),
+                            last_seq,
+                            ts,
+                        },
+                    );
+                }
+            }
+        }
+
+        // Populate needed gaps from __corro_bookkeeping_gaps
+        {
+            let mut prepped =
+                conn.prepare("SELECT actor_id, start, end FROM __corro_bookkeeping_gaps")?;
+            let rows = prepped.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+            for row in rows {
+                let (actor_id, start_v, end_v): (ActorId, CrsqlDbVersion, CrsqlDbVersion) = row?;
+                if let Some(bv) = map.get_mut(&actor_id) {
+                    bv.needed.insert(start_v..=end_v);
+                    if Some(end_v) > bv.max {
+                        warn!(%actor_id, %start_v, %end_v, max = ?bv.max, "max for actor is less than gap");
+                    }
+                }
+            }
+        }
+
+        Ok(map)
+    }
+
     pub fn contains_version(&self, version: &CrsqlDbVersion) -> bool {
         // corrosion knows about a version if...
 
@@ -1241,14 +1329,6 @@ impl Bookie {
             .pin()
             .get_or_insert(actor_id, Booked::new(BookedVersions::new(actor_id)))
             .clone()
-    }
-
-    pub fn insert(&self, actor_id: ActorId, booked: Booked) -> Option<Booked> {
-        self.map.pin().insert(actor_id, booked).cloned()
-    }
-
-    pub fn replace_actor(&self, actor_id: ActorId, bv: BookedVersions) {
-        self.map.pin().insert(actor_id, Booked::new(bv));
     }
 }
 
