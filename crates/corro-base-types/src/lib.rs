@@ -233,7 +233,7 @@ impl fmt::Display for CrsqlSeq {
 
 macro_rules! range {
     ($inner:ident, $name:ident, $iter:ident) => {
-        #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+        #[derive(Copy, Clone, PartialEq, Eq, Hash)]
         pub struct $name {
             start: u64,
             end: u64,
@@ -322,6 +322,15 @@ macro_rules! range {
                     end: end.0,
                     exhausted: false,
                 }
+            }
+        }
+
+        impl fmt::Debug for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.debug_struct(stringify!($name))
+                    .field("start", &self.start())
+                    .field("end", &self.end())
+                    .finish()
             }
         }
 
