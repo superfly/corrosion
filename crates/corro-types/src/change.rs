@@ -1,4 +1,4 @@
-use std::iter::Peekable;
+use std::{iter::Peekable, ops::DerefMut};
 
 use antithesis_sdk::assert_always;
 pub use corro_api_types::SqliteValue;
@@ -11,7 +11,7 @@ use speedy::{Readable, Writable};
 use tracing::{debug, trace, warn};
 
 use crate::{
-    agent::{Agent, BookedVersions, ChangeError, VersionsSnapshot},
+    agent::{Agent, BookedVersions, ChangeError},
     base::CrsqlSeq,
     broadcast::{ChangesetPerTable, Timestamp},
 };
@@ -185,13 +185,12 @@ pub struct InsertChangesInfo {
     pub db_version: CrsqlDbVersion,
     pub last_seq: CrsqlSeq,
     pub ts: Timestamp,
-    pub snap: VersionsSnapshot,
 }
 
 pub fn insert_local_changes(
     agent: &Agent,
     tx: &Connection,
-    book_writer: &mut tokio::sync::RwLockWriteGuard<'_, BookedVersions>,
+    book_writer: &mut impl DerefMut<Target = BookedVersions>,
 ) -> Result<Option<InsertChangesInfo>, ChangeError> {
     let actor_id = agent.actor_id();
 
@@ -243,8 +242,8 @@ pub fn insert_local_changes(
 
             let db_versions = db_version..=db_version;
 
-            let mut snap = book_writer.snapshot();
-            snap.insert_db(tx, [db_versions].into())
+            book_writer
+                .insert_db(tx, [db_versions].into())
                 .map_err(|source| ChangeError::Rusqlite {
                     source,
                     actor_id: Some(actor_id),
@@ -255,7 +254,6 @@ pub fn insert_local_changes(
                 db_version,
                 last_seq,
                 ts,
-                snap,
             }))
         }
     }
