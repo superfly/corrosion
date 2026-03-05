@@ -251,16 +251,6 @@ macro_rules! range {
                 }
             }
 
-            /// Creates an empty range
-            #[inline]
-            pub fn empty() -> Self {
-                Self {
-                    start: 1,
-                    end: 0,
-                    exhausted: false,
-                }
-            }
-
             /// Creates a range that starts and ends at the specified value
             #[inline]
             pub fn single(single: $inner) -> Self {
@@ -516,7 +506,8 @@ mod test {
 
     #[test]
     fn ranges_iterator() {
-        let empty = CrsqlDbVersionRange::empty();
+        // if start > end, the range is empty
+        let empty = CrsqlDbVersionRange::new(CrsqlDbVersion(1), CrsqlDbVersion(0));
         assert!(empty.into_iter().collect::<Vec<_>>().is_empty());
 
         let zero = CrsqlDbVersionRange::single(CrsqlDbVersion(0));
@@ -547,7 +538,7 @@ mod test {
             assert_eq!(input, deser);
         }
 
-        speedy(CrsqlDbVersionRange::empty());
+        speedy(CrsqlDbVersionRange::single(CrsqlDbVersion(0)));
         speedy(CrsqlDbVersionRange::new(
             CrsqlDbVersion(0),
             CrsqlDbVersion(u64::MAX),
