@@ -46,26 +46,35 @@ use corro_types::{
 };
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-async fn http_api_requested_region_header_enforced() -> eyre::Result<()> {
+async fn http_api_requested_endpoint_name_header_enforced() -> eyre::Result<()> {
     _ = tracing_subscriber::fmt::try_init();
     let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
-    let ta1 = launch_test_agent(|conf| conf.region("us-east-1").build(), tripwire.clone()).await?;
+    let ta1 = launch_test_agent(
+        |conf| conf.endpoint_name("us-east-1").build(),
+        tripwire.clone(),
+    )
+    .await?;
+    let ta2 = launch_test_agent(|conf| conf.build(), tripwire.clone()).await?;
 
     let client = reqwest::Client::new();
     let req_body_1: Vec<Statement> = serde_json::from_value(json!([[
         "INSERT INTO tests (id,text) VALUES (?,?)",
-        [999_001, "region header test 1"]
+        [999_001, "endpoint header test 1"]
     ]]))?;
     let req_body_2: Vec<Statement> = serde_json::from_value(json!([[
         "INSERT INTO tests (id,text) VALUES (?,?)",
-        [999_002, "region header test 2"]
+        [999_002, "endpoint header test 2"]
     ]]))?;
     let req_body_3: Vec<Statement> = serde_json::from_value(json!([[
         "INSERT INTO tests (id,text) VALUES (?,?)",
-        [999_003, "region header test 3"]
+        [999_003, "endpoint header test 3"]
+    ]]))?;
+    let req_body_4: Vec<Statement> = serde_json::from_value(json!([[
+        "INSERT INTO tests (id,text) VALUES (?,?)",
+        [999_004, "endpoint header test 4"]
     ]]))?;
 
-    // No X-Corrosion-Requested-Region: accept all requests
+    // No X-Corrosion-Requested-Endpoint-Name: accept all requests
     let no_header_res = client
         .post(format!("http://{}/v1/transactions", ta1.agent.api_addr()))
         .header(hyper::header::CONTENT_TYPE, "application/json")
@@ -74,27 +83,40 @@ async fn http_api_requested_region_header_enforced() -> eyre::Result<()> {
         .await?;
     assert_eq!(no_header_res.status(), StatusCode::OK);
 
-    // w/ X-Corrosion-Requested-Region, matching
+    // w/ X-Corrosion-Requested-Endpoint-Name, matching
     let matching_header_res = client
         .post(format!("http://{}/v1/transactions", ta1.agent.api_addr()))
         .header(hyper::header::CONTENT_TYPE, "application/json")
-        .header("x-corrosion-requested-region", "us-east-1")
+        .header("x-corrosion-requested-endpoint-name", "us-east-1")
         .body(serde_json::to_vec(&req_body_2)?)
         .send()
         .await?;
     assert_eq!(matching_header_res.status(), StatusCode::OK);
 
-    // w/ X-Corrosion-Requested-Region, mismatching
+    // w/ X-Corrosion-Requested-Endpoint-Name, mismatching
     let mismatched_header_res = client
         .post(format!("http://{}/v1/transactions", ta1.agent.api_addr()))
         .header(hyper::header::CONTENT_TYPE, "application/json")
-        .header("x-corrosion-requested-region", "eu-west-1")
+        .header("x-corrosion-requested-endpoint-name", "eu-west-1")
         .body(serde_json::to_vec(&req_body_3)?)
         .send()
         .await?;
     assert_eq!(
         mismatched_header_res.status(),
         StatusCode::MISDIRECTED_REQUEST
+    );
+
+    // Endpoint header is ignored if node has no endpoint name configured
+    let header_ignored_when_unconfigured_res = client
+        .post(format!("http://{}/v1/transactions", ta2.agent.api_addr()))
+        .header(hyper::header::CONTENT_TYPE, "application/json")
+        .header("x-corrosion-requested-endpoint-name", "eu-west-1")
+        .body(serde_json::to_vec(&req_body_4)?)
+        .send()
+        .await?;
+    assert_eq!(
+        header_ignored_when_unconfigured_res.status(),
+        StatusCode::OK
     );
 
     tripwire_tx.send(()).await.ok();
