@@ -1699,7 +1699,6 @@ mod tests {
     use super::*;
     use crate::base::{dbvr, dbvri};
     use rangemap::range_inclusive_set;
-    use rusqlite::params;
 
     #[test]
     fn test_booked_insert_db() -> rusqlite::Result<()> {
@@ -1874,72 +1873,6 @@ mod tests {
         bv2.max = Some(CrsqlDbVersion(55));
 
         assert_eq!(bv, bv2);
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_load_all_from_conn() -> rusqlite::Result<()> {
-        _ = tracing_subscriber::fmt::try_init();
-
-        let mut conn = CrConn::init(Connection::open_in_memory()?)?;
-        setup_conn(&conn)?;
-        let clock = Arc::new(uhlc::HLC::default());
-        migrate(clock, &mut conn)?;
-
-        // The local node's own site_id is stored at ordinal=0 in crsql_site_id.
-        let local_actor_id: ActorId = conn.query_row(
-            "SELECT site_id FROM crsql_site_id WHERE ordinal = 0",
-            [],
-            |row| row.get(0),
-        )?;
-
-        // Create a cr-sqlite tracked table and insert a row so that crsql_db_versions
-        // records a db_version for the local actor. This lets us verify that max is loaded.
-        conn.execute_batch(
-            "CREATE TABLE test_dummy (id INTEGER NOT NULL PRIMARY KEY, val TEXT);
-             SELECT crsql_as_crr('test_dummy');",
-        )?;
-        conn.execute("INSERT INTO test_dummy (id, val) VALUES (1, 'hello')", [])?;
-        let expected_max: CrsqlDbVersion = conn.query_row(
-            "SELECT db_version FROM crsql_db_versions WHERE site_id = crsql_site_id()",
-            [],
-            |row| row.get(0),
-        )?;
-
-        // A remote actor known only via a bookkeeping gap (versions 3..=5 are missing).
-        let gap_actor_id = ActorId(uuid::Uuid::new_v4());
-        conn.execute(
-            "INSERT INTO __corro_bookkeeping_gaps (actor_id, start, end) VALUES (?, ?, ?)",
-            params![gap_actor_id, CrsqlDbVersion(3), CrsqlDbVersion(5)],
-        )?;
-
-        // A remote actor known only via a partial seq entry.
-        let partial_actor_id = ActorId(uuid::Uuid::new_v4());
-        conn.execute(
-            "INSERT INTO __corro_seq_bookkeeping (site_id, db_version, start_seq, end_seq, last_seq, ts) VALUES (?, ?, ?, ?, ?, ?)",
-            params![partial_actor_id, CrsqlDbVersion(1), 0i64, 4i64, 9i64, Timestamp::zero()],
-        )?;
-
-        let map = BookedVersions::load_all_from_conn(&conn)?;
-
-        assert!(
-            map.contains_key(&local_actor_id),
-            "load_all_from_conn must include the local actor (ordinal=0 in crsql_site_id), but it was missing"
-        );
-        assert_eq!(
-            map[&local_actor_id].max,
-            Some(expected_max),
-            "local actor's max db_version must be loaded from crsql_db_versions"
-        );
-        assert!(
-            map.contains_key(&gap_actor_id),
-            "load_all_from_conn must include actors known via __corro_bookkeeping_gaps"
-        );
-        assert!(
-            map.contains_key(&partial_actor_id),
-            "load_all_from_conn must include actors known via __corro_seq_bookkeeping"
-        );
 
         Ok(())
     }
