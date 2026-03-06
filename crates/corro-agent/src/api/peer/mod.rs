@@ -1345,7 +1345,7 @@ pub async fn parallel_sync(
                                 .increment(changes_len as u64);
 
                             debug!(
-                                "handling versions: {:?}, actor_id: {:?}, seqs: {:?}, len: {changes_len} (is_empty: {}, is_complete: {}) from {actor_id}",
+:                               "handling versions: {:?}, actor_id: {:?}, seqs: {:?}, len: {changes_len} (is_empty: {}, is_complete: {}) from {actor_id}",
                                 change.versions(),
                                 change.seqs(),
                                 change.is_empty(),
