@@ -1345,10 +1345,11 @@ pub async fn parallel_sync(
                                 .increment(changes_len as u64);
 
                             debug!(
-                                "handling versions: {:?}, seqs: {:?}, len: {changes_len} (is_empty: {}) from {actor_id}",
+                                "handling versions: {:?}, actor_id: {:?}, seqs: {:?}, len: {changes_len} (is_empty: {}, is_complete: {}) from {actor_id}",
                                 change.versions(),
                                 change.seqs(),
-                                change.is_empty()
+                                change.is_empty(),
+                                change.is_complete()
                             );
                             // only accept emptyset that's from the same node that's syncing
                             if change.is_empty_set() {
