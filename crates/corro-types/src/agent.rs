@@ -1164,7 +1164,9 @@ impl BookedVersions {
                     // then we must have it as a fully applied or cleared version
                     None => true,
                 })
-                .unwrap_or(true)
+                // if we have partials for the version but seqs are empty
+                // then a partial version has been cleared and we haven't seen it yet
+                .unwrap_or(!self.partials.contains_key(&version))
     }
 
     #[inline]
