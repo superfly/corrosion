@@ -46,6 +46,65 @@ use corro_types::{
 };
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn http_api_requested_region_header_enforced() -> eyre::Result<()> {
+    _ = tracing_subscriber::fmt::try_init();
+    let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
+    let ta1 = launch_test_agent(|conf| conf.region("us-east-1").build(), tripwire.clone()).await?;
+
+    let client = reqwest::Client::new();
+    let req_body_1: Vec<Statement> = serde_json::from_value(json!([[
+        "INSERT INTO tests (id,text) VALUES (?,?)",
+        [999_001, "region header test 1"]
+    ]]))?;
+    let req_body_2: Vec<Statement> = serde_json::from_value(json!([[
+        "INSERT INTO tests (id,text) VALUES (?,?)",
+        [999_002, "region header test 2"]
+    ]]))?;
+    let req_body_3: Vec<Statement> = serde_json::from_value(json!([[
+        "INSERT INTO tests (id,text) VALUES (?,?)",
+        [999_003, "region header test 3"]
+    ]]))?;
+
+    // No X-Corrosion-Requested-Region: accept all requests
+    let no_header_res = client
+        .post(format!("http://{}/v1/transactions", ta1.agent.api_addr()))
+        .header(hyper::header::CONTENT_TYPE, "application/json")
+        .body(serde_json::to_vec(&req_body_1)?)
+        .send()
+        .await?;
+    assert_eq!(no_header_res.status(), StatusCode::OK);
+
+    // w/ X-Corrosion-Requested-Region, matching
+    let matching_header_res = client
+        .post(format!("http://{}/v1/transactions", ta1.agent.api_addr()))
+        .header(hyper::header::CONTENT_TYPE, "application/json")
+        .header("x-corrosion-requested-region", "us-east-1")
+        .body(serde_json::to_vec(&req_body_2)?)
+        .send()
+        .await?;
+    assert_eq!(matching_header_res.status(), StatusCode::OK);
+
+    // w/ X-Corrosion-Requested-Region, mismatching
+    let mismatched_header_res = client
+        .post(format!("http://{}/v1/transactions", ta1.agent.api_addr()))
+        .header(hyper::header::CONTENT_TYPE, "application/json")
+        .header("x-corrosion-requested-region", "eu-west-1")
+        .body(serde_json::to_vec(&req_body_3)?)
+        .send()
+        .await?;
+    assert_eq!(
+        mismatched_header_res.status(),
+        StatusCode::MISDIRECTED_REQUEST
+    );
+
+    tripwire_tx.send(()).await.ok();
+    tripwire_worker.await;
+    wait_for_all_pending_handles().await;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 
 async fn insert_rows_and_gossip() -> eyre::Result<()> {
     _ = tracing_subscriber::fmt::try_init();

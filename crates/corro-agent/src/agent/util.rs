@@ -69,6 +69,8 @@ use tower_http::trace::TraceLayer;
 use tracing::{debug, error, info, trace, warn};
 use tripwire::{Outcome, PreemptibleFutureExt, Tripwire};
 
+const REQUESTED_REGION_HEADER: &str = "x-corrosion-requested-region";
+
 pub async fn initialise_foca(agent: &Agent, states: Vec<(SocketAddr, Member<Actor>)>) {
     if !states.is_empty() {
         let mut foca_states = BTreeMap::<SocketAddr, Member<Actor>>::new();
@@ -384,6 +386,23 @@ async fn require_authz(
     request: axum::http::Request<axum::body::Body>,
     next: axum::middleware::Next,
 ) -> Result<axum::response::Response, axum::http::StatusCode> {
+    let maybe_requested_region = request
+        .headers()
+        .get(REQUESTED_REGION_HEADER)
+        .map(|v| v.to_str())
+        .transpose()
+        .map_err(|_| axum::http::StatusCode::BAD_REQUEST)?;
+
+    if maybe_requested_region
+        .is_some_and(|region| agent.config().api.region.as_deref() != Some(region))
+    {
+        warn!(
+            "Rejecting request intended for region {maybe_requested_region:?}, we are {:?}",
+            agent.config().api.region
+        );
+        return Err(axum::http::StatusCode::MISDIRECTED_REQUEST);
+    }
+
     let passed = if let Some(ref authz) = agent.config().api.authorization {
         match authz {
             AuthzConfig::BearerToken(token) => maybe_authz_header
