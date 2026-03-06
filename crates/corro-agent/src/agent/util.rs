@@ -69,6 +69,8 @@ use tower_http::trace::TraceLayer;
 use tracing::{debug, error, info, trace, warn};
 use tripwire::{Outcome, PreemptibleFutureExt, Tripwire};
 
+const REQUESTED_ENDPOINT_NAME_HEADER: &str = "x-corrosion-requested-endpoint-name";
+
 pub async fn initialise_foca(agent: &Agent, states: Vec<(SocketAddr, Member<Actor>)>) {
     if !states.is_empty() {
         let mut foca_states = BTreeMap::<SocketAddr, Member<Actor>>::new();
@@ -384,6 +386,24 @@ async fn require_authz(
     request: axum::http::Request<axum::body::Body>,
     next: axum::middleware::Next,
 ) -> Result<axum::response::Response, axum::http::StatusCode> {
+    if let Some(configured_endpoint_name) = agent.config().api.endpoint_name.as_deref() {
+        let maybe_requested_endpoint_name = request
+            .headers()
+            .get(REQUESTED_ENDPOINT_NAME_HEADER)
+            .map(|v| v.to_str())
+            .transpose()
+            .map_err(|_| axum::http::StatusCode::BAD_REQUEST)?;
+
+        if let Some(requested_endpoint_name) = maybe_requested_endpoint_name {
+            if requested_endpoint_name != configured_endpoint_name {
+                warn!(
+                    "Rejecting request intended for endpoint {requested_endpoint_name}, we are {configured_endpoint_name}",
+                );
+                return Err(axum::http::StatusCode::MISDIRECTED_REQUEST);
+            }
+        }
+    }
+
     let passed = if let Some(ref authz) = agent.config().api.authorization {
         match authz {
             AuthzConfig::BearerToken(token) => maybe_authz_header

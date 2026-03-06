@@ -172,6 +172,8 @@ pub struct ApiConfig {
     #[serde(alias = "addr")]
     #[serde_as(deserialize_as = "OneOrMany<_, PreferOne>")]
     pub bind_addr: Vec<SocketAddr>,
+    #[serde(default)]
+    pub endpoint_name: Option<String>,
     #[serde(alias = "authz", default)]
     pub authorization: Option<AuthzConfig>,
     #[serde_as(deserialize_as = "Option<OneOrMany<_, PreferOne>>")]
@@ -385,6 +387,7 @@ pub struct ConfigBuilder {
     pub db_path: Option<Utf8PathBuf>,
     gossip_addr: Option<SocketAddr>,
     api_addr: Vec<SocketAddr>,
+    endpoint_name: Option<String>,
     external_addr: Option<SocketAddr>,
     admin_path: Option<Utf8PathBuf>,
     prometheus_addr: Option<SocketAddr>,
@@ -412,6 +415,11 @@ impl ConfigBuilder {
 
     pub fn api_addr(mut self, addr: SocketAddr) -> Self {
         self.api_addr.push(addr);
+        self
+    }
+
+    pub fn endpoint_name<S: Into<String>>(mut self, endpoint_name: S) -> Self {
+        self.endpoint_name = Some(endpoint_name.into());
         self
     }
 
@@ -488,6 +496,7 @@ impl ConfigBuilder {
             },
             api: ApiConfig {
                 bind_addr: self.api_addr,
+                endpoint_name: self.endpoint_name,
                 authorization: None,
                 pg: None,
             },
