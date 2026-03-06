@@ -661,7 +661,25 @@ fn collapse_gaps(
             [actor_id],
         )?;
 
+        // insert gaps for buffered changes that are missing bookkeeping on __corro_seq_bookkeeping
+        let buffered_versions = tx
+            .prepare_cached(
+                "
+            SELECT DISTINCT db_version FROM __corro_buffered_changes bc
+                WHERE bc.site_id = ? 
+            AND NOT EXISTS (
+            SELECT 1 FROM __corro_seq_bookkeeping bk 
+                WHERE bk.site_id = bc.site_id 
+                AND bk.db_version = bc.db_version)",
+            )?
+            .query_map(rusqlite::params![actor_id], |row| {
+                let db_version = row.get::<_, CrsqlDbVersion>(0)?;
+                Ok(db_version..=db_version)
+            })?
+            .collect::<rusqlite::Result<rangemap::RangeInclusiveSet<CrsqlDbVersion>>>()?;
+
         bv.insert_gaps(versions);
+        bv.insert_gaps(buffered_versions);
 
         let mut inserted = 0;
         for range in bv.needed().iter() {
