@@ -855,12 +855,18 @@ async fn process_sync(
                     .collect::<Vec<(ActorId, Vec<SyncNeedV1>)>>();
 
                 for (actor_id, needs) in agg {
-                    let booked = bookie.get(&actor_id);
+                    let booked = bookie
+                        .read::<&str, _>("process_sync get actor", None)
+                        .await
+                        .get(&actor_id)
+                        .cloned();
                     let booked = match booked {
                         Some(b) => b,
                         None => continue,
                     };
-                    let booked_read = booked.read();
+                    let booked_read = booked
+                        .read::<&str, _>("process_sync check needs", None)
+                        .await;
 
                     for need in needs {
                         match &need {
@@ -1833,10 +1839,15 @@ mod tests {
         )
         .await?;
 
-        let booked = bookie.get(&actor_id).unwrap();
+        let booked = bookie
+            .read::<&str, _>("test", None)
+            .await
+            .get(&actor_id)
+            .cloned()
+            .unwrap();
 
         {
-            let read = booked.read();
+            let read = booked.read::<&str, _>("test", None).await;
 
             assert!(read.contains_version(&CrsqlDbVersion(1)));
             assert!(read.contains_version(&CrsqlDbVersion(2)));

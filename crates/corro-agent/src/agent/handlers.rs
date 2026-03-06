@@ -990,14 +990,29 @@ pub async fn handle_changes(
         }
 
         // Skip changes we've already seen in the bookie
-        let booked = bookie.get(&change.actor_id);
-        if let Some(booked) = booked {
-            if booked.read().contains_all(change.versions(), change.seqs()) {
-                trace!("already seen, stop disseminating");
-                if matches!(src, ChangeSource::Broadcast) {
-                    counter!("corro.broadcast.duplicate.count", "from" => "bookie").increment(1);
+        // Do this in a new scope to avoid holding the bookie lock for too long
+        {
+            let booked = {
+                bookie
+                    .read("handle_change(get)", change.actor_id.as_simple())
+                    .await
+                    .get(&change.actor_id)
+                    .cloned()
+            };
+
+            if let Some(booked) = booked {
+                if booked
+                    .read("handle_change(contains?)", change.actor_id.as_simple())
+                    .await
+                    .contains_all(change.versions(), change.seqs())
+                {
+                    trace!("already seen, stop disseminating");
+                    if matches!(src, ChangeSource::Broadcast) {
+                        counter!("corro.broadcast.duplicate.count", "from" => "bookie")
+                            .increment(1);
+                    }
+                    continue;
                 }
-                continue;
             }
         }
 
@@ -1273,7 +1288,12 @@ mod tests {
 
         sleep(Duration::from_secs(2)).await;
 
-        let booked = bookie.get(&other_actor).unwrap().read();
+        let bookie = bookie.read::<&str, _>("read booked", None).await;
+        let booked = bookie
+            .get(&other_actor)
+            .unwrap()
+            .read::<&str, _>("test", None)
+            .await;
 
         // With batch_size=1 and queue_len=3, the behavior is:
         // - Version 10 processes immediately (first change, hits threshold)

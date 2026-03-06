@@ -10,7 +10,7 @@ use tracing::warn;
 
 use crate::{
     actor::ActorId,
-    agent::Bookie,
+    agent::{Booked, Bookie},
     base::{CrsqlDbVersion, CrsqlDbVersionRange, CrsqlSeq, CrsqlSeqRange},
     broadcast::{ChangeV1, Timestamp},
 };
@@ -284,10 +284,17 @@ pub async fn generate_sync(bookie: &Bookie, self_actor_id: ActorId) -> SyncState
         ..Default::default()
     };
 
-    let guard = bookie.owned_guard();
+    let actors: Vec<(ActorId, Booked)> = {
+        bookie
+            .read::<&str, _>("generate_sync", None)
+            .await
+            .iter()
+            .map(|(k, v)| (*k, v.clone()))
+            .collect()
+    };
 
-    for (&actor_id, booked) in bookie.iter(&guard) {
-        let bookedr = booked.read();
+    for (actor_id, booked) in actors {
+        let bookedr = booked.read("generate_sync", actor_id.as_simple()).await;
 
         let last_version = match bookedr.last() {
             None => continue,

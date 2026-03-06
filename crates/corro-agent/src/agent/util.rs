@@ -18,7 +18,7 @@ use crate::{
 use antithesis_sdk::assert_sometimes;
 use corro_types::{
     actor::{Actor, ActorId},
-    agent::{Agent, Booked, Bookie, ChangeError, CurrentVersion, KnownDbVersion, PartialVersion},
+    agent::{Agent, Bookie, ChangeError, CurrentVersion, KnownDbVersion, PartialVersion},
     api::TableName,
     base::{CrsqlDbVersion, CrsqlDbVersionRange, CrsqlSeq},
     broadcast::{ChangeSource, ChangeV1, Changeset, ChangesetParts, FocaCmd, FocaInput},
@@ -621,17 +621,26 @@ pub async fn process_fully_buffered_changes(
     tx_timeout: Duration,
 ) -> Result<bool, ChangeError> {
     let rows_impacted = {
-        assert_sometimes!(true, "Corrosion processes fully buffered changes");
-        let booked = bookie.ensure(actor_id);
         let mut conn = agent.pool().write_normal().await?;
+
         debug!(%actor_id, %version, "acquired write (normal) connection to process fully buffered changes");
+        assert_sometimes!(true, "Corrosion processes fully buffered changes");
+        let booked = {
+            bookie
+                .write("process_fully_buffered(ensure)", actor_id.as_simple())
+                .await
+                .ensure(actor_id)
+        };
 
-        block_in_place(move || {
-            let bookie_write = bookie.write_lock_blocking();
-            let bookedw = bookie_write.write_tx(&booked);
-            debug!(%actor_id, %version, "acquired Booked write lock to process fully buffered changes");
+        let mut bookedw = booked
+            .write(
+                "process_fully_buffered(booked writer)",
+                actor_id.as_simple(),
+            )
+            .await;
+        debug!(%actor_id, %version, "acquired Booked write lock to process fully buffered changes");
 
-            let mut bookedw = bookedw;
+        block_in_place(|| {
             let last_seq = {
                 match bookedw.partials.get(&version) {
                     Some(PartialVersion { seqs, last_seq, .. }) => {
@@ -714,8 +723,8 @@ pub async fn process_fully_buffered_changes(
 
             debug!(%actor_id, %version, "rows impacted by buffered changes insertion: {rows_impacted}");
 
-            bookedw
-                .insert_db(&tx, [version..=version].into())
+            let mut snap = bookedw.snapshot();
+            snap.insert_db(&tx, [version..=version].into())
                 .map_err(|source| ChangeError::Rusqlite {
                     source,
                     actor_id: Some(actor_id),
@@ -728,7 +737,7 @@ pub async fn process_fully_buffered_changes(
                 version: Some(version),
             })?;
 
-            bookedw.commit();
+            bookedw.commit_snapshot(snap);
 
             Ok::<_, ChangeError>(rows_impacted > 0)
         })
@@ -771,7 +780,7 @@ pub async fn process_multiple_changes(
     const PROCESSING_WARN_THRESHOLD: Duration = Duration::from_secs(5);
 
     let mut seen = HashSet::new();
-    let mut unknown_changes: BTreeMap<ActorId, (Booked, Vec<_>)> = BTreeMap::new();
+    let mut unknown_changes: BTreeMap<_, Vec<_>> = BTreeMap::new();
     for (change, src, queued_at) in changes {
         histogram!("corro.agent.changes.queued.seconds").record(queued_at.elapsed());
         let versions = change.versions();
@@ -781,34 +790,40 @@ pub async fn process_multiple_changes(
             continue;
         }
 
-        let booked = bookie.ensure(change.actor_id);
-        if booked.read().contains_all(change.versions(), change.seqs()) {
+        let booked_writer = {
+            bookie
+                .write(
+                    "process_multiple_changes(ensure)",
+                    change.actor_id.as_simple(),
+                )
+                .await
+                .ensure(change.actor_id)
+        };
+        if booked_writer
+            .read(
+                "process_multiple_changes(contains_all?)",
+                change.actor_id.as_simple(),
+            )
+            .await
+            .contains_all(change.versions(), change.seqs())
+        {
             continue;
         }
 
         unknown_changes
             .entry(change.actor_id)
-            .and_modify(|(_, per_actor_changes)| per_actor_changes.push((change.clone(), src)))
-            .or_insert_with(|| (booked, vec![(change, src)]));
+            .or_default()
+            .push((change, src));
     }
     let elapsed = start.elapsed();
     if elapsed >= PROCESSING_WARN_THRESHOLD {
         warn!("process_multiple_changes: removing duplicates took too long - {elapsed:?}");
     }
 
-    if unknown_changes.is_empty() {
-        return Ok(());
-    }
-
     let mut conn = agent.pool().write_normal().await?;
-    let bookie = bookie.clone();
-    let agent_for_block = agent.clone();
 
-    let changesets = block_in_place(move || {
-        let bookie_write = bookie.write_lock_blocking();
-        let agent = agent_for_block;
+    let changesets = block_in_place(|| {
         let start = Instant::now();
-
         let tx = conn
             .immediate_transaction()
             .map_err(|source| ChangeError::Rusqlite {
@@ -822,19 +837,23 @@ pub async fn process_multiple_changes(
 
         let mut processed: BTreeMap<ActorId, Vec<_>> = BTreeMap::new();
         let mut changesets = vec![];
-        let mut booked_writes = BTreeMap::new();
-
-        for (actor_id, (booked, _)) in &unknown_changes {
-            booked_writes.insert(*actor_id, bookie_write.write_tx(booked));
-        }
 
         let mut count = 0;
 
         let sub_start = Instant::now();
-        for (actor_id, (_, changes)) in unknown_changes {
-            let booked_write = booked_writes
-                .get_mut(&actor_id)
-                .expect("booked write guard should be present for every actor");
+        for (actor_id, changes) in unknown_changes {
+            let booked = {
+                bookie
+                    .blocking_write(
+                        "process_multiple_changes(for_actor_blocking)",
+                        actor_id.as_simple(),
+                    )
+                    .ensure(actor_id)
+            };
+            let booked_write = booked.blocking_write(
+                "process_multiple_changes(booked writer, unknown changes)",
+                actor_id.as_simple(),
+            );
 
             let max = booked_write.last();
             let mut seen = RangeInclusiveMap::new();
@@ -942,26 +961,46 @@ pub async fn process_multiple_changes(
         }
 
         let sub_start = Instant::now();
+        let mut snapshots = BTreeMap::new();
+
         for (actor_id, processed) in processed.iter() {
             debug!(%actor_id, self_actor_id = %agent.actor_id(), "processing {} changesets", processed.len());
 
-            let booked_write = booked_writes
-                .get_mut(actor_id)
-                .expect("booked write guard should be present for every actor");
+            let booked = {
+                bookie
+                    .blocking_write(
+                        "process_multiple_changes(for_actor_blocking)",
+                        actor_id.as_simple(),
+                    )
+                    .ensure(*actor_id)
+            };
 
-            booked_write
-                .insert_db(
-                    &tx,
-                    processed
-                        .iter()
-                        .map(|(versions, _)| versions.into())
-                        .collect(),
-                )
-                .map_err(|source| ChangeError::Rusqlite {
-                    source,
-                    actor_id: Some(*actor_id),
-                    version: None,
-                })?;
+            // FIXME: here we're making dangerous assumptions that nothing will modify booked versions
+            let mut snap = match snapshots.remove(actor_id) {
+                Some(snap) => snap,
+                None => {
+                    let booked_write = booked.blocking_write(
+                        "process_multiple_changes(booked writer, during processed)",
+                        actor_id.as_simple(),
+                    );
+                    booked_write.snapshot()
+                }
+            };
+
+            snap.insert_db(
+                &tx,
+                processed
+                    .iter()
+                    .map(|(versions, _)| versions.into())
+                    .collect(),
+            )
+            .map_err(|source| ChangeError::Rusqlite {
+                source,
+                actor_id: Some(*actor_id),
+                version: None,
+            })?;
+
+            snapshots.insert(*actor_id, snap);
         }
 
         debug!("inserted {count} new changesets");
@@ -1000,9 +1039,22 @@ pub async fn process_multiple_changes(
 
         let sub_start = Instant::now();
         for (actor_id, processed) in processed {
-            let booked_write = booked_writes
-                .get_mut(&actor_id)
-                .expect("booked write guard should be present for every actor");
+            let booked = {
+                bookie
+                    .blocking_write(
+                        "process_multiple_changes(for_actor_blocking)",
+                        actor_id.as_simple(),
+                    )
+                    .ensure(actor_id)
+            };
+            let mut booked_write = booked.blocking_write(
+                "process_multiple_changes(booked writer, before apply needed)",
+                actor_id.as_simple(),
+            );
+
+            if let Some(snap) = snapshots.remove(&actor_id) {
+                booked_write.commit_snapshot(snap);
+            }
 
             for (versions, partial) in processed {
                 let version = versions.start();
@@ -1036,11 +1088,7 @@ pub async fn process_multiple_changes(
             &details
         );
         if elapsed >= PROCESSING_WARN_THRESHOLD {
-            warn!("process_multiple_changes: applying in-memory booked updates took too long - {elapsed:?}");
-        }
-
-        for (_, booked_write) in booked_writes {
-            booked_write.commit();
+            warn!("process_multiple_changes: commiting snapshots took too long - {elapsed:?}");
         }
 
         Ok::<_, ChangeError>(changesets)

@@ -7,19 +7,13 @@
 //!
 //! ```rust,no_run
 //! # use rusqlite::{types::Value, Connection, Result, params};
-//! # use rusqlite::vtab::eponymous_only_module;
-//! # use corro_types::vtab::unnest::UnnestTab;
 //! # use std::rc::Rc;
 //! fn example(db: &Connection) -> Result<()> {
 //!     // Load the unnest module
 //!     db.create_module("unnest", eponymous_only_module::<UnnestTab>(), None)?;
 //!     
 //!     let arr1 = Rc::new(vec![Value::from(1i64), Value::from(2i64), Value::from(3i64)]);
-//!     let arr2 = Rc::new(vec![
-//!         Value::from(String::from("a")),
-//!         Value::from(String::from("b")),
-//!         Value::from(String::from("c")),
-//!     ]);
+//!     let arr2 = Rc::new(vec![Value::from("a"), Value::from("b"), Value::from("c")]);
 //!     
 //!     // Query with multiple arrays - like PostgreSQL's unnest(array1, array2)
 //!     let mut stmt = db.prepare("SELECT * FROM unnest(?1, ?2);")?;

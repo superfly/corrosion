@@ -1,21 +1,26 @@
 use std::{
     cmp,
     collections::{btree_map, BTreeMap, HashMap, HashSet},
+    fmt,
     future::Future,
     io,
     net::SocketAddr,
     ops::{Deref, DerefMut, RangeInclusive},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 
 use antithesis_sdk::assert_unreachable;
 use arc_swap::ArcSwap;
 use camino::Utf8PathBuf;
+use compact_str::{CompactString, ToCompactString};
+use indexmap::IndexMap;
 use metrics::{gauge, histogram};
-use papaya::{Guard, HashMap as PapayaHashMap};
-use parking_lot::{ArcMutexGuard, Mutex, RawMutex, RwLock};
+use parking_lot::RwLock;
 use rangemap::RangeInclusiveSet;
 use rusqlite::{named_params, Connection, OpenFlags, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
@@ -26,7 +31,11 @@ use tokio::{
     sync::{oneshot, Semaphore},
 };
 use tokio::{
-    sync::{AcquireError, OwnedSemaphorePermit},
+    sync::{
+        AcquireError, OwnedRwLockWriteGuard as OwnedTokioRwLockWriteGuard, OwnedSemaphorePermit,
+        RwLock as TokioRwLock, RwLockReadGuard as TokioRwLockReadGuard,
+        RwLockWriteGuard as TokioRwLockWriteGuard,
+    },
     time::timeout,
 };
 use tokio_util::sync::{CancellationToken, DropGuard};
@@ -65,7 +74,6 @@ pub struct AgentConfig {
     pub clock: Arc<uhlc::HLC>,
 
     pub booked: Booked,
-    pub bookie: Bookie,
 
     pub tx_bcast: CorroSender<BroadcastInput>,
     pub tx_apply: CorroSender<(ActorId, CrsqlDbVersion)>,
@@ -98,7 +106,6 @@ pub struct AgentInner {
     metrics_tracker: MetricsTracker,
     clock: Arc<uhlc::HLC>,
     booked: Booked,
-    bookie: Bookie,
     tx_bcast: CorroSender<BroadcastInput>,
     tx_apply: CorroSender<(ActorId, CrsqlDbVersion)>,
     tx_clear_buf: CorroSender<(ActorId, CrsqlDbVersionRange)>,
@@ -130,7 +137,6 @@ impl Agent {
             metrics_tracker: config.metrics_tracker,
             clock: config.clock,
             booked: config.booked,
-            bookie: config.bookie,
             tx_bcast: config.tx_bcast,
             tx_apply: config.tx_apply,
             tx_clear_buf: config.tx_clear_buf,
@@ -220,10 +226,6 @@ impl Agent {
 
     pub fn booked(&self) -> &Booked {
         &self.0.booked
-    }
-
-    pub fn bookie(&self) -> &Bookie {
-        &self.0.bookie
     }
 
     pub fn members(&self) -> &RwLock<Members> {
@@ -750,6 +752,366 @@ impl DerefMut for WriteConn {
         &mut self.conn
     }
 }
+pub struct CountedTokioRwLock<T> {
+    registry: LockRegistry,
+    lock: Arc<TokioRwLock<T>>,
+}
+
+impl<T> CountedTokioRwLock<T> {
+    fn new(registry: LockRegistry, value: T) -> Self {
+        Self {
+            registry,
+            lock: Arc::new(TokioRwLock::new(value)),
+        }
+    }
+
+    #[tracing::instrument(skip_all, level = "debug")]
+    pub async fn write<C: fmt::Display, E: Into<Option<C>>>(
+        &self,
+        label: &'static str,
+        extra: E,
+    ) -> CountedTokioRwLockWriteGuard<'_, T> {
+        self.registry.acquire_write(label, extra, &self.lock).await
+    }
+
+    #[tracing::instrument(skip_all, level = "debug")]
+    pub async fn write_owned<C: fmt::Display, E: Into<Option<C>>>(
+        &self,
+        label: &'static str,
+        extra: E,
+    ) -> CountedOwnedTokioRwLockWriteGuard<T> {
+        self.registry
+            .acquire_write_owned(label, extra, self.lock.clone())
+            .await
+    }
+
+    #[tracing::instrument(skip_all, level = "debug")]
+    pub fn blocking_write<C: fmt::Display, E: Into<Option<C>>>(
+        &self,
+        label: &'static str,
+        extra: E,
+    ) -> CountedTokioRwLockWriteGuard<'_, T> {
+        self.registry
+            .acquire_blocking_write(label, extra, &self.lock)
+    }
+
+    #[tracing::instrument(skip_all, level = "debug")]
+    pub fn blocking_write_owned<C: fmt::Display, E: Into<Option<C>>>(
+        &self,
+        label: &'static str,
+        extra: E,
+    ) -> CountedOwnedTokioRwLockWriteGuard<T> {
+        self.registry
+            .acquire_blocking_write_owned(label, extra, self.lock.clone())
+    }
+
+    #[tracing::instrument(skip_all, level = "debug")]
+    pub fn blocking_read<C: fmt::Display, E: Into<Option<C>>>(
+        &self,
+        label: &'static str,
+        extra: E,
+    ) -> CountedTokioRwLockReadGuard<'_, T> {
+        self.registry
+            .acquire_blocking_read(label, extra, &self.lock)
+    }
+
+    #[tracing::instrument(skip_all, level = "debug")]
+    pub async fn read<C: fmt::Display, E: Into<Option<C>>>(
+        &self,
+        label: &'static str,
+        extra: E,
+    ) -> CountedTokioRwLockReadGuard<'_, T> {
+        self.registry.acquire_read(label, extra, &self.lock).await
+    }
+
+    pub fn registry(&self) -> &LockRegistry {
+        &self.registry
+    }
+}
+
+pub struct CountedTokioRwLockWriteGuard<'a, T> {
+    lock: TokioRwLockWriteGuard<'a, T>,
+    _tracker: LockTracker,
+}
+
+impl<'a, T> Deref for CountedTokioRwLockWriteGuard<'a, T> {
+    type Target = TokioRwLockWriteGuard<'a, T>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.lock
+    }
+}
+
+impl<'a, T> DerefMut for CountedTokioRwLockWriteGuard<'a, T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.lock
+    }
+}
+
+pub struct CountedOwnedTokioRwLockWriteGuard<T> {
+    lock: OwnedTokioRwLockWriteGuard<T>,
+    _tracker: LockTracker,
+}
+
+impl<T> Deref for CountedOwnedTokioRwLockWriteGuard<T> {
+    type Target = OwnedTokioRwLockWriteGuard<T>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.lock
+    }
+}
+
+impl<T> DerefMut for CountedOwnedTokioRwLockWriteGuard<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.lock
+    }
+}
+
+pub struct CountedTokioRwLockReadGuard<'a, T> {
+    lock: TokioRwLockReadGuard<'a, T>,
+    _tracker: LockTracker,
+}
+
+impl<'a, T> Deref for CountedTokioRwLockReadGuard<'a, T> {
+    type Target = TokioRwLockReadGuard<'a, T>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.lock
+    }
+}
+
+impl<'a, T> DerefMut for CountedTokioRwLockReadGuard<'a, T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.lock
+    }
+}
+
+type LockId = usize;
+
+#[derive(Debug, Clone)]
+pub struct LockMeta {
+    pub label: &'static str,
+    pub extra: Option<CompactString>,
+    pub kind: LockKind,
+    pub state: LockState,
+    pub started_at: Instant,
+}
+
+#[derive(Default, Clone)]
+pub struct LockRegistry {
+    id_gen: Arc<AtomicUsize>,
+    pub map: Arc<RwLock<IndexMap<LockId, LockMeta>>>,
+}
+
+impl LockRegistry {
+    fn remove(&self, id: &LockId) {
+        self.map.write().shift_remove(id);
+    }
+
+    async fn acquire_write<'a, T, C: fmt::Display, E: Into<Option<C>>>(
+        &self,
+        label: &'static str,
+        extra: E,
+        lock: &'a TokioRwLock<T>,
+    ) -> CountedTokioRwLockWriteGuard<'a, T> {
+        let id = self.gen_id();
+        self.insert_lock(
+            id,
+            LockMeta {
+                label,
+                extra: extra.into().map(|d| d.to_compact_string()),
+                kind: LockKind::Write,
+                state: LockState::Acquiring,
+                started_at: Instant::now(),
+            },
+        );
+        let _tracker = LockTracker {
+            id,
+            registry: self.clone(),
+        };
+        let w = lock.write().await;
+        self.set_lock_state(&id, LockState::Locked);
+        CountedTokioRwLockWriteGuard { lock: w, _tracker }
+    }
+
+    async fn acquire_write_owned<T, C: fmt::Display, E: Into<Option<C>>>(
+        &self,
+        label: &'static str,
+        extra: E,
+        lock: Arc<TokioRwLock<T>>,
+    ) -> CountedOwnedTokioRwLockWriteGuard<T> {
+        let id = self.gen_id();
+        self.insert_lock(
+            id,
+            LockMeta {
+                label,
+                extra: extra.into().map(|d| d.to_compact_string()),
+                kind: LockKind::Write,
+                state: LockState::Acquiring,
+                started_at: Instant::now(),
+            },
+        );
+        let _tracker = LockTracker {
+            id,
+            registry: self.clone(),
+        };
+        let w = lock.write_owned().await;
+        self.set_lock_state(&id, LockState::Locked);
+        CountedOwnedTokioRwLockWriteGuard { lock: w, _tracker }
+    }
+
+    fn acquire_blocking_write<'a, T, C: fmt::Display, E: Into<Option<C>>>(
+        &self,
+        label: &'static str,
+        extra: E,
+        lock: &'a TokioRwLock<T>,
+    ) -> CountedTokioRwLockWriteGuard<'a, T> {
+        let id = self.gen_id();
+        self.insert_lock(
+            id,
+            LockMeta {
+                label,
+                extra: extra.into().map(|d| d.to_compact_string()),
+                kind: LockKind::Write,
+                state: LockState::Acquiring,
+                started_at: Instant::now(),
+            },
+        );
+        let _tracker = LockTracker {
+            id,
+            registry: self.clone(),
+        };
+        let w = lock.blocking_write();
+        self.set_lock_state(&id, LockState::Locked);
+        CountedTokioRwLockWriteGuard { lock: w, _tracker }
+    }
+
+    fn acquire_blocking_write_owned<T, C: fmt::Display, E: Into<Option<C>>>(
+        &self,
+        label: &'static str,
+        extra: E,
+        lock: Arc<TokioRwLock<T>>,
+    ) -> CountedOwnedTokioRwLockWriteGuard<T> {
+        let id = self.gen_id();
+        self.insert_lock(
+            id,
+            LockMeta {
+                label,
+                extra: extra.into().map(|d| d.to_compact_string()),
+                kind: LockKind::Write,
+                state: LockState::Acquiring,
+                started_at: Instant::now(),
+            },
+        );
+        let _tracker = LockTracker {
+            id,
+            registry: self.clone(),
+        };
+        let w = loop {
+            if let Ok(w) = lock.clone().try_write_owned() {
+                break w;
+            }
+            // don't instantly loop
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        self.set_lock_state(&id, LockState::Locked);
+        CountedOwnedTokioRwLockWriteGuard { lock: w, _tracker }
+    }
+
+    async fn acquire_read<'a, T, C: fmt::Display, E: Into<Option<C>>>(
+        &self,
+        label: &'static str,
+        extra: E,
+        lock: &'a TokioRwLock<T>,
+    ) -> CountedTokioRwLockReadGuard<'a, T> {
+        let id = self.gen_id();
+        self.insert_lock(
+            id,
+            LockMeta {
+                label,
+                extra: extra
+                    .into()
+                    .map(|d| d.to_compact_string())
+                    .map(|d| d.to_compact_string()),
+                kind: LockKind::Read,
+                state: LockState::Acquiring,
+                started_at: Instant::now(),
+            },
+        );
+        let _tracker = LockTracker {
+            id,
+            registry: self.clone(),
+        };
+        let w = lock.read().await;
+        self.set_lock_state(&id, LockState::Locked);
+        CountedTokioRwLockReadGuard { lock: w, _tracker }
+    }
+
+    fn acquire_blocking_read<'a, T, C: fmt::Display, E: Into<Option<C>>>(
+        &self,
+        label: &'static str,
+        extra: E,
+        lock: &'a TokioRwLock<T>,
+    ) -> CountedTokioRwLockReadGuard<'a, T> {
+        let id = self.gen_id();
+        self.insert_lock(
+            id,
+            LockMeta {
+                label,
+                extra: extra.into().map(|d| d.to_compact_string()),
+                kind: LockKind::Read,
+                state: LockState::Acquiring,
+                started_at: Instant::now(),
+            },
+        );
+        let _tracker = LockTracker {
+            id,
+            registry: self.clone(),
+        };
+        let w = lock.blocking_read();
+        self.set_lock_state(&id, LockState::Locked);
+        CountedTokioRwLockReadGuard { lock: w, _tracker }
+    }
+
+    fn set_lock_state(&self, id: &LockId, state: LockState) {
+        if let Some(meta) = self.map.write().get_mut(id) {
+            meta.state = state
+        }
+    }
+
+    fn insert_lock(&self, id: LockId, meta: LockMeta) {
+        self.map.write().insert(id, meta);
+    }
+
+    fn gen_id(&self) -> LockId {
+        self.id_gen.fetch_add(1, Ordering::Release) + 1
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LockState {
+    Acquiring,
+    Locked,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LockKind {
+    Read,
+    Write,
+}
+
+struct LockTracker {
+    id: LockId,
+    registry: LockRegistry,
+}
+
+impl Drop for LockTracker {
+    fn drop(&mut self) {
+        self.registry.remove(&self.id)
+    }
+}
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PartialVersion {
@@ -785,7 +1147,15 @@ pub enum KnownDbVersion {
     Partial(PartialVersion),
 }
 
-impl BookedVersions {
+#[derive(Debug)]
+pub struct VersionsSnapshot {
+    actor_id: ActorId,
+    needed: RangeInclusiveSet<CrsqlDbVersion>,
+    partials: BTreeMap<CrsqlDbVersion, PartialVersion>,
+    max: Option<CrsqlDbVersion>,
+}
+
+impl VersionsSnapshot {
     pub fn needed(&self) -> &RangeInclusiveSet<CrsqlDbVersion> {
         &self.needed
     }
@@ -795,7 +1165,7 @@ impl BookedVersions {
     }
 
     pub fn insert_db(
-        &mut self,
+        &mut self,         // only because we want 1 mt a time here
         conn: &Connection, // usually a `Transaction`
         db_versions: RangeInclusiveSet<CrsqlDbVersion>,
     ) -> rusqlite::Result<()> {
@@ -963,6 +1333,28 @@ impl BookedVersions {
     }
 }
 
+// this struct must be drained!
+impl Drop for VersionsSnapshot {
+    fn drop(&mut self) {
+        trace!("dropping snapshot: {self:?}");
+        if !self.needed.is_empty() {
+            warn!(actor_id = %self.actor_id, "needed versions from snapshot were not drained: {:?}", self.needed);
+        }
+        debug_assert!(
+            self.needed.is_empty(),
+            "needed versions from snapshot were not drained"
+        );
+        if !self.partials.is_empty() {
+            warn!(actor_id = %self.actor_id, "partials were not drained: {:?}", self.partials);
+        }
+        debug_assert!(
+            self.partials.is_empty(),
+            "partials from snapshot were not drained!"
+        );
+        debug_assert!(self.max.is_none(), "max value was not applied");
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BookedVersions {
     actor_id: ActorId,
@@ -1023,6 +1415,8 @@ impl BookedVersions {
             }
         }
 
+        let mut snap = bv.snapshot();
+
         {
             // fetch the sync's needed version gaps
             let mut prepped = conn.prepare_cached(
@@ -1039,15 +1433,17 @@ impl BookedVersions {
                         let end_v = row.get(1)?;
 
                         // TODO: don't do this manually...
-                        bv.needed.insert(start_v..=end_v);
+                        snap.needed.insert(start_v..=end_v);
                         // max for booked versions shouldn't come from gaps
-                        if Some(end_v) > bv.max {
-                            warn!(%actor_id, %start_v, %end_v, max = ?bv.max, "max for actor is less than gap");
+                        if Some(end_v) > snap.max {
+                            warn!(%actor_id, %start_v, %end_v, max = ?snap.max, "max for actor is less than gap");
                         }
                     }
                 }
             }
         }
+
+        bv.commit_snapshot(snap);
 
         Ok(bv)
     }
@@ -1094,8 +1490,24 @@ impl BookedVersions {
         self.max
     }
 
-    // Called for each partial changeset which has been successfully buffered in the database.
-    // Right now db reconciliation is done when inserting a partial changeset.
+    pub fn commit_snapshot(&mut self, mut snap: VersionsSnapshot) {
+        debug!("comitting snapshot");
+        self.needed = std::mem::take(&mut snap.needed);
+        self.partials = std::mem::take(&mut snap.partials);
+        self.max = snap.max.take();
+    }
+
+    pub fn snapshot(&self) -> VersionsSnapshot {
+        trace!("creating snapshot");
+        VersionsSnapshot {
+            actor_id: self.actor_id,
+            needed: self.needed.clone(),
+            partials: self.partials.clone(),
+            max: self.max,
+        }
+    }
+
+    // used when the commit has succeeded
     pub fn insert_partial(
         &mut self,
         version: CrsqlDbVersion,
@@ -1115,6 +1527,10 @@ impl BookedVersions {
             }
         }
     }
+
+    pub fn needed(&self) -> &RangeInclusiveSet<CrsqlDbVersion> {
+        &self.needed
+    }
 }
 
 #[derive(Debug)]
@@ -1124,133 +1540,157 @@ pub struct GapsChanges {
     remove_ranges: HashSet<RangeInclusive<CrsqlDbVersion>>,
 }
 
+pub type BookedInner = Arc<CountedTokioRwLock<BookedVersions>>;
+
 #[derive(Clone)]
-pub struct Booked {
-    versions: Arc<ArcSwap<BookedVersions>>,
-}
-
-pub struct BookedWriteTx {
-    versions: Arc<ArcSwap<BookedVersions>>,
-    working: BookedVersions,
-}
-
-impl BookedWriteTx {
-    // Publishes the working copy into ArcSwap so it's visible by readers.
-    // The external BookieWriteGuard controls lock lifetime.
-    pub fn commit(self) {
-        self.versions.store(Arc::new(self.working));
-    }
-}
-
-impl Deref for BookedWriteTx {
-    type Target = BookedVersions;
-
-    fn deref(&self) -> &Self::Target {
-        &self.working
-    }
-}
-
-impl DerefMut for BookedWriteTx {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.working
-    }
-}
-
-pub struct BookieWriteGuard {
-    _writer_guard: ArcMutexGuard<RawMutex, ()>,
-}
-
-impl BookieWriteGuard {
-    fn new(writer_guard: ArcMutexGuard<RawMutex, ()>) -> BookieWriteGuard {
-        BookieWriteGuard {
-            _writer_guard: writer_guard,
-        }
-    }
-
-    pub fn write_tx(&self, booked: &Booked) -> BookedWriteTx {
-        booked.write_tx()
-    }
-}
+pub struct Booked(BookedInner);
 
 impl Booked {
-    pub fn new(versions: BookedVersions) -> Self {
-        Self {
-            versions: Arc::new(ArcSwap::from_pointee(versions)),
-        }
+    pub fn new(versions: BookedVersions, registry: LockRegistry) -> Self {
+        Self(Arc::new(CountedTokioRwLock::new(registry, versions)))
     }
 
-    pub fn read(
+    pub async fn read<D: fmt::Display, E: Into<Option<D>>>(
         &self,
-    ) -> arc_swap::Guard<Arc<BookedVersions>, arc_swap::strategy::DefaultStrategy> {
-        self.versions.load()
+        label: &'static str,
+        extra: E,
+    ) -> CountedTokioRwLockReadGuard<'_, BookedVersions> {
+        self.0.read(label, extra).await
     }
 
-    fn write_tx(&self) -> BookedWriteTx {
-        let current = self.versions.load_full();
+    pub async fn write<C: fmt::Display, E: Into<Option<C>>>(
+        &self,
+        label: &'static str,
+        extra: E,
+    ) -> CountedTokioRwLockWriteGuard<'_, BookedVersions> {
+        self.0.write(label, extra).await
+    }
 
-        BookedWriteTx {
-            versions: self.versions.clone(),
-            working: (*current).clone(),
-        }
+    pub async fn write_owned<C: fmt::Display, E: Into<Option<C>>>(
+        &self,
+        label: &'static str,
+        extra: E,
+    ) -> CountedOwnedTokioRwLockWriteGuard<BookedVersions> {
+        self.0.write_owned(label, extra).await
+    }
+
+    pub fn blocking_write<C: fmt::Display, E: Into<Option<C>>>(
+        &self,
+        label: &'static str,
+        extra: E,
+    ) -> CountedTokioRwLockWriteGuard<'_, BookedVersions> {
+        self.0.blocking_write(label, extra)
+    }
+
+    pub fn blocking_read<C: fmt::Display, E: Into<Option<C>>>(
+        &self,
+        label: &'static str,
+        extra: E,
+    ) -> CountedTokioRwLockReadGuard<'_, BookedVersions> {
+        self.0.blocking_read(label, extra)
+    }
+
+    pub fn blocking_write_owned<C: fmt::Display, E: Into<Option<C>>>(
+        &self,
+        label: &'static str,
+        extra: E,
+    ) -> CountedOwnedTokioRwLockWriteGuard<BookedVersions> {
+        self.0.blocking_write_owned(label, extra)
     }
 }
 
-#[derive(Clone)]
-pub struct Bookie {
-    map: Arc<PapayaHashMap<ActorId, Booked>>,
-    writer: Arc<Mutex<()>>,
+#[derive(Default)]
+pub struct BookieInner {
+    map: HashMap<ActorId, Booked>,
+    registry: LockRegistry,
 }
 
-impl Bookie {
-    // WARNING: this method blocks the current thread while waiting for the lock.
-    // In async contexts this can starve runtime workers if used outside block_in_place/spawn_blocking.
-    pub fn write_lock_blocking(&self) -> BookieWriteGuard {
-        BookieWriteGuard::new(self.writer.lock_arc())
-    }
-
-    pub fn new(map: HashMap<ActorId, BookedVersions>) -> Self {
-        let papaya_map = PapayaHashMap::new();
-        {
-            let pinned_map = papaya_map.pin();
-            for (actor_id, booked_versions) in map {
-                pinned_map.insert(actor_id, Booked::new(booked_versions));
-            }
-        }
-
-        Self {
-            map: Arc::new(papaya_map),
-            writer: Arc::new(Mutex::new(())),
-        }
-    }
-
-    pub fn get(&self, actor_id: &ActorId) -> Option<Booked> {
-        self.map.pin().get(actor_id).cloned()
-    }
-
-    pub fn owned_guard(&self) -> impl Guard + '_ {
-        self.map.owned_guard()
-    }
-
-    pub fn iter<'guard>(
-        &self,
-        guard: &'guard impl Guard,
-    ) -> impl Iterator<Item = (&'guard ActorId, &'guard Booked)> {
-        self.map.iter(guard)
-    }
-
-    pub fn ensure(&self, actor_id: ActorId) -> Booked {
+impl BookieInner {
+    pub fn ensure(&mut self, actor_id: ActorId) -> Booked {
         self.map
-            .pin()
-            .get_or_insert(actor_id, Booked::new(BookedVersions::new(actor_id)))
+            .entry(actor_id)
+            .or_insert_with(|| {
+                Booked(Arc::new(CountedTokioRwLock::new(
+                    self.registry.clone(),
+                    BookedVersions::new(actor_id),
+                )))
+            })
             .clone()
     }
 
-    pub fn insert(&self, actor_id: ActorId, booked: Booked) -> Option<Booked> {
-        self.map.pin().insert(actor_id, booked).cloned()
+    pub fn replace_actor(&mut self, actor_id: ActorId, bv: BookedVersions) {
+        self.map.insert(
+            actor_id,
+            Booked(Arc::new(CountedTokioRwLock::new(self.registry.clone(), bv))),
+        );
+    }
+}
+
+impl Deref for BookieInner {
+    type Target = HashMap<ActorId, Booked>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.map
+    }
+}
+
+impl DerefMut for BookieInner {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.map
+    }
+}
+
+#[derive(Clone)]
+pub struct Bookie(Arc<CountedTokioRwLock<BookieInner>>);
+
+impl Bookie {
+    pub fn new(map: HashMap<ActorId, BookedVersions>) -> Self {
+        let registry = LockRegistry::default();
+        Self::new_with_registry(map, registry)
     }
 
-    pub fn replace_actor(&self, actor_id: ActorId, bv: BookedVersions) {
-        self.map.pin().insert(actor_id, Booked::new(bv));
+    pub fn new_with_registry(
+        map: HashMap<ActorId, BookedVersions>,
+        registry: LockRegistry,
+    ) -> Self {
+        Self(Arc::new(CountedTokioRwLock::new(
+            registry.clone(),
+            BookieInner {
+                map: map
+                    .into_iter()
+                    .map(|(k, v)| (k, Booked::new(v, registry.clone())))
+                    .collect(),
+                registry,
+            },
+        )))
+    }
+
+    pub async fn read<C: fmt::Display, E: Into<Option<C>>>(
+        &self,
+        label: &'static str,
+        extra: E,
+    ) -> CountedTokioRwLockReadGuard<'_, BookieInner> {
+        self.0.read(label, extra).await
+    }
+
+    pub async fn write<C: fmt::Display, E: Into<Option<C>>>(
+        &self,
+        label: &'static str,
+        extra: E,
+    ) -> CountedTokioRwLockWriteGuard<'_, BookieInner> {
+        self.0.write(label, extra).await
+    }
+
+    pub fn blocking_write<C: fmt::Display, E: Into<Option<C>>>(
+        &self,
+        label: &'static str,
+        extra: E,
+    ) -> CountedTokioRwLockWriteGuard<'_, BookieInner> {
+        self.0.blocking_write(label, extra)
+    }
+
+    pub fn registry(&self) -> &LockRegistry {
+        self.0.registry()
     }
 }
 
@@ -1511,7 +1951,10 @@ mod tests {
         versions: RangeInclusiveSet<CrsqlDbVersion>,
     ) -> rusqlite::Result<()> {
         all_versions.extend(versions.clone());
-        bv.insert_db(conn, versions)
+        let mut snap = bv.snapshot();
+        snap.insert_db(conn, versions)?;
+        bv.commit_snapshot(snap);
+        Ok(())
     }
 
     fn expect_gaps(

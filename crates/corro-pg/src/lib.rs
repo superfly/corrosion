@@ -22,7 +22,7 @@ use std::{
 use chrono::NaiveDateTime;
 use compact_str::CompactString;
 use corro_types::{
-    agent::{Agent, BookieWriteGuard, ChangeError},
+    agent::{Agent, ChangeError},
     broadcast::{broadcast_changes, Timestamp},
     change::{insert_local_changes, InsertChangesInfo},
     config::PgConfig,
@@ -352,11 +352,11 @@ fn parse_query(sql: &str) -> Result<VecDeque<ParsedCmd>, ParseError> {
     Ok(cmds)
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 enum TxState {
     Started {
         kind: OpenTxKind,
-        permits: Option<(OwnedSemaphorePermit, BookieWriteGuard)>,
+        write_permit: Option<OwnedSemaphorePermit>,
     },
     #[default]
     Ended,
@@ -366,13 +366,13 @@ impl TxState {
     fn implicit() -> Self {
         Self::Started {
             kind: OpenTxKind::Implicit,
-            permits: None,
+            write_permit: None,
         }
     }
     fn explicit() -> Self {
         Self::Started {
             kind: OpenTxKind::Explicit,
-            permits: None,
+            write_permit: None,
         }
     }
 
@@ -380,17 +380,15 @@ impl TxState {
         matches!(
             self,
             TxState::Started {
-                permits: Some(_),
+                write_permit: Some(_),
                 ..
             }
         )
     }
 
-    fn set_write_context(&mut self, permit: OwnedSemaphorePermit, bookie_write: BookieWriteGuard) {
+    fn set_write_permit(&mut self, permit: OwnedSemaphorePermit) {
         match self {
-            TxState::Started { permits, .. } => {
-                *permits = Some((permit, bookie_write));
-            }
+            TxState::Started { write_permit, .. } => *write_permit = Some(permit),
             TxState::Ended => {
                 // do nothing, maybe bomb?
             }
@@ -427,13 +425,13 @@ impl TxState {
         *self = Self::explicit()
     }
 
-    fn end(&mut self) -> Option<(OwnedSemaphorePermit, BookieWriteGuard)> {
-        let permits = match self {
-            TxState::Started { permits, .. } => permits.take(),
+    fn end(&mut self) -> Option<OwnedSemaphorePermit> {
+        let permit = match self {
+            TxState::Started { write_permit, .. } => write_permit.take(),
             TxState::Ended => None,
         };
         *self = TxState::Ended;
-        permits
+        permit
     }
 }
 
@@ -1868,15 +1866,9 @@ pub async fn start(
                                     // automatically commit an implicit tx
                                     if session.tx_state.is_implicit() {
                                         trace!("committing IMPLICIT tx");
-                                        let permits = session.tx_state.end();
+                                        let _permit = session.tx_state.end();
 
-                                        let commit_res = if let Some((_permit, bookie_write)) = permits {
-                                            session.handle_commit(bookie_write)
-                                        } else {
-                                            session.commit_db()
-                                        };
-
-                                        if let Err(e) = commit_res {
+                                        if let Err(e) = session.handle_commit() {
                                             back_tx.blocking_send(
                                                 (
                                                     PgWireBackendMessage::ErrorResponse(
@@ -2207,13 +2199,9 @@ impl<'conn> Session<'conn> {
             self.tx_state.start_implicit();
         } else if self.tx_state.is_implicit() && cmd.is_begin() {
             trace!("committing IMPLICIT tx");
-            let permits = self.tx_state.end();
+            let _permit = self.tx_state.end();
 
-            if let Some((_permit, bookie_write)) = permits {
-                self.handle_commit(bookie_write)?;
-            } else {
-                self.commit_db()?;
-            }
+            self.handle_commit()?;
             trace!("committed IMPLICIT tx");
         }
 
@@ -2226,15 +2214,11 @@ impl<'conn> Session<'conn> {
             self.tx_state.start_explicit();
             0
         } else if cmd.is_commit() {
-            let permits = self.tx_state.end();
-            if let Some((_permit, bookie_write)) = permits {
-                self.handle_commit(bookie_write)?;
-            } else {
-                self.commit_db()?;
-            }
+            let _permit = self.tx_state.end();
+            self.handle_commit()?;
             0
         } else if cmd.is_rollback() {
-            let _permits = self.tx_state.end();
+            let _permit = self.tx_state.end();
             self.conn.execute_batch("ROLLBACK")?;
             0
         } else {
@@ -2264,9 +2248,8 @@ impl<'conn> Session<'conn> {
 
             if !self.tx_state.is_writing() && !prepped.readonly() {
                 trace!("query statement writes, acquiring permit...");
-                let write_permit = self.agent.write_permit_blocking()?;
-                let bookie_permit = self.agent.bookie().write_lock_blocking();
-                self.tx_state.set_write_context(write_permit, bookie_permit);
+                self.tx_state
+                    .set_write_permit(self.agent.write_permit_blocking()?);
 
                 counter!("corro.acquired.write.permit.count", "protocol" => "pg").increment(1);
                 self.set_ts()?;
@@ -2375,21 +2358,16 @@ impl<'conn> Session<'conn> {
         let mut changes = 0usize;
 
         if cmd.is_commit() {
-            let permits = self.tx_state.end();
-            if let Some((_permit, bookie_write)) = permits {
-                self.handle_commit(bookie_write)?;
-            } else {
-                self.commit_db()?;
-            }
+            let _permit = self.tx_state.end();
+            self.handle_commit()?;
         } else if cmd.is_begin() {
             // do nothing
             debug!("cmd is BEGIN");
         } else {
             if !self.tx_state.is_writing() && !prepped.readonly() {
                 trace!("statement writes, acquiring permit...");
-                let write_permit = self.agent.write_permit_blocking()?;
-                let bookie_permit = self.agent.bookie().write_lock_blocking();
-                self.tx_state.set_write_context(write_permit, bookie_permit);
+                self.tx_state
+                    .set_write_permit(self.agent.write_permit_blocking()?);
 
                 self.set_ts()?;
             }
@@ -2552,12 +2530,8 @@ impl<'conn> Session<'conn> {
             }
 
             if opened_implicit_tx {
-                let permits = self.tx_state.end();
-                if let Some((_permit, bookie_write)) = permits {
-                    self.handle_commit(bookie_write)?;
-                } else {
-                    self.commit_db()?;
-                }
+                let _permit = self.tx_state.end();
+                self.handle_commit()?;
             }
         }
 
@@ -2579,24 +2553,15 @@ impl<'conn> Session<'conn> {
         Ok(())
     }
 
-    fn commit_db(&self) -> Result<(), ChangeError> {
-        let actor_id = self.agent.actor_id();
-        self.conn
-            .execute_batch("COMMIT")
-            .map_err(|source| ChangeError::Rusqlite {
-                source,
-                actor_id: Some(actor_id),
-                version: None,
-            })?;
-        Ok(())
-    }
-
-    fn handle_commit(&self, bookie_write: BookieWriteGuard) -> Result<(), ChangeError> {
+    fn handle_commit(&self) -> Result<(), ChangeError> {
         trace!("HANDLE COMMIT");
 
-        let actor_id = self.agent.actor_id();
+        let mut book_writer = self
+            .agent
+            .booked()
+            .blocking_write::<&str, _>("handle_write_tx(book_writer)", None);
 
-        let mut book_writer = bookie_write.write_tx(self.agent.booked());
+        let actor_id = self.agent.actor_id();
 
         let insert_info = insert_local_changes(&self.agent, self.conn, &mut book_writer)?;
         self.conn
@@ -2611,11 +2576,12 @@ impl<'conn> Session<'conn> {
             db_version,
             last_seq,
             ts,
+            snap,
         }) = insert_info
         {
             trace!("committed tx, db_version: {db_version}, last_seq: {last_seq:?}");
 
-            book_writer.commit();
+            book_writer.commit_snapshot(snap);
 
             let agent = self.agent.clone();
 
@@ -2640,7 +2606,7 @@ impl<'conn> Session<'conn> {
 impl<'conn> Drop for Session<'conn> {
     fn drop(&mut self) {
         if !self.tx_state.is_ended() {
-            let _permits = self.tx_state.end();
+            let _permit = self.tx_state.end();
             if let Err(e) = self.conn.execute_batch("ROLLBACK") {
                 warn!("failed to rollback tx: {e}");
             } else {
@@ -2656,7 +2622,7 @@ fn send_ready(
     back_tx: &Sender<BackendResponse>,
 ) -> Result<(), BoxError> {
     let ready_status = if session.tx_state.is_implicit() {
-        let permits = session.tx_state.end(); // do this first, in case of failure
+        let _permit = session.tx_state.end(); // do this first, in case of failure
         if discard_until_sync {
             // an error occured, rollback implicit tx!
             warn!("receive Sync message w/ an error to send, rolling back implicit tx");
@@ -2664,11 +2630,7 @@ fn send_ready(
         } else {
             // no error, commit implicit tx
             warn!("receive Sync message, committing implicit tx");
-            if let Some((_permit, bookie_write)) = permits {
-                session.handle_commit(bookie_write)?;
-            } else {
-                session.commit_db()?;
-            }
+            session.handle_commit()?;
         }
 
         TransactionStatus::Idle

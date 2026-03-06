@@ -64,19 +64,22 @@ pub async fn make_broadcastable_changes<F, T>(
 where
     F: FnOnce(&InterruptibleTransaction<Transaction>) -> Result<T, ChangeError>,
 {
-    let actor_id = agent.actor_id();
     trace!("getting conn...");
     let mut conn = agent.pool().write_priority().await?;
     trace!("got conn");
+
+    let actor_id = agent.actor_id();
+    // maybe we should do this earlier, but there can only ever be 1 write conn at a time,
+    // so it probably doesn't matter too much, except for reads of internal state
+    let mut book_writer = agent
+        .booked()
+        .write::<&str, _>("make_broadcastable_changes(booked writer)", None)
+        .await;
 
     let start = Instant::now();
     let ts = Timestamp::from(agent.clock().new_timestamp());
 
     block_in_place(move || {
-        trace!("acquiring bookie write lock...");
-        let bookie_write = agent.bookie().write_lock_blocking();
-        let mut book_writer = bookie_write.write_tx(agent.booked());
-
         let tx = conn
             .immediate_transaction()
             .map_err(|source| ChangeError::Rusqlite {
@@ -122,10 +125,11 @@ where
                 db_version,
                 last_seq,
                 ts,
+                snap,
             }) => {
                 trace!("committed tx, db_version: {db_version}, last_seq: {last_seq:?}");
 
-                book_writer.commit();
+                book_writer.commit_snapshot(snap);
 
                 let agent = agent.clone();
 
@@ -843,7 +847,10 @@ mod tests {
             }))
         ));
 
-        assert_eq!(agent.booked().read().last(), Some(CrsqlDbVersion(1)));
+        assert_eq!(
+            agent.booked().read::<&str, _>("test", None).await.last(),
+            Some(CrsqlDbVersion(1))
+        );
 
         println!("second req...");
 

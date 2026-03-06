@@ -54,6 +54,7 @@ async fn run(
         transport,
         api_listeners,
         mut tripwire,
+        lock_registry,
         rx_bcast,
         rx_apply,
         rx_clear_buf,
@@ -157,7 +158,11 @@ async fn run(
 
     spawn_handle_db_maintenance(&agent);
 
-    let bookie = agent.bookie().clone();
+    let bookie = Bookie::new_with_registry(Default::default(), lock_registry);
+    {
+        let mut w = bookie.write::<&str, _>("init", None).await;
+        w.insert(agent.actor_id(), agent.booked().clone());
+    }
 
     let start = Instant::now();
     {
@@ -216,7 +221,10 @@ async fn run(
                 }
             }
 
-            bookie.replace_actor(actor_id, bv);
+            bookie
+                .write::<&str, _>("replace_actor", None)
+                .await
+                .replace_actor(actor_id, bv);
         }
     }
 

@@ -1,11 +1,16 @@
 //! Setup main agent state
 
 // External crates
+use antithesis_sdk::assert_unreachable;
 use arc_swap::ArcSwap;
 use camino::Utf8PathBuf;
+use indexmap::IndexMap;
+use metrics::counter;
 use parking_lot::RwLock;
 use rusqlite::{Connection, OptionalExtension};
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use serde_json::json;
+use spawn::spawn_counted;
+use std::{net::SocketAddr, ops::DerefMut, sync::Arc, time::Duration};
 use tokio::{
     net::TcpListener,
     sync::{
@@ -13,7 +18,7 @@ use tokio::{
         RwLock as TokioRwLock, Semaphore,
     },
 };
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, trace, warn};
 use tripwire::Tripwire;
 
 // Internals
@@ -29,7 +34,9 @@ use crate::{
 };
 use corro_types::{
     actor::ActorId,
-    agent::{migrate, Agent, AgentConfig, Booked, BookedVersions, Bookie, SplitPool},
+    agent::{
+        migrate, Agent, AgentConfig, Booked, BookedVersions, LockRegistry, LockState, SplitPool,
+    },
     base::{CrsqlDbVersion, CrsqlDbVersionRange},
     broadcast::{BroadcastInput, ChangeSource, ChangeV1, FocaInput},
     channel::{bounded, CorroReceiver},
@@ -44,6 +51,7 @@ use corro_types::{
 
 /// Runtime state for the Corrosion agent
 pub struct AgentOptions {
+    pub lock_registry: LockRegistry,
     pub gossip_server_endpoint: quinn::Endpoint,
     pub transport: Transport,
     pub api_listeners: Vec<TcpListener>,
@@ -155,10 +163,86 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
     let (tx_changes, rx_changes) = bounded(conf.perf.changes_channel_len, "changes");
     let (tx_foca, rx_foca) = bounded(conf.perf.foca_channel_len, "foca");
 
+    let lock_registry = LockRegistry::default();
+
     // make an empty booked!
-    let booked = Booked::new(BookedVersions::new(actor_id));
-    let bookie = Bookie::new(Default::default());
-    bookie.insert(actor_id, booked.clone());
+    let booked = Booked::new(BookedVersions::new(actor_id), lock_registry.clone());
+
+    // asynchronously load it up!
+    tokio::spawn({
+        let pool = pool.clone();
+        // acquiring the lock here means everything will have to wait for it to be ready
+        let mut booked = booked.write_owned::<&str, _>("init", None).await;
+        async move {
+            let conn = pool.read().await?;
+            *booked.deref_mut().deref_mut() =
+                tokio::task::block_in_place(|| BookedVersions::from_conn(&conn, actor_id))
+                    .expect("loading BookedVersions from db failed");
+            Ok::<_, eyre::Report>(())
+        }
+    });
+
+    spawn_counted({
+        let registry = lock_registry.clone();
+        let mut tripwire = tripwire.clone();
+        async move {
+            const WARNING_THRESHOLD: Duration = Duration::from_secs(10);
+            let mut interval = tokio::time::interval(Duration::from_secs(60));
+
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {}
+                    _ = &mut tripwire => {
+                        return;
+                    }
+                }
+                trace!("inspecting the lock registry...");
+
+                let top: IndexMap<_, _> = {
+                    registry
+                        .map
+                        .read()
+                        .iter()
+                        .take(10) // this is an ordered map, so taking the first few is gonna be the highest values
+                        .map(|(k, v)| (*k, v.clone()))
+                        .collect()
+                };
+
+                if top.values().any(|meta| {
+                    let duration = meta.started_at.elapsed();
+                    duration >= WARNING_THRESHOLD
+                }) {
+                    warn!(
+                        "lock registry shows locks held for a long time! top {} locks:",
+                        top.len()
+                    );
+
+                    for (id, lock) in top {
+                        let duration = lock.started_at.elapsed();
+                        warn!(
+                            "{} (id: {id}, type: {:?}, state: {:?}) locked for: {duration:?}",
+                            lock.label, lock.kind, lock.state
+                        );
+
+                        if matches!(lock.state, LockState::Locked) {
+                            let details = json!({
+                                "duration": duration,
+                                "label": lock.label,
+                                "kind": lock.kind,
+                                "state": lock.state,
+                            });
+                            assert_unreachable!("bookie lock held for too long", &details);
+                        }
+
+                        if duration >= WARNING_THRESHOLD {
+                            counter!("corro.agent.lock.slow.count", "name" => lock.label)
+                                .increment(1);
+                        }
+                    }
+                }
+            }
+        }
+    });
 
     let metrics_tracker = MetricsTracker::new(Duration::from_secs(120), 5)?;
 
@@ -166,6 +250,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
         gossip_server_endpoint,
         transport: transport.clone(),
         api_listeners,
+        lock_registry,
         rx_bcast,
         rx_apply,
         rx_clear_buf,
@@ -180,7 +265,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
 
     let agent = Agent::new(AgentConfig {
         actor_id,
-        pool: pool.clone(),
+        pool,
         gossip_addr,
         external_addr,
         api_addr,
@@ -188,7 +273,6 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
         config: ArcSwap::from_pointee(conf),
         clock,
         booked,
-        bookie,
         tx_bcast,
         tx_apply,
         tx_clear_buf,
@@ -201,24 +285,6 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
         updates_manager,
         metrics_tracker,
         tripwire,
-    });
-
-    // asynchronously load booked versions for local actor
-    tokio::spawn({
-        let pool = pool.clone();
-        let agent = agent.clone();
-        async move {
-            let conn = pool.read().await?;
-            let loaded = tokio::task::block_in_place(|| BookedVersions::from_conn(&conn, actor_id))
-                .expect("loading BookedVersions from db failed");
-            tokio::task::block_in_place(|| {
-                let bookie_write = agent.bookie().write_lock_blocking();
-                let mut bookedw = bookie_write.write_tx(agent.booked());
-                *bookedw = loaded;
-                bookedw.commit();
-            });
-            Ok::<_, eyre::Report>(())
-        }
     });
 
     Ok((agent, opts))

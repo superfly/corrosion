@@ -6,7 +6,7 @@ use std::{
 use camino::Utf8PathBuf;
 use corro_types::{
     actor::{ActorId, ClusterId},
-    agent::{Agent, Bookie},
+    agent::{Agent, BookedVersions, Bookie, LockKind, LockMeta, LockState},
     base::{CrsqlDbVersion, CrsqlSeq},
     broadcast::{FocaCmd, FocaInput},
     sqlite::SqlitePoolError,
@@ -103,6 +103,7 @@ pub fn start_server(
 pub enum Command {
     Ping,
     Sync(SyncCommand),
+    Locks { top: usize },
     Cluster(ClusterCommand),
     Actor(ActorCommand),
     Subs(SubsCommand),
@@ -189,6 +190,25 @@ type FramedStream = Framed<
     Json<Command, Response>,
 >;
 
+#[derive(Serialize, Deserialize)]
+pub struct LockMetaElapsed {
+    pub label: String,
+    pub kind: LockKind,
+    pub state: LockState,
+    pub duration: Duration,
+}
+
+impl From<LockMeta> for LockMetaElapsed {
+    fn from(value: LockMeta) -> Self {
+        LockMetaElapsed {
+            label: value.label.into(),
+            kind: value.kind,
+            state: value.state,
+            duration: value.started_at.elapsed(),
+        }
+    }
+}
+
 async fn handle_conn(
     agent: Agent,
     bookie: &Bookie,
@@ -221,8 +241,8 @@ async fn handle_conn(
                     send_success(&mut stream).await;
                 }
                 Command::Sync(SyncCommand::ReconcileGaps) => {
-                    // First acquire all actor_ids via a read only sqlite connection
-                    let ro_conn = match agent.pool().read().await {
+                    info_log(&mut stream, "reconciling gaps...").await;
+                    let mut conn = match agent.pool().write_low().await {
                         Ok(conn) => conn,
                         Err(e) => {
                             send_error(&mut stream, e).await;
@@ -231,7 +251,7 @@ async fn handle_conn(
                     };
 
                     let actor_ids = {
-                        match block_in_place(|| get_gaps_actor_ids(&ro_conn)) {
+                        match get_gaps_actor_ids(&conn) {
                             Ok(actor_ids) => actor_ids,
                             Err(e) => {
                                 send_error(&mut stream, e).await;
@@ -239,47 +259,46 @@ async fn handle_conn(
                             }
                         }
                     };
+                    for actor_id in actor_ids {
+                        let booked = bookie
+                            .read("admin sync reconcile gaps get actor", actor_id.as_simple())
+                            .await
+                            .get(&actor_id)
+                            .unwrap()
+                            .clone();
 
-                    info_log(
-                        &mut stream,
-                        format!("reconciling gaps for {} actors...", actor_ids.len()),
-                    )
-                    .await;
-                    // To avoid blocking the db for too long we release the write connection from time to time
-                    for batch in actor_ids.chunks(16) {
-                        let mut rw_conn = match agent.pool().write_low().await {
-                            Ok(conn) => conn,
-                            Err(e) => {
-                                send_error(&mut stream, e).await;
-                                continue;
-                            }
-                        };
-
-                        for actor_id in batch {
-                            _ = info_log(&mut stream, format!("collapsing ranges for {actor_id}"))
-                                .await;
-                            let start = Instant::now();
-                            let res = collapse_gaps(&mut rw_conn, bookie, actor_id)
-                                .map(|(deleted, inserted)| (deleted, inserted, start.elapsed()));
-
-                            let (deleted, inserted, elapsed) = match res {
-                                Ok(res) => res,
-                                Err(e) => {
-                                    send_error(&mut stream, e).await;
-                                    continue;
-                                }
-                            };
-
-                            info_log(
-                            &mut stream,
-                            format!(
-                                "collapsed ranges for {actor_id} in {elapsed:?} (deleted: {deleted}, inserted: {inserted})"
-                            ),
-                        )
-                        .await;
+                        let mut bv = booked
+                            .write::<&str, _>("admin sync reconcile gaps booked versions", None)
+                            .await;
+                        debug_log(&mut stream, format!("got bookie for actor id: {actor_id}"))
+                            .await;
+                        if let Err(e) = collapse_gaps(&mut stream, &mut conn, &mut bv).await {
+                            send_error(&mut stream, e).await;
+                            continue;
                         }
                     }
 
+                    send_success(&mut stream).await;
+                }
+                Command::Locks { top } => {
+                    info_log(&mut stream, "gathering top locks").await;
+                    let registry = bookie.registry();
+
+                    let topn: Vec<LockMetaElapsed> = {
+                        registry
+                            .map
+                            .read()
+                            .values()
+                            .take(top)
+                            .cloned()
+                            .map(LockMetaElapsed::from)
+                            .collect()
+                    };
+
+                    match serde_json::to_value(&topn) {
+                        Ok(json) => send(&mut stream, Response::Json(json)).await,
+                        Err(e) => send_error(&mut stream, e).await,
+                    }
                     send_success(&mut stream).await;
                 }
                 Command::Cluster(ClusterCommand::Rejoin) => {
@@ -396,6 +415,7 @@ async fn handle_conn(
                 }
                 Command::Actor(ActorCommand::Version { actor_id, version }) => {
                     let json: Result<serde_json::Value, rusqlite::Error> = {
+                        let bookie = bookie.read::<&str, _>("admin actor version", None).await;
                         let booked = match bookie.get(&actor_id) {
                             Some(booked) => booked,
                             None => {
@@ -404,7 +424,9 @@ async fn handle_conn(
                                 continue;
                             }
                         };
-                        let booked_read = booked.read();
+                        let booked_read = booked
+                            .read::<&str, _>("admin actor version booked", None)
+                            .await;
                         if booked_read.contains_version(&version) {
                             match booked_read.get_partial(&version) {
                                 Some(partial) => {
@@ -647,17 +669,17 @@ fn get_gaps_actor_ids(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<Actor
     .collect::<Result<Vec<_>, _>>()
 }
 
-fn collapse_gaps(
+async fn collapse_gaps(
+    stream: &mut FramedStream,
     conn: &mut rusqlite::Connection,
-    bookie: &Bookie,
-    actor_id: &ActorId,
-) -> rusqlite::Result<(usize, usize)> {
-    let booked = bookie.ensure(*actor_id);
+    bv: &mut BookedVersions,
+) -> rusqlite::Result<()> {
+    let actor_id = bv.actor_id();
+    let mut snap = bv.snapshot();
+    _ = info_log(stream, format!("collapsing ranges for {actor_id}")).await;
+    let start = Instant::now();
     let (deleted, inserted) = block_in_place(|| {
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let bookie_write = bookie.write_lock_blocking();
-        let mut bv = bookie_write.write_tx(&booked);
-
         let versions = tx
             .prepare_cached("SELECT start, end FROM __corro_bookkeeping_gaps WHERE actor_id = ?")?
             .query_map(rusqlite::params![actor_id], |row| {
@@ -687,11 +709,11 @@ fn collapse_gaps(
             })?
             .collect::<rusqlite::Result<rangemap::RangeInclusiveSet<CrsqlDbVersion>>>()?;
 
-        bv.insert_gaps(versions);
-        bv.insert_gaps(buffered_versions);
+        snap.insert_gaps(versions);
+        snap.insert_gaps(buffered_versions);
 
         let mut inserted = 0;
-        for range in bv.needed().iter() {
+        for range in snap.needed().iter() {
             tx.prepare_cached(
                 "INSERT INTO __corro_bookkeeping_gaps (actor_id, start, end) VALUES (?,?,?);",
             )?
@@ -700,10 +722,19 @@ fn collapse_gaps(
         }
 
         tx.commit()?;
-        bv.commit();
 
         Ok::<_, rusqlite::Error>((deleted, inserted))
     })?;
 
-    Ok((deleted, inserted))
+    _ = info_log(
+        stream,
+        format!(
+            "collapsed ranges in {:?} (deleted: {deleted}, inserted: {inserted})",
+            start.elapsed()
+        ),
+    )
+    .await;
+
+    bv.commit_snapshot(snap);
+    Ok(())
 }
