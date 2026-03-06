@@ -1059,7 +1059,7 @@ impl BookedVersions {
         // plus any we have buffered partial changes for, plus ourselves.
         {
             let mut prepped = conn.prepare(
-                "SELECT site_id FROM crsql_site_id
+                "SELECT site_id FROM crsql_site_id WHERE ordinal > 0
                         UNION
                     SELECT DISTINCT site_id FROM __corro_seq_bookkeeping
                         UNION 
