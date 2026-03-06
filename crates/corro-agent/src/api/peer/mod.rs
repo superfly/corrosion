@@ -1347,6 +1347,7 @@ pub async fn parallel_sync(
                             debug!(
 :                               "handling versions: {:?}, actor_id: {:?}, seqs: {:?}, len: {changes_len} (is_empty: {}, is_complete: {}) from {actor_id}",
                                 change.versions(),
+                                change.actor_id,
                                 change.seqs(),
                                 change.is_empty(),
                                 change.is_complete()
