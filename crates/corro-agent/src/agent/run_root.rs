@@ -15,13 +15,14 @@ use crate::{
 };
 
 use corro_types::{
-    agent::{Agent, Bookie},
+    actor::ActorId,
+    agent::{Agent, BookedVersions, Bookie},
     base::CrsqlSeq,
     channel::bounded,
     config::{Config, PerfConfig},
 };
 
-use futures::FutureExt;
+use futures::{FutureExt, StreamExt, TryStreamExt};
 use spawn::spawn_counted;
 use tokio::task::JoinHandle;
 use tracing::{error, info};
@@ -158,15 +159,51 @@ async fn run(
 
     let bookie = agent.bookie().clone();
 
-    // Bookie was fully loaded by setup(). Walk it to schedule apply for any
-    // fully-buffered (gap-free) partials that were never applied before shutdown.
     let start = Instant::now();
     {
-        let guard = bookie.owned_guard();
-        for (&actor_id, booked) in bookie.iter(&guard) {
-            let bookedr = booked.read();
-            for (version, partial) in bookedr.partials.iter() {
+        let conn = agent.pool().read().await?;
+        // check __corro_seq_bookkeeping for any actor ids that we only have partial changes for.
+        let actor_ids: Vec<ActorId> = conn
+            .prepare(
+                "SELECT site_id FROM crsql_site_id WHERE ordinal > 0
+                        UNION
+                    SELECT distinct site_id FROM __corro_seq_bookkeeping",
+            )?
+            .query_map([], |row| row.get(0))
+            .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>())?;
+
+        // not strictly required, but we don't need to keep it open
+        drop(conn);
+
+        let pool = agent.pool();
+
+        let mut buf = futures::stream::iter(
+            actor_ids
+                .into_iter()
+                // don't re-process the current actor!
+                .filter(|other_actor_id| *other_actor_id != agent.actor_id())
+                .map(|actor_id| {
+                    let pool = pool.clone();
+                    async move {
+                        tokio::spawn(async move {
+                            let conn = pool.read().await?;
+
+                            tokio::task::block_in_place(|| {
+                                BookedVersions::from_conn(&conn, actor_id)
+                                    .map(|bv| (actor_id, bv))
+                                    .map_err(eyre::Report::from)
+                            })
+                        })
+                        .await?
+                    }
+                }),
+        )
+        .buffer_unordered(4);
+
+        while let Some((actor_id, bv)) = TryStreamExt::try_next(&mut buf).await? {
+            for (version, partial) in bv.partials.iter() {
                 let gaps_count = partial.seqs.gaps(&(CrsqlSeq(0)..=partial.last_seq)).count();
+
                 if gaps_count == 0 {
                     info!(%actor_id, %version, "found fully buffered, unapplied, changes! scheduling apply");
                     let tx_apply = agent.tx_apply().clone();
@@ -178,9 +215,12 @@ async fn run(
                     });
                 }
             }
+
+            bookie.replace_actor(actor_id, bv);
         }
     }
-    info!("Checked bookie partials in {:?}", start.elapsed());
+
+    info!("Bookkeeping fully loaded in {:?}", start.elapsed());
 
     spawn_counted(
         util::sync_loop(

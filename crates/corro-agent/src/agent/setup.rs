@@ -12,7 +12,6 @@ use tokio::{
         mpsc::{channel as tokio_channel, Receiver as TokioReceiver},
         RwLock as TokioRwLock, Semaphore,
     },
-    time::Instant,
 };
 use tracing::{debug, error, info};
 use tripwire::Tripwire;
@@ -30,7 +29,7 @@ use crate::{
 };
 use corro_types::{
     actor::ActorId,
-    agent::{migrate, Agent, AgentConfig, BookedVersions, Bookie, SplitPool},
+    agent::{migrate, Agent, AgentConfig, Booked, BookedVersions, Bookie, SplitPool},
     base::{CrsqlDbVersion, CrsqlDbVersionRange},
     broadcast::{BroadcastInput, ChangeSource, ChangeV1, FocaInput},
     channel::{bounded, CorroReceiver},
@@ -156,16 +155,10 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
     let (tx_changes, rx_changes) = bounded(conf.perf.changes_channel_len, "changes");
     let (tx_foca, rx_foca) = bounded(conf.perf.foca_channel_len, "foca");
 
-    // Load all actors' bookie state synchronously.
-    let start = Instant::now();
-    let all_booked = {
-        let conn = pool.read().await?;
-        BookedVersions::load_all_from_conn(&conn)?
-    };
-    info!("Loaded booked versions in {:?}", start.elapsed());
-
-    let bookie = Bookie::new(all_booked);
-    let booked = bookie.ensure(actor_id);
+    // make an empty booked!
+    let booked = Booked::new(BookedVersions::new(actor_id));
+    let bookie = Bookie::new(Default::default());
+    bookie.insert(actor_id, booked.clone());
 
     let metrics_tracker = MetricsTracker::new(Duration::from_secs(120), 5)?;
 
@@ -208,6 +201,24 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
         updates_manager,
         metrics_tracker,
         tripwire,
+    });
+
+    // asynchronously load booked versions for local actor
+    tokio::spawn({
+        let pool = pool.clone();
+        let agent = agent.clone();
+        async move {
+            let conn = pool.read().await?;
+            let loaded = tokio::task::block_in_place(|| BookedVersions::from_conn(&conn, actor_id))
+                .expect("loading BookedVersions from db failed");
+            tokio::task::block_in_place(|| {
+                let bookie_write = agent.bookie().write_lock_blocking();
+                let mut bookedw = bookie_write.write_tx(agent.booked());
+                *bookedw = loaded;
+                bookedw.commit();
+            });
+            Ok::<_, eyre::Report>(())
+        }
     });
 
     Ok((agent, opts))
