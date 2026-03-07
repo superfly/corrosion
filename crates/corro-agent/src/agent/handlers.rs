@@ -27,6 +27,7 @@ use corro_types::{
     broadcast::{BroadcastInput, BroadcastV1, ChangeSource, ChangeV1, FocaInput},
     channel::CorroReceiver,
     members::MemberAddedResult,
+    sqlite::log_slow_inflight_queries,
     sync::generate_sync,
 };
 
@@ -439,6 +440,7 @@ fn wal_checkpoint(conn: &rusqlite::Connection, timeout: u64) -> eyre::Result<()>
     let busy: bool = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE);", [], |row| row.get(0))?;
     if busy {
         warn!("could not truncate sqlite WAL, database busy - with timeout: {timeout}");
+        log_slow_inflight_queries();
         counter!("corro.db.wal.truncate.busy").increment(1);
     } else {
         debug!("successfully truncated sqlite WAL!");

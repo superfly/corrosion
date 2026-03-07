@@ -26,7 +26,10 @@ pub type SqlitePoolError = sqlite_pool::PoolError;
 // Global registry for query stats
 // (sql, readonly) => (total_count, total_nanos)
 type QueryStats = HashMap<(String, bool), (u64, u128)>;
+type InFlightQueries = HashMap<String, Instant>;
 static QUERY_STATS: ThreadLocal<Mutex<QueryStats>> = ThreadLocal::new();
+pub static IN_FLIGHT_QUERIES: ThreadLocal<Mutex<InFlightQueries>> = ThreadLocal::new();
+
 pub async fn query_metrics_loop(mut tripwire: Tripwire) {
     let mut interval = tokio::time::interval(Duration::from_secs(10));
     let mut prev_tick = interval.tick().await;
@@ -120,34 +123,67 @@ fn tracing_callback_rw(ev: rusqlite::trace::TraceEvent) {
 }
 
 fn handle_sql_tracing_event(ev: rusqlite::trace::TraceEvent, readonly: bool) {
-    if let rusqlite::trace::TraceEvent::Profile(stmt_ref, duration) = ev {
-        let dur = duration.as_nanos();
-        let sql = stmt_ref.sql().to_string();
+    match ev {
+        rusqlite::trace::TraceEvent::Profile(stmt_ref, duration) => {
+            let dur = duration.as_nanos();
+            let sql = stmt_ref.sql().to_string();
 
-        // Update per-thread stats to avoid contention on hot path
-        let stats_mutex = QUERY_STATS.get_or_default();
-        let mut stats = stats_mutex.lock();
-        let entry = stats
-            .entry((sql.clone(), readonly))
-            .or_insert((0u64, 0u128));
-        entry.0 += 1;
-        entry.1 += dur;
-        drop(stats); // Release lock quickly
+            // Update per-thread stats to avoid contention on hot path
+            let stats_mutex = QUERY_STATS.get_or_default();
+            let mut stats = stats_mutex.lock();
+            let entry = stats
+                .entry((sql.clone(), readonly))
+                .or_insert((0u64, 0u128));
+            entry.0 += 1;
+            entry.1 += dur;
+            drop(stats); // Release lock quickly
 
-        if duration >= SLOW_QUERY_THRESHOLD {
-            warn!(
-                "SLOW {} query {duration:?} => {}",
-                if readonly { "RO" } else { "RW" },
-                sql
-            );
+            let queries_mu = IN_FLIGHT_QUERIES.get_or_default();
+            let mut inflight_queries = queries_mu.lock();
+            inflight_queries.remove(&sql);
+            drop(inflight_queries);
+
+            if duration >= SLOW_QUERY_THRESHOLD {
+                warn!(
+                    "SLOW {} query {duration:?} => {}",
+                    if readonly { "RO" } else { "RW" },
+                    sql
+                );
+            }
         }
+        rusqlite::trace::TraceEvent::Stmt(_, sql) => {
+            // skip trigger for subprograms.
+            if sql.starts_with("--") {
+                return;
+            }
+            let start_time = Instant::now();
+            // expanded sql so we differentiate similar queries ??
+            let queries_mu = IN_FLIGHT_QUERIES.get_or_default();
+            let mut inflight_queries = queries_mu.lock();
+            inflight_queries.insert(sql.to_string(), start_time);
+        }
+        _ => {}
     }
+}
+
+pub fn log_slow_inflight_queries() {
+    let mut aggregated = HashMap::new();
+    for queries_mu in IN_FLIGHT_QUERIES.iter() {
+        let inflight_queries = queries_mu.lock().clone();
+        aggregated.extend(inflight_queries.into_iter());
+    }
+    aggregated.iter().for_each(|(sql, start_time)| {
+        let elapsed = start_time.elapsed();
+        if elapsed > SLOW_QUERY_THRESHOLD {
+            warn!("SLOW in-progress query: {sql} - time since start: {elapsed:?}");
+        }
+    });
 }
 
 pub fn trace_heavy_queries(conn: &Connection) -> rusqlite::Result<()> {
     let readonly = conn.is_readonly(MAIN_DB)?;
     conn.trace_v2(
-        TraceEventCodes::SQLITE_TRACE_PROFILE,
+        TraceEventCodes::SQLITE_TRACE_PROFILE | TraceEventCodes::SQLITE_TRACE_STMT,
         Some(if readonly {
             tracing_callback_ro
         } else {
