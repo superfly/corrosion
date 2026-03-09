@@ -288,6 +288,7 @@ async fn update_hashes(
 
     for svc in services {
         if service_hashes.get(&svc.id).is_none() {
+            info!("inserting hash for service: {}", svc.id);
             let hash = hash_service(&svc);
             statements.push(Statement::WithParams(
                 "INSERT INTO __corro_consul_services ( id, hash ) VALUES (?, ?);".into(),
@@ -299,6 +300,7 @@ async fn update_hashes(
 
     for check in checks {
         if check_hashes.get(&check.id).is_none() {
+            info!("inserting hash for check: {}", check.id);
             let hash = hash_check(&check);
             statements.push(Statement::WithParams(
                 "INSERT OR REPLACE INTO __corro_consul_checks ( id, hash ) VALUES (?, ?)".into(),
