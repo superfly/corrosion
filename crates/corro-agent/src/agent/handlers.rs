@@ -556,11 +556,16 @@ pub fn spawn_handle_db_maintenance(agent: &Agent) {
                 error!("could not check freelist and vacuum: {e}");
             }
 
-            if let Err(e) =
-                wal_checkpoint_over_threshold(wal_path.as_path(), &pool, truncate_wal_threshold)
-                    .await
+            match wal_checkpoint_over_threshold(wal_path.as_path(), &pool, truncate_wal_threshold)
+                .await
             {
-                error!("could not wal_checkpoint truncate: {e}");
+                Err(e) => {
+                    error!("could not wal_checkpoint truncate: {e}");
+                }
+                Ok(truncated) => {
+                    info!("truncated WAL: {truncated}");
+                }
+                _ => {}
             }
         }
     });
