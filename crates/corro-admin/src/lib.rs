@@ -221,7 +221,6 @@ async fn handle_conn(
                     send_success(&mut stream).await;
                 }
                 Command::Sync(SyncCommand::ReconcileGaps) => {
-                    info_log(&mut stream, "reconciling gaps...").await;
                     // First acquire all actor_ids via a read only sqlite connection
                     let ro_conn = match agent.pool().read().await {
                         Ok(conn) => conn,
@@ -240,6 +239,12 @@ async fn handle_conn(
                             }
                         }
                     };
+
+                    info_log(
+                        &mut stream,
+                        format!("reconciling gaps for {} actors...", actor_ids.len()),
+                    )
+                    .await;
                     // To avoid blocking the db for too long we release the write connection from time to time
                     for batch in actor_ids.chunks(16) {
                         let mut rw_conn = match agent.pool().write_low().await {
@@ -633,9 +638,13 @@ async fn send_error<E: Display>(stream: &mut FramedStream, error: E) {
 }
 
 fn get_gaps_actor_ids(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<ActorId>> {
-    conn.prepare_cached("SELECT DISTINCT actor_id FROM __corro_bookkeeping_gaps")?
-        .query_map([], |row| row.get::<_, ActorId>(0))?
-        .collect::<Result<Vec<_>, _>>()
+    conn.prepare_cached(
+        "SELECT DISTINCT actor_id FROM __corro_bookkeeping_gaps
+        UNION
+        SELECT DISTINCT site_id FROM __corro_buffered_changes",
+    )?
+    .query_map([], |row| row.get::<_, ActorId>(0))?
+    .collect::<Result<Vec<_>, _>>()
 }
 
 fn collapse_gaps(
@@ -661,7 +670,25 @@ fn collapse_gaps(
             [actor_id],
         )?;
 
+        // insert gaps for buffered changes that are missing bookkeeping on __corro_seq_bookkeeping
+        let buffered_versions = tx
+            .prepare_cached(
+                "
+            SELECT DISTINCT db_version FROM __corro_buffered_changes bc
+                WHERE bc.site_id = ? 
+            AND NOT EXISTS (
+            SELECT 1 FROM __corro_seq_bookkeeping bk 
+                WHERE bk.site_id = bc.site_id 
+                AND bk.db_version = bc.db_version)",
+            )?
+            .query_map(rusqlite::params![actor_id], |row| {
+                let db_version = row.get::<_, CrsqlDbVersion>(0)?;
+                Ok(db_version..=db_version)
+            })?
+            .collect::<rusqlite::Result<rangemap::RangeInclusiveSet<CrsqlDbVersion>>>()?;
+
         bv.insert_gaps(versions);
+        bv.insert_gaps(buffered_versions);
 
         let mut inserted = 0;
         for range in bv.needed().iter() {
