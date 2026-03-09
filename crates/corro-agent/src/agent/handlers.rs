@@ -526,6 +526,7 @@ pub fn spawn_handle_db_maintenance(agent: &Agent) {
     let interval_secs = if on_antithesis { 30 } else { 5 * 60 };
 
     tokio::spawn(async move {
+        info!("starting db maintenance with interval: {interval_secs} seconds");
         let truncate_wal_threshold: u64 = wal_threshold * 1024 * 1024;
 
         // try to initially truncate the WAL
