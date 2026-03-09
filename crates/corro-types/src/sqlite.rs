@@ -157,7 +157,6 @@ fn handle_sql_tracing_event(ev: rusqlite::trace::TraceEvent, readonly: bool) {
                 return;
             }
             let start_time = Instant::now();
-            // expanded sql so we differentiate similar queries ??
             let queries_mu = IN_FLIGHT_QUERIES.get_or_default();
             let mut inflight_queries = queries_mu.lock();
             inflight_queries.insert(sql.to_string(), start_time);
