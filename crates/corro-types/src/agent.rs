@@ -1536,12 +1536,14 @@ mod tests {
         let mut bv = BookedVersions::new(actor_id);
         let mut all = RangeInclusiveSet::new();
 
-        insert_everywhere(
+        insert_everywhere( 
             &conn,
             &mut bv,
             &mut all,
-            range_inclusive_set![CrsqlDbVersion(1)..=CrsqlDbVersion(20)],
+            range_inclusive_set![CrsqlDbVersion(1)..=CrsqlDbVersion(8), CrsqlDbVersion(11)..=CrsqlDbVersion(20)],
         )?;
+        assert!(bv.needed.contains(&CrsqlDbVersion(9)));
+        assert!(bv.needed.contains(&CrsqlDbVersion(10)));
 
         bv.insert_partial(
             CrsqlDbVersion(10),
@@ -1560,7 +1562,7 @@ mod tests {
             },
         );
 
-        // insert partials and verify that the partial is removed
+        // verify that the partial is removed even if it isn't in a gap
         bv.insert_db(
             &conn,
             range_inclusive_set![CrsqlDbVersion(9)..=CrsqlDbVersion(10)],
