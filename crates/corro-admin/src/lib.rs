@@ -660,9 +660,13 @@ async fn send_error<E: Display>(stream: &mut FramedStream, error: E) {
 }
 
 fn get_gaps_actor_ids(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<ActorId>> {
-    conn.prepare_cached("SELECT DISTINCT actor_id FROM __corro_bookkeeping_gaps")?
-        .query_map([], |row| row.get::<_, ActorId>(0))?
-        .collect::<Result<Vec<_>, _>>()
+    conn.prepare_cached(
+        "SELECT DISTINCT actor_id FROM __corro_bookkeeping_gaps
+        UNION
+        SELECT DISTINCT site_id FROM __corro_buffered_changes",
+    )?
+    .query_map([], |row| row.get::<_, ActorId>(0))?
+    .collect::<Result<Vec<_>, _>>()
 }
 
 async fn collapse_gaps(
@@ -688,7 +692,25 @@ async fn collapse_gaps(
             [actor_id],
         )?;
 
+        // insert gaps for buffered changes that are missing bookkeeping on __corro_seq_bookkeeping
+        let buffered_versions = tx
+            .prepare_cached(
+                "
+            SELECT DISTINCT db_version FROM __corro_buffered_changes bc
+                WHERE bc.site_id = ? 
+            AND NOT EXISTS (
+            SELECT 1 FROM __corro_seq_bookkeeping bk 
+                WHERE bk.site_id = bc.site_id 
+                AND bk.db_version = bc.db_version)",
+            )?
+            .query_map(rusqlite::params![actor_id], |row| {
+                let db_version = row.get::<_, CrsqlDbVersion>(0)?;
+                Ok(db_version..=db_version)
+            })?
+            .collect::<rusqlite::Result<rangemap::RangeInclusiveSet<CrsqlDbVersion>>>()?;
+
         snap.insert_gaps(versions);
+        snap.insert_gaps(buffered_versions);
 
         let mut inserted = 0;
         for range in snap.needed().iter() {
