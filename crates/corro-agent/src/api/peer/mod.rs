@@ -1228,13 +1228,57 @@ pub async fn parallel_sync(
                             let mut new_versions =
                                 RangeInclusiveSet::from_iter(std::iter::once(versions.into()));
 
+                            let original_count = versions.len() as u64;
+                            
                             // check if we've already requested
                             for overlap in range.overlapping(&versions.into()) {
+                                debug!(
+                                    sync_debug = true,
+                                    %server_actor_id,
+                                    %actor_id,
+                                    %addr,
+                                    requested = ?versions,
+                                    already_requested = ?overlap,
+                                    "parallel_sync: deduplicating already-requested versions"
+                                );
                                 new_versions.remove(overlap.clone());
                             }
 
                             if new_versions.is_empty() {
+                                warn!(
+                                    sync_debug = true,
+                                    %server_actor_id,
+                                    %actor_id,
+                                    %addr,
+                                    versions = ?versions,
+                                    "parallel_sync: skipping completely duplicate request"
+                                );
                                 continue;
+                            }
+
+                            let new_count: u64 = new_versions.iter().map(|r| (r.end().0 - r.start().0) + 1).sum();
+                            if new_count < original_count {
+                                info!(
+                                    sync_debug = true,
+                                    %server_actor_id,
+                                    %actor_id,
+                                    %addr,
+                                    original = ?versions,
+                                    deduplicated = ?new_versions,
+                                    original_count,
+                                    new_count,
+                                    "parallel_sync: partial deduplication of request"
+                                );
+                            } else {
+                                debug!(
+                                    sync_debug = true,
+                                    %server_actor_id,
+                                    %actor_id,
+                                    %addr,
+                                    versions = ?versions,
+                                    count = original_count,
+                                    "parallel_sync: requesting new versions"
+                                );
                             }
 
                             new_versions
@@ -1250,15 +1294,47 @@ pub async fn parallel_sync(
                             let mut new_seqs =
                                 RangeInclusiveSet::from_iter(seqs.iter().map(|s| s.into()));
 
+                            let original_seqs = seqs.clone();
+
                             for seqs in seqs {
                                 for overlap in range.overlapping(&seqs.into()) {
+                                    debug!(
+                                        sync_debug = true,
+                                        %server_actor_id,
+                                        %actor_id,
+                                        %addr,
+                                        version = %version,
+                                        requested_seqs = ?seqs,
+                                        already_requested = ?overlap,
+                                        "parallel_sync: deduplicating already-requested partial seqs"
+                                    );
                                     new_seqs.remove(overlap.clone());
                                 }
                             }
 
                             if new_seqs.is_empty() {
+                                warn!(
+                                    sync_debug = true,
+                                    %server_actor_id,
+                                    %actor_id,
+                                    %addr,
+                                    version = %version,
+                                    seqs = ?original_seqs,
+                                    "parallel_sync: skipping completely duplicate partial request"
+                                );
                                 continue;
                             }
+
+                            debug!(
+                                sync_debug = true,
+                                %server_actor_id,
+                                %actor_id,
+                                %addr,
+                                version = %version,
+                                original_seqs = ?original_seqs,
+                                new_seqs = ?new_seqs,
+                                "parallel_sync: requesting partial version seqs"
+                            );
 
                             vec![SyncNeedV1::Partial {
                                 version,

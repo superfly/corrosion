@@ -1072,6 +1072,17 @@ pub async fn handle_sync(
     for (actor_id, version) in sync_state.heads.iter() {
         gauge!("corro.sync.client.head", "actor_id" => actor_id.to_string()).set(version.0 as f64);
     }
+    
+    if !sync_state.need.is_empty() || !sync_state.partial_need.is_empty() {
+        info!(
+            sync_debug = true,
+            self_actor = %agent.actor_id(),
+            actors_with_gaps = sync_state.need.len(),
+            actors_with_partials = sync_state.partial_need.len(),
+            total_needed = sync_state.need_len(),
+            "handle_sync: starting sync with needs"
+        );
+    }
 
     let chosen: Vec<(ActorId, SocketAddr)> = {
         let candidates = {
@@ -1136,6 +1147,14 @@ pub async fn handle_sync(
     if chosen.is_empty() {
         return Ok(());
     }
+
+    info!(
+        sync_debug = true,
+        self_actor = %agent.actor_id(),
+        peer_count = chosen.len(),
+        peers = ?chosen.iter().map(|(id, addr)| format!("{}@{}", id, addr)).collect::<Vec<_>>(),
+        "handle_sync: initiating parallel sync with peers"
+    );
 
     let start = Instant::now();
     let n = match parallel_sync(agent, transport, chosen.clone(), sync_state).await {

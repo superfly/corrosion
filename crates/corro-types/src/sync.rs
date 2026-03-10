@@ -166,6 +166,16 @@ impl SyncStateV1 {
                     for overlap in other_haves.overlapping(range) {
                         let start = cmp::max(range.start(), overlap.start());
                         let end = cmp::min(range.end(), overlap.end());
+                        tracing::info!(
+                            sync_debug = true,
+                            %actor_id,
+                            our_actor = %self.actor_id,
+                            their_actor = %other.actor_id,
+                            our_gap = ?range,
+                            they_have = ?overlap,
+                            requesting = ?(*start..=*end),
+                            "compute_available_needs: requesting to fill our gap"
+                        );
                         needs.entry(*actor_id).or_default().push(SyncNeedV1::Full {
                             versions: CrsqlDbVersionRange::new(*start, *end),
                         })
@@ -226,12 +236,32 @@ impl SyncStateV1 {
             let missing = match self.heads.get(actor_id) {
                 Some(our_head) => {
                     if head > our_head {
+                        tracing::info!(
+                            sync_debug = true,
+                            %actor_id,
+                            our_actor = %self.actor_id,
+                            their_actor = %other.actor_id,
+                            our_head = %our_head,
+                            their_head = %head,
+                            requesting = ?((*our_head + 1)..=*head),
+                            "compute_available_needs: requesting new versions beyond our head"
+                        );
                         Some((*our_head + 1)..=*head)
                     } else {
                         None
                     }
                 }
-                None => Some(CrsqlDbVersion(1)..=*head),
+                None => {
+                    tracing::info!(
+                        sync_debug = true,
+                        %actor_id,
+                        our_actor = %self.actor_id,
+                        their_actor = %other.actor_id,
+                        their_head = %head,
+                        "compute_available_needs: first time seeing actor, requesting all versions"
+                    );
+                    Some(CrsqlDbVersion(1)..=*head)
+                }
             };
 
             if let Some(missing) = missing {
@@ -297,26 +327,73 @@ pub async fn generate_sync(bookie: &Bookie, self_actor_id: ActorId) -> SyncState
         let need: Vec<_> = bookedr.needed().iter().cloned().collect();
 
         if !need.is_empty() {
+            tracing::info!(
+                sync_debug = true,
+                %actor_id,
+                %self_actor_id,
+                head = %last_version,
+                gaps = ?need,
+                gap_count = need.iter().map(|r| (r.end().0 - r.start().0) + 1).sum::<u64>(),
+                "generate_sync: found version gaps"
+            );
             state.need.insert(actor_id, need);
         }
 
         {
+            let partial_count = bookedr.partials.len();
+            let incomplete_count = bookedr.partials.iter().filter(|(_, p)| !p.is_complete()).count();
+            
+            if partial_count > 0 {
+                tracing::debug!(
+                    sync_debug = true,
+                    %actor_id,
+                    %self_actor_id,
+                    total_partials = partial_count,
+                    incomplete_partials = incomplete_count,
+                    "generate_sync: checking partial versions"
+                );
+            }
+            
             for (v, partial) in bookedr
                 .partials
                 .iter()
                 // don't set partial if it is effectively complete
                 .filter(|(_, partial)| !partial.is_complete())
             {
+                let gaps: Vec<_> = partial
+                    .seqs
+                    .gaps(&(CrsqlSeq(0)..=partial.last_seq))
+                    .collect();
+                
+                tracing::info!(
+                    sync_debug = true,
+                    %actor_id,
+                    %self_actor_id,
+                    version = %v,
+                    seq_gaps = ?gaps,
+                    last_seq = %partial.last_seq,
+                    "generate_sync: found incomplete partial version"
+                );
+                
                 state.partial_need.entry(actor_id).or_default().insert(
                     *v,
-                    partial
-                        .seqs
-                        .gaps(&(CrsqlSeq(0)..=partial.last_seq))
-                        .collect(),
+                    gaps,
                 );
             }
         }
         state.heads.insert(actor_id, last_version);
+    }
+
+    let total_needed = state.need_len();
+    if total_needed > 0 || !state.partial_need.is_empty() {
+        tracing::info!(
+            sync_debug = true,
+            %self_actor_id,
+            total_needed,
+            actors_with_gaps = state.need.len(),
+            actors_with_partials = state.partial_need.len(),
+            "generate_sync: completed with needs"
+        );
     }
 
     state
