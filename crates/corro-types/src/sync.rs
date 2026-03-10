@@ -365,14 +365,23 @@ pub async fn generate_sync(bookie: &Bookie, self_actor_id: ActorId) -> SyncState
                     .gaps(&(CrsqlSeq(0)..=partial.last_seq))
                     .collect();
                 
+                let gap_count = gaps.len();
+                let total_missing_seqs: u64 = gaps.iter().map(|r| (r.end().0 - r.start().0) + 1).sum();
+                let has_seqs = !partial.seqs.is_empty();
+                let seq_ranges_count = partial.seqs.iter().count();
+                
                 tracing::info!(
                     sync_debug = true,
                     %actor_id,
                     %self_actor_id,
                     version = %v,
-                    seq_gaps = ?gaps,
+                    gap_count,
+                    total_missing_seqs,
                     last_seq = %partial.last_seq,
-                    "generate_sync: found incomplete partial version"
+                    has_seqs,
+                    seq_ranges_count,
+                    seq_gaps = ?gaps,
+                    "generate_sync: STUCK incomplete partial version - not completing!"
                 );
                 
                 state.partial_need.entry(actor_id).or_default().insert(
