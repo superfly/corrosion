@@ -800,7 +800,7 @@ impl BookedVersions {
         db_versions: RangeInclusiveSet<CrsqlDbVersion>,
     ) -> rusqlite::Result<()> {
         trace!("wants to insert into db {db_versions:?}");
-        let mut changes = self.compute_gaps_change(db_versions);
+        let mut changes = self.compute_gaps_change(&db_versions);
 
         trace!(actor_id = %self.actor_id, "delete: {:?}", changes.remove_ranges);
         trace!(actor_id = %self.actor_id, "new: {:?}", changes.insert_set);
@@ -831,10 +831,13 @@ impl BookedVersions {
             }
 
             for range in remove_ranges {
+                self.needed.remove(range);
+            }
+
+            for range in db_versions {
                 for version in CrsqlDbVersionRange::from(&range) {
                     self.partials.remove(&version);
                 }
-                self.needed.remove(range);
             }
         }
 
@@ -895,7 +898,7 @@ impl BookedVersions {
         Ok(())
     }
 
-    fn compute_gaps_change(&self, versions: RangeInclusiveSet<CrsqlDbVersion>) -> GapsChanges {
+    fn compute_gaps_change(&self, versions: &RangeInclusiveSet<CrsqlDbVersion>) -> GapsChanges {
         trace!("needed: {:?}", self.needed);
 
         let mut changes = GapsChanges {
@@ -906,12 +909,12 @@ impl BookedVersions {
             remove_ranges: Default::default(),
         };
 
-        for versions in versions.clone() {
+        for versions in versions.iter() {
             // only update the max if it's bigger
             changes.max = cmp::max(changes.max, Some(*versions.end()));
 
             // iterate all partially or fully overlapping changes
-            for range in self.needed.overlapping(&versions) {
+            for range in self.needed.overlapping(versions) {
                 trace!(actor_id = %self.actor_id, "overlapping: {range:?}");
                 // insert the overlapping range in the set (collapses ajoining ranges)
                 changes.insert_set.insert(range.clone());
@@ -954,7 +957,7 @@ impl BookedVersions {
             }
         }
 
-        for versions in versions {
+        for versions in versions.iter() {
             // we now know the applied versions
             changes.insert_set.remove(versions.clone());
         }
@@ -1514,6 +1517,56 @@ mod tests {
         bv2.max = Some(CrsqlDbVersion(55));
 
         assert_eq!(bv, bv2);
+
+        Ok(())
+    }
+
+    // test that processed partials versions are properly removed
+    // regardless of whether they are currently needed
+    #[test]
+    fn test_booked_insert_db_with_partials() -> rusqlite::Result<()> {
+        _ = tracing_subscriber::fmt::try_init();
+
+        let mut conn = CrConn::init(Connection::open_in_memory()?)?;
+        setup_conn(&conn)?;
+        let clock = Arc::new(uhlc::HLC::default());
+        migrate(clock, &mut conn)?;
+
+        let actor_id = ActorId::default();
+        let mut bv = BookedVersions::new(actor_id);
+        let mut all = RangeInclusiveSet::new();
+
+        insert_everywhere(
+            &conn,
+            &mut bv,
+            &mut all,
+            range_inclusive_set![CrsqlDbVersion(1)..=CrsqlDbVersion(20)],
+        )?;
+
+        bv.insert_partial(
+            CrsqlDbVersion(10),
+            PartialVersion {
+                seqs: RangeInclusiveSet::from_iter(vec![CrsqlSeq(2)..=CrsqlSeq(10)]),
+                last_seq: CrsqlSeq(10),
+                ts: Timestamp::zero(),
+            },
+        );
+        bv.insert_partial(
+            CrsqlDbVersion(9),
+            PartialVersion {
+                seqs: RangeInclusiveSet::from_iter(vec![CrsqlSeq(2)..=CrsqlSeq(10)]),
+                last_seq: CrsqlSeq(20),
+                ts: Timestamp::zero(),
+            },
+        );
+
+        // insert partials and verify that the partial is removed
+        bv.insert_db(
+            &conn,
+            range_inclusive_set![CrsqlDbVersion(9)..=CrsqlDbVersion(10)],
+        )?;
+        assert!(!bv.partials.contains_key(&CrsqlDbVersion(9)));
+        assert!(!bv.partials.contains_key(&CrsqlDbVersion(10)));
 
         Ok(())
     }
