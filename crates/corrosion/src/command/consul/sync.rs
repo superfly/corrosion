@@ -19,6 +19,7 @@ use tokio::{
 use tracing::{debug, error, info, trace};
 
 const CONSUL_PULL_INTERVAL: Duration = Duration::from_secs(1);
+const CONSUL_SYNC_INTERVAL: Duration = Duration::from_secs(15 * 60);
 
 pub async fn run<P: AsRef<Path>>(
     config: &ConsulConfig,
@@ -87,12 +88,16 @@ pub async fn run<P: AsRef<Path>>(
     update_hashes(&corrosion, node, &mut consul_services, &mut consul_checks).await?;
 
     let mut pull_interval = interval(CONSUL_PULL_INTERVAL);
+    let mut sync_interval = interval(CONSUL_SYNC_INTERVAL);
 
     info!("Starting consul pull interval");
     loop {
         let res = tokio::select! {
             _ = pull_interval.tick() => {
                 update_consul(&consul, node, &corrosion, &mut consul_services, &mut consul_checks, false).await
+            },
+            _ = sync_interval.tick() => {
+                update_consul(&consul, node, &corrosion, &mut consul_services, &mut consul_checks, true).await
             },
             _ = &mut stop_signal => {
                 debug!("tripped consul loop");
@@ -283,6 +288,7 @@ async fn update_hashes(
 
     for svc in services {
         if service_hashes.get(&svc.id).is_none() {
+            info!("inserting hash for service: {}", svc.id);
             let hash = hash_service(&svc);
             statements.push(Statement::WithParams(
                 "INSERT INTO __corro_consul_services ( id, hash ) VALUES (?, ?);".into(),
@@ -294,6 +300,7 @@ async fn update_hashes(
 
     for check in checks {
         if check_hashes.get(&check.id).is_none() {
+            info!("inserting hash for check: {}", check.id);
             let hash = hash_check(&check);
             statements.push(Statement::WithParams(
                 "INSERT OR REPLACE INTO __corro_consul_checks ( id, hash ) VALUES (?, ?)".into(),
