@@ -10,13 +10,13 @@ use std::{
     time::{Duration, Instant},
 };
 
-use antithesis_sdk::assert_unreachable;
+use antithesis_sdk::{assert_always, assert_unreachable};
 use arc_swap::ArcSwap;
 use camino::Utf8PathBuf;
 use metrics::{gauge, histogram};
 use papaya::{Guard, HashMap as PapayaHashMap};
 use parking_lot::{ArcMutexGuard, Mutex, RawMutex, RwLock};
-use rangemap::RangeInclusiveSet;
+use rangemap::{RangeInclusiveSet, StepLite};
 use rusqlite::{named_params, Connection, OpenFlags, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -831,9 +831,6 @@ impl BookedVersions {
             }
 
             for range in remove_ranges {
-                for version in CrsqlDbVersionRange::from(&range) {
-                    self.partials.remove(&version);
-                }
                 self.needed.remove(range);
             }
         }
@@ -910,32 +907,9 @@ impl BookedVersions {
             // only update the max if it's bigger
             changes.max = cmp::max(changes.max, Some(*versions.end()));
 
-            // iterate all partially or fully overlapping changes
-            for range in self.needed.overlapping(&versions) {
-                trace!(actor_id = %self.actor_id, "overlapping: {range:?}");
-                // insert the overlapping range in the set (collapses ajoining ranges)
-                changes.insert_set.insert(range.clone());
-                // remove the range, they'll be added back from the insert set ^
-                changes.remove_ranges.insert(range.clone());
-            }
-
-            // check if there's a previous range with an end version = start version - 1
-            if let Some(range) = self.needed.get(&CrsqlDbVersion(versions.start().0 - 1)) {
-                trace!(actor_id = %self.actor_id, "got a start - 1: {range:?}");
-                // insert the collapsible range
-                changes.insert_set.insert(range.clone());
-                // remove the collapsible range
-                changes.remove_ranges.insert(range.clone());
-            }
-
-            // check if there's a next range with an start version = end version + 1
-            if let Some(range) = self.needed.get(&CrsqlDbVersion(versions.end().0 + 1)) {
-                trace!(actor_id = %self.actor_id, "got a end + 1: {range:?}");
-                // insert the collapsible range
-                changes.insert_set.insert(range.clone());
-                // remove the collapsible range
-                changes.remove_ranges.insert(range.clone());
-            }
+            let overlapping_ranges = compute_overlapping_ranges(&self.needed, &versions);
+            changes.insert_set.extend(overlapping_ranges.clone());
+            changes.remove_ranges.extend(overlapping_ranges.clone());
 
             // either a max or 0
             // TODO: figure out if we want to use 0 instead of None in the struct by default
@@ -961,6 +935,35 @@ impl BookedVersions {
 
         changes
     }
+}
+
+fn compute_overlapping_ranges<T: Ord + Clone + StepLite + Into<u64>>(
+    check_ranges: &RangeInclusiveSet<T>,
+    range: &RangeInclusive<T>,
+) -> RangeInclusiveSet<T> {
+    let mut overlapping_ranges = RangeInclusiveSet::new();
+
+    // iterate all partially or fully overlapping ranges
+    for range in check_ranges.overlapping(range) {
+        overlapping_ranges.insert(range.clone());
+    }
+
+    // check if there's a previous range with an end version = start version - 1
+    let start_u64: u64 = range.start().clone().into();
+    if start_u64 > 0 {
+        let start = range.start().sub_one();
+        if let Some(range) = check_ranges.get(&start) {
+            overlapping_ranges.insert(range.clone());
+        }
+    }
+
+    // check if there's a next range with an start version = end version + 1
+    let end = range.end().add_one();
+    if let Some(range) = check_ranges.get(&end) {
+        overlapping_ranges.insert(range.clone());
+    }
+
+    overlapping_ranges
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1182,8 +1185,37 @@ impl BookedVersions {
         self.max
     }
 
-    // Called for each partial changeset which has been successfully buffered in the database.
-    // Right now db reconciliation is done when inserting a partial changeset.
+    /// Removes partials for the versions
+    pub fn clear_partials(
+        &mut self,
+        conn: &Connection,
+        versions: RangeInclusiveSet<CrsqlDbVersion>,
+    ) -> rusqlite::Result<()> {
+        let remove_versions = versions
+            .into_iter()
+            .flat_map(|v| CrsqlDbVersionRange::from(v))
+            .filter(|v| self.partials.contains_key(v))
+            .collect::<Vec<_>>();
+
+        let deleted = conn.prepare_cached(
+            "DELETE FROM __corro_seq_bookkeeping WHERE site_id = ? AND db_version IN (SELECT value0 FROM unnest(:versions))",
+        )?
+        .execute((self.actor_id, unnest_param(&remove_versions)))?;
+
+        if deleted != remove_versions.len() {
+            warn!(actor_id = %self.actor_id, "ineffective deletion of partials in-db: {remove_versions:?} count: {deleted}");
+            let details: serde_json::Value = json!({"count": deleted, "expected": remove_versions.len(), "versions": remove_versions});
+            assert_unreachable!("ineffective deletion of partials in-db", &details);
+        }
+
+        for version in remove_versions {
+            self.partials.remove(&version);
+        }
+
+        Ok(())
+    }
+
+    /// Merges new partial data into the in-memory `partials` map only.
     pub fn insert_partial(
         &mut self,
         version: CrsqlDbVersion,
@@ -1203,6 +1235,169 @@ impl BookedVersions {
             }
         }
     }
+
+    /// Compute what `__corro_seq_bookkeeping` rows need to change based on the
+    /// current in-memory `partials` state and the new partial data to merge.
+    fn compute_partials_change(
+        &self,
+        version: CrsqlDbVersion,
+        partial: &PartialVersion,
+    ) -> PartialChanges {
+        let mut changes = PartialChanges {
+            remove_seqs: RangeInclusiveSet::new(),
+            insert_seqs: RangeInclusiveSet::new(),
+        };
+
+        if let Some(existing) = self.partials.get(&version) {
+            for seq in partial.seqs.iter() {
+                let ranges = compute_overlapping_ranges(&existing.seqs, seq);
+                changes.insert_seqs.extend(ranges.clone());
+                changes.remove_seqs.extend(ranges.clone());
+            }
+        }
+
+        // ensure that all the new seqs are inserted
+        for range in partial.seqs.iter() {
+            changes.insert_seqs.insert(range.clone());
+        }
+
+        changes
+    }
+
+    /// Update `__corro_seq_bookkeeping` and in-memory `partials`
+    /// based on new partial data, similar to `insert_db` for gaps.
+    ///
+    /// Returns the list of versions that became complete after merging.
+    pub fn insert_partials_db(
+        &mut self,
+        conn: &Connection,
+        partials: BTreeMap<CrsqlDbVersion, PartialVersion>,
+    ) -> rusqlite::Result<Vec<CrsqlDbVersion>> {
+        #[derive(Default)]
+        struct PartialParams {
+            actors: Vec<ActorId>,
+            versions: Vec<CrsqlDbVersion>,
+            start_seqs: Vec<CrsqlSeq>,
+            end_seqs: Vec<CrsqlSeq>,
+
+            // only used in insert cases
+            last_seqs: Vec<CrsqlSeq>,
+            timestamps: Vec<Timestamp>,
+        }
+
+        let mut remove_params = PartialParams::default();
+        let mut insert_params = PartialParams::default();
+        for (version, partial) in partials.iter() {
+            let last_seq = partial.last_seq;
+            let ts = partial.ts;
+            let changes = self.compute_partials_change(*version, &partial);
+            if !changes.remove_seqs.is_empty() {
+                remove_params
+                    .actors
+                    .extend(changes.remove_seqs.iter().map(|_| self.actor_id));
+                remove_params
+                    .versions
+                    .extend(changes.remove_seqs.iter().map(|_| *version));
+                remove_params
+                    .start_seqs
+                    .extend(changes.remove_seqs.iter().map(|s| s.start()));
+                remove_params
+                    .end_seqs
+                    .extend(changes.remove_seqs.iter().map(|s| s.end()));
+            }
+
+            // we should always have something to insert
+            let details =
+                json!({"actor_id": self.actor_id, "version": version, "last_seq": last_seq});
+            assert_always!(
+                !changes.insert_seqs.is_empty(),
+                "insert_seqs should not be empty",
+                &details
+            );
+            insert_params
+                .actors
+                .extend(changes.insert_seqs.iter().map(|_| self.actor_id));
+            insert_params
+                .versions
+                .extend(changes.insert_seqs.iter().map(|_| version));
+            insert_params
+                .start_seqs
+                .extend(changes.insert_seqs.iter().map(|s| s.start()));
+            insert_params
+                .end_seqs
+                .extend(changes.insert_seqs.iter().map(|s| s.end()));
+            insert_params
+                .last_seqs
+                .extend(changes.insert_seqs.iter().map(|_| last_seq));
+            insert_params
+                .timestamps
+                .extend(changes.insert_seqs.iter().map(|_| ts));
+        }
+
+        trace!(actor_id = %self.actor_id, "partials delete: {:?}", remove_params.actors.len());
+        trace!(actor_id = %self.actor_id, "partials insert: {:?}", insert_params.actors.len());
+
+        // delete old seq bookkeeping rows
+        if !remove_params.actors.is_empty() {
+            let actors = unnest_param(remove_params.actors.iter());
+            let versions = unnest_param(remove_params.versions.iter());
+            let start_seqs = unnest_param(remove_params.start_seqs.iter());
+            let end_seqs = unnest_param(remove_params.end_seqs.iter());
+
+            conn.prepare_cached(
+                "DELETE FROM __corro_seq_bookkeeping
+                 WHERE (site_id, db_version, start_seq, end_seq)
+                 IN (SELECT value0, value1, value2, value3 FROM unnest(:actors, :versions, :start_seqs, :end_seqs))",
+            )?
+            .execute(named_params! {
+                ":actors": actors,
+                ":versions": versions,
+                ":start_seqs": start_seqs,
+                ":end_seqs": end_seqs,
+            })?;
+        }
+
+        // insert new merged seq bookkeeping rows
+        if !insert_params.actors.is_empty() {
+            let actors = unnest_param(insert_params.actors.iter());
+            let versions = unnest_param(insert_params.versions.iter());
+            let start_seqs = unnest_param(insert_params.start_seqs.iter());
+            let end_seqs = unnest_param(insert_params.end_seqs.iter());
+            let last_seqs = unnest_param(insert_params.last_seqs.iter());
+            let timestamps = unnest_param(insert_params.timestamps.iter());
+
+            conn.prepare_cached(
+                "INSERT OR REPLACE INTO __corro_seq_bookkeeping
+                    (site_id, db_version, start_seq, end_seq, last_seq, ts)
+                 SELECT value0, value1, value2, value3, value4, value5
+                 FROM unnest(:actors, :versions, :start_seqs, :end_seqs, :last_seqs, :timestamps)",
+            )?
+            .execute(named_params! {
+                ":actors": actors,
+                ":versions": versions,
+                ":start_seqs": start_seqs,
+                ":end_seqs": end_seqs,
+                ":last_seqs": last_seqs,
+                ":timestamps": timestamps,
+            })?;
+        }
+
+        let mut completed = Vec::new();
+        for (version, partial) in partials {
+            let partial = self.insert_partial(version, partial);
+            if partial.is_complete() {
+                completed.push(version);
+            }
+        }
+
+        Ok(completed)
+    }
+}
+
+#[derive(Debug)]
+pub struct PartialChanges {
+    remove_seqs: RangeInclusiveSet<CrsqlSeq>,
+    insert_seqs: RangeInclusiveSet<CrsqlSeq>,
 }
 
 #[derive(Debug)]
@@ -1630,6 +1825,270 @@ mod tests {
             all_versions.iter().next_back().map(|range| *range.end()),
             "expected last version not to increment"
         );
+
+        Ok(())
+    }
+
+    fn new_test_conn() -> rusqlite::Result<CrConn> {
+        let mut conn = CrConn::init(Connection::open_in_memory()?)?;
+        setup_conn(&conn)?;
+        let clock = Arc::new(uhlc::HLC::default());
+        migrate(clock, &mut conn)?;
+        Ok(conn)
+    }
+
+    fn read_seq_bookkeeping(
+        conn: &Connection,
+        actor_id: ActorId,
+    ) -> rusqlite::Result<Vec<(CrsqlDbVersion, CrsqlSeq, CrsqlSeq, CrsqlSeq)>> {
+        conn.prepare_cached(
+            "SELECT db_version, start_seq, end_seq, last_seq
+             FROM __corro_seq_bookkeeping
+             WHERE site_id = ?
+             ORDER BY db_version, start_seq",
+        )?
+        .query_map([actor_id], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })?
+        .collect()
+    }
+
+    fn partial(
+        seqs: impl IntoIterator<Item = RangeInclusive<CrsqlSeq>>,
+        last_seq: u64,
+    ) -> PartialVersion {
+        PartialVersion {
+            seqs: RangeInclusiveSet::from_iter(seqs),
+            last_seq: CrsqlSeq(last_seq),
+            ts: Timestamp::zero(),
+        }
+    }
+
+    fn expect_partials(
+        conn: &Connection,
+        bv: &BookedVersions,
+        expected_rows: Vec<(CrsqlDbVersion, CrsqlSeq, CrsqlSeq, CrsqlSeq)>,
+    ) -> rusqlite::Result<()> {
+        let db_rows = read_seq_bookkeeping(conn, bv.actor_id())?;
+        assert_eq!(db_rows, expected_rows, "DB seq bookkeeping mismatch");
+
+        // verify memory matches DB: for each version in partials, the seq ranges
+        // should correspond to the DB rows for that version
+        for (version, partial) in &bv.partials {
+            let mem_ranges: Vec<_> = partial
+                .seqs
+                .iter()
+                .map(|r| (*version, *r.start(), *r.end(), partial.last_seq))
+                .collect();
+
+            let db_for_version: Vec<_> = db_rows
+                .iter()
+                .filter(|(v, _, _, _)| v == version)
+                .cloned()
+                .collect();
+            assert_eq!(
+                mem_ranges, db_for_version,
+                "memory/DB mismatch for version {version}"
+            );
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_booked_insert_partials_db() -> rusqlite::Result<()> {
+        _ = tracing_subscriber::fmt::try_init();
+        let conn = new_test_conn()?;
+        let actor_id = ActorId(uuid::Uuid::new_v4());
+        let mut bv = BookedVersions::new(actor_id);
+
+        let v1 = CrsqlDbVersion(1);
+        let v2 = CrsqlDbVersion(2);
+        let v3 = CrsqlDbVersion(3);
+
+        // empty input is a no-op
+        let completed = bv.insert_partials_db(&conn, BTreeMap::new())?;
+        assert!(completed.is_empty());
+        expect_partials(&conn, &bv, vec![])?;
+
+        // insert two partials at once: v1 is already complete, v2 is not
+        let completed = bv.insert_partials_db(
+            &conn,
+            BTreeMap::from([
+                (v1, partial([CrsqlSeq(0)..=CrsqlSeq(5)], 5)),
+                (v2, partial([CrsqlSeq(0)..=CrsqlSeq(3)], 9)),
+            ]),
+        )?;
+        assert_eq!(completed, vec![v1]);
+        assert!(bv.partials.get(&v1).unwrap().is_complete());
+        assert!(!bv.partials.get(&v2).unwrap().is_complete());
+        expect_partials(
+            &conn,
+            &bv,
+            vec![
+                (v1, CrsqlSeq(0), CrsqlSeq(5), CrsqlSeq(5)),
+                (v2, CrsqlSeq(0), CrsqlSeq(3), CrsqlSeq(9)),
+            ],
+        )?;
+
+        // merge adjacent seqs into v2: 4..=6 merges with 0..=3 → 0..=6
+        let completed = bv.insert_partials_db(
+            &conn,
+            BTreeMap::from([(v2, partial([CrsqlSeq(4)..=CrsqlSeq(6)], 9))]),
+        )?;
+        assert!(completed.is_empty());
+        assert_eq!(
+            bv.partials[&v2].seqs,
+            RangeInclusiveSet::from_iter([CrsqlSeq(0)..=CrsqlSeq(6)])
+        );
+        expect_partials(
+            &conn,
+            &bv,
+            vec![
+                (v1, CrsqlSeq(0), CrsqlSeq(5), CrsqlSeq(5)),
+                (v2, CrsqlSeq(0), CrsqlSeq(6), CrsqlSeq(9)),
+            ],
+        )?;
+
+        // overlapping seqs into v2: 3..=8 overlaps 0..=6 → 0..=8
+        bv.insert_partials_db(
+            &conn,
+            BTreeMap::from([(v2, partial([CrsqlSeq(3)..=CrsqlSeq(8)], 9))]),
+        )?;
+        assert_eq!(
+            bv.partials[&v2].seqs,
+            RangeInclusiveSet::from_iter([CrsqlSeq(0)..=CrsqlSeq(8)])
+        );
+        expect_partials(
+            &conn,
+            &bv,
+            vec![
+                (v1, CrsqlSeq(0), CrsqlSeq(5), CrsqlSeq(5)),
+                (v2, CrsqlSeq(0), CrsqlSeq(8), CrsqlSeq(9)),
+            ],
+        )?;
+
+        // non-contiguous seqs: v3 gets two disjoint ranges
+        bv.insert_partials_db(
+            &conn,
+            BTreeMap::from([(v3, partial([CrsqlSeq(0)..=CrsqlSeq(2)], 9))]),
+        )?;
+        bv.insert_partials_db(
+            &conn,
+            BTreeMap::from([(v3, partial([CrsqlSeq(5)..=CrsqlSeq(7)], 9))]),
+        )?;
+        assert_eq!(
+            bv.partials[&v3].seqs,
+            RangeInclusiveSet::from_iter([CrsqlSeq(0)..=CrsqlSeq(2), CrsqlSeq(5)..=CrsqlSeq(7)])
+        );
+        expect_partials(
+            &conn,
+            &bv,
+            vec![
+                (v1, CrsqlSeq(0), CrsqlSeq(5), CrsqlSeq(5)),
+                (v2, CrsqlSeq(0), CrsqlSeq(8), CrsqlSeq(9)),
+                (v3, CrsqlSeq(0), CrsqlSeq(2), CrsqlSeq(9)),
+                (v3, CrsqlSeq(5), CrsqlSeq(7), CrsqlSeq(9)),
+            ],
+        )?;
+
+        // fill v3's gap 3..=4 → merges into 0..=7
+        bv.insert_partials_db(
+            &conn,
+            BTreeMap::from([(v3, partial([CrsqlSeq(3)..=CrsqlSeq(4)], 9))]),
+        )?;
+        assert_eq!(
+            bv.partials[&v3].seqs,
+            RangeInclusiveSet::from_iter([CrsqlSeq(0)..=CrsqlSeq(7)])
+        );
+
+        // complete v2: add the last seq 9
+        let completed = bv.insert_partials_db(
+            &conn,
+            BTreeMap::from([(v2, partial([CrsqlSeq(9)..=CrsqlSeq(9)], 9))]),
+        )?;
+        assert_eq!(completed, vec![v2]);
+        assert!(bv.partials[&v2].is_complete());
+
+        // idempotent: re-inserting v1's same data should not change anything
+        bv.insert_partials_db(
+            &conn,
+            BTreeMap::from([(v1, partial([CrsqlSeq(0)..=CrsqlSeq(5)], 5))]),
+        )?;
+        assert_eq!(
+            bv.partials[&v1].seqs,
+            RangeInclusiveSet::from_iter([CrsqlSeq(0)..=CrsqlSeq(5)])
+        );
+
+        // clear_partials removes from memory and DB
+        bv.clear_partials(&conn, RangeInclusiveSet::from([v1..=v1]))?;
+        assert!(!bv.partials.contains_key(&v1));
+        assert!(
+            read_seq_bookkeeping(&conn, actor_id)?
+                .iter()
+                .all(|(v, _, _, _)| *v != v1)
+        );
+
+        // clearing a non-existent version is a no-op
+        bv.clear_partials(
+            &conn,
+            RangeInclusiveSet::from([CrsqlDbVersion(99)..=CrsqlDbVersion(99)]),
+        )?;
+
+        // roundtrip: loading from DB matches in-memory state
+        let bv2 = BookedVersions::from_conn(&conn, actor_id)?;
+        assert_eq!(bv.partials, bv2.partials);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_insert_db_clears_seq_bookkeeping_on_gap_resolve() -> rusqlite::Result<()> {
+        _ = tracing_subscriber::fmt::try_init();
+        let conn = new_test_conn()?;
+        let actor_id = ActorId(uuid::Uuid::new_v4());
+        let mut bv = BookedVersions::new(actor_id);
+
+        let v2 = CrsqlDbVersion(2);
+        let v3 = CrsqlDbVersion(3);
+
+        // create gaps: insert 1 and 5, leaving 2..=4 as a gap
+        bv.insert_db(&conn, range_inclusive_set![dbvri!(1, 1), dbvri!(5, 5)])?;
+        expect_gaps(
+            &conn,
+            &bv,
+            &range_inclusive_set![dbvri!(1, 1), dbvri!(5, 5)],
+            vec![dbvr!(2, 4)],
+        )?;
+
+        // add partials for v2 and v3 (both in the gap)
+        bv.insert_partials_db(
+            &conn,
+            BTreeMap::from([
+                (v2, partial([CrsqlSeq(0)..=CrsqlSeq(3)], 9)),
+                (v3, partial([CrsqlSeq(0)..=CrsqlSeq(5)], 5)),
+            ]),
+        )?;
+        assert!(bv.partials.contains_key(&v2));
+        assert!(bv.partials.contains_key(&v3));
+        assert_eq!(read_seq_bookkeeping(&conn, actor_id)?.len(), 2);
+
+        // partially fill gap: apply v2 only — v3 partial should survive
+        bv.insert_db(&conn, range_inclusive_set![dbvri!(2, 2)])?;
+        bv.clear_partials(&conn, RangeInclusiveSet::from([v2..=v2]))?;
+        assert!(!bv.partials.contains_key(&v2));
+        assert!(bv.partials.contains_key(&v3));
+
+        let rows = read_seq_bookkeeping(&conn, actor_id)?;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, v3);
+
+        // fill rest of gap: apply 3..=4 — v3 partial should be cleared
+        bv.insert_db(&conn, range_inclusive_set![dbvri!(3, 4)])?;
+        bv.clear_partials(&conn, RangeInclusiveSet::from([v3..=v3]))?;
+        assert!(bv.partials.is_empty());
+        assert!(read_seq_bookkeeping(&conn, actor_id)?.is_empty());
+        assert!(bv.needed().is_empty());
 
         Ok(())
     }

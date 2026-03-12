@@ -15,7 +15,7 @@ use crate::{
     transport::Transport,
 };
 
-use antithesis_sdk::assert_sometimes;
+use antithesis_sdk::{assert_always, assert_sometimes};
 use corro_types::{
     actor::{Actor, ActorId},
     agent::{Agent, Booked, Bookie, ChangeError, CurrentVersion, KnownDbVersion, PartialVersion},
@@ -31,7 +31,7 @@ use corro_types::{
 
 use super::BcastCache;
 use crate::api::public::update::api_v1_updates;
-use antithesis_sdk::{assert_always, assert_unreachable};
+use antithesis_sdk::assert_unreachable;
 use axum::{
     error_handling::HandleErrorLayer,
     extract::DefaultBodyLimit,
@@ -56,7 +56,7 @@ use std::{
     collections::{BTreeMap, HashSet},
     convert::Infallible,
     net::SocketAddr,
-    ops::{Deref, RangeInclusive},
+    ops::Deref,
     sync::{atomic::AtomicI64, Arc},
     time::{Duration, Instant},
 };
@@ -506,7 +506,9 @@ pub async fn apply_fully_buffered_changes_loop(
     info!("fully_buffered_changes_loop ended");
 }
 
-/// Compact the database by finding cleared versions
+/// Clean up `__corro_buffered_changes` rows for versions that have been fully applied.
+/// `__corro_seq_bookkeeping` is managed through the bookie via `insert_partials_db`/`insert_db`.
+///
 pub async fn clear_buffered_meta_loop(
     agent: Agent,
     mut rx_partials: CorroReceiver<(ActorId, CrsqlDbVersionRange)>,
@@ -533,31 +535,23 @@ pub async fn clear_buffered_meta_loop(
                             "clear_buffered_meta",
                         );
 
-                        // TODO: delete buffered changes from deleted sequences only (maybe, it's kind of hard and may not be necessary)
-
-                        // sub query required due to DELETE and LIMIT interaction
-                        let seq_count = tx
-                            .prepare_cached("DELETE FROM __corro_seq_bookkeeping WHERE (site_id, db_version, start_seq) IN (SELECT site_id, db_version, start_seq FROM __corro_seq_bookkeeping WHERE site_id = ? AND db_version >= ? AND db_version <= ? LIMIT ?)")?
-                            .execute(params![actor_id, versions.start(), versions.end(), TO_CLEAR_COUNT])?;
-
-                        // sub query required due to DELETE and LIMIT interaction
                         let buf_count = tx
                             .prepare_cached("DELETE FROM __corro_buffered_changes WHERE (site_id, db_version, seq) IN (SELECT site_id, db_version, seq FROM __corro_buffered_changes WHERE site_id = ? AND db_version >= ? AND db_version <= ? LIMIT ?)")?
                             .execute(params![actor_id, versions.start(), versions.end(), TO_CLEAR_COUNT])?;
 
                         tx.commit()?;
 
-                        Ok::<_, rusqlite::Error>((buf_count, seq_count))
+                        Ok::<_, rusqlite::Error>(buf_count)
                     })
                 };
 
                 match res {
-                    Ok((buf_count, seq_count)) => {
-                        if buf_count + seq_count > 0 {
+                    Ok(buf_count) => {
+                        if buf_count > 0 {
                             assert_sometimes!(true, "Corrosion clears buffered meta");
-                            info!(%actor_id, %self_actor_id, "cleared {} buffered meta rows for versions {versions:?}", buf_count + seq_count);
+                            info!(%actor_id, %self_actor_id, "cleared {buf_count} buffered change rows for versions {versions:?}");
                         }
-                        if buf_count < TO_CLEAR_COUNT && seq_count < TO_CLEAR_COUNT {
+                        if buf_count < TO_CLEAR_COUNT {
                             break;
                         }
                     }
@@ -736,6 +730,15 @@ pub async fn process_fully_buffered_changes(
 
             bookedw
                 .insert_db(&tx, [version..=version].into())
+                .map_err(|source| ChangeError::Rusqlite {
+                    source,
+                    actor_id: Some(actor_id),
+                    version: Some(version),
+                })?;
+
+            // the version transitions from partial → fully applied, clean up its seq bookkeeping
+            bookedw
+                .clear_partials(&tx, RangeInclusiveSet::from([version..=version]))
                 .map_err(|source| ChangeError::Rusqlite {
                     source,
                     actor_id: Some(actor_id),
@@ -962,6 +965,8 @@ pub async fn process_multiple_changes(
         }
 
         let sub_start = Instant::now();
+
+        let mut completed_partials = BTreeMap::new();
         for (actor_id, processed) in processed.iter() {
             debug!(%actor_id, self_actor_id = %agent.actor_id(), "processing {} changesets", processed.len());
 
@@ -982,6 +987,51 @@ pub async fn process_multiple_changes(
                     actor_id: Some(*actor_id),
                     version: None,
                 })?;
+
+            // for complete/cleared versions, clean up any prior partial bookkeeping
+            // TODO: do we want to leave this to be done when clearing buffered changes?
+            let complete_versions = processed
+                .iter()
+                .filter_map(|(versions, partial)| partial.is_none().then_some(versions.into()))
+                .collect::<RangeInclusiveSet<CrsqlDbVersion>>();
+
+            booked_write
+                .clear_partials(&tx, complete_versions)
+                .map_err(|source| ChangeError::Rusqlite {
+                    source,
+                    actor_id: Some(*actor_id),
+                    version: None,
+                })?;
+
+            // collect updated partials for this actor and update bookkeeping table
+            let partial_versions: BTreeMap<_, _> =
+                processed
+                    .iter()
+                    .fold(BTreeMap::new(), |mut acc, (versions, partial)| {
+                        if let Some(p) = partial {
+                            acc.entry(versions.start())
+                                .and_modify(|existing: &mut PartialVersion| {
+                                    assert_always!(
+                                        p.last_seq == existing.last_seq,
+                                        "last_seq mismatch for partial version {versions:?}"
+                                    );
+                                    existing.seqs.extend(p.seqs.clone());
+                                })
+                                .or_insert(p.clone());
+                        }
+                        acc
+                    });
+
+            let completed = booked_write
+                .insert_partials_db(&tx, partial_versions)
+                .map_err(|source| ChangeError::Rusqlite {
+                    source,
+                    actor_id: Some(*actor_id),
+                    version: None,
+                })?;
+            if !completed.is_empty() {
+                completed_partials.insert(*actor_id, completed);
+            }
         }
 
         debug!("inserted {count} new changesets");
@@ -1008,6 +1058,10 @@ pub async fn process_multiple_changes(
             warn!("process_multiple_changes: commiting transaction took too long - {elapsed:?}");
         }
 
+        for (_, booked_write) in booked_writes {
+            booked_write.commit();
+        }
+
         for (_, changeset, _, _) in changesets.iter() {
             if let Some(ts) = changeset.ts() {
                 let dur = (agent.clock().new_timestamp().get_time() - ts.0).to_duration();
@@ -1018,49 +1072,19 @@ pub async fn process_multiple_changes(
 
         debug!("committed {count} changes in {:?}", start.elapsed());
 
-        let sub_start = Instant::now();
-        for (actor_id, processed) in processed {
-            let booked_write = booked_writes
-                .get_mut(&actor_id)
-                .expect("booked write guard should be present for every actor");
-
-            for (versions, partial) in processed {
-                let version = versions.start();
-                if let Some(partial) = partial {
-                    let PartialVersion { seqs, last_seq, .. } =
-                        booked_write.insert_partial(version, partial);
-
-                    let full_seqs_range = CrsqlSeq(0)..=last_seq;
-                    let gaps_count = seqs.gaps(&full_seqs_range).count();
-                    if gaps_count == 0 {
-                        // if we have no gaps, then we can schedule applying all these changes.
-                        debug!(%actor_id, %version, "we now have all versions, notifying for background jobber to insert buffered changes! seqs: {seqs:?}, expected full seqs: {full_seqs_range:?}");
-                        let tx_apply = agent.tx_apply().clone();
-                        tokio::spawn(async move {
-                            if let Err(e) = tx_apply.send((actor_id, version)).await {
-                                error!("could not send trigger for applying fully buffered changes later: {e}");
-                            }
-                        });
-                    } else {
-                        debug!(%actor_id, %version, "still have {gaps_count} gaps in partially buffered seqs: {:?}", seqs.gaps(&full_seqs_range).collect::<Vec<_>>());
+        // schedule apply for partials that became complete
+        for (actor_id, versions) in completed_partials {
+            for version in versions {
+                debug!(%actor_id, %version, "partial is now complete, notifying for background apply");
+                let tx_apply = agent.tx_apply().clone();
+                tokio::spawn(async move {
+                    if let Err(e) = tx_apply.send((actor_id, version)).await {
+                        error!(
+                            "could not send trigger for applying fully buffered changes later: {e}"
+                        );
                     }
-                }
+                });
             }
-        }
-
-        let elapsed = sub_start.elapsed();
-        let details = json!({"elapsed": elapsed.as_secs_f32()});
-        assert_always!(
-            elapsed < Duration::from_secs(60),
-            "process_multiple_changes took too long",
-            &details
-        );
-        if elapsed >= PROCESSING_WARN_THRESHOLD {
-            warn!("process_multiple_changes: applying in-memory booked updates took too long - {elapsed:?}");
-        }
-
-        for (_, booked_write) in booked_writes {
-            booked_write.commit();
         }
 
         Ok::<_, ChangeError>(changesets)
@@ -1130,7 +1154,6 @@ pub fn process_incomplete_version<T: Deref<Target = rusqlite::Connection> + Comm
     assert_sometimes!(true, "Corrosion processes incomplete changes");
 
     trace!("buffering changes! {changes:?}");
-    // Insert all changes in one go. Return the table names for which we buffered changes.
     let mut stmt = sp.prepare_cached(
                 r#"
                 INSERT INTO __corro_buffered_changes
@@ -1174,79 +1197,12 @@ pub fn process_incomplete_version<T: Deref<Target = rusqlite::Connection> + Comm
     }
     debug!(%actor_id, %version, "buffered {inserted} changes");
 
-    let deleted: Vec<RangeInclusive<CrsqlSeq>> = sp
-        .prepare_cached(
-            "
-            DELETE FROM __corro_seq_bookkeeping
-                WHERE site_id = :actor_id AND db_version = :db_version AND
-                (
-                    -- [:start]---[start_seq]---[:end]
-                    ( start_seq BETWEEN :start AND :end ) OR
-
-                    -- [start_seq]---[:start]---[:end]---[end_seq]
-                    ( start_seq <= :start AND end_seq >= :end ) OR
-
-                    -- [:start]---[start_seq]---[:end]---[end_seq]
-                    ( start_seq <= :end AND end_seq >= :end ) OR
-
-                    -- [:start]---[end_seq]---[:end]
-                    ( end_seq BETWEEN :start AND :end ) OR
-
-                    -- ---[:end][start_seq]---[end_seq]
-                    ( start_seq = :end + 1 AND end_seq ) OR
-
-                    -- [end_seq][:start]---
-                    ( end_seq = :start - 1 )
-                )
-                RETURNING start_seq, end_seq
-        ",
-        )?
-        .query_map(
-            named_params![
-                ":actor_id": actor_id,
-                ":db_version": version,
-                ":start": seqs.start_int(),
-                ":end": seqs.end_int(),
-            ],
-            |row| Ok(row.get(0)?..=row.get(1)?),
-        )
-        .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>())?;
-
-    // re-compute the ranges
-    let mut new_ranges = RangeInclusiveSet::from_iter(deleted);
-    new_ranges.insert((*seqs).into());
-
-    let details = json!({"new_ranges": new_ranges});
-    assert_always!(
-        new_ranges.len() == 1,
-        "deleted non-contiguous seq ranges!",
-        &details
-    );
-    // we should never have deleted non-contiguous seq ranges, abort!
-    if new_ranges.len() > 1 {
-        warn!("deleted non-contiguous seq ranges! {new_ranges:?}");
-        // this serves as a failsafe
-        return Err(rusqlite::Error::StatementChangedRows(new_ranges.len()));
-    }
-
-    // insert new seq ranges, there should only be one...
-    for range in new_ranges.clone() {
-        sp
-        .prepare_cached(
-            "
-                INSERT INTO __corro_seq_bookkeeping (site_id, db_version, start_seq, end_seq, last_seq, ts)
-                    VALUES (?, ?, ?, ?, ?, ?);
-            ",
-        )?
-        .execute(params![actor_id, version, range.start(), range.end(), last_seq, ts])?;
-    }
-
     for (table_name, count) in changes_per_table {
         counter!("corro.changes.committed", "table" => table_name.to_string(), "source" => "remote").increment(count);
     }
 
     Ok(KnownDbVersion::Partial(PartialVersion {
-        seqs: new_ranges,
+        seqs: RangeInclusiveSet::from_iter([(*seqs).into()]),
         last_seq: *last_seq,
         ts: *ts,
     }))
@@ -1380,12 +1336,7 @@ pub fn check_buffered_meta_to_clear(
     actor_id: ActorId,
     versions: CrsqlDbVersionRange,
 ) -> rusqlite::Result<bool> {
-    let should_clear: bool = conn.prepare_cached("SELECT EXISTS(SELECT 1 FROM __corro_buffered_changes WHERE site_id = ? AND db_version >= ? AND db_version <= ?)")?.query_row(params![actor_id, versions.start(), versions.end()], |row| row.get(0))?;
-    if should_clear {
-        return Ok(true);
-    }
-
-    conn.prepare_cached("SELECT EXISTS(SELECT 1 FROM __corro_seq_bookkeeping WHERE site_id = ? AND db_version >= ? AND db_version <= ?)")?.query_row(params![actor_id, versions.start(), versions.end()], |row| row.get(0))
+    conn.prepare_cached("SELECT EXISTS(SELECT 1 FROM __corro_buffered_changes WHERE site_id = ? AND db_version >= ? AND db_version <= ?)")?.query_row(params![actor_id, versions.start(), versions.end()], |row| row.get(0))
 }
 
 pub fn log_at_pow_10(msg: &str, count: &mut u64) {
