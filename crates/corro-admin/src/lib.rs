@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     fmt::Display,
     time::{Duration, Instant},
 };
@@ -6,7 +7,7 @@ use std::{
 use camino::Utf8PathBuf;
 use corro_types::{
     actor::{ActorId, ClusterId},
-    agent::{Agent, Bookie},
+    agent::{Agent, BookedVersions, Bookie},
     base::{CrsqlDbVersion, CrsqlSeq},
     broadcast::{FocaCmd, FocaInput},
     sqlite::SqlitePoolError,
@@ -113,6 +114,7 @@ pub enum Command {
 pub enum SyncCommand {
     Generate,
     ReconcileGaps,
+    CheckBookieConsistency,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -278,6 +280,54 @@ async fn handle_conn(
                         )
                         .await;
                         }
+                    }
+
+                    send_success(&mut stream).await;
+                }
+                Command::Sync(SyncCommand::CheckBookieConsistency) => {
+                    info_log(
+                        &mut stream,
+                        "checking in-memory and DB bookie consistency...",
+                    )
+                    .await;
+
+                    let rw_conn = match agent.pool().write_low().await {
+                        Ok(conn) => conn,
+                        Err(e) => {
+                            send_error(&mut stream, e).await;
+                            continue;
+                        }
+                    };
+
+                    let report = match block_in_place(|| check_bookie_consistency(&rw_conn, bookie))
+                    {
+                        Ok(report) => report,
+                        Err(e) => {
+                            send_error(&mut stream, e).await;
+                            continue;
+                        }
+                    };
+
+                    match serde_json::to_value(&report) {
+                        Ok(json) => send(&mut stream, Response::Json(json)).await,
+                        Err(e) => {
+                            send_error(&mut stream, e).await;
+                            continue;
+                        }
+                    }
+
+                    if !report.ok {
+                        send_error(
+                            &mut stream,
+                            format!(
+                                "bookie mismatch: value_mismatch={}, only_in_memory={}, only_in_db={}",
+                                report.value_mismatch_actors.len(),
+                                report.only_in_memory_actors.len(),
+                                report.only_in_db_actors.len()
+                            ),
+                        )
+                        .await;
+                        continue;
                     }
 
                     send_success(&mut stream).await;
@@ -706,4 +756,67 @@ fn collapse_gaps(
     })?;
 
     Ok((deleted, inserted))
+}
+
+#[derive(Debug, Serialize)]
+struct BookieConsistencyReport {
+    ok: bool,
+    in_memory_actors: usize,
+    db_actors: usize,
+    value_mismatch_actors: Vec<ActorId>,
+    only_in_memory_actors: Vec<ActorId>,
+    only_in_db_actors: Vec<ActorId>,
+}
+
+fn check_bookie_consistency(
+    conn: &rusqlite::Connection,
+    bookie: &Bookie,
+) -> rusqlite::Result<BookieConsistencyReport> {
+    let _bookie_write_guard = bookie.write_lock_blocking();
+
+    let db_map = BookedVersions::load_all_from_conn(conn)?;
+
+    let in_memory_map: HashMap<ActorId, BookedVersions> = {
+        let guard = bookie.owned_guard();
+        bookie
+            .iter(&guard)
+            .map(|(actor_id, booked)| {
+                let read = booked.read();
+                (*actor_id, (**read).clone())
+            })
+            .collect()
+    };
+
+    let mut value_mismatch_actors = Vec::new();
+    let mut only_in_memory_actors = Vec::new();
+    let mut only_in_db_actors = Vec::new();
+
+    for (actor_id, mem) in &in_memory_map {
+        match db_map.get(actor_id) {
+            Some(db) if db != mem => value_mismatch_actors.push(*actor_id),
+            Some(_) => {}
+            None => only_in_memory_actors.push(*actor_id),
+        }
+    }
+
+    for actor_id in db_map.keys() {
+        if !in_memory_map.contains_key(actor_id) {
+            only_in_db_actors.push(*actor_id);
+        }
+    }
+
+    value_mismatch_actors.sort_unstable();
+    only_in_memory_actors.sort_unstable();
+    only_in_db_actors.sort_unstable();
+
+    Ok(BookieConsistencyReport {
+        ok: value_mismatch_actors.is_empty()
+            && only_in_memory_actors.is_empty()
+            && only_in_db_actors.is_empty(),
+        in_memory_actors: in_memory_map.len(),
+        db_actors: db_map.len(),
+        value_mismatch_actors,
+        only_in_memory_actors,
+        only_in_db_actors,
+    })
 }
