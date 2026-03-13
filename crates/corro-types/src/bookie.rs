@@ -430,7 +430,7 @@ impl BookedVersions {
     ) -> rusqlite::Result<()> {
         let remove_versions = versions
             .into_iter()
-            .flat_map(CrsqlDbVersionRange::from(v))
+            .flat_map(CrsqlDbVersionRange::from)
             .filter(|v| self.partials.contains_key(v))
             .collect::<Vec<_>>();
 
