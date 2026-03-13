@@ -430,7 +430,7 @@ impl BookedVersions {
     ) -> rusqlite::Result<()> {
         let remove_versions = versions
             .into_iter()
-            .flat_map(|v| CrsqlDbVersionRange::from(v))
+            .flat_map(CrsqlDbVersionRange::from(v))
             .filter(|v| self.partials.contains_key(v))
             .collect::<Vec<_>>();
 
@@ -527,7 +527,7 @@ impl BookedVersions {
         for (version, partial) in partials.iter() {
             let last_seq = partial.last_seq;
             let ts = partial.ts;
-            let changes = self.compute_partials_change(*version, &partial);
+            let changes = self.compute_partials_change(*version, partial);
             debug!(actor_id = %self.actor_id, "computed partials change for version {version:?}: {changes:?}");
             if !changes.remove_seqs.is_empty() {
                 remove_params
