@@ -22,6 +22,14 @@ use crate::{
     sqlite::unnest_param,
 };
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BookedVersions {
+    actor_id: ActorId,
+    pub partials: BTreeMap<CrsqlDbVersion, PartialVersion>,
+    needed: RangeInclusiveSet<CrsqlDbVersion>,
+    max: Option<CrsqlDbVersion>,
+}
+
 impl BookedVersions {
     pub fn needed(&self) -> &RangeInclusiveSet<CrsqlDbVersion> {
         &self.needed
@@ -201,14 +209,6 @@ fn compute_overlapping_ranges<T: Ord + Clone + StepLite + Into<u64>>(
     }
 
     overlapping_ranges
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct BookedVersions {
-    actor_id: ActorId,
-    pub partials: BTreeMap<CrsqlDbVersion, PartialVersion>,
-    needed: RangeInclusiveSet<CrsqlDbVersion>,
-    max: Option<CrsqlDbVersion>,
 }
 
 impl BookedVersions {
@@ -1076,7 +1076,7 @@ mod tests {
         all: &BTreeMap<CrsqlDbVersion, (CrsqlSeq, RangeInclusiveSet<CrsqlSeq>)>,
     ) -> rusqlite::Result<()> {
         for (version, (last_seq, expected_seqs)) in all.iter() {
-            let bookie_partial = bv.partials.get(&version).unwrap();
+            let bookie_partial = bv.partials.get(version).unwrap();
             assert_eq!(bookie_partial.last_seq, *last_seq, "last_seq mismatch");
             assert_eq!(&bookie_partial.seqs, expected_seqs, "partial seqs mismatch");
 
@@ -1231,7 +1231,7 @@ mod tests {
             "SELECT EXISTS(SELECT 1 FROM __corro_seq_bookkeeping WHERE site_id = ? AND db_version = ?)",
         )?
         .query_row((bv.actor_id(), version), |row| {
-            Ok(row.get(0)?)
+            row.get(0)
         })?;
         Ok(db_row || bv.get_partial(&version).is_some())
     }
