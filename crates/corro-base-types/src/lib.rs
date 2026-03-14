@@ -176,6 +176,12 @@ impl StepLite for CrsqlSeq {
     }
 }
 
+impl From<CrsqlSeq> for u64 {
+    fn from(v: CrsqlSeq) -> Self {
+        v.0
+    }
+}
+
 impl ToSql for CrsqlSeq {
     fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
         self.0.to_sql()
