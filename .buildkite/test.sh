@@ -2,6 +2,9 @@
 
 export RUST_LOG=info,corro=debug
 
+# Ring wants the standard cross toolchain naming
+ln -s /usr/bin/musl-gcc /usr/bin/x86_64-linux-musl-gcc
+
 # Tests (with coverage + generating JUnit XML report)
 export NEXTEST_PROFILE=ci
 set +e
