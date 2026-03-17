@@ -3,7 +3,7 @@
 set -e
 
 # ensure latest rust image
-docker pull flyio/docker-rust-cargo:ubuntu-focal-2025-08-21
+docker pull flyio/docker-rust-cargo:ubuntu-focal-2025-08-21-musl
 
 docker run --rm -t \
     -e RUST_BACKTRACE=1 \
