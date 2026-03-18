@@ -23,4 +23,4 @@ docker run --rm -t \
     -v "${SSH_AUTH_SOCK}:/ssh-agent" \
 		-v "${PWD}:/build_dir" \
 		-w /build_dir \
-		flyio/docker-rust-cargo:ubuntu-focal-2025-08-21 /bin/bash -c "$@"
+		flyio/docker-rust-cargo:ubuntu-focal-2025-08-21-musl /bin/bash -c "$@"
