@@ -969,14 +969,14 @@ pub async fn process_multiple_changes(
 
         let mut all_changes = Vec::with_capacity(processed.len());
         let mut completed_partials = BTreeMap::new();
-        for (actor_id, entries) in processed.iter() {
-            debug!(%actor_id, self_actor_id = %agent.actor_id(), "processing {} changesets", entries.len());
+        for (actor_id, processed) in processed.iter() {
+            debug!(%actor_id, self_actor_id = %agent.actor_id(), "processing {} changesets", processed.len());
 
             let booked_write = booked_writes
                 .get_mut(actor_id)
                 .expect("booked write guard should be present for every actor");
 
-            let (changes, completed) = booked_write.compute_and_apply(entries);
+            let (changes, completed) = booked_write.compute_and_apply(processed);
             debug!(%actor_id, "computed and applied changes: {changes:?}, completed versions: {completed:?}");
             all_changes.push(changes);
             if !completed.is_empty() {

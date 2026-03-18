@@ -402,7 +402,7 @@ impl BookedVersions {
     ) -> Vec<CrsqlDbVersion> {
         let clear_versions: Vec<_> = versions
             .into_iter()
-            .flat_map(|v| CrsqlDbVersionRange::from(v))
+            .flat_map(CrsqlDbVersionRange::from)
             .filter(|v| self.partials.contains_key(v))
             .collect();
         for version in &clear_versions {
@@ -1233,7 +1233,7 @@ mod tests {
         all: &BTreeMap<CrsqlDbVersion, (CrsqlSeq, RangeInclusiveSet<CrsqlSeq>)>,
     ) -> rusqlite::Result<()> {
         for (version, (last_seq, expected_seqs)) in all.iter() {
-            let bookie_partial = bv.partials.get(&version).unwrap();
+            let bookie_partial = bv.partials.get(version).unwrap();
             assert_eq!(bookie_partial.last_seq, *last_seq, "last_seq mismatch");
             assert_eq!(&bookie_partial.seqs, expected_seqs, "partial seqs mismatch");
 
@@ -1388,7 +1388,7 @@ mod tests {
             "SELECT EXISTS(SELECT 1 FROM __corro_seq_bookkeeping WHERE site_id = ? AND db_version = ?)",
         )?
         .query_row((bv.actor_id(), version), |row| {
-            Ok(row.get(0)?)
+            row.get(0)
         })?;
         Ok(db_row || bv.get_partial(&version).is_some())
     }
