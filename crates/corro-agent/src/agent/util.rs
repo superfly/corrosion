@@ -48,7 +48,7 @@ use foca::Member;
 use http::StatusCode;
 use metrics::{counter, histogram};
 use rangemap::{RangeInclusiveMap, RangeInclusiveSet};
-use rusqlite::{named_params, params, Connection};
+use rusqlite::{named_params, params, Connection, OptionalExtension};
 use serde_json::json;
 use spawn::spawn_counted;
 use sqlite_pool::{Committable, InterruptibleTransaction};
@@ -68,7 +68,7 @@ use tokio::{
 use tower::{limit::ConcurrencyLimitLayer, load_shed::LoadShedLayer};
 use tower_http::trace::TraceLayer;
 use tracing::{debug, error, info, trace, warn};
-use tripwire::{Outcome, PreemptibleFutureExt, Tripwire};
+use tripwire::{PreemptibleFutureExt, Tripwire};
 
 const REQUESTED_ENDPOINT_NAME_HEADER: &str = "x-corrosion-requested-endpoint-name";
 
@@ -485,16 +485,40 @@ pub async fn apply_fully_buffered_changes_loop(
     info!("Starting apply_fully_buffered_changes loop");
 
     let tx_timeout: Duration = Duration::from_secs(agent.config().perf.sql_tx_timeout as u64);
-    while let Outcome::Completed(Some((actor_id, version))) =
-        rx_apply.recv().preemptible(&mut tripwire).await
-    {
+    let mut retry_interval = tokio::time::interval(Duration::from_secs(60));
+    retry_interval.tick().await;
+
+    loop {
+        let (actor_id, version) = tokio::select! {
+            biased;
+            _ = &mut tripwire => break,
+            maybe_version = rx_apply.recv() => match maybe_version {
+                Some(version) => version,
+                None => break,
+            },
+
+            _ = retry_interval.tick() => {
+                match find_fully_buffered_partial(&agent).await {
+                    Ok(Some(pair)) => pair,
+                    Ok(None) => continue,
+                    Err(e) => {
+                        warn!("could not query for fully buffered partials: {e}");
+                        continue;
+                    },
+                }
+            },
+        };
+
         debug!(%actor_id, %version, "picked up background apply of buffered changes");
+        let start = Instant::now();
         match process_fully_buffered_changes(&agent, &bookie, actor_id, version, tx_timeout).await {
             Ok(false) => {
                 warn!(%actor_id, %version, "did not apply buffered changes");
             }
             Ok(true) => {
                 debug!(%actor_id, %version, "succesfully applied buffered changes");
+                histogram!("corro.agent.changes.processing.time.seconds", "source" => "buffered")
+                    .record(start.elapsed().as_secs_f64());
             }
             Err(e) => {
                 error!(%actor_id, %version, "could not apply fully buffered changes: {e}");
@@ -507,23 +531,74 @@ pub async fn apply_fully_buffered_changes_loop(
     info!("fully_buffered_changes_loop ended");
 }
 
+async fn find_fully_buffered_partial(
+    agent: &Agent,
+) -> Result<Option<(ActorId, CrsqlDbVersion)>, ChangeError> {
+    let conn = agent.pool().read().await.map_err(ChangeError::SqlitePool)?;
+    block_in_place(|| {
+        conn.prepare_cached(
+            "SELECT site_id, db_version FROM __corro_seq_bookkeeping
+             WHERE start_seq = 0 AND end_seq = last_seq
+             LIMIT 1",
+        )
+        .and_then(|mut stmt| {
+            stmt.query_row([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .optional()
+        })
+        .map_err(|source| ChangeError::Rusqlite {
+            source,
+            actor_id: None,
+            version: None,
+        })
+    })
+}
+
 /// Clean up `__corro_buffered_changes` rows for versions that have been fully applied.
 /// `__corro_seq_bookkeeping` is managed through the bookie via `insert_partials_db`/`insert_db`.
 ///
 pub async fn clear_buffered_meta_loop(
     agent: Agent,
     mut rx_partials: CorroReceiver<(ActorId, CrsqlDbVersionRange)>,
-    tripwire: Tripwire,
+    mut tripwire: Tripwire,
 ) {
     let tx_timeout: Duration = Duration::from_secs(agent.config().perf.sql_tx_timeout as u64);
+    // check for orphaned buffered changes every 5 minutes
+    let mut retry_interval = tokio::time::interval(Duration::from_secs(5 * 60));
+    retry_interval.tick().await;
 
-    let mut recv_tripwire = tripwire.clone();
-    while let Outcome::Completed(Some((actor_id, versions))) =
-        rx_partials.recv().preemptible(&mut recv_tripwire).await
-    {
+    loop {
+        let (actor_id, versions) = tokio::select! {
+            biased;
+            _ = &mut tripwire => break,
+            maybe_partials = rx_partials.recv() => match maybe_partials {
+                Some(partials) => partials,
+                None => break,
+            },
+            _ = retry_interval.tick() => {
+                match find_orphaned_buffered_changes(&agent).await {
+                    Ok(Some((actor_id, version))) => (actor_id, CrsqlDbVersionRange::single(version)),
+                    Ok(None) => continue,
+                    Err(e) => {
+                        warn!("could not query for orphaned buffered changes: {e}");
+                        continue;
+                    }
+                }
+            }
+        };
+
+        if let Some(booked) = agent.bookie().get(&actor_id) {
+            let booked_read = booked.read();
+            for version in versions {
+                if booked_read.get_partial(&version).is_some() {
+                    warn!(%actor_id, %version, "clear_buffered_meta: received partial version that's still in bookie, skipping");
+                    continue;
+                }
+            }
+        }
+
         let pool = agent.pool().clone();
         let self_actor_id = agent.actor_id();
-        let mut tripwire = tripwire.clone();
+        let mut task_tripwire = tripwire.clone();
         spawn_counted(async move {
             loop {
                 let res = {
@@ -535,6 +610,7 @@ pub async fn clear_buffered_meta_loop(
                             Some(tx_timeout),
                             "clear_buffered_meta",
                         );
+                        // TODO: delete buffered changes from deleted sequences only (maybe, it's kind of hard and may not be necessary)
 
                         let buf_count = tx
                             .prepare_cached("DELETE FROM __corro_buffered_changes WHERE (site_id, db_version, seq) IN (SELECT site_id, db_version, seq FROM __corro_buffered_changes WHERE site_id = ? AND db_version >= ? AND db_version <= ? LIMIT ?)")?
@@ -562,7 +638,7 @@ pub async fn clear_buffered_meta_loop(
                 }
 
                 tokio::select! {
-                    _ = &mut tripwire => {
+                    _ = &mut task_tripwire => {
                         break;
                     }
                     _ = tokio::time::sleep(Duration::from_secs(2)) => {}
@@ -572,6 +648,32 @@ pub async fn clear_buffered_meta_loop(
             Ok::<_, eyre::Report>(())
         });
     }
+}
+
+async fn find_orphaned_buffered_changes(
+    agent: &Agent,
+) -> Result<Option<(ActorId, CrsqlDbVersion)>, ChangeError> {
+    let conn = agent.pool().read().await.map_err(ChangeError::SqlitePool)?;
+    block_in_place(|| {
+        conn.prepare_cached(
+            "SELECT DISTINCT bc.site_id, bc.db_version
+             FROM __corro_buffered_changes bc
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM __corro_seq_bookkeeping bk
+                 WHERE bk.site_id = bc.site_id AND bk.db_version = bc.db_version
+             )
+             LIMIT 1",
+        )
+        .and_then(|mut stmt| {
+            stmt.query_row([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .optional()
+        })
+        .map_err(|source| ChangeError::Rusqlite {
+            source,
+            actor_id: None,
+            version: None,
+        })
+    })
 }
 
 #[tracing::instrument(skip_all, err)]
