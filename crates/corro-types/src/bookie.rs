@@ -11,6 +11,7 @@ use papaya::{Guard, HashMap as PapayaHashMap};
 use parking_lot::{ArcMutexGuard, Mutex, RawMutex};
 use rangemap::{RangeInclusiveSet, StepLite};
 use rusqlite::{named_params, Connection, OptionalExtension};
+use serde::Serialize;
 use serde_json::json;
 use tracing::{debug, trace, warn};
 
