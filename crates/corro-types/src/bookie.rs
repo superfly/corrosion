@@ -467,6 +467,12 @@ impl BookedVersions {
             }
             btree_map::Entry::Occupied(mut entry) => {
                 let got = entry.get_mut();
+                let details = json!({"version": version, "current": got.last_seq, "received": partial.last_seq});
+                assert_always!(
+                    got.last_seq == partial.last_seq,
+                    "last_seq matches for partial version",
+                    &details
+                );
                 got.seqs.extend(partial.seqs);
                 got.clone()
             }
@@ -510,7 +516,7 @@ impl BookedVersions {
         conn: &Connection,
         partials: BTreeMap<CrsqlDbVersion, PartialVersion>,
     ) -> rusqlite::Result<Vec<CrsqlDbVersion>> {
-        #[derive(Default)]
+        #[derive(Default, Serialize)]
         struct PartialParams {
             actors: Vec<ActorId>,
             versions: Vec<CrsqlDbVersion>,
@@ -582,7 +588,7 @@ impl BookedVersions {
             let start_seqs = unnest_param(remove_params.start_seqs.iter());
             let end_seqs = unnest_param(remove_params.end_seqs.iter());
 
-            conn.prepare_cached(
+            let deleted = conn.prepare_cached(
                 "DELETE FROM __corro_seq_bookkeeping
                  WHERE (site_id, db_version, start_seq, end_seq)
                  IN (SELECT value0, value1, value2, value3 FROM unnest(:actors, :versions, :start_seqs, :end_seqs))",
@@ -593,6 +599,15 @@ impl BookedVersions {
                 ":start_seqs": start_seqs,
                 ":end_seqs": end_seqs,
             })?;
+
+            if deleted != remove_params.actors.len() {
+                warn!(actor_id = %self.actor_id, "did not delete some seq bookkeeping rows from db: deleted: {deleted}, expected: {}", remove_params.actors.len());
+                let details: serde_json::Value = json!({"count": deleted, "expected": remove_params.actors.len(), "params": remove_params});
+                assert_unreachable!(
+                    "ineffective deletion of seq bookkeeping rows in-db",
+                    &details
+                );
+            }
         }
 
         // insert new merged seq bookkeeping rows
