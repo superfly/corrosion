@@ -15,7 +15,7 @@ use deadpool::managed::{self, Object};
 use metrics::counter;
 use rusqlite::{CachedStatement, InterruptHandle, Params, Transaction};
 use tokio::time::{sleep, Duration};
-use tokio_util::sync::CancellationToken;
+use tokio_util::sync::{CancellationToken, DropGuard};
 
 pub use deadpool::managed::reexports::*;
 pub use rusqlite;
@@ -109,16 +109,6 @@ where
     }
 }
 
-struct TimeoutGuard {
-    cancel_token: CancellationToken,
-}
-
-impl Drop for TimeoutGuard {
-    fn drop(&mut self) {
-        self.cancel_token.cancel();
-    }
-}
-
 #[derive(Clone)]
 pub struct InterruptHandler {
     interrupt_hdl: Arc<InterruptHandle>,
@@ -139,7 +129,7 @@ impl InterruptHandler {
         }
     }
 
-    fn timeout_guard(&self) -> TimeoutGuard {
+    fn timeout_guard(&self) -> DropGuard {
         let cancel_token = CancellationToken::new();
 
         if let Some(timeout) = self.timeout {
@@ -158,7 +148,7 @@ impl InterruptHandler {
             });
         }
 
-        TimeoutGuard { cancel_token }
+        cancel_token.drop_guard()
     }
 }
 
@@ -172,7 +162,7 @@ pub struct InterruptibleTransaction<T> {
 
 impl<T> InterruptibleTransaction<T>
 where
-    T: Deref<Target = rusqlite::Connection> + Committable,
+    T: Deref<Target = rusqlite::Connection>,
 {
     pub fn new(conn: T, timeout: Option<Duration>, source: &'static str) -> Self {
         let interrupt_hdl = Arc::new(conn.get_interrupt_handle());
@@ -195,11 +185,6 @@ where
         let _guard = self.int_hdlr.timeout_guard();
         self.current_sql.store(Arc::new(Some(sql.to_string())));
         self.conn.execute(sql, params)
-    }
-
-    pub fn commit(self) -> Result<(), rusqlite::Error> {
-        let _guard = self.int_hdlr.timeout_guard();
-        self.conn.commit()
     }
 
     pub fn prepare(
@@ -227,6 +212,16 @@ where
         let _guard = self.int_hdlr.timeout_guard();
         self.current_sql.store(Arc::new(Some(sql.to_string())));
         self.conn.execute_batch(sql)
+    }
+}
+
+impl<T> InterruptibleTransaction<T>
+where
+    T: Deref<Target = rusqlite::Connection> + Committable,
+{
+    pub fn commit(self) -> Result<(), rusqlite::Error> {
+        let _guard = self.int_hdlr.timeout_guard();
+        self.conn.commit()
     }
 
     pub fn savepoint(
@@ -278,26 +273,28 @@ where
     pub fn query<'rows, P: Params>(
         &'a mut self,
         params: P,
-    ) -> Result<rusqlite::Rows<'rows>, rusqlite::Error>
+    ) -> Result<InterruptibleRows<'rows>, rusqlite::Error>
     where
         'conn: 'rows,
         'a: 'rows,
     {
         let _guard = self.int_hdlr.timeout_guard();
-        self.stmt.query(params)
+        let rows = self.stmt.query(params)?;
+        Ok(InterruptibleRows::new(rows, self.int_hdlr.clone()))
     }
 
     pub fn query_map<P: Params, S, F>(
         &'a mut self,
         params: P,
         f: F,
-    ) -> rusqlite::Result<rusqlite::MappedRows<'a, F>>
+    ) -> rusqlite::Result<InterruptibleMappedRows<'a, F>>
     where
         F: FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<S>,
         'conn: 'a,
     {
         let _guard = self.int_hdlr.timeout_guard();
-        self.stmt.query_map(params, f)
+        let mapped_rows = self.stmt.query_map(params, f)?;
+        Ok(InterruptibleMappedRows::new(mapped_rows, self.int_hdlr.clone()))
     }
 }
 
@@ -389,6 +386,24 @@ where
     type Item = rusqlite::Result<T>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        let _guard = self.int_hdlr.timeout_guard();
+        self.rows.next()
+    }
+}
+
+pub struct InterruptibleRows<'stmt> {
+    rows: rusqlite::Rows<'stmt>,
+    int_hdlr: InterruptHandler,
+}
+
+impl<'stmt> InterruptibleRows<'stmt> {
+    pub fn new(rows: rusqlite::Rows<'stmt>, int_hdlr: InterruptHandler) -> Self {
+        Self { rows, int_hdlr }
+    }
+}
+
+impl<'stmt> InterruptibleRows<'stmt> {
+    pub fn next(&mut self) -> Result<Option<&rusqlite::Row<'stmt>>, rusqlite::Error> {
         let _guard = self.int_hdlr.timeout_guard();
         self.rows.next()
     }

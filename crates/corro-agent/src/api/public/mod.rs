@@ -32,7 +32,7 @@ use metrics::{counter, histogram};
 use rusqlite::{params_from_iter, ToSql, Transaction};
 use serde::Deserialize;
 use spawn::spawn_counted;
-use sqlite_pool::{Committable, InterruptibleTransaction};
+use sqlite_pool::{Committable, InterruptibleTransaction, SqliteConn};
 
 use tokio::{
     sync::{
@@ -41,7 +41,6 @@ use tokio::{
     },
     task::block_in_place,
 };
-use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, trace, warn};
 
 use corro_types::broadcast::broadcast_changes;
@@ -291,6 +290,11 @@ async fn build_query_rows_response(
             }
         };
 
+        // default timeout of 1 minute if no timeout is provided
+        let timeout_secs = timeout.unwrap_or(60);
+        let timeout: Option<Duration> = (timeout_secs > 0).then(|| Duration::from_secs(timeout_secs));
+
+        let conn = InterruptibleTransaction::new(conn.conn(), timeout, "query");
         trace!(%client_addr, "Preparing statement {}", stmt.query());
 
         let prepped_res = block_in_place(|| conn.prepare(stmt.query()));
@@ -318,31 +322,6 @@ async fn build_query_rows_response(
             return;
         }
 
-        let timeout = timeout.unwrap_or(4);
-        let timeout: Option<Duration> = if timeout > 0 {
-            Some(Duration::from_secs(timeout * 60))
-        } else {
-            None
-        };
-
-        let int_handle = conn.get_interrupt_handle();
-        let token = CancellationToken::new();
-        if let Some(timeout) = timeout {
-            let cloned_token = token.clone();
-            let stmt_query = stmt.query().to_string();
-            tokio::spawn(async move {
-                tokio::select! {
-                    _ = cloned_token.cancelled() => {}
-                    _ = tokio::time::sleep(timeout) => {
-                        warn!("sql call took more than {timeout:?}, interrupting stmt- {:?}", stmt_query);
-                        int_handle.interrupt();
-                        counter!("corro.sqlite.interrupt", "source" => "timeout").increment(1);
-                    }
-                };
-            });
-        }
-
-        let _dropguard = token.drop_guard();
         block_in_place(|| {
             let col_count = prepped.column_count();
             trace!("inside block in place, col count: {col_count}");
