@@ -2,6 +2,7 @@
 pub mod actor;
 pub mod agent;
 pub mod api;
+pub mod bookie;
 pub mod broadcast;
 pub mod change;
 pub mod channel;
