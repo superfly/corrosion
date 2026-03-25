@@ -579,16 +579,24 @@ impl ComputedChanges {
     }
 }
 
+/// PartialChanges hold changes that should be made to partials for a single version's
+/// partial bookkeeping both in the db and bookie
 #[derive(Debug, Default)]
 pub struct PartialChanges {
+    // existing seq ranges that need to be deleted (because they have been merged into new ranges)
     remove_seqs: RangeInclusiveSet<CrsqlSeq>,
+    // new seq ranges that should be inserted
     insert_seqs: RangeInclusiveSet<CrsqlSeq>,
 }
 
+/// GapChanges hold changes that should be made to gaps for a single actor both in the db and bookie
 #[derive(Debug, Default)]
 pub struct GapsChanges {
     max: Option<CrsqlDbVersion>,
+    // new gap ranges (gotten after removing seen versions) that need to be inserted
     insert_set: RangeInclusiveSet<CrsqlDbVersion>,
+    // existing gap ranges that need to be deleted
+    // (because they have been merged into new ranges or some versions has been received)
     remove_ranges: HashSet<RangeInclusive<CrsqlDbVersion>>,
 }
 
