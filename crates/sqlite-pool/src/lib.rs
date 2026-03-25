@@ -114,6 +114,7 @@ pub struct InterruptHandler {
     interrupt_hdl: Arc<InterruptHandle>,
     current_sql: Arc<ArcSwap<Option<String>>>,
     timeout: Option<Duration>,
+    source: &'static str,
 }
 
 impl InterruptHandler {
@@ -121,11 +122,13 @@ impl InterruptHandler {
         interrupt_hdl: Arc<InterruptHandle>,
         current_sql: Arc<ArcSwap<Option<String>>>,
         timeout: Option<Duration>,
+        source: &'static str,
     ) -> Self {
         Self {
             interrupt_hdl,
             current_sql,
             timeout,
+            source,
         }
     }
 
@@ -136,13 +139,14 @@ impl InterruptHandler {
             let cloned_token = cancel_token.clone();
             let interrupt_hdl = self.interrupt_hdl.clone();
             let current_sql = self.current_sql.clone();
+            let source = self.source;
             tokio::spawn(async move {
                 tokio::select! {
                     _ = cloned_token.cancelled() => {}
                     _ = sleep(timeout) => {
                         warn!("sql call took more than {timeout:?}, interrupting.. {:?}", current_sql);
                         interrupt_hdl.interrupt();
-                        counter!("corro.sqlite.interrupt", "source" => "timeout").increment(1);
+                        counter!("corro.sqlite.interrupt", "source" => source, "reason" => "timeout").increment(1);
                     }
                 }
             });
@@ -154,9 +158,7 @@ impl InterruptHandler {
 
 pub struct InterruptibleTransaction<T> {
     conn: T,
-    timeout: Option<Duration>,
     int_hdlr: InterruptHandler,
-    source: &'static str,
     current_sql: Arc<ArcSwap<Option<String>>>,
 }
 
@@ -167,12 +169,18 @@ where
     pub fn new(conn: T, timeout: Option<Duration>, source: &'static str) -> Self {
         let interrupt_hdl = Arc::new(conn.get_interrupt_handle());
         let query_store: Arc<ArcSwap<Option<String>>> = Arc::new(ArcSwap::new(Arc::new(None)));
-        let int_hdlr = InterruptHandler::new(interrupt_hdl, query_store.clone(), timeout);
+        let int_hdlr = InterruptHandler::new(interrupt_hdl, query_store.clone(), timeout, source);
         Self {
             conn,
-            timeout,
             int_hdlr,
-            source,
+            current_sql: query_store,
+        }
+    }
+
+    pub fn new_with_hdlr(conn: T, query_store: Arc<ArcSwap<Option<String>>>, int_hdlr: InterruptHandler) -> Self {
+        Self {
+            conn,
+            int_hdlr,
             current_sql: query_store,
         }
     }
@@ -228,7 +236,7 @@ where
         &mut self,
     ) -> Result<InterruptibleTransaction<rusqlite::Savepoint<'_>>, rusqlite::Error> {
         let sp = self.conn.savepoint()?;
-        Ok(InterruptibleTransaction::new(sp, self.timeout, self.source))
+        Ok(InterruptibleTransaction::new_with_hdlr(sp, self.current_sql.clone(), self.int_hdlr.clone()))
     }
 }
 
@@ -339,19 +347,6 @@ impl Committable for rusqlite::Savepoint<'_> {
     }
 }
 
-// No-op for plain connections
-impl Committable for rusqlite::Connection {
-    fn commit(self) -> Result<(), rusqlite::Error> {
-        Ok(())
-    }
-
-    fn savepoint(&mut self) -> Result<rusqlite::Savepoint<'_>, rusqlite::Error> {
-        Err(rusqlite::Error::ModuleError(String::from(
-            "cannot create savepoint from connection",
-        )))
-    }
-}
-
 pub struct Statement<'conn>(pub rusqlite::Statement<'conn>);
 
 impl<'conn> Deref for Statement<'conn> {
@@ -403,6 +398,7 @@ impl<'stmt> InterruptibleRows<'stmt> {
 }
 
 impl<'stmt> InterruptibleRows<'stmt> {
+    #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Result<Option<&rusqlite::Row<'stmt>>, rusqlite::Error> {
         let _guard = self.int_hdlr.timeout_guard();
         self.rows.next()

@@ -85,7 +85,7 @@ where
             })?;
 
         let timeout = timeout.map(Duration::from_secs);
-        let tx = InterruptibleTransaction::new(tx, timeout, "local_changes");
+        let tx = InterruptibleTransaction::new(tx, timeout, "query_endpoint");
 
         let _ = tx
             .prepare_cached("SELECT crsql_set_ts(?)")
