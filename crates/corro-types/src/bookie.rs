@@ -10,8 +10,9 @@ use arc_swap::ArcSwap;
 use papaya::{Guard, HashMap as PapayaHashMap};
 use parking_lot::{ArcMutexGuard, Mutex, RawMutex};
 use rangemap::{RangeInclusiveSet, StepLite};
-use rusqlite::{named_params, Connection, OptionalExtension};
+use rusqlite::{named_params, Connection, OptionalExtension, Transaction};
 use serde_json::json;
+use sqlite_pool::InterruptibleTransaction;
 use tracing::{debug, trace, warn};
 
 use crate::{
@@ -264,6 +265,12 @@ impl BookedVersions {
             }
             btree_map::Entry::Occupied(mut entry) => {
                 let got = entry.get_mut();
+                let details = json!({"version": version, "current": got.last_seq, "received": partial.last_seq});
+                assert_always!(
+                    got.last_seq == partial.last_seq,
+                    "last_seq matches for partial version",
+                    &details
+                );
                 got.seqs.extend(partial.seqs);
                 got.clone()
             }
@@ -369,7 +376,7 @@ impl BookedVersions {
     /// Convenience: compute, apply in-memory, and execute DB for a single actor (partials only).
     pub fn insert_partials_db(
         &mut self,
-        conn: &Connection,
+        conn: &InterruptibleTransaction<Transaction>,
         partials: BTreeMap<CrsqlDbVersion, PartialVersion>,
     ) -> rusqlite::Result<Vec<CrsqlDbVersion>> {
         let (partial_seq_changes, completed) = self.compute_and_apply_partials(partials);
@@ -1253,7 +1260,10 @@ mod tests {
     #[test]
     fn test_booked_insert_partials_db() -> rusqlite::Result<()> {
         _ = tracing_subscriber::fmt::try_init();
-        let conn = new_conn()?;
+        let mut conn = new_conn()?;
+
+        let tx = conn.transaction()?;
+        let itx = InterruptibleTransaction::new(tx, None, "test_booked_insert_partials_db");
         let actor_id = ActorId(uuid::Uuid::new_v4());
         let mut bv = BookedVersions::new(actor_id);
 
@@ -1265,12 +1275,12 @@ mod tests {
         let (v4, last_seq_4) = (CrsqlDbVersion(4), CrsqlSeq(9));
 
         // empty input is a no-op
-        let complete_seqs = bv.insert_partials_db(&conn, BTreeMap::new())?;
+        let complete_seqs = bv.insert_partials_db(&itx, BTreeMap::new())?;
         assert!(complete_seqs.is_empty());
         assert!(bv.partials.is_empty());
 
         let complete_seqs = insert_partials_all(
-            &conn,
+            &itx,
             &mut all,
             &mut bv,
             vec![
@@ -1283,10 +1293,10 @@ mod tests {
 
         assert_eq!(complete_seqs, vec![v1]);
         assert!(bv.partials.get(&v1).unwrap().is_complete());
-        check_version_partials(&conn, &bv, &all)?;
+        check_version_partials(&itx, &bv, &all)?;
 
         let complete_seqs = insert_partials_all(
-            &conn,
+            &itx,
             &mut all,
             &mut bv,
             vec![
@@ -1296,10 +1306,10 @@ mod tests {
             ],
         )?;
         assert!(complete_seqs.is_empty());
-        check_version_partials(&conn, &bv, &all)?;
+        check_version_partials(&itx, &bv, &all)?;
 
         let complete_seqs = insert_partials_all(
-            &conn,
+            &itx,
             &mut all,
             &mut bv,
             vec![
@@ -1309,10 +1319,10 @@ mod tests {
             ],
         )?;
         assert!(complete_seqs.is_empty());
-        check_version_partials(&conn, &bv, &all)?;
+        check_version_partials(&itx, &bv, &all)?;
 
         let complete_seqs = insert_partials_all(
-            &conn,
+            &itx,
             &mut all,
             &mut bv,
             vec![
@@ -1321,11 +1331,11 @@ mod tests {
             ],
         )?;
         assert!(complete_seqs.is_empty());
-        check_version_partials(&conn, &bv, &all)?;
+        check_version_partials(&itx, &bv, &all)?;
 
         // complete v2
         let complete_seqs = insert_partials_all(
-            &conn,
+            &itx,
             &mut all,
             &mut bv,
             vec![
@@ -1334,22 +1344,22 @@ mod tests {
             ],
         )?;
         assert!(!complete_seqs.is_empty());
-        check_version_partials(&conn, &bv, &all)?;
+        check_version_partials(&itx, &bv, &all)?;
 
         // clear complete partial from memory and DB
-        bv.clear_partials(&conn, RangeInclusiveSet::from([v1..=v2]))?;
-        assert!(!check_seq_partials_exists(&conn, &bv, v1)?);
-        assert!(!check_seq_partials_exists(&conn, &bv, v2)?);
+        bv.clear_partials(&itx, RangeInclusiveSet::from([v1..=v2]))?;
+        assert!(!check_seq_partials_exists(&itx, &bv, v1)?);
+        assert!(!check_seq_partials_exists(&itx, &bv, v2)?);
 
         // roundtrip: loading from DB matches in-memory state
-        let bv2 = BookedVersions::from_conn(&conn, actor_id)?;
+        let bv2 = BookedVersions::from_conn(&itx, actor_id)?;
         assert_eq!(bv.partials, bv2.partials);
 
         Ok(())
     }
 
     fn insert_partials_all(
-        conn: &Connection,
+        conn: &InterruptibleTransaction<Transaction>,
         all: &mut BTreeMap<CrsqlDbVersion, (CrsqlSeq, RangeInclusiveSet<CrsqlSeq>)>,
         bv: &mut BookedVersions,
         partials: Vec<(CrsqlDbVersion, CrsqlSeq, RangeInclusiveSet<u64>)>,
@@ -1380,7 +1390,7 @@ mod tests {
     }
 
     fn check_seq_partials_exists(
-        conn: &Connection,
+        conn: &InterruptibleTransaction<Transaction>,
         bv: &BookedVersions,
         version: CrsqlDbVersion,
     ) -> rusqlite::Result<bool> {
