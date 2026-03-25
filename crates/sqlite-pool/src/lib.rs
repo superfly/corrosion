@@ -177,7 +177,11 @@ where
         }
     }
 
-    pub fn new_with_hdlr(conn: T, query_store: Arc<ArcSwap<Option<String>>>, int_hdlr: InterruptHandler) -> Self {
+    pub fn new_with_hdlr(
+        conn: T,
+        query_store: Arc<ArcSwap<Option<String>>>,
+        int_hdlr: InterruptHandler,
+    ) -> Self {
         Self {
             conn,
             int_hdlr,
@@ -236,7 +240,11 @@ where
         &mut self,
     ) -> Result<InterruptibleTransaction<rusqlite::Savepoint<'_>>, rusqlite::Error> {
         let sp = self.conn.savepoint()?;
-        Ok(InterruptibleTransaction::new_with_hdlr(sp, self.current_sql.clone(), self.int_hdlr.clone()))
+        Ok(InterruptibleTransaction::new_with_hdlr(
+            sp,
+            self.current_sql.clone(),
+            self.int_hdlr.clone(),
+        ))
     }
 }
 
@@ -302,7 +310,10 @@ where
     {
         let _guard = self.int_hdlr.timeout_guard();
         let mapped_rows = self.stmt.query_map(params, f)?;
-        Ok(InterruptibleMappedRows::new(mapped_rows, self.int_hdlr.clone()))
+        Ok(InterruptibleMappedRows::new(
+            mapped_rows,
+            self.int_hdlr.clone(),
+        ))
     }
 }
 

@@ -292,7 +292,8 @@ async fn build_query_rows_response(
 
         // default timeout of 1 minute if no timeout is provided
         let timeout_secs = timeout.unwrap_or(60);
-        let timeout: Option<Duration> = (timeout_secs > 0).then(|| Duration::from_secs(timeout_secs));
+        let timeout: Option<Duration> =
+            (timeout_secs > 0).then(|| Duration::from_secs(timeout_secs));
 
         let conn = InterruptibleTransaction::new(conn.conn(), timeout, "query");
         trace!(%client_addr, "Preparing statement {}", stmt.query());
