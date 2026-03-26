@@ -610,7 +610,6 @@ pub async fn clear_buffered_meta_loop(
                             Some(tx_timeout),
                             "clear_buffered_meta",
                         );
-                        // TODO: delete buffered changes from deleted sequences only (maybe, it's kind of hard and may not be necessary)
 
                         let buf_count = tx
                             .prepare_cached("DELETE FROM __corro_buffered_changes WHERE (site_id, db_version, seq) IN (SELECT site_id, db_version, seq FROM __corro_buffered_changes WHERE site_id = ? AND db_version >= ? AND db_version <= ? LIMIT ?)")?
@@ -702,14 +701,6 @@ pub fn process_single_version<T: Deref<Target = rusqlite::Connection> + Committa
                 .expect("no changeset parts, this shouldn't be happening!"),
         )?;
 
-        if check_buffered_meta_to_clear(&sp, actor_id, changeset.versions())? {
-            if let Err(e) = agent
-                .tx_clear_buf()
-                .try_send((actor_id, changeset.versions()))
-            {
-                error!("could not schedule buffered meta clear: {e}");
-            }
-        }
         changes_per_table = table;
 
         (known, changeset)
@@ -808,13 +799,6 @@ pub async fn process_fully_buffered_changes(
                 info!(%actor_id, %version, "No buffered rows, skipped insertion into crsql_changes");
             }
 
-            if let Err(e) = agent
-                .tx_clear_buf()
-                .try_send((actor_id, CrsqlDbVersionRange::single(version)))
-            {
-                error!("could not schedule buffered data clear: {e}");
-            }
-
             let rows_impacted: i64 = tx
                 .prepare_cached("SELECT crsql_rows_impacted()")
                 .map_err(|source| ChangeError::Rusqlite {
@@ -855,6 +839,13 @@ pub async fn process_fully_buffered_changes(
             })?;
 
             bookedw.commit();
+
+            if let Err(e) = agent
+                .tx_clear_buf()
+                .try_send((actor_id, CrsqlDbVersionRange::single(version)))
+            {
+                error!("could not schedule buffered data clear: {e}");
+            }
 
             Ok::<_, ChangeError>(rows_impacted > 0)
         })
@@ -994,12 +985,13 @@ pub async fn process_multiple_changes(
 
                 // optimizing this, insert later!
                 let known = if change.is_complete() && change.is_empty() {
-                    process_empty_version(&agent, &tx, change.actor_id, &max, change.versions())
-                        .map_err(|e| ChangeError::Rusqlite {
+                    process_empty_version(&tx, change.actor_id, &max, change.versions()).map_err(
+                        |e| ChangeError::Rusqlite {
                             source: e,
                             actor_id: Some(change.actor_id),
                             version: Some(change.versions().end()),
-                        })?;
+                        },
+                    )?;
                     KnownDbVersion::Cleared
                 } else {
                     if let Some(seqs) = change.seqs() {
@@ -1070,7 +1062,7 @@ pub async fn process_multiple_changes(
         let sub_start = Instant::now();
 
         let mut all_changes = Vec::with_capacity(processed.len());
-        let mut completed_partials = BTreeMap::new();
+        let mut completed_versions = BTreeMap::new();
         for (actor_id, processed) in processed.iter() {
             debug!(%actor_id, self_actor_id = %agent.actor_id(), "processing {} changesets", processed.len());
 
@@ -1078,12 +1070,15 @@ pub async fn process_multiple_changes(
                 .get_mut(actor_id)
                 .expect("booked write guard should be present for every actor");
 
-            let (changes, completed) = booked_write.compute_and_apply(processed);
-            debug!(%actor_id, "computed and applied changes: {changes:?}, completed versions: {completed:?}");
+            let (changes, completed_partials) = booked_write.compute_and_apply(processed);
+            debug!(%actor_id, "computed and applied changes: {changes:?}, completed versions: {completed_partials:?}");
+            let clear_versions = changes
+                .clear_versions
+                .iter()
+                .map(|v| *v..=*v)
+                .collect::<RangeInclusiveSet<CrsqlDbVersion>>();
+            completed_versions.insert(*actor_id, (completed_partials, clear_versions));
             all_changes.push(changes);
-            if !completed.is_empty() {
-                completed_partials.insert(*actor_id, completed);
-            }
         }
 
         BookieDbParams::from_changes(&all_changes)
@@ -1133,7 +1128,7 @@ pub async fn process_multiple_changes(
         debug!("committed {count} changes in {:?}", start.elapsed());
 
         // schedule apply for partials that became complete
-        for (actor_id, versions) in completed_partials {
+        for (actor_id, (versions, clear_versions)) in completed_versions {
             for version in versions {
                 debug!(%actor_id, %version, "partial is now complete, notifying for background apply");
                 let tx_apply = agent.tx_apply().clone();
@@ -1144,6 +1139,12 @@ pub async fn process_multiple_changes(
                         );
                     }
                 });
+            }
+
+            for range in clear_versions {
+                if let Err(e) = agent.tx_clear_buf().try_send((actor_id, range.into())) {
+                    error!("could not schedule buffered meta clear: {e}");
+                }
             }
         }
 
@@ -1169,9 +1170,8 @@ pub async fn process_multiple_changes(
     Ok(())
 }
 
-#[tracing::instrument(skip(agent, tx), err)]
+#[tracing::instrument(skip(tx), err)]
 pub fn process_empty_version<T: Deref<Target = rusqlite::Connection> + Committable>(
-    agent: &Agent,
     tx: &InterruptibleTransaction<T>,
     actor_id: ActorId,
     max: &Option<CrsqlDbVersion>,
@@ -1183,12 +1183,6 @@ pub fn process_empty_version<T: Deref<Target = rusqlite::Connection> + Committab
         let _ = tx
             .prepare_cached("SELECT crsql_set_db_version(?, ?)")?
             .query_row((actor_id, versions.end()), |row| row.get::<_, String>(0))?;
-    }
-
-    if check_buffered_meta_to_clear(tx, actor_id, versions)? {
-        if let Err(e) = agent.tx_clear_buf().try_send((actor_id, versions)) {
-            error!("could not schedule buffered meta clear: {e}");
-        }
     }
 
     Ok(())
