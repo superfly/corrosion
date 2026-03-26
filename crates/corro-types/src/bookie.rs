@@ -11,7 +11,6 @@ use papaya::{Guard, HashMap as PapayaHashMap};
 use parking_lot::{ArcMutexGuard, Mutex, RawMutex};
 use rangemap::{RangeInclusiveSet, StepLite};
 use rusqlite::{named_params, Connection, OptionalExtension, Transaction};
-use serde::Serialize;
 use serde_json::json;
 use sqlite_pool::InterruptibleTransaction;
 use tracing::{debug, trace, warn};
@@ -33,187 +32,6 @@ pub struct BookedVersions {
 }
 
 impl BookedVersions {
-    pub fn needed(&self) -> &RangeInclusiveSet<CrsqlDbVersion> {
-        &self.needed
-    }
-
-    pub fn insert_gaps(&mut self, db_versions: RangeInclusiveSet<CrsqlDbVersion>) {
-        self.needed.extend(db_versions);
-    }
-
-    pub fn insert_db(
-        &mut self,
-        conn: &Connection, // usually a `Transaction`
-        db_versions: RangeInclusiveSet<CrsqlDbVersion>,
-    ) -> rusqlite::Result<()> {
-        trace!("wants to insert into db {db_versions:?}");
-        let mut changes = self.compute_gaps_change(db_versions);
-
-        trace!(actor_id = %self.actor_id, "delete: {:?}", changes.remove_ranges);
-        trace!(actor_id = %self.actor_id, "new: {:?}", changes.insert_set);
-
-        // those are actual ranges we had stored and will change, remove them from the DB
-        {
-            let remove_ranges = std::mem::take(&mut changes.remove_ranges);
-            let actors = unnest_param(remove_ranges.iter().map(|_| self.actor_id));
-            let starts = unnest_param(remove_ranges.iter().map(|r| r.start()));
-            let ends = unnest_param(remove_ranges.iter().map(|r| r.end()));
-            // TODO: use returning to discover which ranges were actually deleted
-            let count = conn
-                .prepare_cached(
-                    "
-                    DELETE FROM __corro_bookkeeping_gaps WHERE (actor_id, start, end) 
-                    IN (SELECT value0, value1, value2 FROM unnest(:actors, :starts, :ends))
-                    ",
-                )?
-                .execute(named_params! {
-                    ":actors": actors,
-                    ":starts": starts,
-                    ":ends": ends,
-                })?;
-            if count != remove_ranges.len() {
-                warn!(actor_id = %self.actor_id, "did not delete some gaps from db: {remove_ranges:?}");
-                let details: serde_json::Value = json!({"count": count, "ranges": remove_ranges});
-                assert_unreachable!("ineffective deletion of gaps in-db", &details);
-            }
-
-            for range in remove_ranges {
-                self.needed.remove(range);
-            }
-        }
-
-        {
-            let insert_set = std::mem::take(&mut changes.insert_set);
-            let actors = unnest_param(insert_set.iter().map(|_| self.actor_id));
-            let starts = unnest_param(insert_set.iter().map(|r| r.start()));
-            let ends = unnest_param(insert_set.iter().map(|r| r.end()));
-            debug!(actor_id = %self.actor_id, "inserting {insert_set:?}");
-            // TODO: use returning to discover which ranges were actually inserted
-            let count = conn
-                .prepare_cached(
-                    "
-                    INSERT OR IGNORE INTO __corro_bookkeeping_gaps (actor_id, start, end) 
-                    SELECT value0, value1, value2 FROM unnest(:actors, :starts, :ends)
-                    ",
-                )?
-                .execute(named_params! {
-                    ":actors": actors,
-                    ":starts": starts,
-                    ":ends": ends,
-                })?;
-            if count != insert_set.len() {
-                warn!(actor_id = %self.actor_id, "did not insert some gaps into db: {insert_set:?}");
-
-                let existing: Vec<(ActorId, CrsqlDbVersion, CrsqlDbVersion)> = conn
-                    .prepare_cached(
-                        "
-                    SELECT actor_id, start, end FROM __corro_bookkeeping_gaps 
-                    WHERE (actor_id, start) 
-                    IN (SELECT value0, value1 FROM unnest(:actors, :starts))",
-                    )?
-                    .query_map(
-                        named_params! {
-                            ":actors": actors,
-                            ":starts": starts,
-                        },
-                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-                    )?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-
-                warn!("already had gaps entries! existing: {existing:?}");
-                let details: serde_json::Value =
-                    json!({"count": count, "insert_set": insert_set, "existing": existing});
-                assert_unreachable!("ineffective insertion of gaps in-db", &details);
-                return Err(rusqlite::Error::ModuleError(
-                    "Gaps entries already present in DB".to_string(),
-                ));
-            }
-
-            for range in insert_set {
-                self.needed.insert(range);
-            }
-        }
-
-        self.max = changes.max.take();
-
-        Ok(())
-    }
-
-    fn compute_gaps_change(&self, versions: RangeInclusiveSet<CrsqlDbVersion>) -> GapsChanges {
-        trace!("needed: {:?}", self.needed);
-
-        let mut changes = GapsChanges {
-            // set as the current max
-            max: self.max,
-
-            insert_set: Default::default(),
-            remove_ranges: Default::default(),
-        };
-
-        for versions in versions.clone() {
-            // only update the max if it's bigger
-            changes.max = cmp::max(changes.max, Some(*versions.end()));
-
-            let overlapping_ranges = compute_overlapping_ranges(&self.needed, &versions);
-            changes.insert_set.extend(overlapping_ranges.clone());
-            changes.remove_ranges.extend(overlapping_ranges.clone());
-
-            // either a max or 0
-            // TODO: figure out if we want to use 0 instead of None in the struct by default
-            let current_max = self.max.unwrap_or_default();
-
-            // check if there's a gap created between our current max and the start version we just inserted
-            let gap_start = current_max + 1;
-            if gap_start < *versions.start() {
-                let range = gap_start..=*versions.start();
-                trace!("inserting gap between max + 1 and start: {range:?}");
-                changes.insert_set.insert(range.clone());
-                for range in self.needed.overlapping(&range) {
-                    changes.insert_set.insert(range.clone());
-                    changes.remove_ranges.insert(range.clone());
-                }
-            }
-        }
-
-        for versions in versions {
-            // we now know the applied versions
-            changes.insert_set.remove(versions.clone());
-        }
-
-        changes
-    }
-}
-
-fn compute_overlapping_ranges<T: Ord + Clone + StepLite + Into<u64>>(
-    check_ranges: &RangeInclusiveSet<T>,
-    range: &RangeInclusive<T>,
-) -> RangeInclusiveSet<T> {
-    let mut overlapping_ranges = RangeInclusiveSet::new();
-
-    // iterate all partially or fully overlapping ranges
-    for range in check_ranges.overlapping(range) {
-        overlapping_ranges.insert(range.clone());
-    }
-
-    // check if there's a previous range with an end version = start version - 1
-    let start_u64: u64 = range.start().clone().into();
-    if start_u64 > 0 {
-        let start = range.start().sub_one();
-        if let Some(range) = check_ranges.get(&start) {
-            overlapping_ranges.insert(range.clone());
-        }
-    }
-
-    // check if there's a next range with an start version = end version + 1
-    let end = range.end().add_one();
-    if let Some(range) = check_ranges.get(&end) {
-        overlapping_ranges.insert(range.clone());
-    }
-
-    overlapping_ranges
-}
-
-impl BookedVersions {
     pub fn new(actor_id: ActorId) -> Self {
         Self {
             actor_id,
@@ -225,6 +43,14 @@ impl BookedVersions {
 
     pub fn actor_id(&self) -> ActorId {
         self.actor_id
+    }
+
+    pub fn needed(&self) -> &RangeInclusiveSet<CrsqlDbVersion> {
+        &self.needed
+    }
+
+    pub fn insert_gaps(&mut self, db_versions: RangeInclusiveSet<CrsqlDbVersion>) {
+        self.needed.extend(db_versions);
     }
 
     pub fn from_conn(conn: &Connection, actor_id: ActorId) -> rusqlite::Result<Self> {
@@ -424,36 +250,6 @@ impl BookedVersions {
         self.max
     }
 
-    /// Removes partials for the versions
-    pub fn clear_partials(
-        &mut self,
-        conn: &Connection,
-        versions: RangeInclusiveSet<CrsqlDbVersion>,
-    ) -> rusqlite::Result<()> {
-        let remove_versions = versions
-            .into_iter()
-            .flat_map(CrsqlDbVersionRange::from)
-            .filter(|v| self.partials.contains_key(v))
-            .collect::<Vec<_>>();
-
-        let deleted = conn.prepare_cached(
-            "DELETE FROM __corro_seq_bookkeeping WHERE site_id = ? AND db_version IN (SELECT value0 FROM unnest(:versions))",
-        )?
-        .execute((self.actor_id, unnest_param(&remove_versions)))?;
-
-        if deleted != remove_versions.len() {
-            warn!(actor_id = %self.actor_id, "ineffective deletion of partials in-db: {remove_versions:?} count: {deleted}");
-            let details: serde_json::Value = json!({"count": deleted, "expected": remove_versions.len(), "versions": remove_versions});
-            assert_unreachable!("ineffective deletion of partials in-db", &details);
-        }
-
-        for version in remove_versions {
-            self.partials.remove(&version);
-        }
-
-        Ok(())
-    }
-
     /// Merges new partial data into the in-memory `partials` map only.
     pub fn insert_partial(
         &mut self,
@@ -480,10 +276,78 @@ impl BookedVersions {
             }
         }
     }
+}
+
+impl BookedVersions {
+    /// compute, apply in-memory, and execute DB to clear completed partials a single actor.
+    pub fn clear_partials(
+        &mut self,
+        conn: &Connection,
+        versions: RangeInclusiveSet<CrsqlDbVersion>,
+    ) -> rusqlite::Result<()> {
+        let clear_versions: Vec<CrsqlDbVersion> = self.compute_and_apply_clear_partials(versions);
+        let changes = ComputedChanges::new(self.actor_id).with_clear_versions(clear_versions);
+        BookieDbParams::from_changes(&[changes]).execute(conn)
+    }
+
+    /// Convenience: compute, apply in-memory, and execute DB for a single actor (gaps only).
+    pub fn insert_db(
+        &mut self,
+        conn: &Connection,
+        db_versions: RangeInclusiveSet<CrsqlDbVersion>,
+    ) -> rusqlite::Result<()> {
+        let gaps = self.compute_and_apply_gaps(db_versions);
+        let changes = ComputedChanges::new(self.actor_id).with_gaps(gaps);
+        BookieDbParams::from_changes(&[changes]).execute(conn)
+    }
+
+    pub fn compute_gaps_change(&self, versions: RangeInclusiveSet<CrsqlDbVersion>) -> GapsChanges {
+        trace!("needed: {:?}", self.needed);
+
+        let mut changes = GapsChanges {
+            // set as the current max
+            max: self.max,
+
+            insert_set: Default::default(),
+            remove_ranges: Default::default(),
+        };
+
+        for versions in versions.clone() {
+            // only update the max if it's bigger
+            changes.max = cmp::max(changes.max, Some(*versions.end()));
+
+            let overlapping_ranges = compute_overlapping_ranges(&self.needed, &versions);
+            changes.insert_set.extend(overlapping_ranges.clone());
+            changes.remove_ranges.extend(overlapping_ranges.clone());
+
+            // either a max or 0
+            // TODO: figure out if we want to use 0 instead of None in the struct by default
+            let current_max = self.max.unwrap_or_default();
+
+            // check if there's a gap created between our current max and the start version we just inserted
+            let gap_start = current_max + 1;
+            if gap_start < *versions.start() {
+                let range = gap_start..=*versions.start();
+                trace!("inserting gap between max + 1 and start: {range:?}");
+                changes.insert_set.insert(range.clone());
+                for range in self.needed.overlapping(&range) {
+                    changes.insert_set.insert(range.clone());
+                    changes.remove_ranges.insert(range.clone());
+                }
+            }
+        }
+
+        for versions in versions {
+            // we now know the applied versions
+            changes.insert_set.remove(versions.clone());
+        }
+
+        changes
+    }
 
     /// Compute what `__corro_seq_bookkeeping` rows need to change based on the
     /// current in-memory `partials` state and the new partial data to merge.
-    fn compute_partials_change(
+    pub fn compute_partials_change(
         &self,
         version: CrsqlDbVersion,
         partial: &PartialVersion,
@@ -509,156 +373,230 @@ impl BookedVersions {
         changes
     }
 
-    /// Update `__corro_seq_bookkeeping` and in-memory `partials`
-    /// based on new partial data, similar to `insert_db` for gaps.
-    ///
-    /// Returns the list of versions that became complete after merging.
+    /// Convenience: compute, apply in-memory, and execute DB for a single actor (partials only).
     pub fn insert_partials_db(
         &mut self,
         conn: &InterruptibleTransaction<Transaction>,
         partials: BTreeMap<CrsqlDbVersion, PartialVersion>,
     ) -> rusqlite::Result<Vec<CrsqlDbVersion>> {
-        #[derive(Default, Serialize)]
-        struct PartialParams {
-            actors: Vec<ActorId>,
-            versions: Vec<CrsqlDbVersion>,
-            start_seqs: Vec<CrsqlSeq>,
-            end_seqs: Vec<CrsqlSeq>,
+        let (partial_seq_changes, completed) = self.compute_and_apply_partials(partials);
+        let changes = ComputedChanges::new(self.actor_id).with_seq_changes(partial_seq_changes);
+        BookieDbParams::from_changes(&[changes]).execute(conn)?;
+        Ok(completed)
+    }
 
-            // only used in insert cases
-            last_seqs: Vec<CrsqlSeq>,
-            timestamps: Vec<Timestamp>,
+    /// Compute gap changes, apply in-memory, return `ComputedChanges` with only gaps populated.
+    pub fn compute_and_apply_gaps(
+        &mut self,
+        db_versions: RangeInclusiveSet<CrsqlDbVersion>,
+    ) -> GapsChanges {
+        let gaps = self.compute_gaps_change(db_versions);
+        for range in gaps.remove_ranges.iter() {
+            self.needed.remove(range.clone());
+        }
+        for range in gaps.insert_set.iter() {
+            self.needed.insert(range.clone());
+        }
+        self.max = gaps.max;
+
+        gaps
+    }
+
+    /// Compute which partials to clear, apply in-memory, return `ComputedChanges` with only clears populated.
+    pub fn compute_and_apply_clear_partials(
+        &mut self,
+        versions: RangeInclusiveSet<CrsqlDbVersion>,
+    ) -> Vec<CrsqlDbVersion> {
+        let clear_versions: Vec<_> = versions
+            .into_iter()
+            .flat_map(CrsqlDbVersionRange::from)
+            .filter(|v| self.partials.contains_key(v))
+            .collect();
+        for version in &clear_versions {
+            self.partials.remove(version);
         }
 
-        let mut remove_params = PartialParams::default();
-        let mut insert_params = PartialParams::default();
-        for (version, partial) in partials.iter() {
-            let last_seq = partial.last_seq;
-            let ts = partial.ts;
-            let changes = self.compute_partials_change(*version, partial);
-            debug!(actor_id = %self.actor_id, "computed partials change for version {version:?}: {changes:?}");
-            if !changes.remove_seqs.is_empty() {
-                remove_params
-                    .actors
-                    .extend(changes.remove_seqs.iter().map(|_| self.actor_id));
-                remove_params
-                    .versions
-                    .extend(changes.remove_seqs.iter().map(|_| *version));
-                remove_params
-                    .start_seqs
-                    .extend(changes.remove_seqs.iter().map(|s| s.start()));
-                remove_params
-                    .end_seqs
-                    .extend(changes.remove_seqs.iter().map(|s| s.end()));
-            }
+        clear_versions
+    }
 
-            // we should always have something to insert
-            let details =
-                json!({"actor_id": self.actor_id, "version": version, "last_seq": last_seq});
-            assert_always!(
-                !changes.insert_seqs.is_empty(),
-                "insert_seqs should not be empty",
-                &details
-            );
-            insert_params
-                .actors
-                .extend(changes.insert_seqs.iter().map(|_| self.actor_id));
-            insert_params
-                .versions
-                .extend(changes.insert_seqs.iter().map(|_| version));
-            insert_params
-                .start_seqs
-                .extend(changes.insert_seqs.iter().map(|s| s.start()));
-            insert_params
-                .end_seqs
-                .extend(changes.insert_seqs.iter().map(|s| s.end()));
-            insert_params
-                .last_seqs
-                .extend(changes.insert_seqs.iter().map(|_| last_seq));
-            insert_params
-                .timestamps
-                .extend(changes.insert_seqs.iter().map(|_| ts));
-        }
-
-        trace!(actor_id = %self.actor_id, "partials delete: {:?}", remove_params.actors.len());
-        trace!(actor_id = %self.actor_id, "partials insert: {:?}", insert_params.actors.len());
-
-        // delete old seq bookkeeping rows
-        if !remove_params.actors.is_empty() {
-            let actors = unnest_param(remove_params.actors.iter());
-            let versions = unnest_param(remove_params.versions.iter());
-            let start_seqs = unnest_param(remove_params.start_seqs.iter());
-            let end_seqs = unnest_param(remove_params.end_seqs.iter());
-
-            let deleted = conn.prepare_cached(
-                "DELETE FROM __corro_seq_bookkeeping
-                 WHERE (site_id, db_version, start_seq, end_seq)
-                 IN (SELECT value0, value1, value2, value3 FROM unnest(:actors, :versions, :start_seqs, :end_seqs))",
-            )?
-            .execute(named_params! {
-                ":actors": actors,
-                ":versions": versions,
-                ":start_seqs": start_seqs,
-                ":end_seqs": end_seqs,
-            })?;
-
-            if deleted != remove_params.actors.len() {
-                warn!(actor_id = %self.actor_id, "did not delete some seq bookkeeping rows from db: deleted: {deleted}, expected: {}", remove_params.actors.len());
-                let details: serde_json::Value = json!({"count": deleted, "expected": remove_params.actors.len(), "params": remove_params});
-                assert_unreachable!(
-                    "ineffective deletion of seq bookkeeping rows in-db",
-                    &details
-                );
-            }
-        }
-
-        // insert new merged seq bookkeeping rows
-        if !insert_params.actors.is_empty() {
-            let actors = unnest_param(insert_params.actors.iter());
-            let versions = unnest_param(insert_params.versions.iter());
-            let start_seqs = unnest_param(insert_params.start_seqs.iter());
-            let end_seqs = unnest_param(insert_params.end_seqs.iter());
-            let last_seqs = unnest_param(insert_params.last_seqs.iter());
-            let timestamps = unnest_param(insert_params.timestamps.iter());
-
-            conn.prepare_cached(
-                "INSERT OR REPLACE INTO __corro_seq_bookkeeping
-                    (site_id, db_version, start_seq, end_seq, last_seq, ts)
-                 SELECT value0, value1, value2, value3, value4, value5
-                 FROM unnest(:actors, :versions, :start_seqs, :end_seqs, :last_seqs, :timestamps)",
-            )?
-            .execute(named_params! {
-                ":actors": actors,
-                ":versions": versions,
-                ":start_seqs": start_seqs,
-                ":end_seqs": end_seqs,
-                ":last_seqs": last_seqs,
-                ":timestamps": timestamps,
-            })?;
-        }
+    /// Compute partial seq changes, apply in-memory, return `ComputedChanges` and completed versions.
+    pub fn compute_and_apply_partials(
+        &mut self,
+        partials: BTreeMap<CrsqlDbVersion, PartialVersion>,
+    ) -> (Vec<ComputedPartialSeqChange>, Vec<CrsqlDbVersion>) {
+        let partial_seq_changes: Vec<_> = partials
+            .iter()
+            .map(|(version, partial)| ComputedPartialSeqChange {
+                version: *version,
+                changes: self.compute_partials_change(*version, partial),
+                last_seq: partial.last_seq,
+                ts: partial.ts,
+            })
+            .collect();
 
         let mut completed = Vec::new();
         for (version, partial) in partials {
-            let partial = self.insert_partial(version, partial);
-            if partial.is_complete() {
+            let merged = self.insert_partial(version, partial);
+            if merged.is_complete() {
                 completed.push(version);
             }
         }
 
-        Ok(completed)
+        (partial_seq_changes, completed)
+    }
+
+    /// Compute all bookkeeping changes from raw processed entries, apply in-memory.
+    /// Returns the collected `ComputedChanges` and completed partial versions.
+    pub fn compute_and_apply(
+        &mut self,
+        processed: &[(CrsqlDbVersionRange, Option<PartialVersion>)],
+    ) -> (ComputedChanges, Vec<CrsqlDbVersion>) {
+        let db_versions: RangeInclusiveSet<CrsqlDbVersion> =
+            processed.iter().map(|(v, _)| v.into()).collect();
+
+        let complete_versions: RangeInclusiveSet<CrsqlDbVersion> = processed
+            .iter()
+            .filter_map(|(v, partial)| partial.is_none().then_some(v.into()))
+            .collect();
+
+        let partial_versions: BTreeMap<CrsqlDbVersion, PartialVersion> =
+            processed
+                .iter()
+                .fold(BTreeMap::new(), |mut acc, (versions, partial)| {
+                    if let Some(p) = partial {
+                        acc.entry(versions.start())
+                            .and_modify(|existing: &mut PartialVersion| {
+                                assert_always!(
+                                    p.last_seq == existing.last_seq,
+                                    "last_seq mismatch for partial version",
+                                    &json!({"version": versions.start(), "expected": existing.last_seq, "got": p.last_seq})
+                                );
+                                existing.seqs.extend(p.seqs.clone());
+                            })
+                            .or_insert(p.clone());
+                    }
+                    acc
+                });
+
+        let gaps_changes = self.compute_and_apply_gaps(db_versions);
+        let clear_changes = self.compute_and_apply_clear_partials(complete_versions);
+        let (partial_changes, completed) = self.compute_and_apply_partials(partial_versions);
+
+        let db_changes = ComputedChanges {
+            actor_id: self.actor_id,
+            gaps: gaps_changes,
+            clear_versions: clear_changes,
+            partial_seq_changes: partial_changes,
+        };
+        (db_changes, completed)
+    }
+}
+
+fn compute_overlapping_ranges<T: Ord + Clone + StepLite + Into<u64>>(
+    check_ranges: &RangeInclusiveSet<T>,
+    range: &RangeInclusive<T>,
+) -> RangeInclusiveSet<T> {
+    let mut overlapping_ranges = RangeInclusiveSet::new();
+
+    // iterate all partially or fully overlapping ranges
+    for range in check_ranges.overlapping(range) {
+        overlapping_ranges.insert(range.clone());
+    }
+
+    // check if there's a previous range with an end version = start version - 1
+    let start_u64: u64 = range.start().clone().into();
+    if start_u64 > 0 {
+        let start = range.start().sub_one();
+        if let Some(range) = check_ranges.get(&start) {
+            overlapping_ranges.insert(range.clone());
+        }
+    }
+
+    // check if there's a next range with an start version = end version + 1
+    let end = range.end().add_one();
+    if let Some(range) = check_ranges.get(&end) {
+        overlapping_ranges.insert(range.clone());
+    }
+
+    overlapping_ranges
+}
+
+/// Pre-computed changes for a single actor, used to build `BookieDbParams`.
+#[derive(Debug)]
+pub struct ComputedChanges {
+    pub actor_id: ActorId,
+    pub gaps: GapsChanges,
+    pub clear_versions: Vec<CrsqlDbVersion>,
+    pub partial_seq_changes: Vec<ComputedPartialSeqChange>,
+}
+
+impl ComputedChanges {
+    pub fn new(actor_id: ActorId) -> Self {
+        Self {
+            actor_id,
+            gaps: GapsChanges::default(),
+            clear_versions: Vec::new(),
+            partial_seq_changes: Vec::new(),
+        }
+    }
+
+    pub fn with_gaps(mut self, gaps: GapsChanges) -> Self {
+        self.gaps = gaps;
+        self
+    }
+
+    pub fn with_clear_versions(mut self, clear_versions: Vec<CrsqlDbVersion>) -> Self {
+        self.clear_versions = clear_versions;
+        self
+    }
+
+    pub fn with_seq_changes(mut self, partial_seq_changes: Vec<ComputedPartialSeqChange>) -> Self {
+        self.partial_seq_changes = partial_seq_changes;
+        self
     }
 }
 
 #[derive(Debug)]
+pub struct ComputedPartialSeqChange {
+    pub version: CrsqlDbVersion,
+    pub changes: PartialChanges,
+    pub last_seq: CrsqlSeq,
+    pub ts: Timestamp,
+}
+
+impl ComputedChanges {
+    pub fn partial_seq_deletes_count(&self) -> usize {
+        self.partial_seq_changes
+            .iter()
+            .map(|c| c.changes.remove_seqs.len())
+            .sum()
+    }
+    pub fn partial_seq_inserts_count(&self) -> usize {
+        self.partial_seq_changes
+            .iter()
+            .map(|c| c.changes.insert_seqs.len())
+            .sum()
+    }
+}
+
+/// PartialChanges hold changes that should be made to partials for a single version's
+/// partial bookkeeping both in the db and bookie
+#[derive(Debug, Default)]
 pub struct PartialChanges {
+    // existing seq ranges that need to be deleted (because they have been merged into new ranges)
     remove_seqs: RangeInclusiveSet<CrsqlSeq>,
+    // new seq ranges that should be inserted
     insert_seqs: RangeInclusiveSet<CrsqlSeq>,
 }
 
-#[derive(Debug)]
+/// GapChanges hold changes that should be made to gaps for a single actor both in the db and bookie
+#[derive(Debug, Default)]
 pub struct GapsChanges {
     max: Option<CrsqlDbVersion>,
+    // new gap ranges (gotten after removing seen versions) that need to be inserted
     insert_set: RangeInclusiveSet<CrsqlDbVersion>,
+    // existing gap ranges that need to be deleted
+    // (because they have been merged into new ranges or some versions has been received)
     remove_ranges: HashSet<RangeInclusive<CrsqlDbVersion>>,
 }
 
@@ -781,6 +719,223 @@ impl Bookie {
             .pin()
             .get_or_insert(actor_id, Booked::new(BookedVersions::new(actor_id)))
             .clone()
+    }
+}
+
+/// Collects DB params across multiple actors for batched execution.
+#[derive(Default)]
+pub struct BookieDbParams {
+    /// Gap deletes from __corro_bookkeeping_gaps: (actor_id, start, end)
+    pub gap_deletes: Vec<(ActorId, CrsqlDbVersion, CrsqlDbVersion)>,
+    /// Gap inserts into __corro_bookkeeping_gaps: (actor_id, start, end)
+    pub gap_inserts: Vec<(ActorId, CrsqlDbVersion, CrsqlDbVersion)>,
+    /// version deletes from __corro_seq_bookkeeping for complete versions: (site_id, db_version)
+    pub complete_version_deletes: Vec<(ActorId, CrsqlDbVersion)>,
+    /// partial seq deletes from __corro_seq_bookkeeping for partial versions: (site_id, db_version, start_seq, end_seq)
+    pub partials_deletes: Vec<(ActorId, CrsqlDbVersion, CrsqlSeq, CrsqlSeq)>,
+    /// partial seq inserts into __corro_seq_bookkeeping for partial versions: (site_id, db_version, start_seq, end_seq, last_seq, ts)
+    pub partial_inserts: Vec<(
+        ActorId,
+        CrsqlDbVersion,
+        CrsqlSeq,
+        CrsqlSeq,
+        CrsqlSeq,
+        Timestamp,
+    )>,
+}
+
+impl BookieDbParams {
+    /// Build `BookieDbParams` from pre-computed changes with exact-capacity allocation.
+    pub fn from_changes(all_changes: &[ComputedChanges]) -> Self {
+        let (gap_del_cap, gap_ins_cap, clear_ver_cap, partial_seq_del_cap, partial_seq_ins_cap) =
+            all_changes
+                .iter()
+                .fold((0, 0, 0, 0, 0), |(gd, gi, svd, psd, psi), c| {
+                    (
+                        gd + c.gaps.remove_ranges.len(),
+                        gi + c.gaps.insert_set.len(),
+                        svd + c.clear_versions.len(),
+                        psd + c.partial_seq_deletes_count(),
+                        psi + c.partial_seq_inserts_count(),
+                    )
+                });
+        let mut params = Self {
+            gap_deletes: Vec::with_capacity(gap_del_cap),
+            gap_inserts: Vec::with_capacity(gap_ins_cap),
+            complete_version_deletes: Vec::with_capacity(clear_ver_cap),
+            partials_deletes: Vec::with_capacity(partial_seq_del_cap),
+            partial_inserts: Vec::with_capacity(partial_seq_ins_cap),
+        };
+
+        for changes in all_changes {
+            let actor_id = changes.actor_id;
+
+            for range in changes.gaps.remove_ranges.iter() {
+                params
+                    .gap_deletes
+                    .push((actor_id, *range.start(), *range.end()));
+            }
+            for range in changes.gaps.insert_set.iter() {
+                params
+                    .gap_inserts
+                    .push((actor_id, *range.start(), *range.end()));
+            }
+            for version in &changes.clear_versions {
+                params.complete_version_deletes.push((actor_id, *version));
+            }
+            for psc in &changes.partial_seq_changes {
+                for range in psc.changes.remove_seqs.iter() {
+                    params.partials_deletes.push((
+                        actor_id,
+                        psc.version,
+                        *range.start(),
+                        *range.end(),
+                    ));
+                }
+                let details =
+                    json!({"actor_id": actor_id, "version": psc.version, "last_seq": psc.last_seq});
+                assert_always!(
+                    !psc.changes.insert_seqs.is_empty(),
+                    "insert_seqs should not be empty",
+                    &details
+                );
+                for range in psc.changes.insert_seqs.iter() {
+                    params.partial_inserts.push((
+                        actor_id,
+                        psc.version,
+                        *range.start(),
+                        *range.end(),
+                        psc.last_seq,
+                        psc.ts,
+                    ));
+                }
+            }
+        }
+
+        params
+    }
+
+    pub fn execute(&self, conn: &Connection) -> rusqlite::Result<()> {
+        if !self.gap_deletes.is_empty() {
+            let actors = unnest_param(self.gap_deletes.iter().map(|(a, _, _)| a));
+            let starts = unnest_param(self.gap_deletes.iter().map(|(_, s, _)| s));
+            let ends = unnest_param(self.gap_deletes.iter().map(|(_, _, e)| e));
+            let count = conn
+                .prepare_cached(
+                    "DELETE FROM __corro_bookkeeping_gaps WHERE (actor_id, start, end)
+                     IN (SELECT value0, value1, value2 FROM unnest(:actors, :starts, :ends))",
+                )?
+                .execute(named_params! {
+                    ":actors": actors,
+                    ":starts": starts,
+                    ":ends": ends,
+                })?;
+            let len = self.gap_deletes.len();
+            if count != len {
+                warn!("did not delete some gaps from db, expected {len}, got {count}");
+                let details = json!({"count": count, "expected": len});
+                assert_unreachable!("ineffective deletion of gaps in-db", &details);
+            }
+        }
+
+        if !self.gap_inserts.is_empty() {
+            let actors = unnest_param(self.gap_inserts.iter().map(|(a, _, _)| a));
+            let starts = unnest_param(self.gap_inserts.iter().map(|(_, s, _)| s));
+            let ends = unnest_param(self.gap_inserts.iter().map(|(_, _, e)| e));
+            let res = conn
+                .prepare_cached(
+                    "INSERT INTO __corro_bookkeeping_gaps (actor_id, start, end)
+                     SELECT value0, value1, value2 FROM unnest(:actors, :starts, :ends)",
+                )?
+                .execute(named_params! {
+                    ":actors": actors,
+                    ":starts": starts,
+                    ":ends": ends,
+                });
+            if let Err(e) = res {
+                warn!("error when inserting gaps into db: {e}");
+                let details = json!({"error": e.to_string()});
+                assert_unreachable!("error when inserting gaps into db", &details);
+                return Err(e);
+            }
+        }
+
+        if !self.complete_version_deletes.is_empty() {
+            let actors = unnest_param(self.complete_version_deletes.iter().map(|(a, _)| a));
+            let versions = unnest_param(self.complete_version_deletes.iter().map(|(_, v)| v));
+            let count = conn
+                .prepare_cached(
+                    "DELETE FROM __corro_seq_bookkeeping WHERE (site_id, db_version)
+                 IN (SELECT value0, value1 FROM unnest(:actors, :versions))",
+                )?
+                .execute(named_params! {
+                    ":actors": actors,
+                    ":versions": versions,
+                })?;
+            let len = self.complete_version_deletes.len();
+            if count != len {
+                warn!("did not delete some complete versions from db, expected {len}, got {count}");
+                let details = json!({"count": count, "expected": len});
+                assert_unreachable!("ineffective deletion of complete versions in-db", &details);
+            }
+        }
+
+        if !self.partials_deletes.is_empty() {
+            let actors = unnest_param(self.partials_deletes.iter().map(|a| a.0));
+            let versions = unnest_param(self.partials_deletes.iter().map(|a| a.1));
+            let start_seqs = unnest_param(self.partials_deletes.iter().map(|a| a.2));
+            let end_seqs = unnest_param(self.partials_deletes.iter().map(|a| a.3));
+            let count = conn.prepare_cached(
+                "DELETE FROM __corro_seq_bookkeeping
+                 WHERE (site_id, db_version, start_seq, end_seq)
+                 IN (SELECT value0, value1, value2, value3 FROM unnest(:actors, :versions, :start_seqs, :end_seqs))",
+            )?
+            .execute(named_params! {
+                ":actors": actors,
+                ":versions": versions,
+                ":start_seqs": start_seqs,
+                ":end_seqs": end_seqs,
+            })?;
+            let len = self.partials_deletes.len();
+            if count != len {
+                warn!("did not delete some partial seqs from db, expected {len}, got {count}");
+                let details = json!({"count": count, "expected": len});
+                assert_unreachable!("ineffective deletion of partial seqs in-db", &details);
+            }
+        }
+
+        if !self.partial_inserts.is_empty() {
+            let actors = unnest_param(self.partial_inserts.iter().map(|a| a.0));
+            let versions = unnest_param(self.partial_inserts.iter().map(|a| a.1));
+            let start_seqs = unnest_param(self.partial_inserts.iter().map(|a| a.2));
+            let end_seqs = unnest_param(self.partial_inserts.iter().map(|a| a.3));
+            let last_seqs = unnest_param(self.partial_inserts.iter().map(|a| a.4));
+            let timestamps = unnest_param(self.partial_inserts.iter().map(|a| a.5));
+            let res = conn
+                .prepare_cached(
+                    "INSERT INTO __corro_seq_bookkeeping
+                    (site_id, db_version, start_seq, end_seq, last_seq, ts)
+                 SELECT value0, value1, value2, value3, value4, value5
+                 FROM unnest(:actors, :versions, :start_seqs, :end_seqs, :last_seqs, :timestamps)",
+                )?
+                .execute(named_params! {
+                    ":actors": actors,
+                    ":versions": versions,
+                    ":start_seqs": start_seqs,
+                    ":end_seqs": end_seqs,
+                    ":last_seqs": last_seqs,
+                    ":timestamps": timestamps,
+                });
+
+            if let Err(e) = res {
+                warn!("error when inserting partial seqs into db: {e}");
+                let details = json!({"error": e.to_string()});
+                assert_unreachable!("ineffective insertion of partial seqs in-db", &details);
+                return Err(e);
+            }
+        }
+
+        Ok(())
     }
 }
 

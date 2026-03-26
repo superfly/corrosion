@@ -15,12 +15,13 @@ use crate::{
     transport::Transport,
 };
 
-use antithesis_sdk::{assert_always, assert_sometimes};
+use antithesis_sdk::assert_sometimes;
 use corro_types::{
     actor::{Actor, ActorId},
     agent::{Agent, Booked, Bookie, ChangeError, CurrentVersion, KnownDbVersion, PartialVersion},
     api::TableName,
     base::{CrsqlDbVersion, CrsqlDbVersionRange, CrsqlSeq},
+    bookie::BookieDbParams,
     broadcast::{ChangeSource, ChangeV1, Changeset, ChangesetParts, FocaCmd, FocaInput},
     channel::CorroReceiver,
     config::AuthzConfig,
@@ -966,6 +967,7 @@ pub async fn process_multiple_changes(
 
         let sub_start = Instant::now();
 
+        let mut all_changes = Vec::with_capacity(processed.len());
         let mut completed_partials = BTreeMap::new();
         for (actor_id, processed) in processed.iter() {
             debug!(%actor_id, self_actor_id = %agent.actor_id(), "processing {} changesets", processed.len());
@@ -974,65 +976,21 @@ pub async fn process_multiple_changes(
                 .get_mut(actor_id)
                 .expect("booked write guard should be present for every actor");
 
-            booked_write
-                .insert_db(
-                    &tx,
-                    processed
-                        .iter()
-                        .map(|(versions, _)| versions.into())
-                        .collect(),
-                )
-                .map_err(|source| ChangeError::Rusqlite {
-                    source,
-                    actor_id: Some(*actor_id),
-                    version: None,
-                })?;
-
-            // for complete/cleared versions, clean up any prior partial bookkeeping
-            // TODO: do we want to leave this to be done when clearing buffered changes?
-            let complete_versions = processed
-                .iter()
-                .filter_map(|(versions, partial)| partial.is_none().then_some(versions.into()))
-                .collect::<RangeInclusiveSet<CrsqlDbVersion>>();
-
-            booked_write
-                .clear_partials(&tx, complete_versions)
-                .map_err(|source| ChangeError::Rusqlite {
-                    source,
-                    actor_id: Some(*actor_id),
-                    version: None,
-                })?;
-
-            // collect updated partials for this actor and update bookkeeping table
-            let partial_versions: BTreeMap<_, _> =
-                processed
-                    .iter()
-                    .fold(BTreeMap::new(), |mut acc, (versions, partial)| {
-                        if let Some(p) = partial {
-                            acc.entry(versions.start())
-                                .and_modify(|existing: &mut PartialVersion| {
-                                    assert_always!(
-                                        p.last_seq == existing.last_seq,
-                                        "last_seq mismatch for partial version {versions:?}"
-                                    );
-                                    existing.seqs.extend(p.seqs.clone());
-                                })
-                                .or_insert(p.clone());
-                        }
-                        acc
-                    });
-
-            let completed = booked_write
-                .insert_partials_db(&tx, partial_versions)
-                .map_err(|source| ChangeError::Rusqlite {
-                    source,
-                    actor_id: Some(*actor_id),
-                    version: None,
-                })?;
+            let (changes, completed) = booked_write.compute_and_apply(processed);
+            debug!(%actor_id, "computed and applied changes: {changes:?}, completed versions: {completed:?}");
+            all_changes.push(changes);
             if !completed.is_empty() {
                 completed_partials.insert(*actor_id, completed);
             }
         }
+
+        BookieDbParams::from_changes(&all_changes)
+            .execute(&tx)
+            .map_err(|source| ChangeError::Rusqlite {
+                source,
+                actor_id: None,
+                version: None,
+            })?;
 
         debug!("inserted {count} new changesets");
 

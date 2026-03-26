@@ -1123,6 +1123,7 @@ async fn test_process_multiple_changes() -> eyre::Result<()> {
     .await?;
 
     // sent 1-25
+    println!("processing cleared versions 21-25");
     let rows = get_rows(
         ta1.agent.clone(),
         vec![
@@ -1204,7 +1205,8 @@ async fn check_bookie_versions(
         }
         assert!(conn.prepare_cached(
             "SELECT EXISTS (SELECT 1 FROM __corro_bookkeeping_gaps WHERE actor_id = ? and start = ? and end = ?)")?
-            .query_row((actor_id, versions.start(), versions.end()), |row| row.get(0))?);
+            .query_row((actor_id, versions.start(), versions.end()), |row| row.get(0))?,
+        "missing gap {versions:?} in __corro_bookkeeping_gaps table");
     }
 
     for versions in cleared {
