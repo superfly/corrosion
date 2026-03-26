@@ -11,7 +11,7 @@ use rusqlite::types::{ToSql, ToSqlOutput, Value};
 use rusqlite::{
     params, trace::TraceEventCodes, vtab::eponymous_only_module, Connection, Transaction, MAIN_DB,
 };
-use sqlite_pool::{Committable, SqliteConn};
+use sqlite_pool::SqliteConn;
 use std::rc::Rc;
 use tempfile::TempDir;
 use thread_local::ThreadLocal;
@@ -283,18 +283,6 @@ impl Drop for CrConn {
         if let Err(e) = self.execute_batch("select crsql_finalize();") {
             error!("could not crsql_finalize: {e}");
         }
-    }
-}
-
-impl Committable for CrConn {
-    fn commit(self) -> Result<(), rusqlite::Error> {
-        Ok(())
-    }
-
-    fn savepoint(&mut self) -> Result<rusqlite::Savepoint<'_>, rusqlite::Error> {
-        Err(rusqlite::Error::ModuleError(String::from(
-            "cannot create savepoint from connection",
-        )))
     }
 }
 

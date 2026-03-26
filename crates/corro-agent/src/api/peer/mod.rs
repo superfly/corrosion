@@ -44,6 +44,7 @@ use crate::agent::SyncRecvError;
 use crate::transport::{Transport, TransportError};
 
 use corro_types::{actor::ActorId, agent::Bookie};
+use sqlite_pool::InterruptibleTransaction;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SyncError {
@@ -387,6 +388,8 @@ fn handle_need(
     assert_sometimes!(true, "Corrosion handles sync requests from other nodes");
     // this is a read transaction!
     let tx = conn.transaction()?;
+    let timeout = Some(Duration::from_secs(60));
+    let tx = InterruptibleTransaction::new(tx, timeout, "handle_need");
 
     let mut prepped = tx.prepare_cached(
         "
