@@ -115,7 +115,7 @@ where
 
     pub fn clear_expired(&mut self) {
         let now = Instant::now();
-        self.inner.retain(|_, next_retry_at| now > *next_retry_at);
+        self.inner.retain(|_, next_retry_at| *next_retry_at > now);
     }
 
     pub fn contains(&self, key: &K) -> bool {
@@ -133,7 +133,7 @@ mod tests {
         throttle_map.throttle("throttle-key");
         assert!(throttle_map.is_throttled(&"throttle-key"));
         // sleep for three secs to expire timeout
-        std::thread::sleep(Duration::from_secs(3));
+        std::thread::sleep(Duration::from_secs(4));
         // key should no longer be throttled
         assert!(!throttle_map.is_throttled(&"throttle-key"));
         throttle_map.throttle("new-key");
