@@ -1102,7 +1102,7 @@ fn try_transmit_broadcast(
                 error!("could not write to uni stream to {addr}: {e}");
             }
             Ok(Ok(_)) => {
-                counter!("corro.peer.stream.bytes.sent.total", "type" => "uni")
+                counter!("corro.peer.stream.bytes.sent.total", "traffic" => "broadcast")
                     .increment(len as u64);
             }
         }

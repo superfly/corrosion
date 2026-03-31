@@ -7,7 +7,7 @@ use std::{
 use camino::Utf8PathBuf;
 use corro_types::{
     actor::{ActorId, ClusterId},
-    agent::{Agent, BookedVersions, Bookie},
+    agent::{Agent, BookedVersions, Bookie, WriteConn},
     base::{CrsqlDbVersion, CrsqlSeq},
     broadcast::{FocaCmd, FocaInput},
     sqlite::SqlitePoolError,
@@ -299,7 +299,7 @@ async fn handle_conn(
                         }
                     };
 
-                    let report = match block_in_place(|| check_bookie_consistency(&rw_conn, bookie))
+                    let report = match block_in_place(|| check_bookie_consistency(rw_conn, bookie))
                     {
                         Ok(report) => report,
                         Err(e) => {
@@ -769,22 +769,29 @@ struct BookieConsistencyReport {
 }
 
 fn check_bookie_consistency(
-    conn: &rusqlite::Connection,
+    rw_conn: WriteConn,
     bookie: &Bookie,
 ) -> rusqlite::Result<BookieConsistencyReport> {
-    let _bookie_write_guard = bookie.write_lock_blocking();
+    let (in_memory_map, db_map): (
+        HashMap<ActorId, BookedVersions>,
+        HashMap<ActorId, BookedVersions>,
+    ) = {
+        let _bookie_write_guard: corro_types::agent::BookieWriteGuard =
+            bookie.write_lock_blocking();
+        let db_map = BookedVersions::load_all_from_conn(&rw_conn)?;
 
-    let db_map = BookedVersions::load_all_from_conn(conn)?;
-
-    let in_memory_map: HashMap<ActorId, BookedVersions> = {
         let guard = bookie.owned_guard();
-        bookie
+        let in_memory_map = bookie
             .iter(&guard)
             .map(|(actor_id, booked)| {
                 let read = booked.read();
                 (*actor_id, (**read).clone())
             })
-            .collect()
+            .collect();
+
+        // Release the locks asap
+        drop(rw_conn);
+        (in_memory_map, db_map)
     };
 
     let mut value_mismatch_actors = Vec::new();
