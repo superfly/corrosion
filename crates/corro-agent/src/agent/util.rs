@@ -29,7 +29,7 @@ use corro_types::{
     sqlite::unnest_param,
     updates::{match_changes, match_changes_from_db_version},
 };
-use indexmap::IndexMap;
+use corro_utils::ThrottleMap;
 
 use super::BcastCache;
 use crate::api::public::update::api_v1_updates;
@@ -488,13 +488,12 @@ pub async fn apply_fully_buffered_changes_loop(
     let timeout = (agent.config().perf.sql_tx_timeout as u64 * 3) / 2;
     let tx_timeout: Duration = Duration::from_secs(timeout);
     let timeout_proximity = tx_timeout.saturating_sub(Duration::from_secs(3));
-    let next_retry_dur = Duration::from_secs(5 * 60);
 
     let mut retry_interval = tokio::time::interval(Duration::from_secs(60));
     let mut clear_limit_interval = tokio::time::interval(Duration::from_secs(5 * 60));
 
-    // map of failed versions that took too long to apply, we don't want to retry them too quickly
-    let mut limit_retries: IndexMap<(ActorId, CrsqlDbVersion), Instant> = IndexMap::new();
+    // map to throttle retries for failed versions that took too long to apply
+    let mut limit_retries = ThrottleMap::new(Duration::from_secs(5 * 60));
 
     retry_interval.tick().await;
 
@@ -519,16 +518,17 @@ pub async fn apply_fully_buffered_changes_loop(
             },
 
             _ = clear_limit_interval.tick() => {
-                limit_retries.retain(|_, next_retry_at| Instant::now() < *next_retry_at);
+                limit_retries.clear_expired();
                 continue;
             }
         };
 
-        if let Some(next_retry_at) = limit_retries.get(&partial_version) {
-            if Instant::now() < *next_retry_at {
-                warn!(?partial_version, "previous attempt to apply buffered changes took too long, next retry at {next_retry_at:?}");
-                continue;
-            }
+        if limit_retries.is_throttled(&partial_version) {
+            warn!(
+                ?partial_version,
+                "previous attempt to apply buffered changes took too long, skipping retry"
+            );
+            continue;
         }
 
         let (actor_id, version) = partial_version;
@@ -552,7 +552,7 @@ pub async fn apply_fully_buffered_changes_loop(
                 assert_unreachable!("could not apply fully buffered changes", &details);
                 // processing time came close to timeout, limit retry
                 if elapsed >= timeout_proximity {
-                    limit_retries.insert((actor_id, version), Instant::now() + next_retry_dur);
+                    limit_retries.throttle((actor_id, version));
                 }
             }
         }
