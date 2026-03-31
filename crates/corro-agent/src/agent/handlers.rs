@@ -169,6 +169,7 @@ pub fn spawn_rtt_handler(
                             let mut members = agent.members().write();
                             for (addr, rtt) in chunks {
                                 members.add_rtt(addr, rtt);
+                                histogram!("corro.transport.rtt.v2.seconds").record(rtt.as_secs_f64());
                             }
                         } else {
                             break;
@@ -299,9 +300,9 @@ pub async fn handle_gossip_to_send(
                     error!("could not write datagram {addr}: {e}");
                     return;
                 }
-                counter!("corro.peer.datagram.sent.total", "actor_id" => actor_id.to_string())
-                    .increment(1);
-                counter!("corro.peer.datagram.bytes.sent.total").increment(len as u64);
+                counter!("corro.peer.datagram.sent.total", "traffic" => "foca").increment(1);
+                counter!("corro.peer.datagram.bytes.sent.total", "traffic" => "foca")
+                    .increment(len as u64);
             }
             .instrument(debug_span!("send_swim_payload", %addr, %actor_id, buf_size = len)),
         );
@@ -340,10 +341,15 @@ pub async fn handle_notifications(
                     MemberAddedResult::NewMember | MemberAddedResult::Removed => {
                         if matches!(member_added_res, MemberAddedResult::Removed) {
                             debug!("Member Removed {actor:?} due to member id mismatch");
-                            counter!("corro.gossip.member.removed", "id" => actor.id().0.to_string(), "addr" => actor.addr().to_string()).increment(1);
+                            counter!(
+                                "corro.gossip.member.removed",
+                                "traffic" => "foca",
+                                "kind" => "member_id_mismatch"
+                            )
+                            .increment(1);
                         } else {
                             debug!("Member Added {actor:?}");
-                            counter!("corro.gossip.member.added", "id" => actor.id().0.to_string(), "addr" => actor.addr().to_string()).increment(1);
+                            counter!("corro.gossip.member.added", "traffic" => "foca").increment(1);
                         }
 
                         let members_len = { agent.members().read().states.len() as u32 };
@@ -386,7 +392,8 @@ pub async fn handle_notifications(
                 info!("Member Down {actor:?} (removed: {removed})");
                 if removed {
                     debug!("Member Down {actor:?}");
-                    counter!("corro.gossip.member.removed", "id" => actor.id().0.to_string(), "addr" => actor.addr().to_string()).increment(1);
+                    counter!("corro.gossip.member.removed", "traffic" => "foca", "kind" => "member_down")
+                        .increment(1);
                     // actually removed a member
                     // notify of new cluster size
                     let member_len = { agent.members().read().states.len() as u32 };
@@ -1065,13 +1072,12 @@ pub async fn handle_sync(
 ) -> Result<(), SyncClientError> {
     let sync_state = generate_sync(bookie, agent.actor_id()).await;
 
-    for (actor_id, needed) in sync_state.need.iter() {
-        gauge!("corro.sync.client.needed", "actor_id" => actor_id.to_string())
-            .set(needed.len() as f64);
-    }
-    for (actor_id, version) in sync_state.heads.iter() {
-        gauge!("corro.sync.client.head", "actor_id" => actor_id.to_string()).set(version.0 as f64);
-    }
+    let needed_total = sync_state
+        .need
+        .values()
+        .map(|needed| needed.len() as u64)
+        .sum::<u64>();
+    gauge!("corro.sync.client.needed.v2", "traffic" => "sync").set(needed_total as f64);
 
     let chosen: Vec<(ActorId, SocketAddr)> = {
         let candidates = {

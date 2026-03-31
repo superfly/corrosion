@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     hash::{Hash, Hasher},
     net::SocketAddr,
-    sync::Arc,
+    sync::{Arc, Mutex as StdMutex},
     time::{Duration, Instant},
 };
 
@@ -30,6 +30,31 @@ struct TransportInner {
     endpoints: Vec<Endpoint>,
     conns: RwLock<HashMap<SocketAddr, Arc<Mutex<Option<Connection>>>>>,
     rtt_tx: mpsc::Sender<(SocketAddr, Duration)>,
+    path_snapshots: StdMutex<HashMap<SocketAddr, PathSnapshot>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PathSnapshot {
+    cwnd: u64,
+    congestion_events: u64,
+    black_holes_detected: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum TrafficClass {
+    Sync,
+    Broadcast,
+    Foca,
+}
+
+impl TrafficClass {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Sync => "sync",
+            Self::Broadcast => "broadcast",
+            Self::Foca => "foca",
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -74,24 +99,33 @@ impl Transport {
             endpoints,
             conns: Default::default(),
             rtt_tx,
+            path_snapshots: Default::default(),
         })))
     }
 
     #[tracing::instrument(skip(self, data), fields(buf_size = data.len()), level = "debug", err)]
     pub async fn send_datagram(&self, addr: SocketAddr, data: Bytes) -> Result<(), TransportError> {
-        let conn = self.connect(addr).await?;
+        let conn = self.connect(addr, TrafficClass::Foca).await?;
         trace!("connected to {addr}");
 
         match conn.send_datagram(data.clone()) {
-            Ok(send) => {
+            Ok(()) => {
                 trace!("sent datagram to {addr}");
-                return Ok(send);
             }
             Err(SendDatagramError::ConnectionLost(e)) => {
                 debug!("retryable error attempting to send datagram: {e}");
+
+                let conn = self.connect(addr, TrafficClass::Foca).await?;
+                debug!("re-connected to {addr}");
+                conn.send_datagram(data.clone())?;
             }
             Err(e) => {
-                counter!("corro.transport.send_datagram.errors", "addr" => addr.to_string(), "error" => e.to_string()).increment(1);
+                counter!(
+                    "corro.transport.send_datagram.errors.v2",
+                    "traffic" => TrafficClass::Foca.as_str(),
+                    "kind" => datagram_error_kind(&e)
+                )
+                .increment(1);
                 if matches!(e, SendDatagramError::TooLarge) {
                     warn!(%addr, "attempted to send a larger-than-PMTU datagram. len: {}, pmtu: {:?}", data.len(), conn.max_datagram_size());
                 }
@@ -99,14 +133,24 @@ impl Transport {
             }
         }
 
-        let conn = self.connect(addr).await?;
-        debug!("re-connected to {addr}");
-        Ok(conn.send_datagram(data)?)
+        counter!(
+            "corro.transport.tx.datagrams.v2.total",
+            "traffic" => TrafficClass::Foca.as_str()
+        )
+        .increment(1);
+        counter!(
+            "corro.transport.tx.bytes.v2.total",
+            "traffic" => TrafficClass::Foca.as_str()
+        )
+        .increment(data.len() as u64);
+
+        Ok(())
     }
 
     #[tracing::instrument(skip(self, data), fields(buf_size = data.len()), level = "debug", err)]
     pub async fn send_uni(&self, addr: SocketAddr, data: Bytes) -> Result<(), TransportError> {
-        let conn = self.connect(addr).await?;
+        let len = data.len();
+        let conn = self.connect(addr, TrafficClass::Broadcast).await?;
 
         let mut stream = match conn
             .open_uni()
@@ -119,7 +163,7 @@ impl Transport {
             }
             Err(e) => {
                 debug!("retryable error attempting to open unidirectional stream: {e}");
-                let conn = self.connect(addr).await?;
+                let conn = self.connect(addr, TrafficClass::Broadcast).await?;
                 conn.open_uni()
                     .instrument(debug_span!("quic_open_uni"))
                     .await?
@@ -140,6 +184,12 @@ impl Transport {
             .instrument(debug_span!("quic_stopped"))
             .await?;
 
+        counter!(
+            "corro.transport.tx.bytes.v2.total",
+            "traffic" => TrafficClass::Broadcast.as_str()
+        )
+        .increment(len as u64);
+
         Ok(())
     }
 
@@ -148,7 +198,7 @@ impl Transport {
         &self,
         addr: SocketAddr,
     ) -> Result<(SendStream, RecvStream), TransportError> {
-        let conn = self.connect(addr).await?;
+        let conn = self.connect(addr, TrafficClass::Sync).await?;
         match conn.open_bi().instrument(debug_span!("quic_open_bi")).await {
             Ok(send_recv) => return Ok(send_recv),
             Err(e @ ConnectionError::VersionMismatch) => {
@@ -160,7 +210,7 @@ impl Transport {
         }
 
         // retry, it should reconnect!
-        let conn = self.connect(addr).await?;
+        let conn = self.connect(addr, TrafficClass::Sync).await?;
         Ok(conn
             .open_bi()
             .instrument(debug_span!("quic_open_bi"))
@@ -171,6 +221,7 @@ impl Transport {
         &self,
         addr: SocketAddr,
         server_name: String,
+        traffic: TrafficClass,
     ) -> Result<Connection, TransportError> {
         let start = Instant::now();
 
@@ -179,27 +230,43 @@ impl Transport {
         let endpoint_idx = (hasher.finish() % self.0.endpoints.len() as u64) as usize;
 
         async {
-            match tokio::time::timeout(Duration::from_secs(5), self
-                .0
-                .endpoints[endpoint_idx]
-                .connect(addr, &server_name)?)
-                .await
+            match tokio::time::timeout(
+                Duration::from_secs(5),
+                self.0.endpoints[endpoint_idx].connect(addr, &server_name)?,
+            )
+            .await
             {
                 Ok(Ok(conn)) => {
-                    histogram!("corro.transport.connect.time.seconds").record(start.elapsed().as_secs_f64());
+                    histogram!(
+                        "corro.transport.connect.time.v2.seconds",
+                        "traffic" => traffic.as_str()
+                    )
+                    .record(start.elapsed().as_secs_f64());
                     tracing::Span::current().record("rtt", conn.rtt().as_secs_f64());
                     Ok(conn)
-                },
+                }
                 Ok(Err(e)) => {
-                    counter!("corro.transport.connect.errors", "addr" => server_name, "error" => e.to_string()).increment(1);
+                    counter!(
+                        "corro.transport.connect.errors.v2",
+                        "traffic" => traffic.as_str(),
+                        "kind" => "connect_error"
+                    )
+                    .increment(1);
                     Err(e.into())
                 }
                 Err(e) => {
-                    counter!("corro.transport.connect.errors", "addr" => server_name, "error" => "timed out").increment(1);
+                    counter!(
+                        "corro.transport.connect.errors.v2",
+                        "traffic" => traffic.as_str(),
+                        "kind" => "timed_out"
+                    )
+                    .increment(1);
                     Err(e.into())
                 }
             }
-        }.instrument(debug_span!("quic_connect", %addr, rtt = tracing::field::Empty)).await
+        }
+        .instrument(debug_span!("quic_connect", %addr, rtt = tracing::field::Empty))
+        .await
     }
 
     // this shouldn't block for long...
@@ -216,7 +283,11 @@ impl Transport {
     }
 
     #[tracing::instrument(skip(self), fields(tid = ?std::thread::current().id()), level = "debug", err)]
-    async fn connect(&self, addr: SocketAddr) -> Result<Connection, TransportError> {
+    async fn connect(
+        &self,
+        addr: SocketAddr,
+        traffic: TrafficClass,
+    ) -> Result<Connection, TransportError> {
         let conn_lock = self.get_lock(addr).await;
 
         let mut lock = conn_lock.lock().await;
@@ -233,7 +304,9 @@ impl Transport {
         // clear it, if there was one it didn't pass the test.
         *lock = None;
 
-        let conn = self.measured_connect(addr, addr.ip().to_string()).await?;
+        let conn = self
+            .measured_connect(addr, addr.ip().to_string(), traffic)
+            .await?;
         *lock = Some(conn.clone());
         Ok(conn)
     }
@@ -256,12 +329,39 @@ impl Transport {
         let stats = conns
             .iter()
             .fold(ConnectionStats::default(), |mut acc, (addr, stats)| {
-                gauge!("corro.transport.path.cwnd", "addr" => addr.to_string())
-                    .set(stats.path.cwnd as f64);
-                gauge!("corro.transport.path.congestion_events", "addr" => addr.to_string())
-                    .set(stats.path.congestion_events as f64);
-                gauge!("corro.transport.path.black_holes_detected", "addr" => addr.to_string())
-                    .set(stats.path.black_holes_detected as f64);
+                let current = PathSnapshot {
+                    cwnd: stats.path.cwnd,
+                    congestion_events: stats.path.congestion_events,
+                    black_holes_detected: stats.path.black_holes_detected,
+                };
+                let mut snapshots = self
+                    .0
+                    .path_snapshots
+                    .lock()
+                    .expect("path snapshots lock should not be poisoned");
+                if let Some(previous) = snapshots.get(addr).copied() {
+                    let cwnd_delta = current.cwnd.saturating_sub(previous.cwnd);
+                    let congestion_events_delta = current
+                        .congestion_events
+                        .saturating_sub(previous.congestion_events);
+                    let black_holes_detected_delta = current
+                        .black_holes_detected
+                        .saturating_sub(previous.black_holes_detected);
+
+                    if cwnd_delta > 0
+                        || congestion_events_delta > 0
+                        || black_holes_detected_delta > 0
+                    {
+                        info!(
+                            %addr,
+                            cwnd_delta,
+                            congestion_events_delta,
+                            black_holes_detected_delta,
+                            "transport path metrics increased"
+                        );
+                    }
+                }
+                snapshots.insert(*addr, current);
 
                 acc.path.lost_packets += stats.path.lost_packets;
                 acc.path.lost_bytes += stats.path.lost_bytes;
@@ -325,6 +425,14 @@ impl Transport {
 
                 acc
             });
+        {
+            let mut snapshots = self
+                .0
+                .path_snapshots
+                .lock()
+                .expect("path snapshots lock should not be poisoned");
+            snapshots.retain(|addr, _| conns.iter().any(|(active_addr, _)| active_addr == addr));
+        }
         gauge!("corro.transport.path.lost_packets").set(stats.path.lost_packets as f64);
         gauge!("corro.transport.path.lost_bytes").set(stats.path.lost_bytes as f64);
         gauge!("corro.transport.path.sent_packets").set(stats.path.sent_packets as f64);
@@ -426,6 +534,15 @@ impl Transport {
 }
 
 const NO_ERROR: quinn::VarInt = quinn::VarInt::from_u32(0);
+
+fn datagram_error_kind(e: &SendDatagramError) -> &'static str {
+    match e {
+        SendDatagramError::UnsupportedByPeer => "unsupported_by_peer",
+        SendDatagramError::Disabled => "disabled",
+        SendDatagramError::TooLarge => "too_large",
+        SendDatagramError::ConnectionLost(_) => "connection_lost",
+    }
+}
 
 fn test_conn(conn: &Connection) -> bool {
     match conn.close_reason() {

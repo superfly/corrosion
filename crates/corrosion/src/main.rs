@@ -499,6 +499,13 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
             ))
             .await?;
         }
+        Command::Sync(SyncCommand::CheckBookieConsistency) => {
+            let mut conn = AdminConn::connect(cli.admin_path()).await?;
+            conn.send_command(corro_admin::Command::Sync(
+                corro_admin::SyncCommand::CheckBookieConsistency,
+            ))
+            .await?;
+        }
         Command::Template { template, flags } => {
             command::tpl::run(cli.api_addr()?, template, flags).await?;
         }
@@ -780,6 +787,8 @@ enum ConsulCommand {
 enum SyncCommand {
     /// Generate a sync message from the current agent
     Generate,
+    /// Check in-memory bookie state against DB-loaded bookie state
+    CheckBookieConsistency,
     ReconcileGaps,
 }
 

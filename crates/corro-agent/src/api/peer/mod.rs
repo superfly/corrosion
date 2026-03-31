@@ -978,6 +978,7 @@ async fn write_buf(send_buf: &mut BytesMut, write: &mut SendStream) -> Result<()
     let len = send_buf.len();
     write.write_chunk(send_buf.split().freeze()).await?;
     counter!("corro.sync.chunk.sent.bytes").increment(len as u64);
+    counter!("corro.transport.tx.bytes.v2.total", "traffic" => "sync").increment(len as u64);
 
     Ok(())
 }
@@ -1088,7 +1089,7 @@ pub async fn parallel_sync(
                     }
                     trace!(%actor_id, self_actor_id = %agent.actor_id(), "read clock payload");
 
-                    counter!("corro.sync.client.member", "id" => actor_id.to_string(), "addr" => addr.to_string()).increment(1);
+                    counter!("corro.sync.client.member", "traffic" => "sync").increment(1);
 
                     let needs = our_sync_state.compute_available_needs(&their_sync_state);
 
@@ -1117,9 +1118,8 @@ pub async fn parallel_sync(
             Err(e) => {
                 counter!(
                     "corro.sync.client.handshake.errors",
-                    "actor_id" => actor_id.to_string(),
-                    "addr" => addr.to_string(),
-                    "error" => e.to_string()
+                    "traffic" => "sync",
+                    "kind" => "handshake"
                 )
                 .increment(1);
                 match agg {
@@ -1294,7 +1294,8 @@ pub async fn parallel_sync(
                         continue 'servers;
                     }
 
-                    counter!("corro.sync.client.req.sent", "actor_id" => server_actor_id.to_string()).increment(req_len as u64);
+                    counter!("corro.sync.client.req.sent", "traffic" => "sync")
+                        .increment(req_len as u64);
                 }
 
                 if !send_buf.is_empty() {
@@ -1344,7 +1345,7 @@ pub async fn parallel_sync(
                             let changes_len = cmp::max(change.len(), 1);
                             // tracing::Span::current().record("changes_len", changes_len);
                             count += changes_len;
-                            counter!("corro.sync.changes.recv", "actor_id" => actor_id.to_string())
+                            counter!("corro.sync.changes.recv", "traffic" => "sync")
                                 .increment(changes_len as u64);
 
                             debug!(
@@ -1598,7 +1599,7 @@ pub async fn serve_sync(
 
             debug!(actor_id = %agent.actor_id(), "done writing sync messages (count: {count})");
 
-            counter!("corro.sync.changes.sent", "actor_id" => their_actor_id.to_string()).increment(count as u64);
+            counter!("corro.sync.changes.sent", "traffic" => "sync").increment(count as u64);
 
             Ok::<_, SyncError>(count)
         }.instrument(info_span!("process_versions_to_send")),
@@ -1649,7 +1650,7 @@ pub async fn serve_sync(
 
             debug!(actor_id = %agent.actor_id(), "done reading sync messages");
 
-            counter!("corro.sync.requests.recv", "actor_id" => their_actor_id.to_string()).increment(count as u64);
+            counter!("corro.sync.requests.recv", "traffic" => "sync").increment(count as u64);
 
             Ok(count)
         }.instrument(info_span!("process_version_requests"))
