@@ -14,10 +14,6 @@ on:
         description: "Target branch for commit"
         required: true
 
-      repo:
-        description: "The repository to download crsqlite [optional]"
-        default: ""
-
 jobs:
   download:
     runs-on: ubuntu-latest
@@ -35,10 +31,7 @@ jobs:
               exit 1
           fi
 
-          INPUT_REPO=${{ inputs.repo }}
-          if [[ -z "$INPUT_REPO" ]]; then
-            INPUT_REPO=${{ github.repository_owner }}
-          fi
+          INPUT_REPO=${{ github.repository_owner }}
           TAG=${{ inputs.tag }} REPO=${INPUT_REPO} ./.buildkite/download-crsqlite.sh
 
       - uses: EndBug/add-and-commit@v9

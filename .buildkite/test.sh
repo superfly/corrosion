@@ -6,7 +6,7 @@ export RUST_LOG=info,corro=debug
 export NEXTEST_PROFILE=ci
 set +e
 CFLAGS="--sysroot=/ubuntu-bionic-sysroot" cargo nextest run --tests --workspace \
-  --config='target.x86_64-unknown-linux-gnu.rustflags = ["-C", "link-arg=--sysroot=/ubuntu-bionic-sysroot"]' \
+  --config='target.x86_64-unknown-linux-gnu.rustflags = ["-C", "link-arg=--sysroot=/ubuntu-bionic-sysroot"]'
 test_status=$?
 set -e
 
