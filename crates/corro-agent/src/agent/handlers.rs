@@ -741,12 +741,16 @@ impl HandleChangesState {
                 debug!("batch processing completed successfully");
             }
             Ok(Err(e)) => {
-                let err_str = e.to_string();
                 error!("error processing batch: {e}");
+
+                if let Some(issue) = e.fatal_db_issue() {
+                    error!("fatal DB issue detected: {issue}");
+                    agent.mark_unhealthy(issue);
+                }
 
                 // Check for memory errors and emergency reduce batch size
                 // TODO: requeue the changes
-                if err_str.contains("SQLITE_NOMEM") || err_str.contains("out of memory") {
+                if e.is_oom_error() {
                     error!("memory error detected, halving batch size");
                     self.current_batch_size =
                         (self.current_batch_size / 2).max(self.min_batch_size);
