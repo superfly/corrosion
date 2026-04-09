@@ -48,7 +48,33 @@ pub enum UniPayload {
 #[derive(Debug, Clone, Readable, Writable)]
 pub enum UniPayloadV1 {
     Broadcast(BroadcastV1),
+    PlumTree(PlumTreeMsg),
 }
+
+// ---------------------------------------------------------------------------
+// Plumtree wire types
+// ---------------------------------------------------------------------------
+
+/// Uniquely identifies a broadcast message in the network.
+/// Uses the start version of the changeset since broadcasts are
+/// almost always single-version (Full / FullV2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Readable, Writable)]
+pub struct BroadcastId {
+    pub actor_id: ActorId,
+    pub version: CrsqlDbVersion,
+}
+
+impl BroadcastId {
+    pub fn from_change(change: &ChangeV1) -> Self {
+        Self {
+            actor_id: change.actor_id,
+            version: change.changeset.versions().start(),
+        }
+    }
+}
+
+/// Concrete Plumtree message type used on the wire.
+pub type PlumTreeMsg = plum_foca::PlumtreeMsg<BroadcastId, BroadcastV1, ActorId>;
 
 #[derive(Debug, Clone, Readable, Writable)]
 pub enum BiPayload {

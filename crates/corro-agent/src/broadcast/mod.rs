@@ -49,13 +49,13 @@ use crate::{
 };
 
 #[derive(Clone)]
-struct TimerSpawner {
-    send: mpsc::UnboundedSender<(Duration, Timer<Actor>)>,
+struct TimerSpawner<T: Send + 'static> {
+    send: mpsc::UnboundedSender<(Duration, T)>,
 }
 
-impl TimerSpawner {
-    pub fn new(timer_tx: mpsc::Sender<(Timer<Actor>, Instant)>) -> Self {
-        let (send, mut recv) = mpsc::unbounded_channel();
+impl<T: Send + 'static> TimerSpawner<T> {
+    pub fn new(timer_tx: mpsc::Sender<(T, Instant)>) -> Self {
+        let (send, mut recv) = mpsc::unbounded_channel::<(Duration, T)>();
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -89,7 +89,7 @@ impl TimerSpawner {
         Self { send }
     }
 
-    pub fn spawn(&self, task: (Duration, Timer<Actor>)) {
+    pub fn spawn(&self, task: (Duration, T)) {
         self.send
             .send(task)
             .expect("Thread with LocalSet has shut down.");
@@ -1119,6 +1119,204 @@ fn try_transmit_broadcast(
     }))
 }
 
+// ---------------------------------------------------------------------------
+// Plumtree broadcast tree
+// ---------------------------------------------------------------------------
+
+/// Messages flowing into `plumtree_loop` from the rest of the agent.
+#[derive(Debug)]
+pub enum PlumtreeInput {
+    /// A wire message received from a remote peer (deserialized from uni-stream).
+    Wire(corro_types::broadcast::PlumTreeMsg),
+    /// Foca membership: a new peer appeared.
+    MemberUp(ActorId),
+    /// Foca membership: a peer left.
+    MemberDown(ActorId),
+    /// Application wants to originate a new broadcast.
+    Broadcast(corro_types::broadcast::BroadcastV1),
+}
+
+use corro_types::broadcast::{BroadcastId, BroadcastV1, ChangeSource, ChangeV1, PlumTreeMsg};
+use plum_foca::PlumtreeState;
+
+/// Implements `plum_foca::Runtime` for Corrosion, bridging the generic protocol
+/// to Corrosion's transport, change processing, and timer infrastructure.
+struct CorrosionPlumtreeRuntime<'a> {
+    agent: &'a Agent,
+    transport: &'a Transport,
+    tx_changes: &'a CorroSender<(ChangeV1, ChangeSource)>,
+    timer_spawner: &'a TimerSpawner<plum_foca::Timer<BroadcastId>>,
+    bcast_codec: &'a mut LengthDelimitedCodec,
+    ser_buf: &'a mut BytesMut,
+}
+
+impl<'a> CorrosionPlumtreeRuntime<'a> {
+    fn resolve_addr(&self, peer: &ActorId) -> Option<std::net::SocketAddr> {
+        let members = self.agent.members().read();
+        members.states.get(peer).map(|m| m.addr)
+    }
+}
+
+impl<'a> plum_foca::Runtime<BroadcastId, BroadcastV1, ActorId> for CorrosionPlumtreeRuntime<'a> {
+    fn send(&mut self, to: ActorId, msg: PlumTreeMsg) {
+        let addr = match self.resolve_addr(&to) {
+            Some(a) => a,
+            None => {
+                debug!("plumtree: no address for peer {to}, dropping message");
+                return;
+            }
+        };
+
+        let payload = UniPayload::V1 {
+            data: UniPayloadV1::PlumTree(msg),
+            cluster_id: self.agent.cluster_id(),
+        };
+
+        self.ser_buf.clear();
+        if let Err(e) = payload.write_to_stream((&mut *self.ser_buf).writer()) {
+            error!("plumtree: failed to serialize wire msg: {e}");
+            return;
+        }
+
+        let mut frame_buf = BytesMut::new();
+        if let Err(e) = self
+            .bcast_codec
+            .encode(self.ser_buf.split().freeze(), &mut frame_buf)
+        {
+            error!("plumtree: failed to frame wire msg: {e}");
+            return;
+        }
+
+        let data = frame_buf.freeze();
+        let transport = self.transport.clone();
+        tokio::spawn(async move {
+            match tokio::time::timeout(Duration::from_secs(5), transport.send_uni(addr, data)).await
+            {
+                Err(_) => warn!("plumtree: timed out sending to {addr}"),
+                Ok(Err(e)) => debug!("plumtree: send error to {addr}: {e}"),
+                Ok(Ok(())) => {
+                    counter!("corro.plumtree.send.total").increment(1);
+                }
+            }
+        });
+    }
+
+    fn deliver(
+        &mut self,
+        _id: BroadcastId,
+        payload: BroadcastV1,
+        _sender: ActorId,
+        _round: plum_foca::Round,
+    ) {
+        let BroadcastV1::Change(change) = payload;
+        let tx = self.tx_changes.clone();
+        tokio::spawn(async move {
+            if let Err(e) = tx.send((change, ChangeSource::Broadcast)).await {
+                error!("plumtree: could not deliver change: {e}");
+            }
+        });
+    }
+
+    fn schedule(&mut self, timer: plum_foca::Timer<BroadcastId>, after: Duration) {
+        self.timer_spawner.spawn((after, timer));
+    }
+
+    fn notify(&mut self, notification: plum_foca::Notification<BroadcastId, ActorId>) {
+        trace!("plumtree notification: {notification:?}");
+    }
+}
+
+/// The main Plumtree event loop. Runs alongside the existing `handle_broadcasts`.
+pub async fn plumtree_loop(
+    agent: Agent,
+    transport: Transport,
+    mut rx_plumtree: CorroReceiver<PlumtreeInput>,
+    tx_changes: CorroSender<(ChangeV1, ChangeSource)>,
+    mut tripwire: Tripwire,
+) {
+    let config = plum_foca::Config {
+        ihave_timeout: Duration::from_millis(500),
+        optimization_threshold: 5,
+        max_cached_payloads: 4096,
+        max_eager: 5,
+        max_lazy: 10,
+    };
+
+    let mut state: PlumtreeState<BroadcastId, BroadcastV1, ActorId> =
+        PlumtreeState::new(agent.actor_id(), config);
+
+    // Seed eager set with current ring0 members
+    {
+        let members = agent.members().read();
+        for (actor_id, _member) in members.states.iter() {
+            if *actor_id != agent.actor_id() {
+                state.peer_up(*actor_id);
+            }
+        }
+        let (eager, lazy) = (state.eager_peers().len(), state.lazy_peers().len());
+        info!("plumtree: seeded with {eager} eager + {lazy} lazy peers from existing members");
+    }
+
+    let (plumtree_timer_tx, mut plumtree_timer_rx) = mpsc::channel(10);
+    let timer_spawner = TimerSpawner::new(plumtree_timer_tx);
+
+    let mut tick_interval = interval(Duration::from_millis(200));
+    let mut bcast_codec = LengthDelimitedCodec::builder()
+        .max_frame_length(10 * 1_024 * 1_024)
+        .new_codec();
+    let mut ser_buf = BytesMut::new();
+
+    loop {
+        let mut rt = CorrosionPlumtreeRuntime {
+            agent: &agent,
+            transport: &transport,
+            tx_changes: &tx_changes,
+            timer_spawner: &timer_spawner,
+            bcast_codec: &mut bcast_codec,
+            ser_buf: &mut ser_buf,
+        };
+
+        tokio::select! {
+            biased;
+            _ = &mut tripwire => {
+                info!("plumtree_loop: tripwire fired, shutting down");
+                break;
+            }
+            input = rx_plumtree.recv() => match input {
+                Some(PlumtreeInput::Wire(msg)) => {
+                    match msg {
+                        PlumTreeMsg::Gossip(g) => { state.receive_gossip(g, &mut rt); }
+                        PlumTreeMsg::IHave(ih) => { state.receive_ihave(ih, &mut rt); }
+                        PlumTreeMsg::Graft(g) => { state.receive_graft(g, &mut rt); }
+                        PlumTreeMsg::Prune(p) => { state.receive_prune(p, &mut rt); }
+                    }
+                }
+                Some(PlumtreeInput::MemberUp(actor_id)) => {
+                    state.peer_up(actor_id);
+                }
+                Some(PlumtreeInput::MemberDown(actor_id)) => {
+                    state.peer_down(&actor_id);
+                }
+                Some(PlumtreeInput::Broadcast(bcast)) => {
+                    let BroadcastV1::Change(ref change) = bcast;
+                    let id = BroadcastId::from_change(change);
+                    state.broadcast(id, bcast, &mut rt);
+                }
+                None => {
+                    warn!("plumtree_loop: input channel closed");
+                    break;
+                }
+            },
+            Some((timer, _seq)) = plumtree_timer_rx.recv() => {
+                state.timer_fired(timer, &mut rt);
+            }
+            _ = tick_interval.tick() => {
+                state.tick(&mut rt);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1269,7 +1467,14 @@ mod tests {
             let conn = conn.await.unwrap();
 
             let (tx_changes, mut rx_changes) = bounded(100, "changes");
-            spawn_unipayload_handler(&tripwire, &conn, ta1.agent.cluster_id(), tx_changes);
+            let (tx_plumtree, _rx_plumtree) = bounded(100, "plumtree_test");
+            spawn_unipayload_handler(
+                &tripwire,
+                &conn,
+                ta1.agent.cluster_id(),
+                tx_changes,
+                tx_plumtree,
+            );
 
             // we should receive five items starting from the biggest version
             for i in (0..5).rev() {
@@ -1424,6 +1629,7 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(10)).await;
         cancel_token.cancel();
 
+        println!("sending cancel signal");
         tripwire_tx.send(()).await.unwrap();
         tripwire_worker.await;
         spawn::wait_for_all_pending_handles().await;

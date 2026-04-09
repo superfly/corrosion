@@ -10,7 +10,7 @@ use crate::{
         reaper::spawn_reaper,
         setup, util, AgentOptions,
     },
-    broadcast::runtime_loop,
+    broadcast::{plumtree_loop, runtime_loop},
     transport::Transport,
 };
 
@@ -58,6 +58,8 @@ async fn run(
         rx_clear_buf,
         rx_changes,
         rx_foca,
+        tx_plumtree,
+        rx_plumtree,
         subs_manager,
         subs_bcast_cache,
         updates_bcast_cache,
@@ -148,6 +150,7 @@ async fn run(
     spawn_counted(handlers::handle_notifications(
         agent.clone(),
         notifications_rx,
+        tx_plumtree.clone(),
         tripwire.clone(),
     ));
 
@@ -205,9 +208,27 @@ async fn run(
 
     info!("Starting peer API on udp/{gossip_addr} (QUIC)");
 
+    //// Start the Plumtree broadcast tree loop
+    spawn_counted(
+        plumtree_loop(
+            agent.clone(),
+            transport.clone(),
+            rx_plumtree,
+            agent.tx_changes().clone(),
+            tripwire.clone(),
+        )
+        .inspect(|_| info!("plumtree loop is done")),
+    );
+
     //// Start an incoming (corrosion) connection handler.  This
     //// future tree spawns additional message type sub-handlers
-    handlers::spawn_gossipserver_handler(&agent, &bookie, &tripwire, gossip_server_endpoint);
+    handlers::spawn_gossipserver_handler(
+        &agent,
+        &bookie,
+        &tripwire,
+        gossip_server_endpoint,
+        tx_plumtree.clone(),
+    );
 
     let changes_handle = spawn_counted(
         handlers::handle_changes(agent.clone(), bookie.clone(), rx_changes, tripwire.clone())
