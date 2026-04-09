@@ -35,6 +35,7 @@ metrics = { workspace = true }
 once_cell = { workspace = true }
 opentelemetry = { workspace = true }
 parking_lot = { workspace = true }
+plum-foca = { path = "../../plum-foca", features = ["speedy"] }
 rand = { workspace = true }
 rangemap = { workspace = true }
 rcgen = { workspace = true }

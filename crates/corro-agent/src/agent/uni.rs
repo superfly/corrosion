@@ -10,6 +10,8 @@ use tokio_util::codec::{FramedRead, LengthDelimitedCodec};
 use tracing::{debug, error, trace};
 use tripwire::Tripwire;
 
+use crate::broadcast::PlumtreeInput;
+
 /// Spawn a task that accepts unidirectional broadcast streams, then
 /// spawns another task for each incoming stream to handle.
 pub fn spawn_unipayload_handler(
@@ -17,6 +19,7 @@ pub fn spawn_unipayload_handler(
     conn: &quinn::Connection,
     cluster_id: ClusterId,
     tx_changes: CorroSender<(ChangeV1, ChangeSource)>,
+    tx_plumtree: CorroSender<PlumtreeInput>,
 ) {
     tokio::spawn({
         let conn = conn.clone();
@@ -46,6 +49,7 @@ pub fn spawn_unipayload_handler(
 
                 tokio::spawn({
                     let tx_changes = tx_changes.clone();
+                    let tx_plumtree = tx_plumtree.clone();
                     async move {
                         let mut framed = FramedRead::new(
                             rx,
@@ -76,6 +80,25 @@ pub fn spawn_unipayload_handler(
                                                         continue;
                                                     }
                                                     changes.push((change, ChangeSource::Broadcast));
+                                                }
+                                                UniPayload::V1 {
+                                                    data: UniPayloadV1::PlumTree(wire_msg),
+                                                    cluster_id: payload_cluster_id,
+                                                } => {
+                                                    if cluster_id != payload_cluster_id {
+                                                        continue;
+                                                    }
+                                                    let tx = tx_plumtree.clone();
+                                                    tokio::spawn(async move {
+                                                        if let Err(e) = tx
+                                                            .send(PlumtreeInput::Wire(wire_msg))
+                                                            .await
+                                                        {
+                                                            error!(
+                                                                "could not route PlumTree msg: {e}"
+                                                            );
+                                                        }
+                                                    });
                                                 }
                                             }
                                         }

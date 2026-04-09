@@ -3,8 +3,12 @@ name = "plum-foca"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+speedy = ["dep:speedy"]
+
 [dependencies]
 serde = { workspace = true }
+speedy = { workspace = true, optional = true }
 
 [lints]
 workspace = true

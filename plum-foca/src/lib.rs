@@ -92,6 +92,7 @@ pub trait Runtime<I: MessageId, P: Payload, N: NodeId> {
 
 /// Wire messages exchanged between Plumtree peers.
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "speedy", derive(speedy::Readable, speedy::Writable))]
 pub enum PlumtreeMsg<I, P, N>
 where
     I: MessageId,
@@ -106,6 +107,7 @@ where
 
 /// Full payload — sent immediately to eager peers.
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "speedy", derive(speedy::Readable, speedy::Writable))]
 pub struct GossipMsg<I, P, N>
 where
     I: MessageId,
@@ -120,6 +122,7 @@ where
 
 /// Digest-only batch — sent to lazy peers on each tick.
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "speedy", derive(speedy::Readable, speedy::Writable))]
 pub struct IHaveMsg<I, N>
 where
     I: MessageId,
@@ -130,12 +133,14 @@ where
 }
 
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "speedy", derive(speedy::Readable, speedy::Writable))]
 pub struct IHaveDigest<I: MessageId> {
     pub id: I,
     pub round: Round,
 }
 
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "speedy", derive(speedy::Readable, speedy::Writable))]
 pub struct GraftMsg<I, N>
 where
     I: MessageId,
@@ -147,6 +152,7 @@ where
 }
 
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "speedy", derive(speedy::Readable, speedy::Writable))]
 pub struct PruneMsg<I, N>
 where
     I: MessageId,
