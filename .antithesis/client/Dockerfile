@@ -1,3 +1,4 @@
+ARG CACHE_BUST_WEEKLY
 FROM corrosion
 
 RUN apt-get update && apt-get install -y curl socat python3
