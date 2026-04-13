@@ -3,11 +3,11 @@ steps:
     priority: 70
     key: build-corrosion
     commands:
-      - docker build -f .antithesis/corrosion/Dockerfile -t corrosion .
+      - docker build --build-arg CACHE_BUST_WEEKLY=$(date +%Y-%V) -f .antithesis/corrosion/Dockerfile -t corrosion .
       - docker tag corrosion ${ANTITHESIS_REGISTRY}/corrosion:${BUILDKITE_COMMIT:0:8}
       - docker push ${ANTITHESIS_REGISTRY}/corrosion:${BUILDKITE_COMMIT:0:8}
       # client image is built from corrosion image
-      - docker build -f .antithesis/client/Dockerfile -t ${ANTITHESIS_REGISTRY}/corro-client:${BUILDKITE_COMMIT:0:8} .
+      - docker build --build-arg CACHE_BUST_WEEKLY=$(date +%Y-%V) -f .antithesis/client/Dockerfile -t ${ANTITHESIS_REGISTRY}/corro-client:${BUILDKITE_COMMIT:0:8} .
       - docker push ${ANTITHESIS_REGISTRY}/corro-client:${BUILDKITE_COMMIT:0:8}
     plugins:
       - docker-login#v3.0.0:

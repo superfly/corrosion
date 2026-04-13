@@ -1,4 +1,5 @@
 # build image
+ARG CACHE_BUST_WEEKLY
 FROM rust:bookworm AS builder
 
 ARG TARGETARCH
