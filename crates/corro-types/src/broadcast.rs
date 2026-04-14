@@ -36,6 +36,8 @@ use crate::{
     updates::match_changes,
 };
 
+use plum_foca::Payload;
+
 #[derive(Debug, Clone, Readable, Writable)]
 pub enum UniPayload {
     V1 {
@@ -48,7 +50,7 @@ pub enum UniPayload {
 #[derive(Debug, Clone, Readable, Writable)]
 pub enum UniPayloadV1 {
     Broadcast(BroadcastV1),
-    PlumTree(PlumTreeMsg),
+    PlumTree(PlumtreeMsg),
 }
 
 // ---------------------------------------------------------------------------
@@ -58,23 +60,33 @@ pub enum UniPayloadV1 {
 /// Uniquely identifies a broadcast message in the network.
 /// Uses the start version of the changeset since broadcasts are
 /// almost always single-version (Full / FullV2).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Readable, Writable)]
-pub struct BroadcastId {
+///
+///
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Readable, Writable)]
+pub struct ChangeId {
     pub actor_id: ActorId,
-    pub version: CrsqlDbVersion,
+    pub changeset_id: ChangesetId,
 }
 
-impl BroadcastId {
-    pub fn from_change(change: &ChangeV1) -> Self {
-        Self {
-            actor_id: change.actor_id,
-            version: change.changeset.versions().start(),
-        }
-    }
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Readable, Writable)]
+pub enum ChangesetId {
+    Full {
+        version: CrsqlDbVersion,
+        seqs: CrsqlSeqRange,
+        last_seq: CrsqlSeq,
+    },
+    Empty {
+        versions: CrsqlDbVersionRange,
+    },
 }
 
 /// Concrete Plumtree message type used on the wire.
-pub type PlumTreeMsg = plum_foca::PlumtreeMsg<BroadcastId, BroadcastV1, ActorId>;
+pub type PlumtreeMsgV1 = plum_foca::PlumtreeMsg<ChangeId, ChangeV1, ActorId>;
+
+#[derive(Debug, Clone, Readable, Writable)]
+pub enum PlumtreeMsg {
+    V1 { data: PlumtreeMsgV1 },
+}
 
 #[derive(Debug, Clone, Readable, Writable)]
 pub enum BiPayload {
@@ -115,6 +127,18 @@ pub enum AuthzV1 {
     Token(String),
 }
 
+#[derive(Debug)]
+pub enum PlumtreeInput {
+    /// A wire message received from a remote peer (deserialized from uni-stream).
+    Wire(PlumtreeMsgV1),
+    /// Foca membership: a new peer appeared.
+    MemberUp(ActorId),
+    /// Foca membership: a peer left.
+    MemberDown(ActorId),
+    /// Application wants to originate a new broadcast.
+    Broadcast(ChangeV1),
+}
+
 #[derive(Clone, Debug, Readable, Writable)]
 pub enum BroadcastV1 {
     Change(ChangeV1),
@@ -147,6 +171,22 @@ impl Deref for ChangeV1 {
 
     fn deref(&self) -> &Self::Target {
         &self.changeset
+    }
+}
+
+impl Payload for ChangeV1 {
+    type MessageId = ChangeId;
+    type NodeId = ActorId;
+
+    fn message_id(&self) -> ChangeId {
+        ChangeId {
+            actor_id: self.actor_id,
+            changeset_id: self.changeset.id(),
+        }
+    }
+
+    fn origin(&self) -> Self::NodeId {
+        self.actor_id
     }
 }
 
@@ -456,6 +496,37 @@ impl Changeset {
             Changeset::Full { changes, .. } => Box::new(changes.iter().map(MatchableChange::from)),
             Changeset::FullV2 { changes, .. } => Box::new(changes.matchable_changes()),
             Changeset::Empty { .. } | Changeset::EmptySet { .. } => Box::new(std::iter::empty()),
+        }
+    }
+
+    pub fn id(&self) -> ChangesetId {
+        match self {
+            Changeset::Full {
+                version,
+                seqs,
+                last_seq,
+                ..
+            } => ChangesetId::Full {
+                version: *version,
+                seqs: *seqs,
+                last_seq: *last_seq,
+            },
+            Changeset::FullV2 {
+                version,
+                seqs,
+                last_seq,
+                ..
+            } => ChangesetId::Full {
+                version: *version,
+                seqs: *seqs,
+                last_seq: *last_seq,
+            },
+            Changeset::Empty { versions, .. } => ChangesetId::Empty {
+                versions: *versions,
+            },
+            Changeset::EmptySet { .. } => {
+                todo!()
+            }
         }
     }
 }

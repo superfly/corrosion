@@ -1,19 +1,36 @@
+use indexmap::IndexSet;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Debug;
 use std::hash::Hash;
 use std::time::Duration;
 
+#[cfg(feature = "tracing")]
+use tracing::{debug, trace};
+
+#[cfg(not(feature = "tracing"))]
+macro_rules! debug {
+    ($($t:tt)*) => {};
+}
+#[cfg(not(feature = "tracing"))]
+macro_rules! trace {
+    ($($t:tt)*) => {};
+}
+
 /// Identifies a unique message in the network.
 pub trait MessageId: Clone + Eq + Hash + Debug + Send + 'static {}
 
 /// The payload carried by a Gossip message.
-pub trait Payload: Clone + Debug + Send + 'static {}
+pub trait Payload: Clone + Debug + Send + 'static {
+    type MessageId: MessageId;
+    type NodeId: NodeId;
+    fn message_id(&self) -> Self::MessageId;
+    fn origin(&self) -> Self::NodeId;
+}
 
 /// Identifies a peer/node for routing purposes.
 pub trait NodeId: Clone + Eq + Hash + Debug + Send + 'static {}
 
 impl<T> MessageId for T where T: Clone + Eq + Hash + Debug + Send + 'static {}
-impl<T> Payload for T where T: Clone + Debug + Send + 'static {}
 impl<T> NodeId for T where T: Clone + Eq + Hash + Debug + Send + 'static {}
 
 /// Hop count from the original sender, incremented on each forward.
@@ -220,21 +237,21 @@ pub struct PlumtreeState<I: MessageId, P: Payload, N: NodeId> {
     local_id: N,
     config: Config,
     eager_peers: HashSet<N>,
-    lazy_peers: HashSet<N>,
+    lazy_peers: IndexSet<N>,
     received: HashMap<I, Round>,
     lazy_queue: HashMap<N, Vec<IHaveDigest<I>>>,
     missing: HashMap<I, MissingEntry<N>>,
     cache: PayloadCache<I, P>,
 }
 
-impl<I: MessageId, P: Payload, N: NodeId> PlumtreeState<I, P, N> {
+impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId> PlumtreeState<I, P, N> {
     pub fn new(local_id: N, config: Config) -> Self {
         let cache_size = config.max_cached_payloads;
         Self {
             local_id,
             config,
             eager_peers: HashSet::new(),
-            lazy_peers: HashSet::new(),
+            lazy_peers: IndexSet::new(),
             received: HashMap::new(),
             lazy_queue: HashMap::new(),
             missing: HashMap::new(),
@@ -251,17 +268,24 @@ impl<I: MessageId, P: Payload, N: NodeId> PlumtreeState<I, P, N> {
             return;
         }
         if self.eager_peers.len() < self.config.max_eager {
+            trace!(local = ?self.local_id, ?peer, "peer_up → eager");
             self.eager_peers.insert(peer);
         } else if self.lazy_peers.len() < self.config.max_lazy {
+            trace!(local = ?self.local_id, ?peer, max_lazy = self.config.max_lazy, "peer_up → lazy");
             self.lazy_peers.insert(peer);
+        } else {
+            debug!(local = ?self.local_id, ?peer, eager = self.eager_peers.len(), lazy = self.lazy_peers.len(), "peer_up → dropped (both full)");
         }
     }
 
     /// Peer leaves or is detected as failed.
-    pub fn peer_down(&mut self, peer: &N) {
-        self.eager_peers.remove(peer);
-        self.lazy_peers.remove(peer);
+    pub fn peer_down(&mut self, peer: &N, rt: &mut impl Runtime<I, P, N>) {
+        let was_eager = self.eager_peers.remove(peer);
+        self.lazy_peers.swap_remove(peer);
         self.lazy_queue.remove(peer);
+        if was_eager {
+            self.replenish_eager(rt);
+        }
     }
 
     pub fn has_message(&self, id: &I) -> bool {
@@ -272,7 +296,7 @@ impl<I: MessageId, P: Payload, N: NodeId> PlumtreeState<I, P, N> {
         &self.eager_peers
     }
 
-    pub fn lazy_peers(&self) -> &HashSet<N> {
+    pub fn lazy_peers(&self) -> &IndexSet<N> {
         &self.lazy_peers
     }
 
@@ -293,16 +317,17 @@ impl<I: MessageId, P: Payload, N: NodeId> PlumtreeState<I, P, N> {
     /// - New → deliver, forward to eager peers, enqueue IHave for lazy,
     ///   promote sender to eager, and optionally GRAFT a shorter-path
     ///   peer discovered via a prior IHave.
-    pub fn receive_gossip(&mut self, msg: GossipMsg<I, P, N>, rt: &mut impl Runtime<I, P, N>) {
+    pub fn handle_gossip(&mut self, msg: GossipMsg<I, P, N>, rt: &mut impl Runtime<I, P, N>) {
         let GossipMsg {
-            id,
+            id: _id,
             round,
             sender,
             payload,
         } = msg;
 
+        let id = payload.message_id();
         if self.received.contains_key(&id) {
-            // Duplicate — tell sender to stop eager-pushing to us.
+            trace!(local = ?self.local_id, ?id, ?sender, "gossip dup → PRUNE sender");
             rt.send(
                 sender.clone(),
                 PlumtreeMsg::Prune(PruneMsg {
@@ -315,16 +340,17 @@ impl<I: MessageId, P: Payload, N: NodeId> PlumtreeState<I, P, N> {
             return;
         }
 
-        // First time seeing this message.
-        self.received.insert(id.clone(), round);
+        trace!(local = ?self.local_id, ?id, round, ?sender,
+               eager = self.eager_peers.len(), lazy = self.lazy_peers.len(),
+               "gossip NEW → deliver + forward");
 
-        // do we want to request this from the application?
+        self.received.insert(id.clone(), round);
         self.cache.insert(id.clone(), payload.clone(), round);
 
         rt.deliver(id.clone(), payload.clone(), sender.clone(), round);
 
-        // Forward full payload to all eager peers except the sender.
         let next_round = round + 1;
+        let mut fwd_count = 0u32;
         for peer in &self.eager_peers {
             if *peer == sender || *peer == self.local_id {
                 continue;
@@ -338,22 +364,21 @@ impl<I: MessageId, P: Payload, N: NodeId> PlumtreeState<I, P, N> {
                     payload: payload.clone(),
                 }),
             );
+            fwd_count += 1;
         }
+        trace!(local = ?self.local_id, ?id, fwd_count, "gossip forwarded");
 
-        // Enqueue digest for lazy peers.
         self.enqueue_ihave(id.clone(), round);
-
-        // Promote the sender to eager (they're part of the tree).
         self.move_to_eager(&sender, rt);
 
-        // Optimization: if we had a pending IHave for this message,
-        // the IHave sender might know a shorter path.
         if let Some(entry) = self.missing.remove(&id) {
             if entry.round + self.config.optimization_threshold < round
                 && entry.ihave_sender != sender
             {
-                // The IHave peer received it in fewer hops — graft them
-                // into our eager set for a shorter tree path.
+                debug!(local = ?self.local_id, ?id,
+                       ihave_round = entry.round, gossip_round = round,
+                       ihave_sender = ?entry.ihave_sender,
+                       "optimization → GRAFT shorter path");
                 rt.send(
                     entry.ihave_sender.clone(),
                     PlumtreeMsg::Graft(GraftMsg {
@@ -372,8 +397,10 @@ impl<I: MessageId, P: Payload, N: NodeId> PlumtreeState<I, P, N> {
     /// For each digest we haven't already received, record it in the
     /// `missing` set and schedule an `IHaveTimeout` timer. If the full
     /// GOSSIP doesn't arrive before the timer fires, we'll GRAFT.
-    pub fn receive_ihave(&mut self, msg: IHaveMsg<I, N>, rt: &mut impl Runtime<I, P, N>) {
+    pub fn handle_ihave(&mut self, msg: IHaveMsg<I, N>, rt: &mut impl Runtime<I, P, N>) {
         let IHaveMsg { sender, digests } = msg;
+        let count = digests.len();
+        let mut new_missing = 0u32;
 
         for digest in digests {
             if self.received.contains_key(&digest.id) {
@@ -383,6 +410,7 @@ impl<I: MessageId, P: Payload, N: NodeId> PlumtreeState<I, P, N> {
                 continue;
             }
 
+            new_missing += 1;
             self.missing.insert(
                 digest.id.clone(),
                 MissingEntry {
@@ -392,18 +420,23 @@ impl<I: MessageId, P: Payload, N: NodeId> PlumtreeState<I, P, N> {
             );
             rt.schedule(Timer::IHaveTimeout(digest.id), self.config.ihave_timeout);
         }
+        if new_missing > 0 {
+            debug!(local = ?self.local_id, ?sender, count, new_missing,
+                   total_missing = self.missing.len(), "handle_ihave → scheduled grafts");
+        }
     }
 
     /// Handle an incoming GRAFT request.
     ///
     /// The sender is asking us to add them back to our eager set and
     /// (re)send the full payload for a specific message.
-    pub fn receive_graft(&mut self, msg: GraftMsg<I, N>, rt: &mut impl Runtime<I, P, N>) {
+    pub fn handle_graft(&mut self, msg: GraftMsg<I, N>, rt: &mut impl Runtime<I, P, N>) {
         let GraftMsg { sender, id, .. } = msg;
 
         self.move_to_eager(&sender, rt);
 
         if let Some((payload, round)) = self.cache.get(&id).cloned() {
+            debug!(local = ?self.local_id, ?id, ?sender, "graft → sending cached payload");
             rt.send(
                 sender,
                 PlumtreeMsg::Gossip(GossipMsg {
@@ -414,6 +447,7 @@ impl<I: MessageId, P: Payload, N: NodeId> PlumtreeState<I, P, N> {
                 }),
             );
         } else {
+            debug!(local = ?self.local_id, ?id, ?sender, cache_size = self.cache.entries.len(), "graft → NOT CACHED");
             rt.notify(Notification::PayloadNotCached(id));
         }
     }
@@ -422,7 +456,8 @@ impl<I: MessageId, P: Payload, N: NodeId> PlumtreeState<I, P, N> {
     ///
     /// The sender already has the message, so demote them from our
     /// eager set to lazy — we'll only send them IHave digests.
-    pub fn receive_prune(&mut self, msg: PruneMsg<I, N>, rt: &mut impl Runtime<I, P, N>) {
+    pub fn handle_prune(&mut self, msg: PruneMsg<I, N>, rt: &mut impl Runtime<I, P, N>) {
+        debug!(local = ?self.local_id, sender = ?msg.sender, triggered_by = ?msg.triggered_by, "handle_prune");
         self.move_to_lazy(&msg.sender, rt);
     }
 
@@ -432,9 +467,13 @@ impl<I: MessageId, P: Payload, N: NodeId> PlumtreeState<I, P, N> {
     /// eager peers (round 0), and enqueues IHave for lazy peers.
     pub fn broadcast(&mut self, id: I, payload: P, rt: &mut impl Runtime<I, P, N>) {
         if self.received.contains_key(&id) {
+            debug!(local = ?self.local_id, ?id, "broadcast skipped (already received)");
             return;
         }
 
+        debug!(local = ?self.local_id, ?id,
+               eager = self.eager_peers.len(), lazy = self.lazy_peers.len(),
+               "broadcast originate");
         self.received.insert(id.clone(), 0);
         self.cache.insert(id.clone(), payload.clone(), 0);
 
@@ -464,6 +503,7 @@ impl<I: MessageId, P: Payload, N: NodeId> PlumtreeState<I, P, N> {
         match timer {
             Timer::IHaveTimeout(ref id) => {
                 if let Some(entry) = self.missing.remove(id) {
+                    debug!(local = ?self.local_id, ?id, sender = ?entry.ihave_sender, "IHave timeout → GRAFT");
                     rt.send(
                         entry.ihave_sender.clone(),
                         PlumtreeMsg::Graft(GraftMsg {
@@ -473,6 +513,8 @@ impl<I: MessageId, P: Payload, N: NodeId> PlumtreeState<I, P, N> {
                         }),
                     );
                     self.move_to_eager(&entry.ihave_sender, rt);
+                } else {
+                    trace!(local = ?self.local_id, ?id, "IHave timeout → already received, noop");
                 }
             }
         }
@@ -517,25 +559,52 @@ impl<I: MessageId, P: Payload, N: NodeId> PlumtreeState<I, P, N> {
     }
 
     fn move_to_eager(&mut self, peer: &N, rt: &mut impl Runtime<I, P, N>) {
-        if self.eager_peers.contains(peer) {
+        if self.eager_peers.contains(peer) || self.eager_peers.len() >= self.config.max_eager {
             return;
         }
-        let was_lazy = self.lazy_peers.remove(peer);
-        if self.eager_peers.len() < self.config.max_eager {
-            self.eager_peers.insert(peer.clone());
-            rt.notify(Notification::PeerMovedToEager(peer.clone()));
-        } else if was_lazy {
-            // Can't promote — put back in lazy.
-            self.lazy_peers.insert(peer.clone());
+
+        self.eager_peers.insert(peer.clone());
+        if self.lazy_peers.contains(peer) {
+            self.lazy_peers.swap_remove(peer);
+            trace!(local = ?self.local_id, ?peer, eager = self.eager_peers.len(), "move_to_eager: promoted from lazy");
+        } else {
+            trace!(local = ?self.local_id, ?peer, eager = self.eager_peers.len(), "move_to_eager: promoted");
         }
+        rt.notify(Notification::PeerMovedToEager(peer.clone()));
     }
 
     fn move_to_lazy(&mut self, peer: &N, rt: &mut impl Runtime<I, P, N>) {
         if self.eager_peers.remove(peer) {
+            debug!(local = ?self.local_id, ?peer,
+                   eager = self.eager_peers.len(), lazy = self.lazy_peers.len(),
+                   "move_to_lazy: demoted, replenishing");
+            self.replenish_eager(rt);
             if self.lazy_peers.len() < self.config.max_lazy {
                 self.lazy_peers.insert(peer.clone());
+            } else {
+                debug!(local = ?self.local_id, ?peer, "move_to_lazy: lazy full, peer dropped from overlay");
             }
             rt.notify(Notification::PeerMovedToLazy(peer.clone()));
+        }
+    }
+
+    fn replenish_eager(&mut self, rt: &mut impl Runtime<I, P, N>) {
+        while self.eager_peers.len() < self.config.max_eager {
+            let peer = match self.lazy_peers.iter().next() {
+                Some(p) => p.clone(),
+                None => {
+                    debug!(local = ?self.local_id,
+                           eager = self.eager_peers.len(), max = self.config.max_eager,
+                           "replenish_eager: no lazy peers left");
+                    break;
+                }
+            };
+            debug!(local = ?self.local_id, ?peer,
+                   eager = self.eager_peers.len() + 1, max = self.config.max_eager,
+                   "replenish_eager: promoting lazy → eager");
+            self.lazy_peers.swap_remove(&peer);
+            self.eager_peers.insert(peer.clone());
+            rt.notify(Notification::PeerMovedToEager(peer.clone()));
         }
     }
 }
@@ -555,6 +624,18 @@ mod tests {
     pub(crate) struct TestPayload(pub Vec<u8>);
 
     pub(crate) type TestNodeId = u8;
+
+    impl Payload for TestPayload {
+        type MessageId = TestMsgId;
+        type NodeId = TestNodeId;
+        fn message_id(&self) -> Self::MessageId {
+            TestMsgId(0)
+        }
+
+        fn origin(&self) -> Self::NodeId {
+            0
+        }
+    }
 
     pub(crate) fn test_config() -> Config {
         Config {
@@ -706,10 +787,14 @@ mod tests {
     #[test]
     fn peer_down_removes_from_both_sets() {
         let mut s = state();
+        let mut rt = AccumulatingRuntime::default();
         s.peer_up(1);
         s.lazy_peers.insert(2);
-        s.peer_down(&1);
-        s.peer_down(&2);
+        s.peer_down(&1, &mut rt);
+        // peer 2 should have been promoted from lazy to eager
+        assert_eq!(s.eager_peers.len(), 1);
+        assert!(s.eager_peers.contains(&2));
+        s.peer_down(&2, &mut rt);
         assert!(s.eager_peers.is_empty());
         assert!(s.lazy_peers.is_empty());
     }
@@ -717,12 +802,44 @@ mod tests {
     #[test]
     fn peer_down_cleans_lazy_queue() {
         let mut s = state();
+        let mut rt = AccumulatingRuntime::default();
         s.lazy_peers.insert(1);
         s.enqueue_ihave(msg(1), 0);
         assert!(s.lazy_queue.contains_key(&1));
 
-        s.peer_down(&1);
+        s.peer_down(&1, &mut rt);
         assert!(!s.lazy_queue.contains_key(&1));
+    }
+
+    #[test]
+    fn replenish_eager_after_prune() {
+        let mut cfg = test_config();
+        cfg.max_eager = 3;
+        cfg.max_lazy = 5;
+        let mut s: PlumtreeState<TestMsgId, TestPayload, TestNodeId> = PlumtreeState::new(0u8, cfg);
+        let mut rt = AccumulatingRuntime::default();
+
+        s.peer_up(1); // eager
+        s.peer_up(2); // eager
+        s.peer_up(3); // eager (full)
+        s.peer_up(4); // lazy
+        s.peer_up(5); // lazy
+        assert_eq!(s.eager_peers.len(), 3);
+        assert_eq!(s.lazy_peers.len(), 2);
+
+        // Receive a PRUNE from peer 1 → eager shrinks, lazy peer promoted
+        s.handle_prune(
+            PruneMsg {
+                sender: 1,
+                triggered_by: msg(99),
+            },
+            &mut rt,
+        );
+        assert_eq!(s.eager_peers.len(), 3, "eager should be replenished");
+        // one lazy promoted to eager, then peer 1 added to lazy → net same
+        assert_eq!(s.lazy_peers.len(), 2);
+        assert!(!s.eager_peers.contains(&1));
+        assert!(s.lazy_peers.contains(&1));
     }
 
     // -----------------------------------------------------------------------
@@ -773,11 +890,11 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // receive_gossip
+    // handle_gossip
     // -----------------------------------------------------------------------
 
     #[test]
-    fn receive_gossip_new_delivers_and_forwards() {
+    fn handle_gossip_new_delivers_and_forwards() {
         let mut s = state();
         let mut rt = AccumulatingRuntime::default();
 
@@ -786,7 +903,7 @@ mod tests {
         s.lazy_peers.insert(4);
 
         // Receive a GOSSIP from peer 1 (not yet in our peer set)
-        s.receive_gossip(
+        s.handle_gossip(
             GossipMsg {
                 id: msg(10),
                 round: 1,
@@ -831,13 +948,13 @@ mod tests {
     }
 
     #[test]
-    fn receive_gossip_duplicate_sends_prune() {
+    fn handle_gossip_duplicate_sends_prune() {
         let mut s = state();
         let mut rt = AccumulatingRuntime::default();
 
         s.peer_up(1);
         // First receive
-        s.receive_gossip(
+        s.handle_gossip(
             GossipMsg {
                 id: msg(1),
                 round: 0,
@@ -852,7 +969,7 @@ mod tests {
 
         // Duplicate from peer 2
         s.peer_up(2);
-        s.receive_gossip(
+        s.handle_gossip(
             GossipMsg {
                 id: msg(1),
                 round: 1,
@@ -879,13 +996,13 @@ mod tests {
     }
 
     #[test]
-    fn receive_gossip_optimization_grafts_shorter_path() {
+    fn handle_gossip_optimization_grafts_shorter_path() {
         let mut s = state();
         let mut rt = AccumulatingRuntime::default();
         // optimization_threshold = 3
 
         // Peer 5 tells us about msg(42) via IHave at round 1
-        s.receive_ihave(
+        s.handle_ihave(
             IHaveMsg {
                 sender: 5,
                 digests: vec![IHaveDigest {
@@ -901,7 +1018,7 @@ mod tests {
 
         // Now the GOSSIP arrives from peer 1 at round 10 (1 + 3 < 10)
         s.peer_up(1);
-        s.receive_gossip(
+        s.handle_gossip(
             GossipMsg {
                 id: msg(42),
                 round: 10,
@@ -931,12 +1048,12 @@ mod tests {
     }
 
     #[test]
-    fn receive_gossip_no_optimization_when_round_close() {
+    fn handle_gossip_no_optimization_when_round_close() {
         let mut s = state();
         let mut rt = AccumulatingRuntime::default();
 
         // IHave at round 5, GOSSIP arrives at round 7 (5 + 3 = 8 > 7, no graft)
-        s.receive_ihave(
+        s.handle_ihave(
             IHaveMsg {
                 sender: 5,
                 digests: vec![IHaveDigest {
@@ -948,7 +1065,7 @@ mod tests {
         );
         rt.sent.clear();
 
-        s.receive_gossip(
+        s.handle_gossip(
             GossipMsg {
                 id: msg(1),
                 round: 7,
@@ -971,15 +1088,15 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // receive_ihave
+    // handle_ihave
     // -----------------------------------------------------------------------
 
     #[test]
-    fn receive_ihave_schedules_timer() {
+    fn handle_ihave_schedules_timer() {
         let mut s = state();
         let mut rt = AccumulatingRuntime::default();
 
-        s.receive_ihave(
+        s.handle_ihave(
             IHaveMsg {
                 sender: 5,
                 digests: vec![
@@ -1003,13 +1120,13 @@ mod tests {
     }
 
     #[test]
-    fn receive_ihave_skips_already_received() {
+    fn handle_ihave_skips_already_received() {
         let mut s = state();
         let mut rt = AccumulatingRuntime::default();
 
         s.received.insert(msg(1), 0);
 
-        s.receive_ihave(
+        s.handle_ihave(
             IHaveMsg {
                 sender: 5,
                 digests: vec![IHaveDigest {
@@ -1025,11 +1142,11 @@ mod tests {
     }
 
     #[test]
-    fn receive_ihave_skips_already_missing() {
+    fn handle_ihave_skips_already_missing() {
         let mut s = state();
         let mut rt = AccumulatingRuntime::default();
 
-        s.receive_ihave(
+        s.handle_ihave(
             IHaveMsg {
                 sender: 5,
                 digests: vec![IHaveDigest {
@@ -1042,7 +1159,7 @@ mod tests {
         assert_eq!(rt.scheduled.len(), 1);
 
         // Second IHave for the same id from a different peer
-        s.receive_ihave(
+        s.handle_ihave(
             IHaveMsg {
                 sender: 6,
                 digests: vec![IHaveDigest {
@@ -1058,11 +1175,11 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // receive_graft
+    // handle_graft
     // -----------------------------------------------------------------------
 
     #[test]
-    fn receive_graft_sends_cached_payload() {
+    fn handle_graft_sends_cached_payload() {
         let mut s = state();
         let mut rt = AccumulatingRuntime::default();
 
@@ -1071,7 +1188,7 @@ mod tests {
         rt.sent.clear();
 
         // Peer 5 sends GRAFT
-        s.receive_graft(
+        s.handle_graft(
             GraftMsg {
                 sender: 5,
                 id: msg(1),
@@ -1092,11 +1209,11 @@ mod tests {
     }
 
     #[test]
-    fn receive_graft_notifies_when_not_cached() {
+    fn handle_graft_notifies_when_not_cached() {
         let mut s = state();
         let mut rt = AccumulatingRuntime::default();
 
-        s.receive_graft(
+        s.handle_graft(
             GraftMsg {
                 sender: 5,
                 id: msg(999),
@@ -1122,16 +1239,16 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // receive_prune
+    // handle_prune
     // -----------------------------------------------------------------------
 
     #[test]
-    fn receive_prune_demotes_to_lazy() {
+    fn handle_prune_demotes_to_lazy() {
         let mut s = state();
         let mut rt = AccumulatingRuntime::default();
 
         s.peer_up(1); // eager
-        s.receive_prune(
+        s.handle_prune(
             PruneMsg {
                 sender: 1,
                 triggered_by: msg(1),
@@ -1152,7 +1269,7 @@ mod tests {
         let mut s = state();
         let mut rt = AccumulatingRuntime::default();
 
-        s.receive_ihave(
+        s.handle_ihave(
             IHaveMsg {
                 sender: 5,
                 digests: vec![IHaveDigest {
@@ -1187,7 +1304,7 @@ mod tests {
         let mut s = state();
         let mut rt = AccumulatingRuntime::default();
 
-        s.receive_ihave(
+        s.handle_ihave(
             IHaveMsg {
                 sender: 5,
                 digests: vec![IHaveDigest {
@@ -1199,7 +1316,7 @@ mod tests {
         );
 
         // GOSSIP arrives before timer fires, removing from missing
-        s.receive_gossip(
+        s.handle_gossip(
             GossipMsg {
                 id: msg(1),
                 round: 0,
@@ -1271,10 +1388,10 @@ mod tests {
         s.peer_up(2); // eager (full)
         s.lazy_peers.insert(3);
 
-        // receive_prune will try move_to_lazy then receive_gossip tries
+        // handle_prune will try move_to_lazy then handle_gossip tries
         // move_to_eager for the sender. Let's test directly via a gossip
         // from peer 3 — it will try to promote 3 to eager but can't.
-        s.receive_gossip(
+        s.handle_gossip(
             GossipMsg {
                 id: msg(1),
                 round: 0,
@@ -1304,7 +1421,7 @@ mod tests {
 
         // Duplicate gossip from peer 2 → should try to demote 2 to lazy
         s.received.insert(msg(1), 0);
-        s.receive_gossip(
+        s.handle_gossip(
             GossipMsg {
                 id: msg(1),
                 round: 0,
@@ -1314,9 +1431,11 @@ mod tests {
             &mut rt,
         );
 
-        // Peer 2 removed from eager but lazy is full → dropped from overlay
+        // Peer 3 promoted from lazy to eager (replenish), making room for
+        // peer 2 in lazy.
         assert!(!s.eager_peers.contains(&2));
-        assert!(!s.lazy_peers.contains(&2));
+        assert!(s.eager_peers.contains(&3));
+        assert!(s.lazy_peers.contains(&2));
     }
 
     // -----------------------------------------------------------------------
@@ -1338,7 +1457,7 @@ mod tests {
         b.peer_up(3); // C
 
         // B receives GOSSIP from A
-        b.receive_gossip(
+        b.handle_gossip(
             GossipMsg {
                 id: msg(1),
                 round: 0,
@@ -1351,7 +1470,7 @@ mod tests {
         rt_b.sent.clear();
 
         // B receives duplicate from C → sends PRUNE to C
-        b.receive_gossip(
+        b.handle_gossip(
             GossipMsg {
                 id: msg(1),
                 round: 1,
@@ -1369,7 +1488,7 @@ mod tests {
 
         // Now C ticks and sends IHave for msg(2) to B (lazy peer)
         // Simulated: B receives the IHave
-        b.receive_ihave(
+        b.handle_ihave(
             IHaveMsg {
                 sender: 3,
                 digests: vec![IHaveDigest {
@@ -1434,7 +1553,7 @@ mod tests {
         rt.notifications.clear();
 
         // GRAFT for evicted msg(1)
-        s.receive_graft(
+        s.handle_graft(
             GraftMsg {
                 sender: 5,
                 id: msg(1),

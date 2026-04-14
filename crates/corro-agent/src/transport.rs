@@ -577,7 +577,7 @@ fn test_conn(conn: &Connection) -> bool {
 impl TransportExt for Transport {
     #[tracing::instrument(skip(self, data), fields(buf_size = data.len()), level = "debug", err)]
     async fn send_datagram(&self, addr: SocketAddr, data: Bytes) -> Result<(), TransportError> {
-        let conn = self.connect(addr).await?;
+        let conn = self.connect(addr, TrafficClass::Foca).await?;
         debug!("connected to {addr}");
 
         match conn.send_datagram(data.clone()) {
@@ -597,14 +597,15 @@ impl TransportExt for Transport {
             }
         }
 
-        let conn = self.connect(addr).await?;
+        let conn = self.connect(addr, TrafficClass::Foca).await?;
         debug!("re-connected to {addr}");
         Ok(conn.send_datagram(data)?)
     }
 
     #[tracing::instrument(skip(self, data), fields(buf_size = data.len()), level = "debug", err)]
     async fn send_uni(&self, addr: SocketAddr, data: Bytes) -> Result<(), TransportError> {
-        let conn = self.connect(addr).await?;
+        let len = data.len();
+        let conn = self.connect(addr, TrafficClass::Broadcast).await?;
 
         let mut stream = match conn
             .open_uni()
@@ -617,7 +618,7 @@ impl TransportExt for Transport {
             }
             Err(e) => {
                 debug!("retryable error attempting to open unidirectional stream: {e}");
-                let conn = self.connect(addr).await?;
+                let conn = self.connect(addr, TrafficClass::Broadcast).await?;
                 conn.open_uni()
                     .instrument(debug_span!("quic_open_uni"))
                     .await?
@@ -631,8 +632,18 @@ impl TransportExt for Transport {
 
         stream
             .finish()
-            .instrument(debug_span!("quic_finish"))
+            .expect("unreachable, the stream does not leave this method");
+
+        stream
+            .stopped()
+            .instrument(debug_span!("quic_stopped"))
             .await?;
+
+        counter!(
+            "corro.transport.tx.bytes.v2.total",
+            "traffic" => TrafficClass::Broadcast.as_str()
+        )
+        .increment(len as u64);
 
         Ok(())
     }

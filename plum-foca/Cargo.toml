@@ -5,10 +5,13 @@ edition = "2024"
 
 [features]
 speedy = ["dep:speedy"]
+tracing = ["dep:tracing"]
 
 [dependencies]
+indexmap = { workspace = true }
 serde = { workspace = true }
 speedy = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }
 
 [lints]
 workspace = true

@@ -16,8 +16,7 @@ use crate::{
         SyncClientError, ANNOUNCE_INTERVAL,
     },
     api::peer::parallel_sync,
-    broadcast::PlumtreeInput,
-    transport::{Transport, TransportExt},
+    transport::Transport,
 };
 use antithesis_sdk::{assert_always, assert_sometimes};
 use camino::Utf8Path;
@@ -25,8 +24,8 @@ use corro_types::{
     actor::{Actor, ActorId},
     agent::{Agent, Bookie, SplitPool},
     base::CrsqlSeq,
-    broadcast::{BroadcastInput, BroadcastV1, ChangeSource, ChangeV1, FocaInput},
-    channel::{CorroReceiver, CorroSender},
+    broadcast::{BroadcastInput, BroadcastV1, ChangeSource, ChangeV1, FocaInput, PlumtreeInput},
+    channel::CorroReceiver,
     members::MemberAddedResult,
     sqlite::log_slow_inflight_queries,
     sync::generate_sync,
@@ -58,7 +57,6 @@ pub fn spawn_gossipserver_handler(
     bookie: &Bookie,
     tripwire: &Tripwire,
     gossip_server_endpoint: quinn::Endpoint,
-    tx_plumtree: CorroSender<PlumtreeInput>,
 ) {
     spawn_counted({
         let agent = agent.clone();
@@ -77,13 +75,7 @@ pub fn spawn_gossipserver_handler(
                 };
 
                 // Spawn incoming connection handlers
-                spawn_incoming_connection_handlers(
-                    &agent,
-                    &bookie,
-                    &tripwire,
-                    incoming,
-                    tx_plumtree.clone(),
-                );
+                spawn_incoming_connection_handlers(&agent, &bookie, &tripwire, incoming);
             }
 
             // graceful shutdown
@@ -117,8 +109,7 @@ pub fn spawn_incoming_connection_handlers(
     agent: &Agent,
     bookie: &Bookie,
     tripwire: &Tripwire,
-    connecting: quinn::Connecting,
-    tx_plumtree: CorroSender<PlumtreeInput>,
+    connecting: quinn::Incoming,
 ) {
     let agent = agent.clone();
     let bookie = bookie.clone();
@@ -147,7 +138,7 @@ pub fn spawn_incoming_connection_handlers(
             &conn,
             agent.cluster_id(),
             agent.tx_changes().clone(),
-            tx_plumtree,
+            agent.tx_plumtree().clone(),
         );
         bi::spawn_bipayload_handler(&agent, &bookie, &tripwire, &conn);
     });
@@ -336,7 +327,6 @@ pub async fn handle_gossip_to_send(
 pub async fn handle_notifications(
     agent: Agent,
     mut notification_rx: CorroReceiver<OwnedNotification<Actor>>,
-    tx_plumtree: CorroSender<PlumtreeInput>,
     mut tripwire: Tripwire,
 ) {
     while let Outcome::Completed(Some(notification)) =
@@ -374,7 +364,10 @@ pub async fn handle_notifications(
                             }
                         }
 
-                        if let Err(e) = tx_plumtree.send(PlumtreeInput::MemberUp(actor.id())).await
+                        if let Err(e) = agent
+                            .tx_plumtree()
+                            .send(PlumtreeInput::MemberUp(actor.id()))
+                            .await
                         {
                             error!("could not forward MemberUp to plumtree: {e}");
                         }
@@ -419,7 +412,8 @@ pub async fn handle_notifications(
                         }
                     }
 
-                    if let Err(e) = tx_plumtree
+                    if let Err(e) = agent
+                        .tx_plumtree()
                         .send(PlumtreeInput::MemberDown(actor.id()))
                         .await
                     {

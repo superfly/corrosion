@@ -1,6 +1,8 @@
 use corro_types::{
     actor::ClusterId,
-    broadcast::{BroadcastV1, ChangeSource, ChangeV1, UniPayload, UniPayloadV1},
+    broadcast::{
+        BroadcastV1, ChangeSource, ChangeV1, PlumtreeInput, PlumtreeMsg, UniPayload, UniPayloadV1,
+    },
     channel::CorroSender,
 };
 use metrics::counter;
@@ -9,8 +11,6 @@ use tokio_stream::StreamExt;
 use tokio_util::codec::{FramedRead, LengthDelimitedCodec};
 use tracing::{debug, error, trace};
 use tripwire::Tripwire;
-
-use crate::broadcast::PlumtreeInput;
 
 /// Spawn a task that accepts unidirectional broadcast streams, then
 /// spawns another task for each incoming stream to handle.
@@ -82,7 +82,10 @@ pub fn spawn_unipayload_handler(
                                                     changes.push((change, ChangeSource::Broadcast));
                                                 }
                                                 UniPayload::V1 {
-                                                    data: UniPayloadV1::PlumTree(wire_msg),
+                                                    data:
+                                                        UniPayloadV1::PlumTree(PlumtreeMsg::V1 {
+                                                            data: wire_msg,
+                                                        }),
                                                     cluster_id: payload_cluster_id,
                                                 } => {
                                                     if cluster_id != payload_cluster_id {
