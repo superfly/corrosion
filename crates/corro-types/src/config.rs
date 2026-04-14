@@ -364,6 +364,8 @@ fn default_as_true() -> bool {
 pub enum ConfigError {
     #[error(transparent)]
     Config(#[from] config::ConfigError),
+    #[error("gossip.max_mtu value {value} is below the QUIC minimum of 1200 (RFC 9000)")]
+    InvalidMaxMtu { value: u16 },
 }
 
 impl Config {
@@ -378,7 +380,17 @@ impl Config {
             .add_source(config::File::new(config_path, config::FileFormat::Toml))
             .add_source(config::Environment::default().separator("__"))
             .build()?;
-        Ok(config.try_deserialize()?)
+        let cfg: Self = config.try_deserialize()?;
+        cfg.validate()?;
+        Ok(cfg)
+    }
+    fn validate(&self) -> Result<(), ConfigError> {
+        if let Some(mtu) = self.gossip.max_mtu {
+            if mtu < 1200 {
+                return Err(ConfigError::InvalidMaxMtu { value: mtu });
+            }
+        }
+        Ok(())
     }
 }
 
@@ -400,6 +412,8 @@ pub struct ConfigBuilder {
     tls: Option<TlsConfig>,
     perf: Option<PerfConfig>,
     member_id: Option<MemberId>,
+    max_mtu: Option<u16>,
+    disable_gso: bool,
 }
 
 impl ConfigBuilder {
@@ -473,6 +487,18 @@ impl ConfigBuilder {
         self
     }
 
+    /// Set the maximum MTU for the QUIC gossip transport.
+    pub fn max_mtu(mut self, mtu: u16) -> Self {
+        self.max_mtu = Some(mtu);
+        self
+    }
+
+    /// Disable Generic Segmentation Offload (GSO) for the QUIC gossip transport.
+    pub fn disable_gso(mut self, disable: bool) -> Self {
+        self.disable_gso = disable;
+        self
+    }
+
     pub fn build(self) -> Result<Config, ConfigBuilderError> {
         let db_path = self.db_path.ok_or(ConfigBuilderError::DbPathRequired)?;
 
@@ -510,8 +536,8 @@ impl ConfigBuilder {
                 plaintext: self.tls.is_none(),
                 tls: self.tls,
                 idle_timeout_secs: default_gossip_idle_timeout(),
-                max_mtu: None, // TODO: add a builder function for it
-                disable_gso: false,
+                max_mtu: self.max_mtu,
+                disable_gso: self.disable_gso,
                 member_id: self.member_id,
             },
             perf: self.perf.unwrap_or_default(),
