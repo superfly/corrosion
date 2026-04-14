@@ -381,7 +381,7 @@ impl Config {
             .add_source(config::Environment::default().separator("__"))
             .build()?;
         let cfg: Self = config.try_deserialize()?;
-        cfg.validate()?;   
+        cfg.validate()?;
         Ok(cfg)
     }
     fn validate(&self) -> Result<(), ConfigError> {
