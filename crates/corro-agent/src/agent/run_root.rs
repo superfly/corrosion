@@ -1,6 +1,9 @@
 //! Start the root agent tasks
 
-use std::time::Instant;
+use std::{
+    sync::{atomic::AtomicU64, Arc},
+    time::Instant,
+};
 
 use crate::api::public::execute_schema;
 use crate::{
@@ -58,7 +61,6 @@ async fn run(
         rx_clear_buf,
         rx_changes,
         rx_foca,
-        tx_plumtree,
         rx_plumtree,
         subs_manager,
         subs_bcast_cache,
@@ -153,7 +155,6 @@ async fn run(
     spawn_counted(handlers::handle_notifications(
         agent.clone(),
         notifications_rx,
-        tx_plumtree.clone(),
         tripwire.clone(),
     ));
 
@@ -219,19 +220,19 @@ async fn run(
             rx_plumtree,
             agent.tx_changes().clone(),
             tripwire.clone(),
+            Arc::new((
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+            )),
         )
         .inspect(|_| info!("plumtree loop is done")),
     );
 
     //// Start an incoming (corrosion) connection handler.  This
     //// future tree spawns additional message type sub-handlers
-    handlers::spawn_gossipserver_handler(
-        &agent,
-        &bookie,
-        &tripwire,
-        gossip_server_endpoint,
-        tx_plumtree.clone(),
-    );
+    handlers::spawn_gossipserver_handler(&agent, &bookie, &tripwire, gossip_server_endpoint);
 
     let changes_handle = spawn_counted(
         handlers::handle_changes(agent.clone(), bookie.clone(), rx_changes, tripwire.clone())
