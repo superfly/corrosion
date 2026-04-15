@@ -30,6 +30,7 @@ use tokio::{
     task::{block_in_place, JoinSet, LocalSet},
     time::interval,
 };
+use rand::seq::{IndexedRandom, SliceRandom};
 use tokio_stream::StreamExt;
 use tokio_util::codec::{Encoder, LengthDelimitedCodec};
 use tracing::{debug, error, log::info, trace, warn};
@@ -1226,8 +1227,9 @@ pub async fn plumtree_loop<T: TransportExt + Clone + Send + 'static>(
         ihave_timeout: Duration::from_millis(500),
         optimization_threshold: 5,
         max_cached_payloads: 4096,
-        max_eager: 3,
-        max_lazy: 5,
+        max_eager: 5,
+        max_lazy: 10,
+        prune_threshold: 2,
     };
 
     let mut state: PlumtreeState<ChangeId, ChangeV1, ActorId> =
@@ -1235,10 +1237,12 @@ pub async fn plumtree_loop<T: TransportExt + Clone + Send + 'static>(
 
     // Seed eager set with current ring0 members
     {
-        let members = agent.members().read();
-        for (actor_id, _member) in members.states.iter() {
-            if *actor_id != agent.actor_id() {
-                state.peer_up(*actor_id);
+        let mut actors = agent.members().read().states.keys().cloned().collect::<Vec<_>>();
+        let mut rng = StdRng::from_os_rng();
+        actors.shuffle(&mut rng);
+        for actor_id in actors {
+            if actor_id != agent.actor_id() {
+                state.peer_up(actor_id);
             }
         }
         let (eager, lazy) = (state.eager_peers().len(), state.lazy_peers().len());
@@ -1721,8 +1725,8 @@ mod tests {
     async fn test_plumtree_broadcast_spread() -> eyre::Result<()> {
         let _ = tracing_subscriber::fmt::try_init();
         let (tripwire, _, _) = Tripwire::new_simple();
-        let num_nodes = 10;
-        let num_changes = 100;
+        let num_nodes = 100;
+        let num_changes = 2000;
         let transport = TestTransport::new();
         let config = Arc::new(RwLock::new(foca::Config::new_wan(
             num_nodes.try_into().unwrap(),
@@ -1763,6 +1767,7 @@ mod tests {
             max_cached_payloads: 4096,
             max_eager: 5,
             max_lazy: 10,
+            prune_threshold: 2,
         };
 
         let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
@@ -1794,17 +1799,14 @@ mod tests {
 
             // load up all the members into plumtree
             // println!("loading up members into plumtree");
-            let mut member_ids = members.states.keys().collect::<Vec<_>>();
-            member_ids.shuffle(&mut StdRng::from_os_rng());
-            for actor_id in member_ids {
-                if *actor_id != agent_clone.actor_id() {
-                    agent_clone
-                        .tx_plumtree()
-                        .send(PlumtreeInput::MemberUp(*actor_id))
-                        .await
-                        .ok();
-                }
-            }
+            // let mut member_ids = members.states.keys().collect::<Vec<_>>();
+            // member_ids.shuffle(&mut StdRng::from_os_rng());
+            // println!("local_id={:?} member up: {:?}", agent_clone.actor_id(), member_ids);
+            // for actor_id in member_ids {
+            //     if *actor_id != agent_clone.actor_id() {
+            //         agent_clone.tx_plumtree().send(PlumtreeInput::MemberUp(*actor_id)).await.ok();
+            //     }
+            // }
             // println!("done loading up members into plumtree");
 
             let cancel_clone = cancel.clone();
@@ -1840,7 +1842,8 @@ mod tests {
 
             // let agent_clone: Agent = agent.clone();
             join_set.spawn(async move {
-                let mut seen_map = HashSet::new();
+                let actor_id = agent.actor_id();
+                let mut seen_map: RangeInclusiveSet<CrsqlDbVersion> = RangeInclusiveSet::new();
                 let mut duplicate = 0;
                 loop {
                     tokio::select! {
@@ -1855,9 +1858,11 @@ mod tests {
                                     },
                                     ChangeSource::Broadcast,
                                 ) => {
-                                    if !seen_map.insert(changeset.versions().start()) {
+                                    if seen_map.contains(&changeset.versions().start()) {
                                         duplicate += 1;
+                                        continue;
                                     }
+                                    seen_map.insert(changeset.versions().start()..=changeset.versions().end());
                                 }
                                 _ => {
                                     warn!("unexpected change source: {:?}", changes);
@@ -1867,35 +1872,39 @@ mod tests {
                     }
                 }
 
-                return (duplicate, seen_map);
+                return (actor_id, duplicate, seen_map);
             });
         }
 
         println!("done spawning processing threads");
         let mut rng = StdRng::from_os_rng();
         let chunk_size = 10u64;
-        let chunk_pause = Duration::from_millis(500);
+        let chunk_pause = Duration::from_millis(1000);
+        let mut all_changes = Vec::new();
         for chunk_start in (0..num_changes).step_by(chunk_size as usize) {
             let chunk_end = (chunk_start + chunk_size).min(num_changes);
             for i in chunk_start..chunk_end {
                 let (actor_id, tx_plumtree) = send_tas.choose(&mut rng).unwrap();
-                tx_plumtree
-                    .send(PlumtreeInput::Broadcast(BroadcastV1::Change(ChangeV1 {
-                        actor_id: *actor_id,
-                        changeset: Changeset::Full {
-                            version: CrsqlDbVersion(i),
-                            changes: vec![],
-                            seqs: dbsr!(0, 0),
-                            last_seq: CrsqlSeq(0),
-                            ts: Default::default(),
-                        },
-                    })))
-                    .await
-                    .unwrap();
+                let change = ChangeV1 {
+                    actor_id: *actor_id,
+                    changeset: Changeset::Full {
+                        version: CrsqlDbVersion(i),
+                        changes: vec![],
+                        seqs: dbsr!(0, 0),
+                        last_seq: CrsqlSeq(0),
+                        ts: Default::default(),
+                    },
+                };
+                all_changes.push(change.clone());
+                tx_plumtree.send(PlumtreeInput::Broadcast(BroadcastV1::Change(change))).await.unwrap();
             }
 
             if chunk_end < num_changes {
-                tokio::time::sleep(chunk_pause).await;
+                // if chunk_start ==  {
+                //     tokio::time::sleep(Duration::from_secs(1)).await;
+                // } else {
+                    tokio::time::sleep(chunk_pause).await;
+                // }
             }
         }
 
@@ -1912,12 +1921,16 @@ mod tests {
 
         let results = join_set.join_all().await;
 
+
+        let mut total_map = results.into_iter().map(|(actor_id, duplicate, seen_map)| (actor_id, (duplicate, seen_map))).collect::<HashMap<_, _>>();
+        for change in all_changes {
+            let (_, seen_map) = total_map.entry(change.actor_id).or_insert((0, RangeInclusiveSet::new()));
+            seen_map.insert(change.changeset.versions().start()..=change.changeset.versions().end());
+        }
+
         let total_expected = num_nodes as u64 * num_changes;
-        let total_seen: u64 = results
-            .iter()
-            .map(|(_, seen_map)| seen_map.len() as u64)
-            .sum();
-        let extra_recvs: u64 = results.iter().map(|(duplicate, _)| *duplicate as u64).sum();
+        let total_seen: u64 = total_map.values().map(|(_, seen_map)| seen_map.iter().map(|v| v.end().0 - v.start().0 + 1).sum::<u64>() as u64).sum();
+        let extra_recvs: u64 = total_map.values().map(|(duplicate, _)| *duplicate as u64).sum();
 
         let (total_gossip, total_ihave, total_graft, total_prune) = plum_stats.iter().fold(
             (0, 0, 0, 0),
@@ -1940,6 +1953,11 @@ mod tests {
         println!("--- Plumtree spread results (async) ---");
         println!("nodes: {num_nodes}, changes: {num_changes}");
         println!();
+
+        for (actor_id, (duplicate, seen_map)) in total_map {
+            println!("actor_id: {actor_id}, duplicate: {duplicate}, seen: {seen_map:?}");
+        }
+
         println!("delivery: {total_seen} / {total_expected}");
         println!(
             "delivery %: {:.2}",

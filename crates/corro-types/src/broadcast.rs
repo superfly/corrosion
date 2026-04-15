@@ -23,6 +23,7 @@ use tokio::{
 };
 use tracing::{debug, error, trace};
 use uhlc::NTP64;
+use plum_foca::Payload;
 
 use crate::{
     actor::{Actor, ActorId, ClusterId},
@@ -164,6 +165,13 @@ pub enum ChangeSource {
 pub struct ChangeV1 {
     pub actor_id: ActorId,
     pub changeset: Changeset,
+}
+
+impl Payload for ChangeV1 {
+    type Node = ActorId;
+    fn node_id(&self) -> Self::Node {
+        self.actor_id
+    }
 }
 
 impl Deref for ChangeV1 {
