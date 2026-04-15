@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Debug;
 use std::hash::Hash;
 use std::time::Duration;
+use indexmap::IndexSet;
 
 #[cfg(feature = "tracing")]
 use tracing::{debug, trace};
@@ -56,6 +57,8 @@ pub struct Config {
     /// Maximum number of lazy peers. Peers beyond this limit are not
     /// tracked. Recommended: 2 * max_eager.
     pub max_lazy: usize,
+    /// Maximum number of times a message can be received before being pruned.
+    pub prune_threshold: u32,
 }
 
 impl Default for Config {
@@ -66,6 +69,7 @@ impl Default for Config {
             max_cached_payloads: 8192,
             max_eager: 5,
             max_lazy: 10,
+            prune_threshold: 1,
         }
     }
 }
@@ -92,7 +96,7 @@ pub enum Notification<I: MessageId, N: NodeId> {
 
 /// Callback interface for I/O and scheduling. Passed by `&mut` reference
 /// to each protocol method — never stored on `PlumtreeState`.
-pub trait Runtime<I: MessageId, P: Payload, N: NodeId> {
+pub trait Runtime<I: MessageId, P: Payload<Node = N>, N: NodeId> {
     /// Send a protocol message to a specific peer.
     fn send(&mut self, to: N, msg: PlumtreeMsg<I, P, N>);
 
@@ -113,7 +117,7 @@ pub trait Runtime<I: MessageId, P: Payload, N: NodeId> {
 pub enum PlumtreeMsg<I, P, N>
 where
     I: MessageId,
-    P: Payload,
+    P: Payload<Node = N>,
     N: NodeId,
 {
     Gossip(GossipMsg<I, P, N>),
@@ -238,7 +242,7 @@ pub struct PlumtreeState<I: MessageId, P: Payload, N: NodeId> {
     config: Config,
     eager_peers: HashSet<N>,
     lazy_peers: IndexSet<N>,
-    received: HashMap<I, Round>,
+    received: HashMap<I, (Round, u32)>,
     lazy_queue: HashMap<N, Vec<IHaveDigest<I>>>,
     missing: HashMap<I, MissingEntry<N>>,
     cache: PayloadCache<I, P>,
@@ -327,24 +331,27 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId> PlumtreeSta
 
         let id = payload.message_id();
         if self.received.contains_key(&id) {
-            trace!(local = ?self.local_id, ?id, ?sender, "gossip dup → PRUNE sender");
-            rt.send(
-                sender.clone(),
-                PlumtreeMsg::Prune(PruneMsg {
-                    sender: self.local_id.clone(),
-                    triggered_by: id.clone(),
-                }),
-            );
-            self.move_to_lazy(&sender, rt);
+            let (_, count) = self.received.get_mut(&id).unwrap();
+            *count += 1;
+            if *count > self.config.prune_threshold {
+                trace!(?id, ?round, "local={:?} sender={:?} gossip dup → PRUNE sender", self.local_id, sender);
+                rt.send(
+                    sender.clone(),
+                    PlumtreeMsg::Prune(PruneMsg {
+                        sender: self.local_id.clone(),
+                        triggered_by: id.clone(),
+                    }),
+                );
+                self.move_to_lazy(&sender, rt);
+            }
             rt.notify(Notification::MessageAlreadyReceived(id));
             return;
         }
 
-        trace!(local = ?self.local_id, ?id, round, ?sender,
-               eager = self.eager_peers.len(), lazy = self.lazy_peers.len(),
-               "gossip NEW → deliver + forward");
+        trace!(?id, round, eager = self.eager_peers.len(), lazy = self.lazy_peers.len(),
+               "local={:?} sender={:?} gossip NEW → deliver + forward", self.local_id, sender);
 
-        self.received.insert(id.clone(), round);
+        self.received.insert(id.clone(), (round, 1));
         self.cache.insert(id.clone(), payload.clone(), round);
 
         rt.deliver(id.clone(), payload.clone(), sender.clone(), round);
@@ -352,7 +359,7 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId> PlumtreeSta
         let next_round = round + 1;
         let mut fwd_count = 0u32;
         for peer in &self.eager_peers {
-            if *peer == sender || *peer == self.local_id {
+            if *peer == sender || *peer == self.local_id || payload.node_id() == *peer {
                 continue;
             }
             rt.send(
@@ -366,7 +373,7 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId> PlumtreeSta
             );
             fwd_count += 1;
         }
-        trace!(local = ?self.local_id, ?id, fwd_count, "gossip forwarded");
+        trace!(?id, fwd_count, "local={:?} gossip forwarded", self.local_id);
 
         self.enqueue_ihave(id.clone(), round);
         self.move_to_eager(&sender, rt);
@@ -375,10 +382,10 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId> PlumtreeSta
             if entry.round + self.config.optimization_threshold < round
                 && entry.ihave_sender != sender
             {
-                debug!(local = ?self.local_id, ?id,
+                debug!(?id,
                        ihave_round = entry.round, gossip_round = round,
                        ihave_sender = ?entry.ihave_sender,
-                       "optimization → GRAFT shorter path");
+                       "local={:?} optimization → GRAFT shorter path", self.local_id);
                 rt.send(
                     entry.ihave_sender.clone(),
                     PlumtreeMsg::Graft(GraftMsg {
@@ -386,7 +393,7 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId> PlumtreeSta
                         id: id.clone(),
                         round: entry.round,
                     }),
-                );
+                );  
                 self.move_to_eager(&entry.ihave_sender, rt);
             }
         }
@@ -436,7 +443,7 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId> PlumtreeSta
         self.move_to_eager(&sender, rt);
 
         if let Some((payload, round)) = self.cache.get(&id).cloned() {
-            debug!(local = ?self.local_id, ?id, ?sender, "graft → sending cached payload");
+            debug!(?id, "local={:?} sender={:?} graft → sending cached payload", self.local_id, sender);
             rt.send(
                 sender,
                 PlumtreeMsg::Gossip(GossipMsg {
@@ -447,7 +454,7 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId> PlumtreeSta
                 }),
             );
         } else {
-            debug!(local = ?self.local_id, ?id, ?sender, cache_size = self.cache.entries.len(), "graft → NOT CACHED");
+            debug!(?id, cache_size = self.cache.entries.len(), "local={:?} sender={:?} graft → NOT CACHED", self.local_id, sender);
             rt.notify(Notification::PayloadNotCached(id));
         }
     }
@@ -467,14 +474,14 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId> PlumtreeSta
     /// eager peers (round 0), and enqueues IHave for lazy peers.
     pub fn broadcast(&mut self, id: I, payload: P, rt: &mut impl Runtime<I, P, N>) {
         if self.received.contains_key(&id) {
-            debug!(local = ?self.local_id, ?id, "broadcast skipped (already received)");
+            debug!(?id, "local={:?} broadcast skipped (already received)", self.local_id);
             return;
         }
 
-        debug!(local = ?self.local_id, ?id,
+        debug!(?id,
                eager = self.eager_peers.len(), lazy = self.lazy_peers.len(),
-               "broadcast originate");
-        self.received.insert(id.clone(), 0);
+               "local={:?} broadcast originate", self.local_id);
+        self.received.insert(id.clone(), (0, 1u32));
         self.cache.insert(id.clone(), payload.clone(), 0);
 
         for peer in &self.eager_peers {
@@ -503,7 +510,7 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId> PlumtreeSta
         match timer {
             Timer::IHaveTimeout(ref id) => {
                 if let Some(entry) = self.missing.remove(id) {
-                    debug!(local = ?self.local_id, ?id, sender = ?entry.ihave_sender, "IHave timeout → GRAFT");
+                    debug!(?id, "local={:?} send_to={:?} IHave timeout → GRAFT", self.local_id, entry.ihave_sender);
                     rt.send(
                         entry.ihave_sender.clone(),
                         PlumtreeMsg::Graft(GraftMsg {
@@ -514,7 +521,7 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId> PlumtreeSta
                     );
                     self.move_to_eager(&entry.ihave_sender, rt);
                 } else {
-                    trace!(local = ?self.local_id, ?id, "IHave timeout → already received, noop");
+                    trace!(?id, "local={:?} IHave timeout → already received, noop", self.local_id);
                 }
             }
         }
@@ -566,23 +573,22 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId> PlumtreeSta
         self.eager_peers.insert(peer.clone());
         if self.lazy_peers.contains(peer) {
             self.lazy_peers.swap_remove(peer);
-            trace!(local = ?self.local_id, ?peer, eager = self.eager_peers.len(), "move_to_eager: promoted from lazy");
+            trace!(eager = self.eager_peers.len(), "local={:?} peer={:?} promoted from lazy", self.local_id, peer);
         } else {
-            trace!(local = ?self.local_id, ?peer, eager = self.eager_peers.len(), "move_to_eager: promoted");
+            trace!(eager = self.eager_peers.len(), "local={:?} peer={:?} promoted", self.local_id, peer);
         }
         rt.notify(Notification::PeerMovedToEager(peer.clone()));
     }
 
     fn move_to_lazy(&mut self, peer: &N, rt: &mut impl Runtime<I, P, N>) {
         if self.eager_peers.remove(peer) {
-            debug!(local = ?self.local_id, ?peer,
-                   eager = self.eager_peers.len(), lazy = self.lazy_peers.len(),
-                   "move_to_lazy: demoted, replenishing");
-            self.replenish_eager(rt);
+            debug!(eager = self.eager_peers.len(), lazy = self.lazy_peers.len(),
+                   "local={:?} peer={:?} demoted_to_lazy, replenishing", self.local_id, peer);
+            // self.replenish_eager(rt);
             if self.lazy_peers.len() < self.config.max_lazy {
                 self.lazy_peers.insert(peer.clone());
             } else {
-                debug!(local = ?self.local_id, ?peer, "move_to_lazy: lazy full, peer dropped from overlay");
+                debug!("local={:?} peer={:?} lazy full, peer dropped from overlay", self.local_id, peer);
             }
             rt.notify(Notification::PeerMovedToLazy(peer.clone()));
         }
@@ -593,15 +599,13 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId> PlumtreeSta
             let peer = match self.lazy_peers.iter().next() {
                 Some(p) => p.clone(),
                 None => {
-                    debug!(local = ?self.local_id,
-                           eager = self.eager_peers.len(), max = self.config.max_eager,
-                           "replenish_eager: no lazy peers left");
+                    debug!(eager = self.eager_peers.len(), max = self.config.max_eager,
+                           "local={:?} replenish_eager: no lazy peers left", self.local_id);
                     break;
                 }
             };
-            debug!(local = ?self.local_id, ?peer,
-                   eager = self.eager_peers.len() + 1, max = self.config.max_eager,
-                   "replenish_eager: promoting lazy → eager");
+            debug!(eager = self.eager_peers.len() + 1, max = self.config.max_eager,
+                   "local={:?} peer={:?} replenish_eager: promoting lazy → eager", self.local_id, peer);
             self.lazy_peers.swap_remove(&peer);
             self.eager_peers.insert(peer.clone());
             rt.notify(Notification::PeerMovedToEager(peer.clone()));
@@ -644,6 +648,7 @@ mod tests {
             max_cached_payloads: 128,
             max_eager: 5,
             max_lazy: 10,
+            prune_threshold: 1,
         }
     }
 
@@ -1124,7 +1129,7 @@ mod tests {
         let mut s = state();
         let mut rt = AccumulatingRuntime::default();
 
-        s.received.insert(msg(1), 0);
+        s.received.insert(msg(1), (0, 1u32));
 
         s.handle_ihave(
             IHaveMsg {
