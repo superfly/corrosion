@@ -737,7 +737,7 @@ pub async fn api_v1_table_stats(
             StatusCode::INTERNAL_SERVER_ERROR,
             axum::Json(TableStatResponse {
                 total_row_count: 0,
-                // Since we don't know what error occured or if any
+                // Since we don't know what error occurred or if any
                 // tables were valid, we just return an empty list
                 invalid_tables: vec![],
             }),
