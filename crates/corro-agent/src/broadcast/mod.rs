@@ -2,7 +2,7 @@ use std::{
     cmp,
     collections::{hash_map::Entry, HashMap, HashSet, VecDeque},
     net::SocketAddr,
-    num::NonZeroU32,
+    num::{NonZeroU32, NonZeroUsize},
     pin::Pin,
     sync::{
         atomic::{AtomicU32, Ordering},
@@ -136,7 +136,7 @@ pub fn runtime_loop(
     let max_mtu = agent.config().gossip.max_mtu;
     let config = Arc::new(RwLock::new(make_foca_config(
         1.try_into().unwrap(),
-        max_mtu,
+        agent.config().gossip.max_mtu,
     )));
 
     let mut foca = Foca::with_custom_broadcast(
@@ -255,7 +255,8 @@ pub fn runtime_loop(
 
                             if size != last_cluster_size {
                                 debug!("Adjusting cluster size to {size}");
-                                let new_config = make_foca_config(size, max_mtu);
+                                let new_config =
+                                    make_foca_config(size, agent.config().gossip.max_mtu);
                                 if let Err(e) = foca.set_config(new_config.clone()) {
                                     error!("foca set_config error: {e}");
                                 } else {
@@ -1020,19 +1021,16 @@ fn foca_state_is_active(state: &foca::State) -> bool {
     matches!(*state, foca::State::Alive | foca::State::Suspect)
 }
 
+const QUIC_SHORT_HEADER_OVERHEAD: u16 = 13;
+
 fn make_foca_config(cluster_size: NonZeroU32, max_mtu: Option<u16>) -> foca::Config {
     let mut config = foca::Config::new_wan(cluster_size);
     config.remove_down_after = Duration::from_secs(2 * 24 * 3600);
 
-    // Derive max packet size from configured MTU if available.
-    // Overhead: 40 bytes IPv6 + 8 bytes UDP + ~13 bytes QUIC short header,
-    // rounded up to 64 for safety. Falls back to a conservative 1178 if
-    // no MTU is configured
     config.max_packet_size = max_mtu
-        .map(|mtu| (mtu.saturating_sub(64)) as usize)
-        .unwrap_or(1178)
-        .try_into()
-        .unwrap();
+        .and_then(|mtu| mtu.checked_sub(QUIC_SHORT_HEADER_OVERHEAD))
+        .and_then(|size| NonZeroUsize::new(size as usize))
+        .unwrap_or_else(|| NonZeroUsize::new(1178).unwrap());
 
     config
 }
