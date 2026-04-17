@@ -136,7 +136,7 @@ pub fn runtime_loop(
     let max_mtu = agent.config().gossip.max_mtu;
     let config = Arc::new(RwLock::new(make_foca_config(
         1.try_into().unwrap(),
-        agent.config().gossip.max_mtu,
+        max_mtu,
     )));
 
     let mut foca = Foca::with_custom_broadcast(
@@ -256,7 +256,7 @@ pub fn runtime_loop(
                             if size != last_cluster_size {
                                 debug!("Adjusting cluster size to {size}");
                                 let new_config =
-                                    make_foca_config(size, agent.config().gossip.max_mtu);
+                                    make_foca_config(size, max_mtu);
                                 if let Err(e) = foca.set_config(new_config.clone()) {
                                     error!("foca set_config error: {e}");
                                 } else {
