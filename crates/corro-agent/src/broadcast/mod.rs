@@ -255,8 +255,7 @@ pub fn runtime_loop(
 
                             if size != last_cluster_size {
                                 debug!("Adjusting cluster size to {size}");
-                                let new_config =
-                                    make_foca_config(size, max_mtu);
+                                let new_config = make_foca_config(size, max_mtu);
                                 if let Err(e) = foca.set_config(new_config.clone()) {
                                     error!("foca set_config error: {e}");
                                 } else {
