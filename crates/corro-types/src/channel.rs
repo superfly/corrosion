@@ -9,7 +9,7 @@ use tokio::{
         error::{SendError, SendTimeoutError, TryRecvError, TrySendError},
         Receiver, Sender,
     },
-    time::sleep,
+    time::interval,
 };
 
 use crate::persistent_gauge;
@@ -72,14 +72,24 @@ pub fn bounded<T: Send + 'static>(
 
     let (tx, rx) = channel(capacity);
 
+    let threshold = (capacity as f64 * 0.9) as usize;
     let inner_channel = tx.clone();
     tokio::spawn(async move {
+        let mut ticks_since_report = 0;
+        let mut tick = interval(Duration::from_secs(1));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
-            sleep(Duration::from_secs(1)).await;
+            tick.tick().await;
             if inner_channel.is_closed() {
                 break;
             }
-            capacity_gauge.set(inner_channel.capacity() as f64);
+            let current = inner_channel.capacity();
+            if current < threshold || ticks_since_report >= 30 {
+                capacity_gauge.set(current as f64);
+                ticks_since_report = 0;
+            } else {
+                ticks_since_report += 1;
+            }
         }
     });
 
