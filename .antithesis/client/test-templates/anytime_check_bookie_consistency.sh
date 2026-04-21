@@ -15,6 +15,13 @@ else
     primary_bin="corrosion2"
 fi
 
+is_node_reachable() {
+    local bin="$1"
+    local config="$2"
+
+    "${bin}" -c "${config}" query "SELECT 1;" >/dev/null 2>&1
+}
+
 check_once() {
     local bin="$1"
     local config="$2"
@@ -25,6 +32,11 @@ check_once() {
 
     if [ ! -f "${config}" ]; then
         return 127
+    fi
+
+    if ! is_node_reachable "${bin}" "${config}"; then
+        echo "[bookie-check] node unreachable, skipping: ${bin} -c ${config}"
+        return 0
     fi
 
     local max_retries=6
