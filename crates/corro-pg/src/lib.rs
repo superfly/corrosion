@@ -2658,7 +2658,7 @@ fn send_ready(
     let ready_status = if session.tx_state.is_implicit() {
         let permits = session.tx_state.end(); // do this first, in case of failure
         if discard_until_sync {
-            // an error occured, rollback implicit tx!
+            // an error occurred, rollback implicit tx!
             warn!("receive Sync message w/ an error to send, rolling back implicit tx");
             session.conn.execute_batch("ROLLBACK")?;
         } else {

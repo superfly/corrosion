@@ -383,7 +383,7 @@ struct PooledClientInner {
     client: Option<CorrosionApiClient>,
     // Whether or not the chosen client has made a successful request
     had_success: bool,
-    // Time when the first fail occured after at least one successful call
+    // Time when the first fail occurred after at least one successful call
     first_fail_at: Option<Instant>,
     // Current client generation, incremented after each client change
     generation: u64,
