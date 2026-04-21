@@ -2,7 +2,7 @@ use std::{
     cmp,
     collections::{hash_map::Entry, HashMap, HashSet, VecDeque},
     net::SocketAddr,
-    num::NonZeroU32,
+    num::{NonZeroU32, NonZeroUsize},
     pin::Pin,
     sync::{
         atomic::{AtomicU32, Ordering},
@@ -133,7 +133,11 @@ pub fn runtime_loop(
     debug!("starting runtime loop for actor: {actor:?}");
     let rng = StdRng::from_os_rng();
 
-    let config = Arc::new(RwLock::new(make_foca_config(1.try_into().unwrap())));
+    let max_mtu = agent.config().gossip.max_mtu;
+    let config = Arc::new(RwLock::new(make_foca_config(
+        1.try_into().unwrap(),
+        max_mtu,
+    )));
 
     let mut foca = Foca::with_custom_broadcast(
         actor,
@@ -251,7 +255,7 @@ pub fn runtime_loop(
 
                             if size != last_cluster_size {
                                 debug!("Adjusting cluster size to {size}");
-                                let new_config = make_foca_config(size);
+                                let new_config = make_foca_config(size, max_mtu);
                                 if let Err(e) = foca.set_config(new_config.clone()) {
                                     error!("foca set_config error: {e}");
                                 } else {
@@ -1016,13 +1020,16 @@ fn foca_state_is_active(state: &foca::State) -> bool {
     matches!(*state, foca::State::Alive | foca::State::Suspect)
 }
 
-fn make_foca_config(cluster_size: NonZeroU32) -> foca::Config {
+const QUIC_SHORT_HEADER_OVERHEAD: u16 = 13;
+
+fn make_foca_config(cluster_size: NonZeroU32, max_mtu: Option<u16>) -> foca::Config {
     let mut config = foca::Config::new_wan(cluster_size);
     config.remove_down_after = Duration::from_secs(2 * 24 * 3600);
 
-    // max payload size for udp datagrams, use a safe value here...
-    // TODO: calculate from smallest max datagram size for all QUIC conns
-    config.max_packet_size = 1178.try_into().unwrap();
+    config.max_packet_size = max_mtu
+        .and_then(|mtu| mtu.checked_sub(QUIC_SHORT_HEADER_OVERHEAD))
+        .and_then(|size| NonZeroUsize::new(size as usize))
+        .unwrap_or_else(|| NonZeroUsize::new(1178).unwrap());
 
     config
 }
@@ -1181,7 +1188,7 @@ mod tests {
         let (tx_bcast, rx_bcast) = bounded(100, "bcast");
         let (tx_rtt, _) = mpsc::channel(100);
 
-        let config = Arc::new(RwLock::new(make_foca_config(1.try_into().unwrap())));
+        let config = Arc::new(RwLock::new(make_foca_config(1.try_into().unwrap(), None)));
         let transport = Transport::new(&ta1.config.gossip, tx_rtt).await?;
 
         let server_config = quinn_plaintext::server_config();
