@@ -18,9 +18,12 @@ use futures::{
     Future,
 };
 use governor::{Quota, RateLimiter};
+use indexmap::IndexMap;
 use metrics::{counter, gauge};
 use parking_lot::RwLock;
+use rand::seq::{IndexedRandom, SliceRandom};
 use rand::{rngs::StdRng, seq::IteratorRandom, SeedableRng};
+use rangemap::RangeInclusiveSet;
 use rusqlite::params;
 use spawn::spawn_counted;
 use speedy::Writable;
@@ -30,7 +33,6 @@ use tokio::{
     task::{block_in_place, JoinSet, LocalSet},
     time::interval,
 };
-use rand::seq::{IndexedRandom, SliceRandom};
 use tokio_stream::StreamExt;
 use tokio_util::codec::{Encoder, LengthDelimitedCodec};
 use tracing::{debug, error, log::info, trace, warn};
@@ -1123,8 +1125,138 @@ fn try_transmit_broadcast(
     }))
 }
 
-use corro_types::broadcast::{ChangeId, ChangeSource, ChangeV1, PlumtreeInput, PlumtreeMsgV1};
-use plum_foca::PlumtreeState;
+use corro_types::base::{CrsqlDbVersion, CrsqlSeq};
+use corro_types::broadcast::{
+    ChangeId, ChangeSource, ChangeV1, Changeset, ChangesetId, PlumtreeInput, PlumtreeMsgV1,
+};
+use plum_foca::{PlumtreeState, SeenStore};
+
+/// One row per `(actor_id, crsql_db_version)` — seq coverage optional (empty changesets).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct SeenKey {
+    actor_id: ActorId,
+    version: CrsqlDbVersion,
+}
+
+#[derive(Debug)]
+struct SeenEntry {
+    seq: Option<RangeInclusiveSet<CrsqlSeq>>,
+    round: plum_foca::Round,
+    dup_count: u32,
+}
+
+#[derive(Debug)]
+struct ChangeSeenStore {
+    entries: IndexMap<(ActorId, CrsqlDbVersion), SeenEntry>,
+    max_entries: Option<usize>,
+}
+
+impl ChangeSeenStore {
+    fn new(max_entries: Option<usize>) -> Self {
+        Self {
+            entries: IndexMap::new(),
+            max_entries,
+        }
+    }
+
+    fn evicht_if_needed(&mut self) {
+        if 
+    }
+}
+
+impl SeenStore<ChangeId> for ChangeSeenStore {
+    fn contains(&self, id: &ChangeId) -> bool {
+        let actor_id = id.actor_id;
+        match &id.changeset_id {
+            ChangesetId::Full {
+                version,
+                seqs,
+                last_seq,
+                ..
+            } => {
+                let entry = self.entries.get(&(actor_id, *version));
+                let Some(entry) = entry else {
+                    return false;
+                };
+                entry
+                    .seq
+                    .map(|range| {
+                        range.iter().any(|old_seq| {
+                            old_seq.start() <= seqs.start() && old_seq.end() >= seqs.end()
+                        })
+                    })
+                    .unwrap_or(false)
+            }
+            ChangesetId::Empty { versions, .. } => versions.iter().all(|version| {
+                self.entries
+                    .get(k)
+                    .map(|e| e.seq.is_none())
+                    .unwrap_or(false)
+            }),
+        }
+    }
+
+    fn observe(
+        &mut self,
+        id: ChangeId,
+        round: plum_foca::Round,
+    ) -> Option<u32> {
+        let actor_id = id.actor_id;
+        match &id.changeset_id {
+            ChangesetId::Full {
+                version,
+                seqs,
+                last_seq,
+            } => match self.entries.entry((actor_id, *version)) {
+                Entry::Vacant(e) => {
+                    self.evict_if_needed();
+                    e.insert(SeenEntry {
+                        seq: Some(seqs.clone()),
+                        round,
+                        dup_count: 0,
+                    });
+
+                    return None;
+                }
+                Entry::Occupied(e) => {
+                    let entry = e.get_mut();
+
+                    if entry.seq.is_none()
+                        || !entry.seq.unwrap().overlaps(&(seqs.start()..=seqs.end()))
+                    {
+                        return Some(entry.dup_count);
+                    }
+
+                    entry.seq.unwrap().extend(seqs.start()..=seqs.end());
+                    entry.round = cmp::max(entry.round, round);
+                    entry.dup_count += 1;
+                    SeenObserve::Duplicate {
+                        count: entry.dup_count,
+                    }
+                }
+            },
+            ChangesetId::Empty { versions } => {
+                for version in versions {
+                    let entry = self
+                        .entries
+                        .entry((actor_id, *version))
+                        .or_insert(SeenEntry {
+                            seq: None,
+                            round: round,
+                            dup_count: 0,
+                        });
+                    self.evict_if_needed();
+
+                    entry.round = cmp::max(entry.round, round);
+                    entry.dup_count += 1;
+                    SeenObserve::Duplicate {
+                        count: entry.dup_count,
+                    }
+                }
+            }
+        };
+    }
+}
 
 /// Implements `plum_foca::Runtime` for Corrosion, bridging the generic protocol
 /// to Corrosion's transport, change processing, and timer infrastructure.
@@ -1190,13 +1322,7 @@ impl<T: TransportExt + Clone + Send + 'static> plum_foca::Runtime<ChangeId, Chan
         });
     }
 
-    fn deliver(
-        &mut self,
-        _id: ChangeId,
-        payload: ChangeV1,
-        _sender: ActorId,
-        _round: plum_foca::Round,
-    ) {
+    fn deliver(&mut self, payload: ChangeV1) {
         let tx = self.tx_changes.clone();
         tokio::spawn(async move {
             if let Err(e) = tx.send((payload, ChangeSource::Broadcast)).await {
@@ -1230,14 +1356,22 @@ pub async fn plumtree_loop<T: TransportExt + Clone + Send + 'static>(
         max_eager: 5,
         max_lazy: 10,
         prune_threshold: 2,
+        max_received_entries: None,
     };
 
-    let mut state: PlumtreeState<ChangeId, ChangeV1, ActorId> =
-        PlumtreeState::new(agent.actor_id(), config);
+    let seen = ChangeSeenStore::new(config.max_received_entries);
+    let mut state: PlumtreeState<ChangeId, ChangeV1, ActorId, ChangeSeenStore> =
+        PlumtreeState::new_with_store(agent.actor_id(), config, seen);
 
     // Seed eager set with current ring0 members
     {
-        let mut actors = agent.members().read().states.keys().cloned().collect::<Vec<_>>();
+        let mut actors = agent
+            .members()
+            .read()
+            .states
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
         let mut rng = StdRng::from_os_rng();
         actors.shuffle(&mut rng);
         for actor_id in actors {
@@ -1328,7 +1462,7 @@ mod tests {
     use corro_tests::{launch_test_agent, test_config};
     use corro_types::{
         base::{dbsr, CrsqlDbVersion, CrsqlSeq},
-        broadcast::{BroadcastV1, ChangeV1, Changeset},
+        broadcast::{BroadcastV1, ChangeV1, Changeset, PlumtreeInput, PlumtreeMsg},
         members::Members,
     };
     // use plum_foca::PlumtreeMsg;
@@ -1524,9 +1658,7 @@ mod tests {
         async fn send_datagram(&self, addr: SocketAddr, data: Bytes) -> Result<(), TransportError> {
             let tx = self.nodes.write().get(&addr).unwrap().clone();
             tokio::spawn(async move {
-                tx.send(data)
-                    .await
-                    .map_err(|_| TransportError::SendError("channel closed".to_string()))
+                let _ = tx.send(data).await;
             });
             Ok(())
         }
@@ -1534,9 +1666,7 @@ mod tests {
         async fn send_uni(&self, addr: SocketAddr, data: Bytes) -> Result<(), TransportError> {
             let tx = self.nodes.write().get(&addr).unwrap().clone();
             tokio::spawn(async move {
-                tx.send(data)
-                    .await
-                    .map_err(|_| TransportError::SendError("channel closed".to_string()))
+                let _ = tx.send(data).await;
             });
             Ok(())
         }
@@ -1571,6 +1701,7 @@ mod tests {
                 agent.gossip_addr(),
                 agent.clock().new_timestamp().into(),
                 agent.cluster_id(),
+                None,
             ));
             tas.push(agent);
         }
@@ -1747,6 +1878,7 @@ mod tests {
                 agent.gossip_addr(),
                 agent.clock().new_timestamp().into(),
                 agent.cluster_id(),
+                None,
             ));
             plum_stats.insert(
                 agent.actor_id(),
@@ -1768,6 +1900,7 @@ mod tests {
             max_eager: 5,
             max_lazy: 10,
             prune_threshold: 2,
+            max_received_entries: None,
         };
 
         let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
@@ -1826,13 +1959,14 @@ mod tests {
                             while let Some(Ok(frame)) = framed.next().await {
                                 if let Ok(UniPayload::V1 {
                                     data: UniPayloadV1::PlumTree(msg),
-                                    cluster_id: cid,
+                                    ..
                                 }) = UniPayload::read_from_buffer(&frame)
                                 {
-                                    // if cid != cluster_id {
-                                    //     continue;
-                                    // }
-                                    tx_plumtree.send(PlumtreeInput::Wire(msg)).await.ok();
+                                    let PlumtreeMsg::V1 { data } = msg;
+                                    tx_plumtree
+                                        .send(PlumtreeInput::Wire(data))
+                                        .await
+                                        .ok();
                                 }
                             }
                         }
@@ -1896,14 +2030,17 @@ mod tests {
                     },
                 };
                 all_changes.push(change.clone());
-                tx_plumtree.send(PlumtreeInput::Broadcast(BroadcastV1::Change(change))).await.unwrap();
+                tx_plumtree
+                    .send(PlumtreeInput::Broadcast(change))
+                    .await
+                    .unwrap();
             }
 
             if chunk_end < num_changes {
                 // if chunk_start ==  {
                 //     tokio::time::sleep(Duration::from_secs(1)).await;
                 // } else {
-                    tokio::time::sleep(chunk_pause).await;
+                tokio::time::sleep(chunk_pause).await;
                 // }
             }
         }
@@ -1921,16 +2058,32 @@ mod tests {
 
         let results = join_set.join_all().await;
 
-
-        let mut total_map = results.into_iter().map(|(actor_id, duplicate, seen_map)| (actor_id, (duplicate, seen_map))).collect::<HashMap<_, _>>();
+        let mut total_map = results
+            .into_iter()
+            .map(|(actor_id, duplicate, seen_map)| (actor_id, (duplicate, seen_map)))
+            .collect::<HashMap<_, _>>();
         for change in all_changes {
-            let (_, seen_map) = total_map.entry(change.actor_id).or_insert((0, RangeInclusiveSet::new()));
-            seen_map.insert(change.changeset.versions().start()..=change.changeset.versions().end());
+            let (_, seen_map) = total_map
+                .entry(change.actor_id)
+                .or_insert((0, RangeInclusiveSet::new()));
+            seen_map
+                .insert(change.changeset.versions().start()..=change.changeset.versions().end());
         }
 
         let total_expected = num_nodes as u64 * num_changes;
-        let total_seen: u64 = total_map.values().map(|(_, seen_map)| seen_map.iter().map(|v| v.end().0 - v.start().0 + 1).sum::<u64>() as u64).sum();
-        let extra_recvs: u64 = total_map.values().map(|(duplicate, _)| *duplicate as u64).sum();
+        let total_seen: u64 = total_map
+            .values()
+            .map(|(_, seen_map)| {
+                seen_map
+                    .iter()
+                    .map(|v| v.end().0 - v.start().0 + 1)
+                    .sum::<u64>() as u64
+            })
+            .sum();
+        let extra_recvs: u64 = total_map
+            .values()
+            .map(|(duplicate, _)| *duplicate as u64)
+            .sum();
 
         let (total_gossip, total_ihave, total_graft, total_prune) = plum_stats.iter().fold(
             (0, 0, 0, 0),
