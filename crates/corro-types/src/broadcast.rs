@@ -10,6 +10,7 @@ use corro_base_types::{CrsqlDbVersionRange, CrsqlSeqRange};
 use foca::{Identity, Member, Notification, Runtime, Timer};
 use indexmap::{map::Entry, IndexMap};
 use metrics::counter;
+use plum_foca::Payload;
 use rusqlite::{
     types::{FromSql, FromSqlError},
     ToSql,
@@ -23,7 +24,6 @@ use tokio::{
 };
 use tracing::{debug, error, trace};
 use uhlc::NTP64;
-use plum_foca::Payload;
 
 use crate::{
     actor::{Actor, ActorId, ClusterId},
@@ -36,8 +36,6 @@ use crate::{
     sync::SyncTraceContextV1,
     updates::match_changes,
 };
-
-use plum_foca::Payload;
 
 #[derive(Debug, Clone, Readable, Writable)]
 pub enum UniPayload {
@@ -165,13 +163,6 @@ pub enum ChangeSource {
 pub struct ChangeV1 {
     pub actor_id: ActorId,
     pub changeset: Changeset,
-}
-
-impl Payload for ChangeV1 {
-    type Node = ActorId;
-    fn node_id(&self) -> Self::Node {
-        self.actor_id
-    }
 }
 
 impl Deref for ChangeV1 {
