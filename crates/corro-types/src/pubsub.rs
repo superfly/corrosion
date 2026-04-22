@@ -1123,9 +1123,9 @@ impl Matcher {
     }
 
     async fn cmd_loop(mut self, mut state_conn: CrConn, mut tripwire: Tripwire) {
-        const PROCESS_CHANGES_THRESHOLD: usize = 1000;
+        const PROCESS_CHANGES_THRESHOLD: usize = 10000;
         const PROCESSING_WARN_THRESHOLD: Duration = Duration::from_secs(5);
-        const PROCESS_BUFFER_DEADLINE: Duration = Duration::from_millis(600);
+        const PROCESS_BUFFER_DEADLINE: Duration = Duration::from_millis(5000);
 
         info!(sub_id = %self.id, "Starting loop to run the subscription");
         {

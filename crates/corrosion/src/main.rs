@@ -599,7 +599,8 @@ fn main() {
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
-        .worker_threads(8)
+        .worker_threads(4)
+        .max_blocking_threads(32)
         .build()
         .expect("could not build tokio runtime");
 
