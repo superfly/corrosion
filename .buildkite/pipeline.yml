@@ -30,4 +30,4 @@ steps:
     key: upload
     commands:
       - .buildkite/upload.sh
-    depends_on: [test, build]
+    depends_on: [build]
