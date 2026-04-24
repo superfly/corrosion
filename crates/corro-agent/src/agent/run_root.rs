@@ -1,9 +1,6 @@
 //! Start the root agent tasks
 
-use std::{
-    sync::{atomic::AtomicU64, Arc},
-    time::Instant,
-};
+use std::time::Instant;
 
 use crate::api::public::execute_schema;
 use crate::{
@@ -13,7 +10,8 @@ use crate::{
         reaper::spawn_reaper,
         setup, util, AgentOptions,
     },
-    broadcast::{plumtree_loop, runtime_loop},
+    broadcast::runtime_loop,
+    plumtree::plumtree_loop,
     transport::Transport,
 };
 
@@ -220,12 +218,6 @@ async fn run(
             rx_plumtree,
             agent.tx_changes().clone(),
             tripwire.clone(),
-            Arc::new((
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-            )),
         )
         .inspect(|_| info!("plumtree loop is done")),
     );
