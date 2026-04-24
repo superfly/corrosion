@@ -2,7 +2,6 @@
 members = [ ".antithesis/client/rust-load-generator",
 	"crates/*",
 	"integration-tests",
-	"plum-foca",
 ]
 resolver = "2"
 

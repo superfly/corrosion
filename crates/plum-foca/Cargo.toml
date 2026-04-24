@@ -3,15 +3,12 @@ name = "plum-foca"
 version = "0.1.0"
 edition = "2024"
 
-[features]
-speedy = ["dep:speedy"]
-tracing = ["dep:tracing"]
-
 [dependencies]
 indexmap = { workspace = true }
 serde = { workspace = true }
-speedy = { workspace = true, optional = true }
-tracing = { workspace = true, optional = true }
+speedy = { workspace = true }
+tracing = { workspace = true }
+rand = { workspace = true }
 
 [lints]
 workspace = true
