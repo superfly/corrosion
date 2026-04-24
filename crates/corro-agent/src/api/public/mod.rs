@@ -629,7 +629,22 @@ pub async fn api_v1_health(
 ) -> (StatusCode, axum::Json<HealthResponse>) {
     match check_health(&agent).await {
         Ok((gaps, members)) => {
-            let p99_lag = agent.metrics_tracker().quantile_lag(0.99).unwrap_or(0.0);
+            let status = query.failure_status.unwrap_or(503);
+            let error_status =
+                StatusCode::from_u16(status).unwrap_or(StatusCode::SERVICE_UNAVAILABLE);
+            let p99_lag = match agent.metrics_tracker().quantile_lag(0.99) {
+                Some(lag) => lag,
+                None => {
+                    error!("no p99 lag information available");
+                    return (
+                        error_status,
+                        axum::Json(HealthResponse::Error(
+                            "no p99 lag information available".into(),
+                        )),
+                    );
+                }
+            };
+
             let queue_size = agent.metrics_tracker().queue_size();
             let status = if query.gaps.is_some_and(|max| gaps > max)
                 || query.max_queue.is_some_and(|max| queue_size > max)
@@ -639,8 +654,7 @@ pub async fn api_v1_health(
                 || (query.p99_lag.is_some_and(|max| p99_lag > max)
                     && query.queue_size.is_none_or(|max| queue_size > max))
             {
-                let status = query.failure_status.unwrap_or(503);
-                StatusCode::from_u16(status).unwrap_or(StatusCode::SERVICE_UNAVAILABLE)
+                error_status
             } else {
                 StatusCode::OK
             };
