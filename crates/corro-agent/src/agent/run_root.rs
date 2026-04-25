@@ -11,7 +11,7 @@ use crate::{
         setup, util, AgentOptions,
     },
     broadcast::runtime_loop,
-    plumtree::plumtree_loop,
+    plumtree::spawn_plumtree_loop,
     transport::Transport,
 };
 
@@ -60,6 +60,7 @@ async fn run(
         rx_changes,
         rx_foca,
         rx_plumtree,
+        rx_plumtree_updates,
         subs_manager,
         subs_bcast_cache,
         updates_bcast_cache,
@@ -212,10 +213,11 @@ async fn run(
 
     //// Start the Plumtree broadcast tree loop
     spawn_counted(
-        plumtree_loop(
+        spawn_plumtree_loop(
             agent.clone(),
             transport.clone(),
             rx_plumtree,
+            rx_plumtree_updates,
             agent.tx_changes().clone(),
             tripwire.clone(),
         )

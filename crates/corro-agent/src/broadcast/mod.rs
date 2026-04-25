@@ -5,7 +5,7 @@ use std::{
     num::NonZeroU32,
     pin::Pin,
     sync::{
-        atomic::{AtomicU32, AtomicU64, Ordering},
+        atomic::{AtomicU32, Ordering},
         Arc,
     },
     time::{Duration, Instant},
