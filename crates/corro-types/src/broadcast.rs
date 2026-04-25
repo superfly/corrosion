@@ -1,6 +1,6 @@
 use std::{
-    cmp, collections::HashMap, fmt, io, num::NonZeroU32, num::ParseIntError, ops::Deref,
-    time::Duration,
+    cmp, collections::HashMap, fmt, io, net::SocketAddr, num::NonZeroU32, num::ParseIntError,
+    ops::Deref, time::Duration,
 };
 
 use antithesis_sdk::assert_sometimes;
@@ -130,12 +130,14 @@ pub enum AuthzV1 {
 pub enum PlumtreeInput {
     /// A wire message received from a remote peer (deserialized from uni-stream).
     Wire(PlumtreeMsgV1),
-    /// Foca membership: a new peer appeared.
-    MemberUp(ActorId),
-    /// Foca membership: a peer left.
-    MemberDown(ActorId),
     /// Application wants to originate a new broadcast.
     Broadcast(ChangeV1),
+}
+
+#[derive(Debug)]
+pub enum PlumtreeUpdates {
+    MemberUp { actor_id: ActorId, addr: SocketAddr },
+    MemberDown(ActorId),
 }
 
 #[derive(Clone, Debug, Readable, Writable)]
