@@ -97,8 +97,22 @@ pub async fn run(
 
     antithesis_init();
     send_systemd_ready();
-    tripwire_worker.await;
+
+    let fatal_shutdown = tokio::select! {
+        _ = tripwire_worker => false,
+        // Dropping tripwire_worker here closes the watch channel,
+        // tripping the tripwire for all agent tasks.
+        _ = agent.shutdown_token().cancelled() => true,
+    };
+
     send_systemd_stopping();
+
+    if fatal_shutdown {
+        if let Some(issue) = agent.fatal_issue() {
+            send_systemd_unhealthy(issue);
+            error!("fatal issue detected: {issue}, initiating shutdown");
+        }
+    }
 
     // wait for handles to finish
     for handle in handles {
@@ -110,6 +124,10 @@ pub async fn run(
     agent.subs_manager().drop_handles().await;
 
     wait_for_all_pending_handles().await;
+
+    if fatal_shutdown {
+        std::process::exit(1);
+    }
 
     Ok(())
 }
@@ -205,7 +223,7 @@ fn spawn_systemd_notifier_if_needed(tripwire: Tripwire) {
         .unwrap_or(Duration::ZERO)
         .is_zero()
     {
-        send_systemd_keepalives(tripwire.clone());
+        send_systemd_keepalives(tripwire);
     }
 }
 
@@ -250,6 +268,17 @@ fn send_systemd_stopping() {
     libsystemd::daemon::notify(false, &[libsystemd::daemon::NotifyState::Stopping]).unwrap();
 }
 
+#[cfg(target_os = "linux")]
+fn send_systemd_unhealthy(issue: &str) {
+    libsystemd::daemon::notify(
+        false,
+        &[libsystemd::daemon::NotifyState::Status(format!(
+            "unhealthy: {issue}"
+        ))],
+    )
+    .ok();
+}
+
 #[cfg(not(target_os = "linux"))]
 fn spawn_systemd_notifier_if_needed(_tripwire: Tripwire) {}
 
@@ -258,3 +287,6 @@ fn send_systemd_ready() {}
 
 #[cfg(not(target_os = "linux"))]
 fn send_systemd_stopping() {}
+
+#[cfg(not(target_os = "linux"))]
+fn send_systemd_unhealthy(_issue: &str) {}
