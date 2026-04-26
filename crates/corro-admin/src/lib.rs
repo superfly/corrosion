@@ -511,6 +511,7 @@ async fn handle_conn(
                                "id": k,
                                "hash": v.hash(),
                                 "sql": v.sql().lines().map(|c| c.trim()).collect::<Vec<_>>().join(" "),
+                                "ms_per_sec_cost": v.ms_per_sec(),
                             })
                         })
                         .collect::<Vec<_>>();
@@ -547,6 +548,7 @@ async fn handle_conn(
                                     "last_change_id": matcher.last_change_id_sent(),
                                     "original_query": matcher.sql().lines().map(|c| c.trim()).collect::<Vec<_>>().join(" "),
                                     "statements": statements,
+                                    "ms_per_sec_cost": matcher.ms_per_sec(),
                                 })),
                             )
                             .await;
