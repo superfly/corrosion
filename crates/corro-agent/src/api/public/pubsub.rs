@@ -12,6 +12,7 @@ use corro_types::{
     pubsub::{MatcherCreated, MatcherError, MatcherHandle, NormalizeStatementError, SubsManager},
     sqlite::SqlitePoolError,
 };
+use metrics::counter;
 use rusqlite::Connection;
 use serde::Deserialize;
 use tokio::{
@@ -42,6 +43,7 @@ pub async fn api_v1_sub_by_id(
     axum::extract::Path(id): axum::extract::Path<Uuid>,
     axum::extract::Query(params): axum::extract::Query<SubParams>,
 ) -> impl IntoResponse {
+    counter!("corro.api.subs.count", "protocol" => "http").increment(1);
     sub_by_id(agent.subs_manager(), id, params, &bcast_cache, tripwire).await
 }
 
@@ -682,6 +684,7 @@ pub async fn api_v1_subs(
     axum::extract::Query(params): axum::extract::Query<SubParams>,
     axum::extract::Json(stmt): axum::extract::Json<Statement>,
 ) -> impl IntoResponse {
+    counter!("corro.api.subs.count", "protocol" => "http").increment(1);
     let stmt = match expand_sql(&agent, &stmt).await {
         Ok(stmt) => stmt,
         Err(e) => return hyper::Response::from(e),
