@@ -1122,25 +1122,15 @@ fn try_transmit_broadcast(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::{setup, spawn_unipayload_handler};
-    use crate::transport::{TransportError, TransportExt};
-    use async_trait::async_trait;
-    use corro_tests::{launch_test_agent, test_config};
+    use crate::agent::spawn_unipayload_handler;
+    use crate::transport::TransportExt;
+    use corro_tests::launch_test_agent;
     use corro_types::{
         base::{dbsr, CrsqlDbVersion, CrsqlSeq},
-        broadcast::{BroadcastV1, ChangeV1, Changeset, PlumtreeInput, PlumtreeMsg},
-        members::Members,
+        broadcast::{BroadcastV1, ChangeV1, Changeset},
     };
     // use plum_foca::PlumtreeMsg;
-    use rand::seq::{IndexedRandom, SliceRandom};
-    use rangemap::RangeInclusiveSet;
-    use speedy::Readable;
     use std::collections::HashSet;
-    // use std::hash::Hash;
-    use std::sync::atomic::AtomicU64;
-    use tokio::task::JoinSet;
-    use tokio_util::codec::FramedRead;
-    use tokio_util::sync::CancellationToken;
     use uuid::Uuid;
 
     #[test]
