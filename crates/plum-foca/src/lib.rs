@@ -605,6 +605,7 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
         if peer == self.local_id || self.known_peers.contains(&peer) {
             return;
         }
+
         self.stats.peer_up += 1;
         self.known_peers.insert(peer);
         self.rebalance(rt);
@@ -635,8 +636,20 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
     /// 6. Lazy never exceeds max_lazy (insert_into_lazy handles eviction).
     /// 7. Stale peers no longer in known_peers are removed from eager/lazy.
     fn rebalance(&mut self, rt: &mut impl Runtime<I, P, N>) {
-        // 1. Recompute ring neighbors from scratch.
+        self.eager_peers.clear();
+        self.lazy_peers.clear();
+
+        // under 5? append all peers to eager
+        if self.known_peers.len() <= 5 {
+            self.eager_peers.extend(self.known_peers.iter().cloned());
+        }
+
+        // 1. Recompute ring neighbor.
         self.set_ring_neighbors();
+
+        self.eager_peers.extend(self.ring_locked.iter().cloned());
+
+        let remaining_eager = self.config.max_eager - self.eager_peers.len();
 
         // 2. Force ring-locked peers into eager.
         let must_eager: Vec<N> = self
@@ -645,84 +658,30 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
             .filter(|p| !self.eager_peers.contains(p))
             .cloned()
             .collect();
+
         for peer in must_eager {
             self.lazy_peers.swap_remove(&peer);
             self.eager_peers.insert(peer.clone());
             rt.notify(Notification::PeerMovedToEager(peer));
         }
 
-        // 3. Fill eager up to max_eager: prefer lazy peers, then known_peers.
-        while self.eager_peers.len() < self.config.max_eager {
-            let from_lazy = self
-                .lazy_peers
+        let mut remaining_peers = self
+            .known_peers
+            .iter()
+            .cloned()
+            .filter(|p| !self.eager_peers.contains(&p))
+            .collect::<Vec<_>>();
+        remaining_peers.shuffle(&mut rand::rng());
+
+        self.eager_peers
+            .extend(remaining_peers.iter().take(remaining_eager).cloned());
+        self.lazy_peers.extend(
+            remaining_peers
                 .iter()
-                .find(|p| !self.eager_peers.contains(*p))
-                .cloned();
-
-            if let Some(peer) = from_lazy {
-                self.lazy_peers.swap_remove(&peer);
-                self.eager_peers.insert(peer.clone());
-                rt.notify(Notification::PeerMovedToEager(peer));
-            } else {
-                let from_known = self
-                    .known_peers
-                    .iter()
-                    .find(|p| !self.eager_peers.contains(*p) && !self.lazy_peers.contains(*p))
-                    .cloned();
-
-                if let Some(peer) = from_known {
-                    self.eager_peers.insert(peer.clone());
-                    rt.notify(Notification::PeerMovedToEager(peer));
-                } else {
-                    break;
-                }
-            }
-        }
-
-        // 4. If eager is over max_eager (ring-locked peers can push it
-        //    above), demote random non-ring peers to lazy.
-        while self.eager_peers.len() > self.config.max_eager {
-            let demotable: Vec<N> = self
-                .eager_peers
-                .iter()
-                .filter(|p| !self.ring_locked.contains(*p))
-                .cloned()
-                .collect();
-
-            if let Some(victim) = demotable.choose(&mut rand::rng()) {
-                let victim = victim.clone();
-                self.eager_peers.remove(&victim);
-                self.insert_into_lazy(victim.clone());
-                rt.notify(Notification::PeerMovedToLazy(victim));
-            } else {
-                break;
-            }
-        }
-
-        // 5. If lazy is below min_lazy, fill from known_peers.
-        //    This guarantees a minimum IHave fanout so the GRAFT repair
-        //    mechanism can actually function.
-        if self.lazy_peers.len() < self.config.min_lazy {
-            let mut candidates: Vec<N> = self
-                .known_peers
-                .iter()
-                .filter(|p| !self.eager_peers.contains(*p) && !self.lazy_peers.contains(*p))
-                .cloned()
-                .collect();
-
-            candidates.shuffle(&mut rand::rng());
-
-            let need = self.config.min_lazy - self.lazy_peers.len();
-            for peer in candidates.into_iter().take(need) {
-                // Direct insert: we're below min, so definitely below max.
-                self.lazy_peers.insert(peer);
-            }
-        }
-
-        // 6. Remove stale peers from eager/lazy that left known_peers
-        //    (e.g. after peer_down removed them).
-        self.eager_peers.retain(|p| self.known_peers.contains(p));
-        self.lazy_peers.retain(|p| self.known_peers.contains(p));
+                .skip(remaining_eager)
+                .take(self.config.min_lazy)
+                .cloned(),
+        );
 
         trace!(
             local = ?self.local_id,
@@ -733,6 +692,34 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
             "rebalance complete"
         );
     }
+
+    // fn maintain_eager_lazy_peers(&mut self, rt: &mut impl Runtime<I, P, N>, rtt_scorer: impl Fn() -> HashMap<N, u64>) {
+    //     // we only want to do this if things are not in the desired state
+    //     if self.eager_peers.len() <= self.config.max_eager
+    //         && self.lazy_peers.len() >= self.config.min_lazy
+    //         && self.lazy_peers.len() <= self.config.max_lazy
+    //     {
+    //         return;
+    //     }
+
+    //     // ensure ring neighbors are in eager
+    //     let ring_locked = self.ring_locked.iter().cloned().collect::<Vec<_>>();
+    //     for peer in ring_locked {
+    //         self.move_to_eager(&peer, rt);
+    //     }
+
+    //     let rtt_scores = rtt_scorer();
+    //     if self.eager_peers.len() < self.config.max_eager {
+    //         // promote based  on ring data
+    //     }
+
+    //     // demote based on ring0 data
+
+    //     // promote based on ring0 data
+
+    //     // fix lazy
+
+    // }
 
     // --- Internal helpers ---
 
@@ -779,7 +766,7 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
     }
 
     fn move_to_eager(&mut self, peer: &N, rt: &mut impl Runtime<I, P, N>) {
-        if self.eager_peers.contains(peer) || self.eager_peers.len() >= self.config.max_eager {
+        if self.eager_peers.contains(peer) || (!self.ring_locked.contains(peer) && self.eager_peers.len() >= self.config.max_eager) {
             return;
         }
 

@@ -562,6 +562,7 @@ mod tests {
                     agent_clone.clone(),
                     transport_clone,
                     opts.rx_plumtree,
+                    opts.rx_plumtree_updates,
                     agent_clone.tx_changes().clone(),
                     config,
                     tripwire_clone,
