@@ -87,6 +87,19 @@ impl Members {
         }
     }
 
+    /// Rolling average RTT in milliseconds for this member (same weighting as
+    /// [`Self::recalculate_rings`]), or `None` if there are no samples yet.
+    pub fn avg_rtt_ms(&self, actor_id: &ActorId) -> Option<u64> {
+        let addr = self.states.get(actor_id)?.addr;
+        let rtt = self.rtts.get(&addr)?;
+        if rtt.buf.is_empty() {
+            return None;
+        }
+        let sum =
+            rtt.buf.as_slices().0.iter().sum::<u64>() + rtt.buf.as_slices().1.iter().sum::<u64>();
+        Some(sum / rtt.buf.len() as u64)
+    }
+
     // A result of `true` means that the effective list of
     // cluster member addresses has changed
     pub fn add_member(&mut self, actor: &Actor) -> MemberAddedResult {

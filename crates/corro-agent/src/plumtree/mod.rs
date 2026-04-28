@@ -3,7 +3,7 @@ use std::{cmp, collections::HashMap, net::SocketAddr, ops::RangeInclusive, time:
 use bytes::{BufMut, BytesMut};
 use corro_types::{
     actor::ActorId,
-    agent::Agent,
+    agent::{Agent, Booked, Bookie},
     base::{CrsqlDbVersion, CrsqlSeq},
     broadcast::{
         ChangeId, ChangeSource, ChangeV1, ChangesetId, PlumtreeInput, PlumtreeMsg, PlumtreeMsgV1,
@@ -13,7 +13,7 @@ use corro_types::{
 };
 use indexmap::IndexMap;
 use metrics::counter;
-use plum_foca::{Payload, PlumtreeState, PlumtreeStats, SeenStore, Timer};
+use plum_foca::{Payload, PeerTopologyInfo, PlumtreeState, PlumtreeStats, SeenStore, Timer};
 use rangemap::RangeInclusiveSet;
 use speedy::Writable;
 use strum::EnumDiscriminants;
@@ -32,52 +32,31 @@ struct SeenEntry {
     duplicate_count: u32,
 }
 
-#[derive(Debug)]
 struct ChangeSeenStore {
     entries: IndexMap<(ActorId, CrsqlDbVersion), SeenEntry>,
     max_entries: usize,
+    bookie: Bookie,
 }
 
 impl ChangeSeenStore {
-    fn new(max_entries: usize) -> Self {
+    fn new(max_entries: usize, bookie: Bookie) -> Self {
         Self {
             entries: IndexMap::new(),
             max_entries,
-        }
-    }
-
-    fn evict_if_needed(&mut self) {
-        if self.entries.len() > self.max_entries {
-            self.entries.drain(0..self.entries.len() - self.max_entries);
+            bookie,
         }
     }
 }
 
 impl SeenStore<ChangeId> for ChangeSeenStore {
-    fn contains(&self, id: &ChangeId) -> bool {
-        let actor_id = id.actor_id;
-        match &id.changeset_id {
-            ChangesetId::Full { version, seqs, .. } => {
-                let entry = self.entries.get(&(actor_id, *version));
-                let Some(entry) = entry else {
-                    return false;
-                };
-                entry
-                    .seqs
-                    .as_ref()
-                    .map(|old_seqs| {
-                        let incoming = RangeInclusive::from(*seqs);
-                        old_seqs.gaps(&incoming).count() == 0
-                    })
-                    .unwrap_or(false)
-            }
-            ChangesetId::Empty { versions, .. } => versions.clone().all(|version| {
-                self.entries
-                    .get(&(actor_id, version))
-                    .map(|e| e.seqs.is_none())
-                    .unwrap_or(false)
-            }),
+    fn evict_if_needed(&mut self) {
+        if self.entries.len() > self.max_entries {
+            self.entries.drain(0..self.entries.len() - self.max_entries);
         }
+    }
+
+    fn contains(&self, id: &ChangeId) -> bool {
+        self.contains_local(id) || self.contains_booked(id)
     }
 
     fn observe(&mut self, id: ChangeId, round: plum_foca::Round) -> Option<u32> {
@@ -163,13 +142,57 @@ impl SeenStore<ChangeId> for ChangeSeenStore {
     }
 }
 
+impl ChangeSeenStore {
+    fn contains_booked(&self, id: &ChangeId) -> bool {
+        let actor_id = id.actor_id;
+        if let Some(bookie) = self.bookie.get(&actor_id) {
+            match &id.changeset_id {
+                ChangesetId::Full { version, seqs, .. } => {
+                    bookie.read().contains(*version, Some(*seqs))
+                }
+                ChangesetId::Empty { versions, .. } => versions
+                    .clone()
+                    .all(|version| bookie.read().contains(version, None)),
+            }
+        } else {
+            false
+        }
+    }
+
+    fn contains_local(&self, id: &ChangeId) -> bool {
+        let actor_id = id.actor_id;
+        match &id.changeset_id {
+            ChangesetId::Full { version, seqs, .. } => {
+                let entry = self.entries.get(&(actor_id, *version));
+                let Some(entry) = entry else {
+                    return false;
+                };
+                entry
+                    .seqs
+                    .as_ref()
+                    .map(|old_seqs| {
+                        let incoming = RangeInclusive::from(*seqs);
+                        old_seqs.gaps(&incoming).count() == 0
+                    })
+                    .unwrap_or(false)
+            }
+            ChangesetId::Empty { versions, .. } => versions.clone().all(|version| {
+                self.entries
+                    .get(&(actor_id, version))
+                    .map(|e| e.seqs.is_none())
+                    .unwrap_or(false)
+            }),
+        }
+    }
+}
+
 /// Implements `plum_foca::Runtime` for Corrosion, bridging the generic protocol
 /// to Corrosion's transport, change processing, and timer infrastructure.
 struct CorrosionPlumtreeRuntime<T: TransportExt> {
     agent: Agent,
     transport: T,
     tx_changes: CorroSender<(ChangeV1, ChangeSource)>,
-    timer_spawner: TimerSpawner<plum_foca::Timer<ChangeId>>,
+    timer_spawner: TimerSpawner<plum_foca::Timer<ChangeId, ActorId>>,
     bcast_codec: LengthDelimitedCodec,
     ser_buf: BytesMut,
     actors: HashMap<ActorId, SocketAddr>,
@@ -240,7 +263,7 @@ impl<T: TransportExt + Clone + Send + 'static> plum_foca::Runtime<ChangeId, Chan
         });
     }
 
-    fn schedule(&mut self, timer: plum_foca::Timer<ChangeId>, after: Duration) {
+    fn schedule(&mut self, timer: plum_foca::Timer<ChangeId, ActorId>, after: Duration) {
         self.timer_spawner.spawn((after, timer));
     }
 
@@ -291,7 +314,7 @@ pub async fn plumtree_loop<T: TransportExt + Clone + Send + 'static>(
     config: plum_foca::Config,
     mut tripwire: Tripwire,
 ) -> PlumtreeStats {
-    let seen = ChangeSeenStore::new(config.max_received_entries);
+    let seen = ChangeSeenStore::new(config.max_received_entries, agent.bookie().clone());
     let mut state: PlumtreeState<ChangeId, ChangeV1, ActorId, ChangeSeenStore> =
         PlumtreeState::new_with_store(agent.actor_id(), config, seen);
 
@@ -299,6 +322,8 @@ pub async fn plumtree_loop<T: TransportExt + Clone + Send + 'static>(
     let timer_spawner = TimerSpawner::new(plumtree_timer_tx);
 
     let mut tick_interval = interval(Duration::from_millis(200));
+    let mut maintenance_interval = interval(Duration::from_secs(10));
+    let mut metrics_interval = interval(Duration::from_secs(10));
     // do we need this if we aren't batching?
     let bcast_codec = LengthDelimitedCodec::builder()
         .max_frame_length(10 * 1_024 * 1_024)
@@ -330,10 +355,11 @@ pub async fn plumtree_loop<T: TransportExt + Clone + Send + 'static>(
     #[derive(EnumDiscriminants)]
     #[strum_discriminants(derive(strum::IntoStaticStr))]
     enum Branch {
-        PlumtreeInput(PlumtreeInput),
-        PlumtreeUpdates(PlumtreeUpdates),
-        HandleTimer(Timer<ChangeId>),
-        PlumtreeTick,
+        Input(PlumtreeInput),
+        Updates(PlumtreeUpdates),
+        HandleTimer(Timer<ChangeId, ActorId>),
+        IHaveTick,
+        MaintenanceTick,
         Metrics,
     }
 
@@ -345,14 +371,14 @@ pub async fn plumtree_loop<T: TransportExt + Clone + Send + 'static>(
                 break;
             },
             updates = rx_plumtree_updates.recv() => match updates {
-                Some(updates) => Branch::PlumtreeUpdates(updates),
+                Some(updates) => Branch::Updates(updates),
                 None => {
                     warn!("plumtree_loop: updates channel closed");
                     break;
                 }
             },
             input = rx_plumtree.recv() => match input {
-                Some(input) => Branch::PlumtreeInput(input),
+                Some(input) => Branch::Input(input),
                 None => {
                     warn!("plumtree_loop: input channel closed");
                     break;
@@ -361,16 +387,20 @@ pub async fn plumtree_loop<T: TransportExt + Clone + Send + 'static>(
             Some((timer, _seq)) = plumtree_timer_rx.recv() => {
                 Branch::HandleTimer(timer)
             }
+            // todo batch this on all timers
             _ = tick_interval.tick() => {
-                Branch::PlumtreeTick
+                Branch::IHaveTick
             }
-            // _ = metrics_interval.tick() => {
-            //     Branch::Metrics
-            // }
+            _ = maintenance_interval.tick() => {
+                Branch::MaintenanceTick
+            }
+            _ = metrics_interval.tick() => {
+                Branch::Metrics
+            }
         };
 
         match branch {
-            Branch::PlumtreeInput(input) => match input {
+            Branch::Input(input) => match input {
                 PlumtreeInput::Wire(msg) => match msg {
                     PlumtreeMsgV1::Gossip(g) => {
                         state.handle_gossip(g, &mut rt);
@@ -390,7 +420,7 @@ pub async fn plumtree_loop<T: TransportExt + Clone + Send + 'static>(
                     state.broadcast(id, change, &mut rt);
                 }
             },
-            Branch::PlumtreeUpdates(updates) => match updates {
+            Branch::Updates(updates) => match updates {
                 PlumtreeUpdates::MemberUp { actor_id, addr } => {
                     rt.update_actor(actor_id, addr);
                     state.peer_up(actor_id, &mut rt);
@@ -403,8 +433,13 @@ pub async fn plumtree_loop<T: TransportExt + Clone + Send + 'static>(
             Branch::HandleTimer(timer) => {
                 state.timer_fired(timer, &mut rt);
             }
-            Branch::PlumtreeTick => {
+            Branch::IHaveTick => {
                 state.tick(&mut rt);
+            }
+            Branch::MaintenanceTick => {
+                let topo = plumtree_topology_map(&agent);
+                state.maintain_topology(&mut rt, topo);
+                state.seen_evict_if_needed();
             }
             Branch::Metrics => {
                 todo!("metrics");
@@ -413,6 +448,25 @@ pub async fn plumtree_loop<T: TransportExt + Clone + Send + 'static>(
     }
 
     return state.stats().clone();
+}
+
+/// Ring + RTT snapshot from [`Members`] for [`PlumtreeState::maintain_topology`].
+fn plumtree_topology_map(agent: &Agent) -> HashMap<ActorId, PeerTopologyInfo> {
+    let members = agent.members().read();
+    members
+        .states
+        .iter()
+        .map(|(id, st)| {
+            let rtt_ms = members.avg_rtt_ms(id).unwrap_or(u64::MAX);
+            (
+                *id,
+                PeerTopologyInfo {
+                    ring: st.ring,
+                    rtt_ms,
+                },
+            )
+        })
+        .collect()
 }
 
 #[cfg(test)]

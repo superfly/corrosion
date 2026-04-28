@@ -1,7 +1,6 @@
 use indexmap::IndexSet;
 use rand::Rng;
-use rand::prelude::IndexedRandom;
-use rand::seq::SliceRandom;
+use rand::seq::{IteratorRandom, SliceRandom};
 use speedy::{Readable, Writable};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Debug;
@@ -28,6 +27,27 @@ impl<T> NodeId for T where T: Clone + Eq + Hash + Ord + Debug + Send + 'static {
 
 /// Hop count from the original sender, incremented on each forward.
 pub type Round = u32;
+
+/// RTT ring index (from the caller's bucketing, e.g. latency class) and a
+/// tie-breaker RTT in milliseconds for ordering within a ring.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PeerTopologyInfo {
+    /// Semantics are caller-defined; `Some(0)` typically means lowest-latency bucket.
+    pub ring: Option<u8>,
+    /// Lower is better for ordering within the same ring.
+    pub rtt_ms: u64,
+}
+
+#[inline]
+fn topology_get<N: Eq + Hash + Clone>(
+    topology: &HashMap<N, PeerTopologyInfo>,
+    p: &N,
+) -> PeerTopologyInfo {
+    topology.get(p).copied().unwrap_or(PeerTopologyInfo {
+        ring: None,
+        rtt_ms: u64::MAX,
+    })
+}
 
 /// Tunable parameters for the Plumtree protocol.
 #[derive(Debug, Clone)]
@@ -73,7 +93,8 @@ impl Default for Config {
     }
 }
 
-pub trait SeenStore<I: MessageId>: std::fmt::Debug {
+pub trait SeenStore<I: MessageId> {
+    fn evict_if_needed(&mut self);
     fn contains(&self, id: &I) -> bool;
     fn observe(&mut self, id: I, round: Round) -> Option<u32>;
 }
@@ -81,10 +102,14 @@ pub trait SeenStore<I: MessageId>: std::fmt::Debug {
 /// Timers produced by the protocol. The caller schedules these externally
 /// (e.g. via tokio) and calls `PlumtreeState::timer_fired` when they expire.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum Timer<I: MessageId> {
+pub enum Timer<I: MessageId, N: NodeId> {
     /// Fires after `config.ihave_timeout`. If the message still hasn't
     /// arrived, the node sends a GRAFT to the IHave sender.
-    IHaveTimeout(I),
+    IHaveTimeout {
+        id: I,
+        retries: u32,
+        senders: Vec<N>,
+    },
 }
 
 /// Observable protocol events for metrics, logging, or diagnostics.
@@ -107,7 +132,7 @@ pub trait Runtime<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId
 
     /// Request the caller to schedule a timer. When the duration elapses,
     /// the caller must invoke `PlumtreeState::timer_fired`.
-    fn schedule(&mut self, timer: Timer<I>, after: Duration);
+    fn schedule(&mut self, timer: Timer<I, N>, after: Duration);
 
     /// Observable protocol event.
     fn notify(&mut self, notification: Notification<I, N>);
@@ -166,6 +191,7 @@ where
     pub sender: N,
     pub id: I,
     pub round: Round,
+    pub send: bool,
 }
 
 #[derive(Debug, Clone, Readable, Writable)]
@@ -180,7 +206,7 @@ where
 
 /// A message we heard about (via IHave) but haven't received yet.
 /// Keyed by message id in `PlumtreeState::missing`.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct MissingEntry<N: NodeId> {
     ihave_sender: N,
     round: Round,
@@ -346,6 +372,7 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
                     }),
                 );
                 self.move_to_lazy(&sender, rt);
+                self.replenish_eager_from_lazy_avoiding(&sender, rt);
             }
             rt.notify(Notification::MessageAlreadyReceived(id));
             return;
@@ -407,6 +434,7 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
                             sender: self.local_id.clone(),
                             id: id.clone(),
                             round: entry.round,
+                            send: false,
                         }),
                     );
                     self.move_to_eager(&entry.ihave_sender, rt);
@@ -426,6 +454,15 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
         let count = digests.len();
         let mut new_missing = 0u32;
 
+        let mut rng = rand::rng();
+        let mut senders = vec![sender.clone()];
+        senders.extend(
+            self.eager_peers
+                .iter()
+                .filter(|p| **p != sender)
+                .choose(&mut rng)
+                .cloned(),
+        );
         for digest in digests {
             if self.seen.contains(&digest.id) {
                 continue;
@@ -442,7 +479,14 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
                     round: digest.round,
                 },
             );
-            rt.schedule(Timer::IHaveTimeout(digest.id), self.config.ihave_timeout);
+            rt.schedule(
+                Timer::IHaveTimeout {
+                    id: digest.id,
+                    retries: 0,
+                    senders: senders.clone(),
+                },
+                self.config.ihave_timeout,
+            );
         }
         if new_missing > 0 {
             debug!(local = ?self.local_id, ?sender, count, new_missing,
@@ -460,6 +504,9 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
 
         self.move_to_eager(&sender, rt);
 
+        if !msg.send {
+            return;
+        }
         if let Some((payload, round)) = self.cache.get(&id).cloned() {
             debug!(
                 ?id,
@@ -494,6 +541,7 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
         debug!(local = ?self.local_id, sender = ?msg.sender, triggered_by = ?msg.triggered_by, "handle_prune");
         if !self.ring_locked.contains(&msg.sender) {
             self.move_to_lazy(&msg.sender, rt);
+            self.replenish_eager_from_lazy_avoiding(&msg.sender, rt);
         }
     }
 
@@ -502,14 +550,6 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
     /// Marks it as received, caches the payload, sends GOSSIP to all
     /// eager peers (round 0), and enqueues IHave for lazy peers.
     pub fn broadcast(&mut self, id: I, payload: P, rt: &mut impl Runtime<I, P, N>) {
-        if self.seen.contains(&id) {
-            debug!(
-                ?id,
-                "local={:?} broadcast skipped (already received)", self.local_id
-            );
-            return;
-        }
-
         debug!(
             ?id,
             eager = self.eager_peers.len(),
@@ -541,25 +581,53 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
     ///
     /// `IHaveTimeout`: if the message is still missing, send GRAFT to
     /// the peer that told us about it and promote them to eager.
-    pub fn timer_fired(&mut self, timer: Timer<I>, rt: &mut impl Runtime<I, P, N>) {
+    pub fn timer_fired(&mut self, timer: Timer<I, N>, rt: &mut impl Runtime<I, P, N>) {
         match timer {
-            Timer::IHaveTimeout(ref id) => {
-                if let Some(entry) = self.missing.remove(id) {
+            Timer::IHaveTimeout {
+                id,
+                retries,
+                senders,
+            } => {
+                if self.seen.contains(&id) {
+                    debug!(
+                        ?id,
+                        "local={:?} timer fired → already received, noop", self.local_id
+                    );
+                    self.missing.remove(&id);
+                    return;
+                }
+
+                let entry = self.missing.get(&id).cloned();
+                if let Some(entry) = entry {
                     debug!(
                         ?id,
                         "local={:?} send_to={:?} IHave timeout → GRAFT",
                         self.local_id,
                         entry.ihave_sender
                     );
+                    if retries >= senders.len() as u32 {
+                        self.missing.remove(&id);
+                    }
+                    let sender = senders[retries as usize].clone();
                     rt.send(
-                        entry.ihave_sender.clone(),
+                        sender.clone(),
                         PlumtreeMsg::Graft(GraftMsg {
                             sender: self.local_id.clone(),
                             id: id.clone(),
                             round: entry.round,
+                            send: true,
                         }),
                     );
-                    self.move_to_eager(&entry.ihave_sender, rt);
+                    // todo: maybe move to eager when we get a graft response?
+                    self.move_to_eager(&sender, rt);
+                    rt.schedule(
+                        Timer::IHaveTimeout {
+                            id: id.clone(),
+                            retries: retries + 1,
+                            senders: senders.clone(),
+                        },
+                        self.config.ihave_timeout / 2,
+                    );
                 } else {
                     trace!(
                         ?id,
@@ -627,61 +695,37 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
     /// change to known_peers. Called by peer_up, peer_down, and
     /// add_peers_bulk.
     ///
-    /// Invariants maintained:
-    /// 1. ring_locked is recomputed from current known_peers.
-    /// 2. All ring-locked peers are in eager (forced, even above max_eager).
-    /// 3. Eager is filled up to max_eager from lazy, then known_peers.
-    /// 4. Non-ring eager peers above max_eager are demoted to lazy.
-    /// 5. Lazy is filled up to min_lazy from known_peers if below floor.
-    /// 6. Lazy never exceeds max_lazy (insert_into_lazy handles eviction).
-    /// 7. Stale peers no longer in known_peers are removed from eager/lazy.
-    fn rebalance(&mut self, rt: &mut impl Runtime<I, P, N>) {
+    /// Ring neighbors are deterministic (sorted ring). Discretionary eager and lazy
+    /// peers are picked from a **shuffled** pool so nodes do not all converge on the
+    /// same lowest-`NodeId` neighbors.
+    fn rebalance(&mut self, _rt: &mut impl Runtime<I, P, N>) {
         self.eager_peers.clear();
         self.lazy_peers.clear();
 
-        // under 5? append all peers to eager
-        if self.known_peers.len() <= 5 {
-            self.eager_peers.extend(self.known_peers.iter().cloned());
-        }
-
-        // 1. Recompute ring neighbor.
         self.set_ring_neighbors();
 
-        self.eager_peers.extend(self.ring_locked.iter().cloned());
-
-        let remaining_eager = self.config.max_eager - self.eager_peers.len();
-
-        // 2. Force ring-locked peers into eager.
-        let must_eager: Vec<N> = self
-            .ring_locked
-            .iter()
-            .filter(|p| !self.eager_peers.contains(p))
-            .cloned()
-            .collect();
-
-        for peer in must_eager {
-            self.lazy_peers.swap_remove(&peer);
-            self.eager_peers.insert(peer.clone());
-            rt.notify(Notification::PeerMovedToEager(peer));
+        // Ring neighbors must be eager for the overlay ring.
+        for p in self.ring_locked.iter().cloned() {
+            self.eager_peers.insert(p);
         }
 
-        let mut remaining_peers = self
+        let mut pool: Vec<N> = self
             .known_peers
             .iter()
             .cloned()
-            .filter(|p| !self.eager_peers.contains(&p))
-            .collect::<Vec<_>>();
-        remaining_peers.shuffle(&mut rand::rng());
+            .filter(|p| !self.eager_peers.contains(p))
+            .collect();
 
-        self.eager_peers
-            .extend(remaining_peers.iter().take(remaining_eager).cloned());
-        self.lazy_peers.extend(
-            remaining_peers
-                .iter()
-                .skip(remaining_eager)
-                .take(self.config.min_lazy)
-                .cloned(),
-        );
+        let mut rng = rand::rng();
+        pool.shuffle(&mut rng);
+
+        let slots = self.config.max_eager.saturating_sub(self.eager_peers.len());
+        self.eager_peers.extend(pool.iter().take(slots).cloned());
+
+        let mut rest: Vec<N> = pool.into_iter().skip(slots).collect();
+        rest.shuffle(&mut rng);
+        let lazy_cap = self.config.min_lazy.min(self.config.max_lazy);
+        self.lazy_peers.extend(rest.iter().take(lazy_cap).cloned());
 
         trace!(
             local = ?self.local_id,
@@ -693,35 +737,150 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
         );
     }
 
-    // fn maintain_eager_lazy_peers(&mut self, rt: &mut impl Runtime<I, P, N>, rtt_scorer: impl Fn() -> HashMap<N, u64>) {
-    //     // we only want to do this if things are not in the desired state
-    //     if self.eager_peers.len() <= self.config.max_eager
-    //         && self.lazy_peers.len() >= self.config.min_lazy
-    //         && self.lazy_peers.len() <= self.config.max_lazy
-    //     {
-    //         return;
-    //     }
+    #[inline]
+    fn topology_peer_is_ring0(topology: &HashMap<N, PeerTopologyInfo>, p: &N) -> bool {
+        topology_get(topology, p).ring == Some(0)
+    }
 
-    //     // ensure ring neighbors are in eager
-    //     let ring_locked = self.ring_locked.iter().cloned().collect::<Vec<_>>();
-    //     for peer in ring_locked {
-    //         self.move_to_eager(&peer, rt);
-    //     }
+    pub fn seen_evict_if_needed(&mut self) {
+        self.seen.evict_if_needed();
+    }
 
-    //     let rtt_scores = rtt_scorer();
-    //     if self.eager_peers.len() < self.config.max_eager {
-    //         // promote based  on ring data
-    //     }
+    /// Recompute eager/lazy using RTT rings when the current overlay drifts from the ideal.
+    ///
+    /// If discretionary eager already matches the greedy target, lazy counts are within
+    /// `min_lazy`/`max_lazy`, and every known peer is in eager or lazy, this is a no-op.
+    ///
+    /// Otherwise we apply minimal moves: demotions prefer the bucket (ring0 vs remote) that is
+    /// **over** quota, highest RTT first; promotions prefer the bucket that is **under** quota,
+    /// best RTT first. Lazy over-cap evicts from the bucket with **more** lazy peers; lazy
+    /// under-cap adds to the bucket with **fewer** (round-robin among orphans as a fallback).
+    ///
+    /// Missing topology entries use worst RTT ordering (`u64::MAX`).
+    pub fn maintain_topology(
+        &mut self,
+        rt: &mut impl Runtime<I, P, N>,
+        topology: HashMap<N, PeerTopologyInfo>,
+    ) {
+        self.set_ring_neighbors();
 
-    //     // demote based on ring0 data
+        let locked: HashSet<N> = self.ring_locked.clone();
+        for p in locked.iter().cloned() {
+            if self.known_peers.contains(&p) && !self.eager_peers.contains(&p) {
+                self.move_to_eager(&p, rt);
+            }
+        }
 
-    //     // promote based on ring0 data
+        let count_eager = self.eager_peers.len();
+        let count_lazy = self.lazy_peers.len();
 
-    //     // fix lazy
+        if count_eager <= self.config.max_eager
+            && count_lazy >= self.config.min_lazy
+            && count_lazy <= self.config.max_lazy
+        {
+            return;
+        }
 
-    // }
+        // we partition the eager peers into ring0 and remote
+        let eager_ring0: Vec<N> = self
+            .eager_peers
+            .iter()
+            .filter(|p| Self::topology_peer_is_ring0(&topology, p) && !locked.contains(p))
+            .cloned()
+            .collect();
+        let eager_remote: Vec<N> = self
+            .eager_peers
+            .iter()
+            .filter(|p| !Self::topology_peer_is_ring0(&topology, p) && !locked.contains(p))
+            .cloned()
+            .collect();
 
-    // --- Internal helpers ---
+        // Anyone not already eager can be promoted: lazy peers (common) plus orphans.
+        let mut eager_candidates: Vec<N> = self.lazy_peers.iter().cloned().collect();
+        eager_candidates.extend(
+            self.known_peers
+                .iter()
+                .filter(|p| {
+                    if self.eager_peers.contains(p) {
+                        return false;
+                    }
+                    let pid = (*p).clone();
+                    !self.lazy_peers.iter().any(|x| *x == pid)
+                })
+                .cloned(),
+        );
+        let eager_candidates_ring0: Vec<N> = eager_candidates
+            .iter()
+            .filter(|p| Self::topology_peer_is_ring0(&topology, p))
+            .cloned()
+            .collect();
+        let eager_candidates_remote: Vec<N> = eager_candidates
+            .iter()
+            .filter(|p| !Self::topology_peer_is_ring0(&topology, p))
+            .cloned()
+            .collect();
+
+        if count_eager > self.config.max_eager {
+            let num_demote = count_eager - self.config.max_eager;
+            let demotion_ring = if eager_ring0.len() > eager_remote.len() {
+                eager_ring0
+            } else {
+                eager_remote
+            };
+            let demote: Vec<N> = demotion_ring.into_iter().take(num_demote).collect();
+            for p in demote {
+                self.move_to_lazy(&p, rt);
+            }
+        } else if count_eager < self.config.max_eager {
+            let split = self.config.max_eager / 2;
+            let ring0_needed = split - eager_ring0.len();
+            let remote_needed = split - eager_remote.len();
+            let ring0_promote: Vec<N> = eager_candidates_ring0
+                .into_iter()
+                .take(ring0_needed)
+                .collect();
+            let remote_promote: Vec<N> = eager_candidates_remote
+                .into_iter()
+                .take(remote_needed)
+                .collect();
+            self.eager_peers.extend(ring0_promote);
+            self.eager_peers.extend(remote_promote);
+        }
+
+        if count_lazy > self.config.max_lazy {
+            let num_evict = count_lazy - self.config.max_lazy;
+            let evict: Vec<N> = self.lazy_peers.iter().take(num_evict).cloned().collect();
+            for p in evict {
+                self.lazy_peers.swap_remove(&p);
+                self.lazy_queue.remove(&p);
+            }
+        } else if count_lazy < self.config.min_lazy {
+            let lazy_candidates: Vec<N> = self
+                .known_peers
+                .iter()
+                .filter(|p| {
+                    if self.eager_peers.contains(p) {
+                        return false;
+                    }
+                    let pid = (*p).clone();
+                    !self.lazy_peers.iter().any(|x| *x == pid)
+                })
+                .cloned()
+                .collect();
+            let num_add = self.config.min_lazy - count_lazy;
+            let add: Vec<N> = lazy_candidates.into_iter().take(num_add).collect();
+            self.lazy_peers.extend(add);
+        }
+
+        trace!(
+            local = ?self.local_id,
+            eager = self.eager_peers.len(),
+            lazy = self.lazy_peers.len(),
+            ring_locked = self.ring_locked.len(),
+            known = self.known_peers.len(),
+            "maintain_topology complete"
+        );
+    }
 
     fn enqueue_ihave(&mut self, id: I, round: Round) {
         let digest = IHaveDigest { id, round };
@@ -766,7 +925,9 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
     }
 
     fn move_to_eager(&mut self, peer: &N, rt: &mut impl Runtime<I, P, N>) {
-        if self.eager_peers.contains(peer) || (!self.ring_locked.contains(peer) && self.eager_peers.len() >= self.config.max_eager) {
+        if self.eager_peers.contains(peer)
+            || (!self.ring_locked.contains(peer) && self.eager_peers.len() >= self.config.max_eager)
+        {
             return;
         }
 
@@ -805,6 +966,26 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
             );
             self.insert_into_lazy(peer.clone());
             rt.notify(Notification::PeerMovedToLazy(peer.clone()));
+        }
+    }
+
+    /// After a peer is demoted to lazy (PRUNE / duplicate path), refill discretionary eager
+    /// slots by promoting from lazy while avoiding immediately re-promoting `avoid`.
+    fn replenish_eager_from_lazy_avoiding(&mut self, avoid: &N, rt: &mut impl Runtime<I, P, N>) {
+        loop {
+            if self.eager_peers.len() >= self.config.max_eager {
+                return;
+            }
+            let next: Option<N> = self
+                .lazy_peers
+                .iter()
+                .filter(|p| *p != avoid)
+                .min()
+                .cloned();
+            let Some(p) = next else {
+                return;
+            };
+            self.move_to_eager(&p, rt);
         }
     }
 
@@ -1040,14 +1221,16 @@ mod tests {
         assert_eq!(s.eager_peers.len(), 5);
 
         s.peer_up(6, &mut rt);
-        assert!(!s.eager_peers.contains(&6));
-        assert!(s.lazy_peers.contains(&6));
+        assert!(s.known_peers.contains(&6));
+        // Sixth peer may be ring-locked (must be eager) or placed in lazy.
+        assert!(s.eager_peers.contains(&6) || s.lazy_peers.contains(&6));
     }
 
     #[test]
     fn peer_up_both_full_ignored() {
         let mut cfg = test_config();
         cfg.max_eager = 2;
+        cfg.min_lazy = 2;
         cfg.max_lazy = 2;
         let mut s: PlumtreeState<TestMsgId, TestPayload, TestNodeId, TestSeenStore> =
             PlumtreeState::new_with_store(0u8, cfg, TestSeenStore::default());
@@ -1057,12 +1240,17 @@ mod tests {
         s.peer_up(2, &mut rt); // eager
         s.peer_up(3, &mut rt); // lazy
         s.peer_up(4, &mut rt); // lazy
-        s.peer_up(5, &mut rt); // ignored
+        s.peer_up(5, &mut rt); // one peer remains only in known_peers (caps exceeded)
 
+        assert_eq!(s.known_peers.len(), 5);
         assert_eq!(s.eager_peers.len(), 2);
         assert_eq!(s.lazy_peers.len(), 2);
-        assert!(!s.eager_peers.contains(&5));
-        assert!(!s.lazy_peers.contains(&5));
+        let orphan = s
+            .known_peers
+            .iter()
+            .filter(|p| !s.eager_peers.contains(*p) && !s.lazy_peers.contains(*p))
+            .count();
+        assert_eq!(orphan, 1);
     }
 
     #[test]
@@ -1077,12 +1265,13 @@ mod tests {
 
     #[test]
     fn peer_down_removes_from_both_sets() {
-        let mut s = state();
+        let mut cfg = test_config();
+        cfg.max_eager = 5;
+        let mut s = PlumtreeState::new_with_store(0u8, cfg, TestSeenStore::default());
         let mut rt = AccumulatingRuntime::default();
         s.peer_up(1, &mut rt);
-        s.lazy_peers.insert(2);
+        s.peer_up(2, &mut rt);
         s.peer_down(&1, &mut rt);
-        // peer 2 should have been promoted from lazy to eager
         assert_eq!(s.eager_peers.len(), 1);
         assert!(s.eager_peers.contains(&2));
         s.peer_down(&2, &mut rt);
@@ -1121,11 +1310,11 @@ mod tests {
         assert_eq!(s.eager_peers.len(), 2);
         s.peer_up(3, &mut rt);
         assert!(s.ring_locked_peers().contains(&3));
-        assert!(s.lazy_peers.contains(&3));
         assert!(
             s.eager_peers.contains(&3),
-            "locked peer 3 should be promoted from lazy"
+            "ring successor/predecessor must stay eager"
         );
+        assert!(!s.lazy_peers.contains(&3));
     }
 
     #[test]
@@ -1157,19 +1346,24 @@ mod tests {
         assert_eq!(s.eager_peers.len(), 3);
         assert_eq!(s.lazy_peers.len(), 2);
 
-        // Receive a PRUNE from peer 1 → eager shrinks, lazy peer promoted
+        // Receive a PRUNE from the discretionary eager peer (who that is depends on shuffle).
+        let prune_sender = *s
+            .eager_peers
+            .iter()
+            .find(|p| !s.ring_locked_peers().contains(*p))
+            .expect("one discretionary eager slot-filled peer");
+        assert!(!s.ring_locked_peers().contains(&prune_sender));
         s.handle_prune(
             PruneMsg {
-                sender: 1,
+                sender: prune_sender,
                 triggered_by: msg(99),
             },
             &mut rt,
         );
         assert_eq!(s.eager_peers.len(), 3, "eager should be replenished");
-        // one lazy promoted to eager, then peer 1 added to lazy → net same
         assert_eq!(s.lazy_peers.len(), 2);
-        assert!(!s.eager_peers.contains(&1));
-        assert!(s.lazy_peers.contains(&1));
+        assert!(!s.eager_peers.contains(&prune_sender));
+        assert!(s.lazy_peers.contains(&prune_sender));
     }
 
     // -----------------------------------------------------------------------
@@ -1186,13 +1380,13 @@ mod tests {
         // manually move 3 to lazy
         s.lazy_peers.insert(3);
 
-        s.broadcast(msg(100), payload(42), &mut rt);
+        s.broadcast(msg(42), payload(42), &mut rt);
 
         // Should have sent GOSSIP to eager peers 1 and 2
         assert_eq!(rt.sent.len(), 2);
         for (to, m) in &rt.sent {
             let g = unwrap_gossip(m);
-            assert_eq!(g.payload.message_id(), msg(100));
+            assert_eq!(g.payload.message_id(), msg(42));
             assert_eq!(g.round, 0);
             assert_eq!(g.sender, 0); // local_id
             assert!(s.eager_peers.contains(to));
@@ -1202,7 +1396,7 @@ mod tests {
         assert_eq!(s.lazy_queue[&3].len(), 1);
 
         // Message should be marked received
-        assert!(s.has_message(&msg(100)));
+        assert!(s.has_message(&msg(42)));
     }
 
     #[test]
@@ -1265,8 +1459,8 @@ mod tests {
             }
         }
 
-        // Sender 1 promoted to eager
-        assert!(s.eager_peers.contains(&1));
+        // Sender 1 at least lazy (sync path does not promote gossip senders to eager).
+        assert!(s.lazy_peers.contains(&1));
 
         // Lazy peer 4 has IHave enqueued
         assert_eq!(s.lazy_queue[&4].len(), 1);
@@ -1277,15 +1471,17 @@ mod tests {
 
     #[test]
     fn handle_gossip_duplicate_sends_prune() {
-        let mut s = state();
+        let mut cfg = test_config();
+        cfg.max_eager = 3;
+        let mut s = PlumtreeState::new_with_store(0u8, cfg, TestSeenStore::default());
         let mut rt = AccumulatingRuntime::default();
 
-        s.peer_up(1, &mut rt);
+        s.peer_up(10, &mut rt);
         // First receive
         s.handle_gossip(
             GossipMsg {
                 round: 0,
-                sender: 1,
+                sender: 10,
                 payload: payload(1),
             },
             &mut rt,
@@ -1294,12 +1490,14 @@ mod tests {
         rt.delivered.clear();
         rt.notifications.clear();
 
-        // Duplicate from peer 2
-        s.peer_up(2, &mut rt);
+        // Known [10..=13]: ring locks 10 and 13; 11 is eager and not ring-locked.
+        s.peer_up(11, &mut rt);
+        s.peer_up(12, &mut rt);
+        s.peer_up(13, &mut rt);
         s.handle_gossip(
             GossipMsg {
                 round: 1,
-                sender: 2,
+                sender: 11,
                 payload: payload(1),
             },
             &mut rt,
@@ -1308,17 +1506,17 @@ mod tests {
         // No delivery
         assert!(rt.delivered.is_empty());
 
-        // PRUNE sent to sender 2
+        // PRUNE sent to duplicate sender 11
         assert_eq!(rt.sent.len(), 1);
         let (to, m) = &rt.sent[0];
-        assert_eq!(*to, 2);
+        assert_eq!(*to, 11);
         let prune = unwrap_prune(m);
         assert_eq!(prune.sender, 0);
         assert_eq!(prune.triggered_by, msg(1));
 
-        // Peer 2 demoted to lazy
-        assert!(s.lazy_peers.contains(&2));
-        assert!(!s.eager_peers.contains(&2));
+        // Peer 11 demoted to lazy (12 replenished eager)
+        assert!(s.lazy_peers.contains(&11));
+        assert!(!s.eager_peers.contains(&11));
     }
 
     #[test]
@@ -1571,17 +1769,22 @@ mod tests {
         let mut s = state();
         let mut rt = AccumulatingRuntime::default();
 
-        s.peer_up(1, &mut rt); // eager
+        // Ring locks min/max only; exactly one discretionary eager → no shuffle ambiguity.
+        s.peer_up(100, &mut rt);
+        s.peer_up(200, &mut rt);
+        s.peer_up(210, &mut rt);
+        assert!(s.eager_peers.contains(&200));
+        assert!(!s.ring_locked_peers().contains(&200));
         s.handle_prune(
             PruneMsg {
-                sender: 1,
+                sender: 200,
                 triggered_by: msg(1),
             },
             &mut rt,
         );
 
-        assert!(!s.eager_peers.contains(&1));
-        assert!(s.lazy_peers.contains(&1));
+        assert!(!s.eager_peers.contains(&200));
+        assert!(s.lazy_peers.contains(&200));
     }
 
     // -----------------------------------------------------------------------
@@ -1732,31 +1935,40 @@ mod tests {
     #[test]
     fn move_to_lazy_respects_max_lazy() {
         let mut cfg = test_config();
-        cfg.max_eager = 5;
-        cfg.max_lazy = 1;
+        cfg.max_eager = 3;
+        // Need room for both prior lazy (6) and demoted peer (5) so 6 is not evicted from lazy.
+        cfg.max_lazy = 2;
         let mut s = PlumtreeState::new_with_store(0u8, cfg, TestSeenStore::default());
         let mut rt = AccumulatingRuntime::default();
 
-        s.peer_up(1, &mut rt); // eager
-        s.peer_up(2, &mut rt); // eager
-        s.lazy_peers.insert(3); // lazy (full, max_lazy=1)
+        // Ring locks 7 and 4; pool {5,6} → one discretionary eager, one lazy (shuffle picks which).
+        s.peer_up(4, &mut rt);
+        s.peer_up(5, &mut rt);
+        s.peer_up(6, &mut rt);
+        s.peer_up(7, &mut rt);
 
-        // Duplicate gossip from peer 2 → should try to demote 2 to lazy
+        let dup_sender = *s
+            .eager_peers
+            .iter()
+            .find(|p| !s.ring_locked_peers().contains(*p))
+            .expect("one discretionary eager");
+        let lazy_peer = *s.lazy_peers.iter().next().expect("one lazy");
+        assert_ne!(dup_sender, lazy_peer);
+
+        // Duplicate gossip from discretionary eager → demote; replenish promotes the lazy peer first.
         s.seen.observe(msg(1), 0);
         s.handle_gossip(
             GossipMsg {
                 round: 0,
-                sender: 2,
+                sender: dup_sender,
                 payload: payload(1),
             },
             &mut rt,
         );
 
-        // Peer 3 promoted from lazy to eager (replenish), making room for
-        // peer 2 in lazy.
-        assert!(!s.eager_peers.contains(&2));
-        assert!(s.eager_peers.contains(&3));
-        assert!(s.lazy_peers.contains(&2));
+        assert!(!s.eager_peers.contains(&dup_sender));
+        assert!(s.eager_peers.contains(&lazy_peer));
+        assert!(s.lazy_peers.contains(&dup_sender));
     }
 
     // -----------------------------------------------------------------------
@@ -1769,7 +1981,7 @@ mod tests {
         // B also receives a duplicate from C → B sends PRUNE to C.
         // Later C has a message B missed → B GRAFTs C back.
 
-        // Node A (id=1), Node B (id=2), Node C (id=3)
+        // Node B (id=2). Ring [1,2,4,10,30]: neighbors of 2 are 1 and 4 — C (30) is not locked.
         let cfg = test_config();
         let mut b =
             PlumtreeState::<TestMsgId, TestPayload, TestNodeId, TestSeenStore>::new_with_store(
@@ -1780,7 +1992,9 @@ mod tests {
         let mut rt_b = AccumulatingRuntime::default();
 
         b.peer_up(1, &mut rt_b); // A
-        b.peer_up(3, &mut rt_b); // C
+        b.peer_up(4, &mut rt_b);
+        b.peer_up(10, &mut rt_b);
+        b.peer_up(30, &mut rt_b); // C — not successor/predecessor of B on the ring
 
         // B receives GOSSIP from A
         b.handle_gossip(
@@ -1798,23 +2012,23 @@ mod tests {
         b.handle_gossip(
             GossipMsg {
                 round: 1,
-                sender: 3,
+                sender: 30,
                 payload: payload(1),
             },
             &mut rt_b,
         );
         assert_eq!(rt_b.sent.len(), 1);
         let (to, m) = &rt_b.sent[0];
-        assert_eq!(*to, 3);
+        assert_eq!(*to, 30);
         unwrap_prune(m); // verifies it's a Prune
-        assert!(b.lazy_peers.contains(&3));
+        assert!(b.lazy_peers.contains(&30));
         rt_b.sent.clear();
 
         // Now C ticks and sends IHave for msg(2) to B (lazy peer)
         // Simulated: B receives the IHave
         b.handle_ihave(
             IHaveMsg {
-                sender: 3,
+                sender: 30,
                 digests: vec![IHaveDigest {
                     id: msg(2),
                     round: 0,
@@ -1827,12 +2041,12 @@ mod tests {
         b.timer_fired(Timer::IHaveTimeout(msg(2)), &mut rt_b);
         assert_eq!(rt_b.sent.len(), 1);
         let (to, m) = &rt_b.sent[0];
-        assert_eq!(*to, 3);
+        assert_eq!(*to, 30);
         unwrap_graft(m);
 
         // C is back in eager
-        assert!(b.eager_peers.contains(&3));
-        assert!(!b.lazy_peers.contains(&3));
+        assert!(b.eager_peers.contains(&30));
+        assert!(!b.lazy_peers.contains(&30));
     }
 
     // -----------------------------------------------------------------------
@@ -1900,5 +2114,33 @@ mod tests {
                 .iter()
                 .any(|n| matches!(n, Notification::PayloadNotCached(id) if *id == msg(1)))
         );
+    }
+
+    #[test]
+    fn maintain_topology_splits_ring0_and_remote() {
+        let mut cfg = test_config();
+        cfg.max_eager = 5;
+        cfg.min_lazy = 3;
+        cfg.max_lazy = 10;
+        let mut s = PlumtreeState::new_with_store(0u8, cfg, TestSeenStore::default());
+        let mut rt = AccumulatingRuntime::default();
+        for i in 1u8..=9u8 {
+            s.peer_up(i, &mut rt);
+        }
+        let mut topo = HashMap::new();
+        for i in 1u8..=9u8 {
+            let ring = if i <= 3 { 0u8 } else { 3u8 };
+            topo.insert(
+                i,
+                PeerTopologyInfo {
+                    ring: Some(ring),
+                    rtt_ms: u64::from(i),
+                },
+            );
+        }
+        s.maintain_topology(&mut rt, topo);
+        assert!(s.eager_peers().len() <= 5);
+        assert!(s.lazy_peers.len() <= 10);
+        assert!(s.lazy_peers.len() >= 3 || s.known_peers.len() - s.eager_peers().len() < 3);
     }
 }
