@@ -675,7 +675,7 @@ async fn handle_broadcasts(
                 let members = agent.members().read();
                 let members_count = members.states.len();
                 let ring0_count = members.ring0(agent.cluster_id()).count();
-                (members_count, ring0_count)
+                (members_count, ring0_ccount)
             };
 
             let (choose_count, max_transmissions) = {
