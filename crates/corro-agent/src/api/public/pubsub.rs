@@ -8,7 +8,7 @@ use corro_types::persistent_gauge;
 use corro_types::updates::Handle;
 use corro_types::{
     agent::Agent,
-    api::{ChangeId, QueryEvent, QueryEventMeta, Statement},
+    api::{ChangeId, QueryEvent, QueryEventMeta, Statement, QUERY_HASH_HEADER, QUERY_ID_HEADER},
     pubsub::{MatcherCreated, MatcherError, MatcherHandle, NormalizeStatementError, SubsManager},
     sqlite::SqlitePoolError,
 };
@@ -108,8 +108,8 @@ async fn sub_by_id(
 
     hyper::Response::builder()
         .status(StatusCode::OK)
-        .header("corro-query-id", id.to_string())
-        .header("corro-query-hash", query_hash)
+        .header(QUERY_ID_HEADER, id.to_string())
+        .header(QUERY_HASH_HEADER, query_hash)
         .body(axum::body::Body::new(body))
         .expect("could not build query response body")
 }
@@ -735,8 +735,8 @@ pub async fn api_v1_subs(
 
     hyper::Response::builder()
         .status(StatusCode::OK)
-        .header("corro-query-id", matcher_id.to_string())
-        .header("corro-query-hash", query_hash)
+        .header(QUERY_ID_HEADER, matcher_id.to_string())
+        .header(QUERY_HASH_HEADER, query_hash)
         .body(axum::body::Body::new(body))
         .expect("could not generate ok http response for query request")
 }
@@ -1102,8 +1102,8 @@ mod tests {
             // The api should always return a corro-query-id header
             let query_id_header = res
                 .headers()
-                .get("corro-query-id")
-                .ok_or(eyre::eyre!("missing corro-query-id header"))?;
+                .get(QUERY_ID_HEADER)
+                .ok_or(eyre::eyre!("missing {} header", QUERY_ID_HEADER))?;
             let res_sub_id = Uuid::parse_str(query_id_header.to_str().unwrap())?;
 
             // If a sub_id was provided, it should match the response sub_id
