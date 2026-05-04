@@ -1,9 +1,7 @@
 pub mod sub;
 
 use corro_api_types::{ChangeId, ExecResponse, ExecResult, SqliteValue, Statement};
-use hickory_resolver::{
-    name_server::TokioConnectionProvider, ResolveError, ResolveErrorKind, Resolver,
-};
+use hickory_resolver::net::NetError as ResolveError;
 use serde::de::DeserializeOwned;
 use std::{
     fmt::Write as _,
@@ -24,6 +22,8 @@ use uuid::Uuid;
 const HTTP2_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const HTTP2_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(10);
 const DNS_RESOLVE_TIMEOUT: Duration = Duration::from_secs(3);
+
+type Resolver = hickory_resolver::Resolver<hickory_resolver::net::runtime::TokioRuntimeProvider>;
 
 #[derive(Clone)]
 pub struct CorrosionApiClient {
@@ -390,11 +390,7 @@ struct PooledClientInner {
 }
 
 impl CorrosionPooledClient {
-    pub fn new(
-        addrs: Vec<String>,
-        stickiness_timeout: time::Duration,
-        resolver: Resolver<TokioConnectionProvider>,
-    ) -> Self {
+    pub fn new(addrs: Vec<String>, stickiness_timeout: time::Duration, resolver: Resolver) -> Self {
         Self {
             inner: Arc::new(RwLock::new(PooledClientInner {
                 picker: AddrPicker::new(addrs, resolver),
@@ -550,7 +546,7 @@ impl CorrosionPooledClient {
 
 struct AddrPicker {
     // Resolver used to resolve the addresses
-    resolver: Resolver<TokioConnectionProvider>,
+    resolver: Resolver,
     // List of addresses/hostname to try in order
     addrs: Vec<String>,
     // Next address/hostname to try
@@ -563,7 +559,7 @@ struct AddrPicker {
 }
 
 impl AddrPicker {
-    fn new(addrs: Vec<String>, resolver: Resolver<TokioConnectionProvider>) -> AddrPicker {
+    fn new(addrs: Vec<String>, resolver: Resolver) -> AddrPicker {
         Self {
             resolver,
             addrs,
@@ -600,7 +596,7 @@ impl AddrPicker {
 
                 timeout(DNS_RESOLVE_TIMEOUT, self.resolver.lookup_ip(host))
                     .await
-                    .map_err(|_| ResolveError::from(ResolveErrorKind::Message("timeout")))??
+                    .map_err(|_| ResolveError::Timeout)??
                     .iter()
                     .map(|addr| (addr, port).into())
                     .collect::<Vec<_>>()
@@ -797,7 +793,7 @@ mod tests {
         let statement = "".into();
         let (servers, addresses) = gen_servers(1).await;
 
-        let resolver = Resolver::builder_tokio().unwrap().build();
+        let resolver = Resolver::builder_tokio().unwrap().build().unwrap();
         let client = CorrosionPooledClient::new(addresses, Duration::from_nanos(1), resolver);
         let sub = client
             .subscribe_typed::<SqliteValue>(&statement, false, None)
@@ -826,7 +822,7 @@ mod tests {
         let statement = "".into();
         let (servers, addresses) = gen_servers(3).await;
 
-        let resolver = Resolver::builder_tokio().unwrap().build();
+        let resolver = Resolver::builder_tokio().unwrap().build().unwrap();
         let client = CorrosionPooledClient::new(addresses, Duration::from_nanos(1), resolver);
 
         // Refuse connections on the first server
@@ -871,7 +867,7 @@ mod tests {
         let statement = "".into();
         let (servers, addresses) = gen_servers(3).await;
 
-        let resolver = Resolver::builder_tokio().unwrap().build();
+        let resolver = Resolver::builder_tokio().unwrap().build().unwrap();
         let client = CorrosionPooledClient::new(addresses, Duration::from_millis(50), resolver);
 
         // Refuse connections on the first server
@@ -921,7 +917,7 @@ mod tests {
         let mut addresses = pool1_addresses;
         addresses.extend_from_slice(&pool2_addresses);
 
-        let resolver = Resolver::builder_tokio().unwrap().build();
+        let resolver = Resolver::builder_tokio().unwrap().build().unwrap();
         let client = CorrosionPooledClient::new(addresses, Duration::from_nanos(1), resolver);
 
         // Refuse connections on all servers

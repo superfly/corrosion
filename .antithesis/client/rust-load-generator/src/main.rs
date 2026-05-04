@@ -41,7 +41,7 @@ impl CorrosionConfig {
         let mut host_port = self.addr.split(':');
         let host_name = host_port.next().unwrap_or("localhost");
 
-        let system_resolver = Resolver::builder_tokio()?.build();
+        let system_resolver = Resolver::builder_tokio()?.build().unwrap();
         match system_resolver.lookup_ip(host_name).await?.iter().next() {
             Some(ip_addr) => {
                 let addr = SocketAddr::from((
