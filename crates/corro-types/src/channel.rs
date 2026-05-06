@@ -85,8 +85,8 @@ pub fn bounded<T: Send + 'static>(
                 break;
             }
             let current = inner_channel.capacity();
-            if prev != current
-                && (current < threshold || prev < threshold || ticks_since_report >= 30)
+            if ticks_since_report >= 30
+                || (prev != current && (current < threshold || prev < threshold))
             {
                 capacity_gauge.set(current as f64);
                 ticks_since_report = 0;
