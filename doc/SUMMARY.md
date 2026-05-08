@@ -48,3 +48,4 @@
     - [telemetry](config/telemetry.md)
     - [consul](config/consul.md)
     - [reaper](config/reaper.md)
+    - [perf](config/perf.md)
