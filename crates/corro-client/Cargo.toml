@@ -2,6 +2,7 @@
 name = "corro-client"
 version = "0.1.0-alpha.1"
 description = "client to interact with corrosion"
+readme = "README.md"
 edition.workspace = true
 license.workspace = true
 homepage.workspace = true

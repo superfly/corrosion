@@ -2,6 +2,7 @@
 name = "corro-api-types"
 version = "0.1.0-alpha.1"
 description = "common API types for corrosion"
+readme = "README.md"
 edition.workspace = true
 license.workspace = true
 homepage.workspace = true

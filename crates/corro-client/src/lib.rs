@@ -25,6 +25,8 @@ const DNS_RESOLVE_TIMEOUT: Duration = Duration::from_secs(3);
 
 type Resolver = hickory_resolver::Resolver<hickory_resolver::net::runtime::TokioRuntimeProvider>;
 
+/// Single-address Corrosion HTTP API client.
+///
 #[derive(Clone)]
 pub struct CorrosionApiClient {
     api_addr: SocketAddr,
@@ -44,6 +46,15 @@ impl CorrosionApiClient {
         })
     }
 
+    /// Run a one-shot query, deserializing each row into `T`. Accepts a
+    /// statement and a timeout.
+    ///
+    /// Wraps `POST /v1/queries` endpoint.
+    ///
+    /// Returns [`sub::QueryStream`] yields a
+    /// [`corro_api_types::TypedQueryEvent::Columns`] frame, then one
+    /// [`corro_api_types::TypedQueryEvent::Row`] per row, then a final
+    /// [`corro_api_types::TypedQueryEvent::EndOfQuery`].
     pub async fn query_typed<T: DeserializeOwned + Unpin>(
         &self,
         statement: &Statement,
@@ -93,6 +104,8 @@ impl CorrosionApiClient {
         Ok(QueryStream::new(res.into()))
     }
 
+    /// Same as [`Self::query_typed`], but returns each row as a
+    /// `Vec<SqliteValue>`.
     pub async fn query(
         &self,
         statement: &Statement,
@@ -101,6 +114,16 @@ impl CorrosionApiClient {
         self.query_typed(statement, timeout).await
     }
 
+    /// Creates a new subscription and streams query updates, deserializing rows into T.
+    ///
+    /// Wraps `POST /v1/subscriptions` endpoint. After the initial result set the agent
+    /// will push a [`corro_api_types::TypedQueryEvent::Change`] frame for
+    /// every row that enters, leaves or is updated within the query.
+    ///
+    /// * `skip_rows` — when `true`, the initial rows are skipped and
+    ///   only changes are streamed.
+    /// * `from` — when set, resume the subscription past the given
+    ///   `ChangeId` instead of producing a fresh snapshot.
     pub async fn subscribe_typed<T: DeserializeOwned + Unpin>(
         &self,
         statement: &Statement,
@@ -150,6 +173,8 @@ impl CorrosionApiClient {
         ))
     }
 
+    /// Same as [`Self::subscribe_typed`], but returns each row as a
+    /// `Vec<SqliteValue>`.
     pub async fn subscribe(
         &self,
         statement: &Statement,
@@ -159,6 +184,7 @@ impl CorrosionApiClient {
         self.subscribe_typed(statement, skip_rows, from).await
     }
 
+    /// Reconnect to an existing subscription identified by its `Uuid`.
     pub async fn subscription_typed<T: DeserializeOwned + Unpin>(
         &self,
         id: Uuid,
@@ -200,6 +226,8 @@ impl CorrosionApiClient {
         ))
     }
 
+    /// Same as [`Self::subscription_typed`], but returns each row as a
+    /// `Vec<SqliteValue>`.
     pub async fn subscription(
         &self,
         id: Uuid,
@@ -209,6 +237,9 @@ impl CorrosionApiClient {
         self.subscription_typed(id, skip_rows, from).await
     }
 
+    /// Subscribe to row-level changes on a single table.
+    ///
+    /// Wraps `POST /v1/updates/{table}` endpoint.
     pub async fn updates_typed<T: DeserializeOwned + Unpin>(
         &self,
         table: &str,
@@ -235,15 +266,18 @@ impl CorrosionApiClient {
         Ok(UpdatesStream::new(id, res.into()))
     }
 
+    /// Same as [`Self::updates_typed`], but returns each row as a
+    /// `Vec<SqliteValue>`.
     pub async fn updates(&self, table: &str) -> Result<UpdatesStream<Vec<SqliteValue>>, Error> {
         self.updates_typed(table).await
     }
 
-    pub async fn execute(
-        &self,
-        statements: &[Statement],
-        timeout: Option<u64>,
-    ) -> Result<ExecResponse, Error> {
+    /// Execute a transaction containing one or more SQL statements.
+    ///
+    /// Wraps `POST /v1/transactions` endpoint. The slice is sent as a JSON array; the
+    /// agent applies the statements in a single transaction and
+    /// returns one `ExecResult` per statement in order.
+    pub async fn execute(&self, statements: &[Statement], timeout: Option<u64>) -> Result<ExecResponse, Error> {
         let uri = if let Some(timeout) = timeout {
             format!("http://{}/v1/transactions?timeout={timeout}", self.api_addr)
         } else {
@@ -293,6 +327,9 @@ impl CorrosionApiClient {
         Ok(serde_json::from_slice(&res.bytes().await?)?)
     }
 
+    /// Update the schema on the Corrosion node.
+    ///
+    /// Wraps `POST /v1/migrations` endpoint
     pub async fn schema(&self, statements: &[Statement]) -> Result<ExecResponse, Error> {
         let res = self
             .api_client
@@ -310,6 +347,12 @@ impl CorrosionApiClient {
         Ok(serde_json::from_slice(&res.bytes().await?)?)
     }
 
+    /// Read schema files from disk and submit them via [`Self::schema`].
+    ///
+    /// Each path can be a single `.sql` file or a directory of files; the
+    /// helper [`corro_utils::read_files_from_paths`] handles enumeration and
+    /// ordering. Returns `Ok(None)` when the supplied paths produce no
+    /// statements.
     pub async fn schema_from_paths<P: AsRef<Path>>(
         &self,
         schema_paths: &[P],
@@ -329,6 +372,8 @@ impl CorrosionApiClient {
     }
 }
 
+/// Convenience client that combines a [`CorrosionApiClient`] with a local
+/// SQLite connection pool.
 #[derive(Clone)]
 pub struct CorrosionClient {
     api_client: CorrosionApiClient,
@@ -356,6 +401,7 @@ impl CorrosionClient {
         })
     }
 
+    /// Borrow the SQLite connection pool used for direct reads.
     pub fn pool(&self) -> &sqlite_pool::RusqlitePool {
         &self.pool
     }
@@ -369,6 +415,12 @@ impl Deref for CorrosionClient {
     }
 }
 
+/// Client to connect to a pool of Corrosion nodes.
+///
+/// Selects the first address from the list and tries to connect to it.
+/// On I/O errors the client falls back to the next address; once a request succeeds the client
+/// "sticks" to that peer until it has been failing continuously for the
+/// configured `stickiness_timeout`.
 #[derive(Clone)]
 pub struct CorrosionPooledClient {
     inner: Arc<RwLock<PooledClientInner>>,
@@ -390,6 +442,17 @@ struct PooledClientInner {
 }
 
 impl CorrosionPooledClient {
+    /// Build a new pooled client.
+    ///
+    /// * `addrs` — ordered list of agent addresses. Each entry can be either
+    ///   a `host:port` string (resolved through `resolver`) or an already
+    ///   resolved `SocketAddr` formatted as a string. Entries are tried in
+    ///   the supplied order; once a peer has been successful the client
+    ///   prefers it for as long as it stays healthy.
+    /// * `stickiness_timeout` — how long the client keeps retrying a
+    ///   previously successful peer after it starts failing before rotating
+    ///   to the next address.
+    /// * `resolver` — DNS resolver used to translate hostnames to addresses.
     pub fn new(addrs: Vec<String>, stickiness_timeout: time::Duration, resolver: Resolver) -> Self {
         Self {
             inner: Arc::new(RwLock::new(PooledClientInner {
@@ -404,6 +467,9 @@ impl CorrosionPooledClient {
         }
     }
 
+    /// Run a one-shot query against the currently selected peer.
+    ///
+    /// Equivalent to [`CorrosionApiClient::query_typed`]
     pub async fn query_typed<T: DeserializeOwned + Unpin>(
         &self,
         statement: &Statement,
@@ -427,6 +493,8 @@ impl CorrosionPooledClient {
         response
     }
 
+    /// Open a new subscription against the currently selected peer.
+    ///
     pub async fn subscribe_typed<T: DeserializeOwned + Unpin>(
         &self,
         statement: &Statement,
@@ -451,6 +519,8 @@ impl CorrosionPooledClient {
         response
     }
 
+    /// Reconnect to an existing subscription by id against the currently
+    /// selected peer. See [`CorrosionApiClient::subscription_typed`].
     pub async fn subscription_typed<T: DeserializeOwned + Unpin>(
         &self,
         id: Uuid,
@@ -630,6 +700,7 @@ impl AddrPicker {
     }
 }
 
+/// Errors returned by [`CorrosionApiClient`] and [`CorrosionPooledClient`].
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error(transparent)]
