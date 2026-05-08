@@ -1,8 +1,14 @@
 # The [api] block
 
-## api.addr
+The `[api]` block configures the local Corrosion HTTP API and, optionally, a PostgreSQL wire-protocol listener.
 
-Address for the Corrosion HTTP API to listen on.
+## Required fields
+
+### `api.addr`
+
+Address for the Corrosion HTTP API to listen on. Accepts either a single socket address or an array of addresses if you want to listen on multiple interfaces.
+
+`addr` is an alias for `bind_addr`; either name works in the config file.
 
 ```toml
 [api]
@@ -11,20 +17,73 @@ addr = "0.0.0.0:9000"
 
 ## api.authz.bearer-token
 
-Bearer token that will be used to authenticate HTTP requests.
-The client should set this token in the `Authorization` header.
+### Optional fields
+
+#### `api.endpoint_name`
+
+A human-readable label for this Corrosion node, surfaced in metrics and tracing labels. Useful for distinguishing nodes in observability backends when you don't want to rely on hostnames or IPs.
+
+```toml
+[api]
+endpoint_name = "corrosion-iad-1"
+```
+
+#### `api.authz.bearer-token`
+
+Bearer token used to authenticate HTTP requests. Clients must set this token in the `Authorization` header (`Authorization: Bearer <token>`).
 
 ```toml
 [api]
 authz.bearer-token = "<token>"
 ```
 
-## api.pg.addr
+## PostgreSQL wire protocol
 
-Address to listen on for PostgresQL connections.
-This allows you to query the sqlite databases using SQL.
+Corrosion can additionally expose its database over the [PostgreSQL wire protocol](../api/pg.md) for ad-hoc SQL access. The `pg` field accepts either a single listener config or an array of listener configs.
+
+#### `api.pg.addr`
+
+Address to listen on for PostgreSQL connections.
 
 ```toml
 [api]
-pg.addr = ""
+pg.addr = "127.0.0.1:5470"
 ```
+
+Multiple listeners (e.g. one read-write, one read-only):
+
+```toml
+[[api.pg]]
+addr = "127.0.0.1:5470"
+
+[[api.pg]]
+addr = "127.0.0.1:5471"
+readonly = true
+```
+
+#### `api.pg.readonly`
+
+When `true`, the listener rejects statements that would mutate the database. Defaults to `false`.
+
+```toml
+[api.pg]
+addr     = "127.0.0.1:5471"
+readonly = true
+```
+
+#### `api.pg.tls`
+
+Enable TLS for incoming PostgreSQL connections.
+
+```toml
+[api.pg]
+addr = "0.0.0.0:5470"
+
+[api.pg.tls]
+cert_file     = "/path/to/server_cert.pem"
+key_file      = "/path/to/server_key.pem"
+ca_file       = "/path/to/ca_cert.pem"   # optional
+verify_client = false                    # optional, set true to require client certs
+```
+
+When `verify_client = true`, only clients presenting a certificate signed by `ca_file` will be accepted (mutual TLS).

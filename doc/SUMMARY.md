@@ -27,6 +27,7 @@
     - [POST /v1/transactions](api/transactions.md)
     - [POST /v1/queries](api/queries.md)
     - [POST /v1/subscriptions](api/subscriptions.md)
+    - [POST /v1/updates/{table}](api/updates.md)
     - [PostgreSQL Wire Protocol](api/pg.md)
 - [Command-line Interface](cli/README.md)
     - [agent](cli/agent.md)
@@ -46,3 +47,4 @@
     - [admin](config/admin.md)
     - [telemetry](config/telemetry.md)
     - [consul](config/consul.md)
+    - [reaper](config/reaper.md)
