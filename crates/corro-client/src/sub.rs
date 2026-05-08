@@ -2,7 +2,7 @@
 //!
 //! Each long-running endpoint exposes a dedicated [`Stream`] implementation:
 //!
-//! * [`QueryStream`] — non-resumable one-shot query results
+//! * [`QueryStream`] — one-shot query results
 //!   (`POST /v1/queries`).
 //! * [`SubscriptionStream`] — resumable live subscription
 //!   (`POST /v1/subscriptions`); transparently reconnects with the last
@@ -358,7 +358,7 @@ where
 /// Stream returned by [`crate::CorrosionApiClient::updates_typed`].
 ///
 /// Yields a [`TypedNotifyEvent`] for every row inserted, updated or deleted
-/// in the watched table after the subscription was registered.
+/// in the watched table after the update was registered.
 pub struct UpdatesStream<T> {
     id: Uuid,
     stream: FramedBody,
@@ -425,11 +425,9 @@ where
     }
 }
 
-/// Stream returned by [`crate::CorrosionApiClient::query_typed`].
+/// Stream returned by [`crate::CorrosionApiClient::query_typed`] for a single query.
 ///
-/// Yields a [`TypedQueryEvent`] for the column header, each row of the
-/// result set, and a final [`TypedQueryEvent::EndOfQuery`]. The stream
-/// terminates after the EOQ frame; queries are not resumable.
+/// Yields a [`TypedQueryEvent`] with columns, each row of the result set, and a final [`TypedQueryEvent::EndOfQuery`].
 pub struct QueryStream<T> {
     stream: FramedBody,
     _deser: std::marker::PhantomData<T>,
@@ -517,7 +515,6 @@ impl Default for LinesBytesCodec {
     /// of a buffered line. See the documentation for [`new_with_max_length`]
     /// for information on why this could be a potential security risk.
     ///
-    /// [`new_with_max_length`]: crate::codec::LinesBytesCodec::default_with_max_length()
     fn default() -> Self {
         LinesBytesCodec {
             next_index: 0,

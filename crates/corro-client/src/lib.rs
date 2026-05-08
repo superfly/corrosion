@@ -46,15 +46,10 @@ impl CorrosionApiClient {
         })
     }
 
-    /// Run a one-shot query, deserializing each row into `T`. Accepts a
-    /// statement and a timeout.
+    /// Executes a single query against a Corrosion node, deserializing each row into `T`. 
+    /// Optionally accepts a timeout for the request.
     ///
-    /// Wraps `POST /v1/queries` endpoint.
-    ///
-    /// Returns [`sub::QueryStream`] yields a
-    /// [`corro_api_types::TypedQueryEvent::Columns`] frame, then one
-    /// [`corro_api_types::TypedQueryEvent::Row`] per row, then a final
-    /// [`corro_api_types::TypedQueryEvent::EndOfQuery`].
+    /// Calls the `/v1/queries` endpoint (<https://superfly.github.io/corrosion/api/queries.html>).
     pub async fn query_typed<T: DeserializeOwned + Unpin>(
         &self,
         statement: &Statement,
@@ -115,15 +110,10 @@ impl CorrosionApiClient {
     }
 
     /// Creates a new subscription and streams query updates, deserializing rows into T.
+    /// * `skip_rows` — when `true`, the initial rows are skipped and only changes are streamed.
+    /// * `from` — when set, resume the subscription past the given `ChangeId` instead of producing a fresh snapshot.
     ///
-    /// Wraps `POST /v1/subscriptions` endpoint. After the initial result set the agent
-    /// will push a [`corro_api_types::TypedQueryEvent::Change`] frame for
-    /// every row that enters, leaves or is updated within the query.
-    ///
-    /// * `skip_rows` — when `true`, the initial rows are skipped and
-    ///   only changes are streamed.
-    /// * `from` — when set, resume the subscription past the given
-    ///   `ChangeId` instead of producing a fresh snapshot.
+    /// Calls the `/v1/subscriptions` endpoint (<https://superfly.github.io/corrosion/api/subscriptions.html>).
     pub async fn subscribe_typed<T: DeserializeOwned + Unpin>(
         &self,
         statement: &Statement,
@@ -239,7 +229,7 @@ impl CorrosionApiClient {
 
     /// Subscribe to row-level changes on a single table.
     ///
-    /// Wraps `POST /v1/updates/{table}` endpoint.
+    /// Calls the `/v1/updates/{table}` endpoint (<https://superfly.github.io/corrosion/api/updates.html>).
     pub async fn updates_typed<T: DeserializeOwned + Unpin>(
         &self,
         table: &str,
@@ -272,12 +262,14 @@ impl CorrosionApiClient {
         self.updates_typed(table).await
     }
 
-    /// Execute a transaction containing one or more SQL statements.
+    /// Execute one or more SQL statements in a single transaction.
     ///
-    /// Wraps `POST /v1/transactions` endpoint. The slice is sent as a JSON array; the
-    /// agent applies the statements in a single transaction and
-    /// returns one `ExecResult` per statement in order.
-    pub async fn execute(&self, statements: &[Statement], timeout: Option<u64>) -> Result<ExecResponse, Error> {
+    /// Calls the `/v1/transactions` endpoint (<https://superfly.github.io/corrosion/api/transactions.html>).
+    pub async fn execute(
+        &self,
+        statements: &[Statement],
+        timeout: Option<u64>,
+    ) -> Result<ExecResponse, Error> {
         let uri = if let Some(timeout) = timeout {
             format!("http://{}/v1/transactions?timeout={timeout}", self.api_addr)
         } else {
@@ -349,10 +341,7 @@ impl CorrosionApiClient {
 
     /// Read schema files from disk and submit them via [`Self::schema`].
     ///
-    /// Each path can be a single `.sql` file or a directory of files; the
-    /// helper [`corro_utils::read_files_from_paths`] handles enumeration and
-    /// ordering. Returns `Ok(None)` when the supplied paths produce no
-    /// statements.
+    /// Each path can be a single `.sql` file or a directory of files;
     pub async fn schema_from_paths<P: AsRef<Path>>(
         &self,
         schema_paths: &[P],

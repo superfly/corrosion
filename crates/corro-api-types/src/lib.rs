@@ -60,8 +60,7 @@ impl<T> TypedQueryEvent<T> {
     }
 }
 
-/// Lightweight enum describing a [`TypedQueryEvent`] without the row
-/// payload.
+/// Lightweight enum describing a [`TypedQueryEvent`]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum QueryEventMeta {
     Columns,
