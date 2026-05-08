@@ -3,7 +3,7 @@ use std::{cmp, collections::HashMap, net::SocketAddr, ops::RangeInclusive, time:
 use bytes::{BufMut, BytesMut};
 use corro_types::{
     actor::ActorId,
-    agent::{Agent, Booked, Bookie},
+    agent::{Agent, Bookie},
     base::{CrsqlDbVersion, CrsqlSeq},
     broadcast::{
         ChangeId, ChangeSource, ChangeV1, ChangesetId, PlumtreeInput, PlumtreeMsg, PlumtreeMsgV1,
@@ -211,6 +211,54 @@ impl<T: TransportExt> CorrosionPlumtreeRuntime<T> {
 impl<T: TransportExt + Clone + Send + 'static> plum_foca::Runtime<ChangeId, ChangeV1, ActorId>
     for CorrosionPlumtreeRuntime<T>
 {
+    fn send_all(
+        &mut self,
+        peers: Vec<ActorId>,
+        msg: plum_foca::PlumtreeMsg<ChangeId, ChangeV1, ActorId>,
+    ) {
+        let addrs = peers
+            .iter()
+            .filter_map(|p| self.actors.get(p).map(|a| *a))
+            .collect::<Vec<_>>();
+
+        let payload = UniPayload::V1 {
+            data: UniPayloadV1::PlumTree(PlumtreeMsg::V1 { data: msg }),
+            cluster_id: self.agent.cluster_id(),
+        };
+
+        self.ser_buf.clear();
+        if let Err(e) = payload.write_to_stream((&mut self.ser_buf).writer()) {
+            error!("plumtree: failed to serialize wire msg: {e}");
+            return;
+        }
+
+        let mut frame_buf = BytesMut::new();
+        if let Err(e) = self
+            .bcast_codec
+            .encode(self.ser_buf.split().freeze(), &mut frame_buf)
+        {
+            error!("plumtree: failed to frame wire msg: {e}");
+            return;
+        }
+
+        let data = frame_buf.freeze();
+        for addr in addrs {
+            let transport = self.transport.clone();
+            let data = data.clone();
+            tokio::spawn(async move {
+                match tokio::time::timeout(Duration::from_secs(5), transport.send_uni(addr, data))
+                    .await
+                {
+                    Err(_) => warn!("plumtree: timed out sending to {addr}"),
+                    Ok(Err(e)) => debug!("plumtree: send error to {addr}: {e}"),
+                    Ok(Ok(())) => {
+                        counter!("corro.plumtree.send.total").increment(1);
+                    }
+                }
+            });
+        }
+    }
+
     fn send(&mut self, to: ActorId, msg: PlumtreeMsgV1) {
         let addr = match self.actors.get(&to) {
             Some(a) => *a,
@@ -360,7 +408,7 @@ pub async fn plumtree_loop<T: TransportExt + Clone + Send + 'static>(
         HandleTimer(Timer<ChangeId, ActorId>),
         IHaveTick,
         MaintenanceTick,
-        Metrics,
+        // Metrics,
     }
 
     loop {
@@ -394,9 +442,9 @@ pub async fn plumtree_loop<T: TransportExt + Clone + Send + 'static>(
             _ = maintenance_interval.tick() => {
                 Branch::MaintenanceTick
             }
-            _ = metrics_interval.tick() => {
-                Branch::Metrics
-            }
+            // _ = metrics_interval.tick() => {
+            //     Branch::Metrics
+            // }
         };
 
         match branch {
@@ -440,10 +488,9 @@ pub async fn plumtree_loop<T: TransportExt + Clone + Send + 'static>(
                 let topo = plumtree_topology_map(&agent);
                 state.maintain_topology(&mut rt, topo);
                 state.seen_evict_if_needed();
-            }
-            Branch::Metrics => {
-                todo!("metrics");
-            }
+            } // Branch::Metrics => {
+              //     todo!("metrics");
+              // }
         }
     }
 
@@ -472,32 +519,28 @@ fn plumtree_topology_map(agent: &Agent) -> HashMap<ActorId, PeerTopologyInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::{setup, spawn_unipayload_handler};
+    use crate::agent::setup;
     use crate::transport::{TransportError, TransportExt};
     use async_trait::async_trait;
-    use bytes::{BufMut, Bytes, BytesMut};
-    use corro_tests::{launch_test_agent, test_config};
+    use bytes::Bytes;
+    use corro_tests::test_config;
     use corro_types::{
         actor::Actor,
         base::{dbsr, CrsqlDbVersion, CrsqlSeq},
-        broadcast::{BroadcastV1, ChangeV1, Changeset},
+        broadcast::{ChangeV1, Changeset},
         members::Members,
     };
     use parking_lot::RwLock;
 
     use std::{collections::HashMap, net::SocketAddr, sync::Arc};
     // use plum_foca::PlumtreeMsg;
-    use rand::seq::{IndexedRandom, SliceRandom};
+    use rand::seq::IndexedRandom;
     use rangemap::RangeInclusiveSet;
     use speedy::Readable;
-    use std::collections::HashSet;
-    // use std::hash::Hash;
-    use std::sync::atomic::AtomicU64;
     use tokio::task::JoinSet;
     use tokio_stream::StreamExt;
-    use tokio_util::codec::{Encoder, FramedRead, LengthDelimitedCodec};
+    use tokio_util::codec::{FramedRead, LengthDelimitedCodec};
     use tokio_util::sync::CancellationToken;
-    use uuid::Uuid;
 
     use rand::{rngs::StdRng, SeedableRng};
 
@@ -670,7 +713,7 @@ mod tests {
                             match changes {
                                 (
                                     ChangeV1 {
-                                        actor_id,
+                                        actor_id: _,
                                         changeset,
                                     },
                                     ChangeSource::Broadcast,
@@ -741,7 +784,7 @@ mod tests {
             .map(|(actor_id, duplicate, seen_map)| (actor_id, (duplicate, seen_map)))
             .collect::<HashMap<_, _>>();
 
-        let mut plumstats_map = plumtree_results
+        let plumstats_map = plumtree_results
             .into_iter()
             .map(|(agent_id, stats)| (agent_id, stats))
             .collect::<HashMap<_, _>>();

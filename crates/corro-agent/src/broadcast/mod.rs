@@ -671,7 +671,7 @@ async fn handle_broadcasts(
                 let members = agent.members().read();
                 let members_count = members.states.len();
                 let ring0_count = members.ring0(agent.cluster_id()).count();
-                (members_count, ring0_ccount)
+                (members_count, ring0_count)
             };
 
             let (choose_count, max_transmissions) = {
@@ -1116,7 +1116,6 @@ fn try_transmit_broadcast(
 mod tests {
     use super::*;
     use crate::agent::spawn_unipayload_handler;
-    use crate::transport::TransportExt;
     use corro_tests::launch_test_agent;
     use corro_types::{
         base::{dbsr, CrsqlDbVersion, CrsqlSeq},

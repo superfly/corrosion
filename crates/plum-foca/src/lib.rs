@@ -8,10 +8,8 @@ use std::hash::Hash;
 use std::time::Duration;
 use tracing::{debug, trace};
 
-/// Identifies a unique message in the network.
 pub trait MessageId: Clone + Eq + Hash + Debug + Send + 'static {}
 
-/// The payload carried by a Gossip message.
 pub trait Payload: Clone + Debug + Send + 'static {
     type MessageId: MessageId;
     type NodeId: NodeId;
@@ -19,17 +17,13 @@ pub trait Payload: Clone + Debug + Send + 'static {
     fn origin(&self) -> Self::NodeId;
 }
 
-/// Identifies a peer/node for routing purposes.
 pub trait NodeId: Clone + Eq + Hash + Ord + Debug + Send + 'static {}
 
 impl<T> MessageId for T where T: Clone + Eq + Hash + Debug + Send + 'static {}
 impl<T> NodeId for T where T: Clone + Eq + Hash + Ord + Debug + Send + 'static {}
 
-/// Hop count from the original sender, incremented on each forward.
 pub type Round = u32;
 
-/// RTT ring index (from the caller's bucketing, e.g. latency class) and a
-/// tie-breaker RTT in milliseconds for ordering within a ring.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PeerTopologyInfo {
     /// Semantics are caller-defined; `Some(0)` typically means lowest-latency bucket.
@@ -127,6 +121,9 @@ pub trait Runtime<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId
     /// Send a protocol message to a specific peer.
     fn send(&mut self, to: N, msg: PlumtreeMsg<I, P, N>);
 
+    // Send a message to a group of peers
+    fn send_all(&mut self, peers: Vec<N>, msg: PlumtreeMsg<I, P, N>);
+
     /// Deliver a received message to the application layer.
     fn deliver(&mut self, payload: P);
 
@@ -204,8 +201,6 @@ where
     pub triggered_by: I,
 }
 
-/// A message we heard about (via IHave) but haven't received yet.
-/// Keyed by message id in `PlumtreeState::missing`.
 #[derive(Debug, Clone)]
 struct MissingEntry<N: NodeId> {
     ihave_sender: N,
@@ -277,7 +272,7 @@ pub struct PlumtreeState<
     known_peers: HashSet<N>,
     ring_locked: HashSet<N>,
 
-    lazy_queue: HashMap<N, Vec<IHaveDigest<I>>>,
+    lazy_queue: Vec<IHaveDigest<I>>,
     missing: HashMap<I, MissingEntry<N>>,
 
     seen: S,
@@ -297,7 +292,7 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
             lazy_peers: IndexSet::new(),
             known_peers: HashSet::new(),
             ring_locked: HashSet::new(),
-            lazy_queue: HashMap::new(),
+            lazy_queue: Vec::new(),
             missing: HashMap::new(),
             seen,
             cache: PayloadCache::new(cache_size),
@@ -336,10 +331,6 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
     // --- Protocol methods ---
 
     /// Handle an incoming GOSSIP message carrying a full payload.
-    ///
-    /// Adapted from Paper §3.2 eagerPush procedure for multi-sender:
-    /// - Duplicate → PRUNE sender (after threshold), demote to lazy.
-    /// - New → deliver, forward to eager peers, enqueue IHave for lazy.
     ///
     /// Unlike the paper, we do NOT promote the sender to eager on receipt.
     /// In a multi-sender network, the peer that forwarded sender A's
@@ -557,22 +548,28 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
             "local={:?} broadcast originate",
             self.local_id
         );
+        if self.seen.contains(&id) {
+            return;
+        }
+
         self.seen.observe(id.clone(), 0);
         self.cache.insert(id.clone(), payload.clone(), 0);
 
-        for peer in &self.eager_peers {
-            if *peer == self.local_id {
-                continue;
-            }
-            rt.send(
-                peer.clone(),
-                PlumtreeMsg::Gossip(GossipMsg {
-                    round: 0,
-                    sender: self.local_id.clone(),
-                    payload: payload.clone(),
-                }),
-            );
-        }
+        let peers = self
+            .eager_peers
+            .clone()
+            .iter()
+            .filter(|p| **p != self.local_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        rt.send_all(
+            peers,
+            PlumtreeMsg::Gossip(GossipMsg {
+                round: 0,
+                sender: self.local_id.clone(),
+                payload,
+            }),
+        );
 
         self.enqueue_ihave(id, 0);
     }
@@ -643,16 +640,14 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
     /// The caller should invoke this on a regular interval (e.g. 200-500ms).
     pub fn tick(&mut self, rt: &mut impl Runtime<I, P, N>) {
         let peers: Vec<N> = self.lazy_peers.iter().cloned().collect();
-        for peer in peers {
-            if let Some(digests) = self.drain_lazy_queue(&peer) {
-                rt.send(
-                    peer,
-                    PlumtreeMsg::IHave(IHaveMsg {
-                        sender: self.local_id.clone(),
-                        digests,
-                    }),
-                );
-            }
+        if let Some(digests) = self.drain_lazy_queue() {
+            rt.send_all(
+                peers,
+                PlumtreeMsg::IHave(IHaveMsg {
+                    sender: self.local_id.clone(),
+                    digests,
+                }),
+            );
         }
     }
 
@@ -684,7 +679,6 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
         self.stats.peer_down += 1;
         self.eager_peers.remove(peer);
         self.lazy_peers.swap_remove(peer);
-        self.lazy_queue.remove(peer);
         self.known_peers.remove(peer);
         self.rebalance(rt);
     }
@@ -852,7 +846,6 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
             let evict: Vec<N> = self.lazy_peers.iter().take(num_evict).cloned().collect();
             for p in evict {
                 self.lazy_peers.swap_remove(&p);
-                self.lazy_queue.remove(&p);
             }
         } else if count_lazy < self.config.min_lazy {
             let lazy_candidates: Vec<N> = self
@@ -884,20 +877,14 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
 
     fn enqueue_ihave(&mut self, id: I, round: Round) {
         let digest = IHaveDigest { id, round };
-        for peer in &self.lazy_peers {
-            self.lazy_queue
-                .entry(peer.clone())
-                .or_default()
-                .push(digest.clone());
-        }
+        self.lazy_queue.push(digest);
     }
 
-    fn drain_lazy_queue(&mut self, peer: &N) -> Option<Vec<IHaveDigest<I>>> {
-        let queue = self.lazy_queue.get_mut(peer)?;
-        if queue.is_empty() {
+    fn drain_lazy_queue(&mut self) -> Option<Vec<IHaveDigest<I>>> {
+        if self.lazy_queue.is_empty() {
             return None;
         }
-        Some(std::mem::take(queue))
+        Some(std::mem::take(&mut self.lazy_queue))
     }
 
     /// Recompute ring neighbors from scratch based on current known_peers.
@@ -1034,7 +1021,6 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
     }
 
     /// Evict a random non-ring-locked peer from the lazy set.
-    /// Cleans up their lazy_queue. Returns the evicted peer if any.
     fn evict_from_lazy(&mut self) -> Option<N> {
         let evictable: Vec<usize> = self
             .lazy_peers
@@ -1050,9 +1036,6 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
 
         let idx = evictable[rand::rng().random_range(0..evictable.len())];
         let evicted = self.lazy_peers.swap_remove_index(idx);
-        if let Some(ref evicted) = evicted {
-            self.lazy_queue.remove(evicted);
-        }
         evicted
     }
 }
@@ -1091,12 +1074,17 @@ mod tests {
     }
 
     impl SeenStore<TestMsgId> for TestSeenStore {
+        fn evict_if_needed(&mut self) {
+            // no-op
+        }
+
         fn contains(&self, id: &TestMsgId) -> bool {
             self.entries.contains_key(id)
         }
 
         fn observe(&mut self, id: TestMsgId, round: Round) -> Option<u32> {
             let existing = self.entries.get_mut(&id);
+            println!("existing: {:?}", existing);
             if let Some((existing, seen)) = existing {
                 *existing = round;
                 *seen += 1;
@@ -1130,11 +1118,21 @@ mod tests {
     pub(crate) struct AccumulatingRuntime {
         pub sent: Vec<(TestNodeId, PlumtreeMsg<TestMsgId, TestPayload, TestNodeId>)>,
         pub delivered: Vec<TestPayload>,
-        pub scheduled: Vec<(Timer<TestMsgId>, Duration)>,
+        pub scheduled: Vec<(Timer<TestMsgId, TestNodeId>, Duration)>,
         pub notifications: Vec<Notification<TestMsgId, TestNodeId>>,
     }
 
     impl Runtime<TestMsgId, TestPayload, TestNodeId> for AccumulatingRuntime {
+        fn send_all(
+            &mut self,
+            peers: Vec<TestNodeId>,
+            msg: PlumtreeMsg<TestMsgId, TestPayload, TestNodeId>,
+        ) {
+            for peer in peers {
+                self.send(peer, msg.clone());
+            }
+        }
+
         fn send(&mut self, to: TestNodeId, msg: PlumtreeMsg<TestMsgId, TestPayload, TestNodeId>) {
             self.sent.push((to, msg));
         }
@@ -1143,7 +1141,7 @@ mod tests {
             self.delivered.push(payload);
         }
 
-        fn schedule(&mut self, timer: Timer<TestMsgId>, after: Duration) {
+        fn schedule(&mut self, timer: Timer<TestMsgId, TestNodeId>, after: Duration) {
             self.scheduled.push((timer, after));
         }
 
@@ -1318,18 +1316,6 @@ mod tests {
     }
 
     #[test]
-    fn peer_down_cleans_lazy_queue() {
-        let mut s = state();
-        let mut rt = AccumulatingRuntime::default();
-        s.lazy_peers.insert(1);
-        s.enqueue_ihave(msg(1), 0);
-        assert!(s.lazy_queue.contains_key(&1));
-
-        s.peer_down(&1, &mut rt);
-        assert!(!s.lazy_queue.contains_key(&1));
-    }
-
-    #[test]
     fn replenish_eager_after_prune() {
         let mut cfg = test_config();
         cfg.max_eager = 3;
@@ -1393,7 +1379,7 @@ mod tests {
         }
 
         // Lazy queue for peer 3 should have one digest
-        assert_eq!(s.lazy_queue[&3].len(), 1);
+        assert_eq!(s.lazy_queue.len(), 1);
 
         // Message should be marked received
         assert!(s.has_message(&msg(42)));
@@ -1463,7 +1449,7 @@ mod tests {
         assert!(s.lazy_peers.contains(&1));
 
         // Lazy peer 4 has IHave enqueued
-        assert_eq!(s.lazy_queue[&4].len(), 1);
+        assert_eq!(s.lazy_queue.len(), 1);
 
         // Marked as received
         assert!(s.has_message(&msg(10)));
@@ -1637,7 +1623,14 @@ mod tests {
 
         assert_eq!(s.missing.len(), 2);
         assert_eq!(rt.scheduled.len(), 2);
-        assert_eq!(rt.scheduled[0].0, Timer::IHaveTimeout(msg(1)));
+        assert_eq!(
+            rt.scheduled[0].0,
+            Timer::IHaveTimeout {
+                id: msg(1),
+                retries: 0,
+                senders: vec![5]
+            }
+        );
         assert_eq!(rt.scheduled[0].1, Duration::from_secs(3));
     }
 
@@ -1715,6 +1708,7 @@ mod tests {
                 sender: 5,
                 id: msg(1),
                 round: 0,
+                send: true,
             },
             &mut rt,
         );
@@ -1740,6 +1734,7 @@ mod tests {
                 sender: 5,
                 id: msg(999),
                 round: 0,
+                send: true,
             },
             &mut rt,
         );
@@ -1809,7 +1804,14 @@ mod tests {
         rt.sent.clear();
 
         // Fire the timer
-        s.timer_fired(Timer::IHaveTimeout(msg(1)), &mut rt);
+        s.timer_fired(
+            Timer::IHaveTimeout {
+                id: msg(1),
+                retries: 0,
+                senders: vec![5],
+            },
+            &mut rt,
+        );
 
         // GRAFT sent to peer 5
         assert_eq!(rt.sent.len(), 1);
@@ -1854,7 +1856,14 @@ mod tests {
         rt.sent.clear();
 
         // Timer fires — but missing entry already removed
-        s.timer_fired(Timer::IHaveTimeout(msg(1)), &mut rt);
+        s.timer_fired(
+            Timer::IHaveTimeout {
+                id: msg(1),
+                retries: 0,
+                senders: vec![5],
+            },
+            &mut rt,
+        );
         assert!(rt.sent.is_empty());
     }
 
@@ -1885,8 +1894,7 @@ mod tests {
         }
 
         // Queue is drained
-        assert!(s.drain_lazy_queue(&3).is_none());
-        assert!(s.drain_lazy_queue(&4).is_none());
+        assert!(s.drain_lazy_queue().is_none());
     }
 
     #[test]
@@ -2038,7 +2046,14 @@ mod tests {
         );
 
         // Timer fires — B sends GRAFT to C
-        b.timer_fired(Timer::IHaveTimeout(msg(2)), &mut rt_b);
+        b.timer_fired(
+            Timer::IHaveTimeout {
+                id: msg(2),
+                retries: 0,
+                senders: vec![30],
+            },
+            &mut rt_b,
+        );
         assert_eq!(rt_b.sent.len(), 1);
         let (to, m) = &rt_b.sent[0];
         assert_eq!(*to, 30);
@@ -2096,6 +2111,7 @@ mod tests {
                 sender: 5,
                 id: msg(1),
                 round: 0,
+                send: true,
             },
             &mut rt,
         );

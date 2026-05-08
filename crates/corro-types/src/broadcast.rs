@@ -801,10 +801,10 @@ pub async fn broadcast_changes(
                     match_changes(agent.subs_manager(), &changeset, db_version);
                     match_changes(agent.updates_manager(), &changeset, db_version);
 
-                    let tx_bcast = agent.tx_plumtree().clone();
+                    let tx_plumtree = agent.tx_plumtree().clone();
                     assert_sometimes!(true, "Corrosion broadcasts changes");
                     tokio::spawn(async move {
-                        if let Err(e) = tx_bcast
+                        if let Err(e) = tx_plumtree
                             .send(PlumtreeInput::Broadcast(ChangeV1 {
                                 actor_id,
                                 changeset,
