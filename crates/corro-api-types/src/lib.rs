@@ -54,7 +54,7 @@ pub enum QueryEventMeta {
     Row(RowId),
     EndOfQuery(Option<ChangeId>),
     Change(ChangeId),
-Error,
+    Error,
     Notify,
 }
 
