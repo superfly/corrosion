@@ -46,7 +46,7 @@ impl CorrosionApiClient {
         })
     }
 
-    /// Execute a single query against a Corrosion node, deserializing each row into `T`. 
+    /// Execute a single query against a Corrosion node, deserializing each row into `T`.
     /// Optionally accepts a timeout for the request.
     ///
     /// Calls the `/v1/queries` endpoint (<https://superfly.github.io/corrosion/api/queries.html>).
