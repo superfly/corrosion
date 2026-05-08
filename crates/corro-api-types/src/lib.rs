@@ -19,6 +19,16 @@ use sqlite::ChangeType;
 
 pub mod sqlite;
 
+/// HTTP response header that carries the UUID of a subscription or update stream.
+/// Set by the server on every successful `/v1/queries`, `/v1/subscriptions`, and
+/// `/v1/updates` response so callers can re-attach to the same stream by ID.
+pub const QUERY_ID_HEADER: &str = "corro-query-id";
+
+/// HTTP response header that carries a hash of the SQL query string.
+/// Returned alongside [`QUERY_ID_HEADER`] so clients can verify that a
+/// cached subscription ID still corresponds to the same query.
+pub const QUERY_HASH_HEADER: &str = "corro-query-hash";
+
 pub type QueryEvent = TypedQueryEvent<Vec<SqliteValue>>;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
