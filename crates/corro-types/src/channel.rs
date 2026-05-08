@@ -78,18 +78,22 @@ pub fn bounded<T: Send + 'static>(
         let mut ticks_since_report = 0;
         let mut tick = interval(Duration::from_secs(1));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut prev = inner_channel.capacity();
         loop {
             tick.tick().await;
             if inner_channel.is_closed() {
                 break;
             }
             let current = inner_channel.capacity();
-            if current < threshold || ticks_since_report >= 30 {
+            if ticks_since_report >= 30
+                || (prev != current && (current < threshold || prev < threshold))
+            {
                 capacity_gauge.set(current as f64);
                 ticks_since_report = 0;
             } else {
                 ticks_since_report += 1;
             }
+            prev = current;
         }
     });
 

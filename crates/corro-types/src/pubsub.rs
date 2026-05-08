@@ -45,7 +45,7 @@ use crate::{
     api::QueryEvent,
     change::Change,
     schema::{Schema, Table},
-    sqlite::CrConn,
+    sqlite::{trace_heavy_queries_subs, CrConn},
     updates::HandleMetrics,
 };
 
@@ -278,6 +278,52 @@ struct InnerMatcherHandle {
     subs_path: String,
     cached_statements: HashMap<String, MatcherStmt>,
     metrics: HashMap<String, HandleMetrics>,
+    /// EMA of ms/s spent in handle_candidates
+    processing_stats: Arc<Mutex<ProcessingStats>>,
+}
+
+/// Tracks a moving average of ms/s for subscription processing cost.
+struct ProcessingStats {
+    /// Exponential moving average of ms/s
+    ema_ms_per_sec: f64,
+    /// Time of the last handle_candidates completion
+    last_process_time: Option<Instant>,
+}
+
+impl ProcessingStats {
+    /// Alpha for EMA smoothing. Higher = more responsive to recent data.
+    const ALPHA: f64 = 0.3;
+
+    /// Update the EMA with a new processing duration.
+    fn record(&mut self, elapsed: Duration) {
+        let now = Instant::now();
+        let ms = elapsed.as_secs_f64() * 1000.0;
+        let ms_per_sec = match self.last_process_time {
+            Some(prev) => {
+                let interval = (now - prev).as_secs_f64();
+                if interval > 0.0 {
+                    ms / interval
+                } else {
+                    0.0
+                }
+            }
+            None => 0.0,
+        };
+        self.ema_ms_per_sec = if self.ema_ms_per_sec == 0.0 {
+            ms_per_sec
+        } else {
+            Self::ALPHA * ms_per_sec + (1.0 - Self::ALPHA) * self.ema_ms_per_sec
+        };
+        self.last_process_time = Some(now);
+    }
+}
+
+impl std::fmt::Debug for ProcessingStats {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProcessingStats")
+            .field("ema_ms_per_sec", &self.ema_ms_per_sec)
+            .finish()
+    }
 }
 
 pub type MatchCandidates = IndexMap<TableName, IndexMap<Vec<u8>, i64>>;
@@ -378,6 +424,10 @@ impl MatcherHandle {
 
     pub fn pool(&self) -> &RusqlitePool {
         &self.inner.pool
+    }
+
+    pub fn ms_per_sec(&self) -> f64 {
+        self.inner.processing_stats.lock().ema_ms_per_sec
     }
 
     fn wait_for_running_state(&self) {
@@ -562,6 +612,7 @@ pub struct Matcher {
     last_change_tx: watch::Sender<ChangeId>,
     changes_rx: mpsc::Receiver<MatchCandidates>,
     purge_rx: mpsc::Receiver<oneshot::Sender<rusqlite::Result<usize>>>,
+    processing_stats: Arc<Mutex<ProcessingStats>>,
 }
 
 #[derive(Debug, Clone)]
@@ -611,6 +662,7 @@ impl Matcher {
         };
 
         let conn = Connection::open(&sub_db_path)?;
+        trace_heavy_queries_subs(&conn)?;
         conn.execute_batch(
             r#"
                 PRAGMA journal_mode = WAL;
@@ -819,9 +871,15 @@ impl Matcher {
                 cached_statements: statements.clone(),
                 subs_path: sub_path.to_string(),
                 metrics: counter_map,
+                processing_stats: Arc::new(Mutex::new(ProcessingStats {
+                    ema_ms_per_sec: 0.0,
+                    last_process_time: None,
+                })),
             }),
             state: state.clone(),
         };
+
+        let processing_stats = handle.inner.processing_stats.clone();
 
         let matcher = Self {
             id,
@@ -840,6 +898,7 @@ impl Matcher {
             last_change_tx,
             changes_rx,
             purge_rx,
+            processing_stats,
         };
 
         Ok((matcher, handle))
@@ -1222,6 +1281,8 @@ impl Matcher {
                     }
                     let elapsed = start.elapsed();
 
+                    self.processing_stats.lock().record(elapsed);
+
                     histogram!("corro.subs.changes.processing.duration.seconds", "sql_hash" => self.hash.clone()).record(elapsed);
 
                     if elapsed >= PROCESSING_WARN_THRESHOLD {
@@ -1278,6 +1339,7 @@ impl Matcher {
                 return;
             }
             let elapsed = start.elapsed();
+            self.processing_stats.lock().record(elapsed);
             info!(sub_id = %self.id, "handled final buffered candidates in {elapsed:?}");
         }
 
@@ -1290,6 +1352,7 @@ impl Matcher {
 
     async fn run(mut self, mut state_conn: CrConn, tripwire: Tripwire) -> Result<(), MatcherError> {
         info!(sub_id = %self.id, "Running initial query");
+
         self.evt_tx
             .send(QueryEvent::Columns(self.col_names.clone()))
             .await
