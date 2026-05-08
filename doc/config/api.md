@@ -21,7 +21,8 @@ addr = "0.0.0.0:9000"
 
 #### `api.endpoint_name`
 
-A human-readable label for this Corrosion node, surfaced in metrics and tracing labels. Useful for distinguishing nodes in observability backends when you don't want to rely on hostnames or IPs.
+This is a label used to identify nodes in the same cluster, used mostly to ensure requests aren't processed
+by the wrong one. An incoming request with a different label in the `x-corrosion-requested-endpoint-name` header is rejected.
 
 ```toml
 [api]
