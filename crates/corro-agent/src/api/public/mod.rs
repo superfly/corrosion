@@ -667,7 +667,7 @@ mod tests {
     use corro_types::{
         api::RowId,
         base::CrsqlDbVersion,
-        broadcast::{BroadcastInput, BroadcastV1, ChangeV1, Changeset},
+        broadcast::{ChangeV1, Changeset, PlumtreeInput},
         config::Config,
         schema::SqliteType,
     };
@@ -699,6 +699,7 @@ mod tests {
         .await?;
 
         let rx_bcast = &mut agent_options.rx_bcast;
+        let rx_plumtree = &mut agent_options.rx_plumtree;
 
         execute_schema(&agent, vec![corro_tests::TEST_SCHEMA.to_owned()]).await?;
 
@@ -718,20 +719,20 @@ mod tests {
 
         assert!(body.0.results.len() == 1);
 
-        let msg = rx_bcast
+        let msg = rx_plumtree
             .recv()
             .await
             .expect("not msg received on bcast channel");
 
         assert!(matches!(
             msg,
-            BroadcastInput::AddBroadcast(BroadcastV1::Change(ChangeV1 {
+            PlumtreeInput::Broadcast(ChangeV1 {
                 changeset: Changeset::FullV2 {
                     version: CrsqlDbVersion(1),
                     ..
                 },
                 ..
-            }))
+            })
         ));
 
         assert_eq!(agent.booked().read().last(), Some(CrsqlDbVersion(1)));
