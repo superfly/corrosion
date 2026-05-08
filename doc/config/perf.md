@@ -77,7 +77,7 @@ batch_size = clamp(
 )
 ```
 
-Defaults to `500`. Smaller values make the batch size grow faster as the queue fills.
+Defaults to `500`. Larger values make the batch size grow faster as the queue fills.
 
 #### `apply_queue_batch_threshold_ratio`
 
