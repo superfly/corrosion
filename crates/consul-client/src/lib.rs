@@ -86,8 +86,7 @@ impl Client {
 
     /// Fetch the services registered on the local Consul agent.
     ///
-    /// Wraps the
-    /// [`/v1/agent/services`](https://developer.hashicorp.com/consul/api-docs/agent/service#list-services)
+    /// Wraps the [`/v1/agent/services`](https://developer.hashicorp.com/consul/api-docs/agent/service#list-services)
     /// endpoint. The returned map is keyed by service ID.
     pub async fn agent_services(&self) -> ConsulResult<HashMap<String, AgentService>> {
         self.request("/v1/agent/services").await
@@ -95,8 +94,7 @@ impl Client {
 
     /// Fetch the health checks registered on the local Consul agent.
     ///
-    /// Wraps the
-    /// [`/v1/agent/checks`](https://developer.hashicorp.com/consul/api-docs/agent/check#list-checks)
+    /// Wraps the [`/v1/agent/checks`](https://developer.hashicorp.com/consul/api-docs/agent/check#list-checks)
     /// endpoint. The returned map is keyed by check ID.
     pub async fn agent_checks(&self) -> ConsulResult<HashMap<String, AgentCheck>> {
         self.request("/v1/agent/checks").await

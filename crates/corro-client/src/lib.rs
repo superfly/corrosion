@@ -46,7 +46,7 @@ impl CorrosionApiClient {
         })
     }
 
-    /// Executes a single query against a Corrosion node, deserializing each row into `T`. 
+    /// Execute a single query against a Corrosion node, deserializing each row into `T`. 
     /// Optionally accepts a timeout for the request.
     ///
     /// Calls the `/v1/queries` endpoint (<https://superfly.github.io/corrosion/api/queries.html>).
@@ -109,7 +109,7 @@ impl CorrosionApiClient {
         self.query_typed(statement, timeout).await
     }
 
-    /// Creates a new subscription and streams query updates, deserializing rows into T.
+    /// Create a new subscription and stream query updates, deserializing rows into T.
     /// * `skip_rows` — when `true`, the initial rows are skipped and only changes are streamed.
     /// * `from` — when set, resume the subscription past the given `ChangeId` instead of producing a fresh snapshot.
     ///
