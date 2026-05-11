@@ -1001,7 +1001,6 @@ version = "0.1.0-alpha.1"
 dependencies = [
  "bytes",
  "corro-api-types",
- "corro-utils",
  "futures",
  "hickory-resolver",
  "http",

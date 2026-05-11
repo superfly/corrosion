@@ -13,7 +13,6 @@ workspace = true
 [dependencies]
 bytes = { workspace = true }
 corro-api-types = { version = "0.1.0-alpha.1", path = "../corro-api-types" }
-corro-utils = { path = "../corro-utils" }
 futures = { workspace = true }
 hickory-resolver = { workspace = true }
 http = { workspace = true }
@@ -22,7 +21,7 @@ pin-project-lite = { workspace = true }
 reqwest.workspace = true
 serde = { workspace = true }
 serde_json = { workspace = true }
-sqlite-pool = { path = "../sqlite-pool" }
+sqlite-pool = { version = "0.1.0-alpha.1", path = "../sqlite-pool" }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
