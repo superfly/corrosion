@@ -1,0 +1,27 @@
+[workspace]
+# Run cargo-semver-checks on libraries to catch breaking API changes
+semver_check = true
+# Don't update Cargo.lock as part of the release PR — keeps diffs small
+dependencies_update = false
+# Label the release PR so it's easy to filter
+pr_labels = ["release"]
+
+# Binary crate: tag as `v0.3.0` so your existing release workflow triggers.
+# release-plz will still create the GitHub Release; your workflow attaches binaries to it.
+[[package]]
+name = "corrosion"
+git_tag_name = "v{{ version }}"
+git_release_name = "v{{ version }}"
+
+# Library crates: default tag format (e.g. `corro-client-v0.1.0`), no GitHub Release noise.
+# Each still publishes to crates.io and gets its own git tag.
+[[package]]
+name = "corro-client"
+git_release_enable = false
+
+[[package]]
+name = "corro-api-types"
+git_release_enable = false
+
+[[package]]
+name = "consul-client"
