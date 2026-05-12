@@ -1,6 +1,8 @@
 pub mod sub;
 
-use corro_api_types::{ChangeId, ExecResponse, ExecResult, SqliteValue, Statement};
+use corro_api_types::{
+    ChangeId, ExecResponse, ExecResult, SqliteValue, Statement, QUERY_HASH_HEADER, QUERY_ID_HEADER,
+};
 use hickory_resolver::net::NetError as ResolveError;
 use serde::de::DeserializeOwned;
 use std::{
@@ -142,15 +144,14 @@ impl CorrosionApiClient {
             return Err(Error::UnexpectedStatusCode(res.status()));
         }
 
-        // TODO: make that header name a const in corro-types
         let id = res
             .headers()
-            .get("corro-query-id")
+            .get(QUERY_ID_HEADER)
             .and_then(|v| v.to_str().ok().and_then(|v| v.parse().ok()))
             .ok_or(Error::ExpectedQueryId)?;
         let hash = res
             .headers()
-            .get("corro-query-hash")
+            .get(QUERY_HASH_HEADER)
             .and_then(|v| v.to_str().map(ToOwned::to_owned).ok());
 
         Ok(SubscriptionStream::new(
@@ -203,7 +204,7 @@ impl CorrosionApiClient {
 
         let hash = res
             .headers()
-            .get("corro-query-hash")
+            .get(QUERY_HASH_HEADER)
             .and_then(|v| v.to_str().map(ToOwned::to_owned).ok());
 
         Ok(SubscriptionStream::new(
@@ -246,10 +247,9 @@ impl CorrosionApiClient {
             return Err(Error::UnexpectedStatusCode(res.status()));
         }
 
-        // TODO: make that header name a const in corro-types
         let id = res
             .headers()
-            .get("corro-query-id")
+            .get(QUERY_ID_HEADER)
             .and_then(|v| v.to_str().ok().and_then(|v| v.parse().ok()))
             .ok_or(Error::ExpectedQueryId)?;
 
@@ -719,7 +719,7 @@ pub enum Error {
 #[cfg(test)]
 mod tests {
     use crate::{CorrosionPooledClient, Error};
-    use corro_api_types::SqliteValue;
+    use corro_api_types::{SqliteValue, QUERY_ID_HEADER};
     use hickory_resolver::Resolver;
     use hyper::{header::HeaderValue, service::service_fn, Request, Response};
     use std::{
@@ -798,7 +798,7 @@ mod tests {
                                 service_fn(move |_: Request<hyper::body::Incoming>| async move {
                                     let mut res = Response::new(Empty::new());
                                     res.headers_mut().insert(
-                                        "corro-query-id",
+                                        QUERY_ID_HEADER,
                                         HeaderValue::from_str(&id.to_string()).unwrap(),
                                     );
                                     Ok::<_, Infallible>(res)
