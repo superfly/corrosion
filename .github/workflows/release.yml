@@ -20,6 +20,7 @@ jobs:
       - uses: taiki-e/create-gh-release-action@v1
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+          changelog: CHANGELOG.md
 
   upload-assets:
     strategy:
