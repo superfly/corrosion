@@ -4,9 +4,9 @@
 
 v1.0.0 is packed with a lot of new features and bug fixes. Some high-level details include:
 
-- **PostgreSQL compatible API:** Implement a PostgreSQL wire protocol (v3) compatible API, including read-only endpoints, tls configuration, and addition of unnest function (similar to `rarray`) that zips multiple arrays into tables for bulk queries ([#83](https://github.com/superfly/corrosion/pull/83), [#337](https://github.com/superfly/corrosion/pull/337), [#405](https://github.com/superfly/corrosion/pull/383),[#174](https://github.com/superfly/corrosion/pull/174), [#283](https://github.com/superfly/corrosion/pull/283))
+- **PostgreSQL compatible API:** Implement a PostgreSQL wire protocol (v3) compatible API, including read-only endpoints, tls configuration, and addition of unnest table-valued function (similar to `rarray`) that accepts postgres arrays into tables for bulk queries ([#83](https://github.com/superfly/corrosion/pull/83), [#337](https://github.com/superfly/corrosion/pull/337), [#405](https://github.com/superfly/corrosion/pull/383),[#174](https://github.com/superfly/corrosion/pull/174), [#283](https://github.com/superfly/corrosion/pull/283))
 - **HTTP API:** Add `v1/updates/:table` endpoint for streaming lightweight primary key updates for a table, `v1/health` endpoint to query current health of corrosion node, and accept _all_ JSON types for SQLite params input ([#262](https://github.com/superfly/corrosion/pull/262), [#423](https://github.com/superfly/corrosion/pull/423))
-- **State synchronization:** Parallel synchronization with many deadlock and bug fixes ([#78](https://github.com/superfly/corrosion/pull/78), [#201](201)), more efficient format for sending changes between nodes and prioritization of more recent changes ([#373](https://github.com/superfly/corrosion/pull/363)), burstable change processing ([#431](https://github.com/superfly/corrosion/pull/431)).
+- **State synchronization:** Parallel synchronization with many deadlock and bug fixes ([#78](https://github.com/superfly/corrosion/pull/78), [#201](https://github.com/superfly/corrosion/pull/201)), more efficient format for sending changes between nodes and prioritization of more recent changes ([#373](https://github.com/superfly/corrosion/pull/363)), burstable change processing ([#431](https://github.com/superfly/corrosion/pull/431)).
 - **Bookkeeping & change processing:** Reduced locks around internal bookie structure ([#433](https://github.com/superfly/corrosion/pull/433)), and reduce info kept in-memory for bookkeeping ([#189](https://github.com/superfly/corrosion/pull/189)) and many fixes around partials, gaps, and buffered versions.
 - **Rust client (`corro-client`):** typed query events and related API cleanups ([#126](https://github.com/superfly/corrosion/pull/126))
 - **CLI**: `corrosion consul sync` will now bundle services and checks in a single transaction (changeset) ([#73](../../pull/73))
@@ -16,8 +16,8 @@ v1.0.0 is packed with a lot of new features and bug fixes. Some high-level detai
 
 **Breaking changes include**:
 - Persist subscriptions across reboots, including many reliability improvements ([#69](https://github.com/superfly/corrosion/pull/69))
-- Schema of internal cr-sqlite tables in the database has changed
-- New wire format for sending changes during sync and broadcasts to reduce duplication
+- Schema of internal cr-sqlite tables in the database has changed ([#320](https://github.com/superfly/corrosion/pull/320))
+- New wire format for sending changes during sync and broadcasts to reduce duplication ([#373](https://github.com/superfly/corrosion/pull/363))
 
 ## v0.1.0
 
