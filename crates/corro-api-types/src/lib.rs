@@ -29,20 +29,32 @@ pub const QUERY_ID_HEADER: &str = "corro-query-id";
 /// cached subscription ID still corresponds to the same query.
 pub const QUERY_HASH_HEADER: &str = "corro-query-hash";
 
+/// Untyped variant of [`TypedQueryEvent`], where each row is a `Vec` of
+/// [`SqliteValue`].
 pub type QueryEvent = TypedQueryEvent<Vec<SqliteValue>>;
 
+/// `TypedQueryEvent` represents the different events that a query
+/// or subscription can produce. It wraps `T` which is the type used to represent a row.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum TypedQueryEvent<T> {
+    /// Names of the columns in the result set.
     Columns(Vec<ColumnName>),
+    /// A row in the initial result set, identified by its [`RowId`].
     Row(RowId, T),
+    /// Marker indicating that the initial query has finished. `time` is the
+    /// query duration in seconds; `change_id` is the latest change observed
+    /// at the time of the snapshot for subscriptions.
     #[serde(rename = "eoq")]
     EndOfQuery {
         time: f64,
         #[serde(skip_serializing_if = "Option::is_none")]
         change_id: Option<ChangeId>,
     },
+    /// A row was inserted, updated or deleted in the subscription, with a
+    /// monotonically increasing [`ChangeId`].
     Change(ChangeType, RowId, T, ChangeId),
+    /// A non-recoverable error occurred while producing the stream.
     Error(CompactString),
 }
 
@@ -58,6 +70,7 @@ impl<T> TypedQueryEvent<T> {
     }
 }
 
+/// Lightweight enum describing a [`TypedQueryEvent`]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum QueryEventMeta {
     Columns,
@@ -68,8 +81,11 @@ pub enum QueryEventMeta {
     Notify,
 }
 
+/// Untyped variant of [`TypedNotifyEvent`], where each payload is a `Vec` of
+/// [`SqliteValue`].
 pub type NotifyEvent = TypedNotifyEvent<Vec<SqliteValue>>;
 
+/// `TypedNotifyEvent` represents the different events that an update stream can produce.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum TypedNotifyEvent<T> {
@@ -195,6 +211,7 @@ impl std::ops::Add<Self> for ChangeId {
     }
 }
 
+/// A SQL statement, optionally with bound parameters.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum Statement {
@@ -225,6 +242,8 @@ impl From<&str> for Statement {
     }
 }
 
+/// Response returned by the `/v1/transactions` and `/v1/migrations` endpoints.
+///
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ExecResponse {
     pub results: Vec<ExecResult>,
@@ -233,12 +252,22 @@ pub struct ExecResponse {
     pub actor_id: Option<String>,
 }
 
+/// Result of executing a single statement.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ExecResult {
-    Execute { rows_affected: usize, time: f64 },
+    /// The statement executed successfully.
+    Execute {
+        /// Number of rows affected by the statement.
+        rows_affected: usize,
+        /// Per-statement processing time in seconds.
+        time: f64,
+    },
+    /// The statement failed; the server returned an error message.
     Error { error: String },
 }
+
+/// Request body for the `/v1/table-stats` endpoint.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct TableStatRequest {
     pub tables: Vec<String>,
@@ -251,6 +280,10 @@ pub struct TableStatResponse {
     pub invalid_tables: Vec<String>,
 }
 
+/// `HealthQuery` represents the query string for the `/v1/health` endpoint.
+///
+/// Each field acts as a threshold: if the corresponding metric exceeds the
+/// supplied value, the agent responds with `failure_status` or `503` by default.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct HealthQuery {
     pub gaps: Option<i64>,
@@ -329,6 +362,9 @@ impl<'a> Hash for SqliteValueRef<'a> {
     }
 }
 
+/// SQLite storage class for a column or value.
+///
+/// Mirrors the five storage classes defined by SQLite
 #[derive(PartialEq, Debug)]
 pub enum ColumnType {
     Integer = 1,
@@ -378,6 +414,7 @@ impl FromSql for ColumnType {
     }
 }
 
+/// A parameter value that can be bound to a `Statement`
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -780,6 +817,7 @@ where
     }
 }
 
+/// Sqlite table name, stored as a [`CompactString`].
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[serde(transparent)]
 pub struct TableName(pub CompactString);
@@ -803,6 +841,7 @@ impl From<&str> for TableName {
     }
 }
 
+/// An SQL column name, stored as a [`CompactString`].
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[serde(transparent)]
 pub struct ColumnName(pub CompactString);

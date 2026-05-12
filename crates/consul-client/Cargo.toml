@@ -2,6 +2,7 @@
 name = "consul-client"
 version = "0.1.0-alpha.0"
 description = "Consul client"
+readme = "README.md"
 edition.workspace = true
 license.workspace = true
 homepage.workspace = true

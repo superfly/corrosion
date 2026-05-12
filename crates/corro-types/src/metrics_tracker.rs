@@ -11,7 +11,7 @@ pub const DEFAULT_BUCKETS: &[f64] = &[
 ];
 
 /// A simple bucket histogram modeled after Prometheus's classic histogram.
-/// See: https://github.com/prometheus/prometheus/blob/main/promql/quantile.go
+/// See: <https://github.com/prometheus/prometheus/blob/7200c43796813095ac3b3afa10202b05ea49d80b/promql/quantile.go>
 pub struct BucketHistogram {
     /// Sorted upper bounds, not including +Inf.
     upper_bounds: Vec<f64>,
