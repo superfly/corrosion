@@ -19,7 +19,6 @@ use sqlite::ChangeType;
 
 pub mod sqlite;
 
-
 /// HTTP response header that carries the UUID of a subscription or update stream.
 /// Set by the server on every successful `/v1/queries`, `/v1/subscriptions`, and
 /// `/v1/updates` response so callers can re-attach to the same stream by ID.
