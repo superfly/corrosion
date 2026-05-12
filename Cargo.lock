@@ -816,7 +816,7 @@ dependencies = [
 
 [[package]]
 name = "consul-client"
-version = "0.1.0-alpha.0"
+version = "0.2.0"
 dependencies = [
  "camino",
  "http",
@@ -961,7 +961,7 @@ dependencies = [
 
 [[package]]
 name = "corro-api-types"
-version = "0.1.0-alpha.1"
+version = "0.2.0"
 dependencies = [
  "camino",
  "compact_str 0.7.1",
@@ -998,7 +998,7 @@ dependencies = [
 
 [[package]]
 name = "corro-client"
-version = "0.1.0-alpha.1"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "corro-api-types",
@@ -4969,7 +4969,7 @@ dependencies = [
 
 [[package]]
 name = "sqlite-pool"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "arc-swap",
  "corro-types",
