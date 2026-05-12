@@ -1,6 +1,6 @@
 [package]
 name = "corro-api-types"
-version = "0.1.0-alpha.1"
+version = "0.2.0"
 description = "common API types for corrosion"
 edition.workspace = true
 license.workspace = true

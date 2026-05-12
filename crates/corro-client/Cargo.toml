@@ -1,6 +1,6 @@
 [package]
 name = "corro-client"
-version = "0.1.0-alpha.1"
+version = "0.2.0"
 description = "client to interact with corrosion"
 edition.workspace = true
 license.workspace = true
@@ -12,7 +12,7 @@ workspace = true
 
 [dependencies]
 bytes = { workspace = true }
-corro-api-types = { version = "0.1.0-alpha.1", path = "../corro-api-types" }
+corro-api-types = { version = "0.2.0", path = "../corro-api-types" }
 futures = { workspace = true }
 hickory-resolver = { workspace = true }
 http = { workspace = true }
