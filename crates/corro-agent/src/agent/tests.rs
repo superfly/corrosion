@@ -25,7 +25,7 @@ use crate::{
     agent::process_multiple_changes,
     api::{
         peer::parallel_sync,
-        public::{api_v1_db_schema, api_v1_transactions, TimeoutParams},
+        public::{api_v1_transactions, TimeoutParams},
     },
     transport::Transport,
 };
@@ -804,21 +804,6 @@ async fn test_clear_empty_versions() -> eyre::Result<()> {
 
     let (rtt_tx, _rtt_rx) = mpsc::channel(1024);
     let ta2_transport = Transport::new(&ta2.agent.config().gossip, rtt_tx.clone()).await?;
-    // setup the schema, for both nodes
-    let (status_code, _body) = api_v1_db_schema(
-        Extension(ta1.agent.clone()),
-        axum::Json(vec![corro_tests::TEST_SCHEMA.into()]),
-    )
-    .await;
-
-    assert_eq!(status_code, StatusCode::OK);
-
-    let (status_code, _body) = api_v1_db_schema(
-        Extension(ta2.agent.clone()),
-        axum::Json(vec![corro_tests::TEST_SCHEMA.into()]),
-    )
-    .await;
-    assert_eq!(status_code, StatusCode::OK);
 
     // make about 50 transactions to ta1
     insert_rows(ta1.agent.clone(), 1, 50).await;
@@ -891,21 +876,8 @@ async fn process_failed_changes() -> eyre::Result<()> {
     let ta1 = launch_test_agent(|conf| conf.build(), tripwire.clone()).await?;
     let uuid = Uuid::parse_str("00000000-0000-0000-a716-446655440000")?;
     let actor_id = ActorId(uuid);
-    // setup the schema, for both nodes
-    let (status_code, _body) = api_v1_db_schema(
-        Extension(ta1.agent.clone()),
-        axum::Json(vec![corro_tests::TEST_SCHEMA.into()]),
-    )
-    .await;
-    assert_eq!(status_code, StatusCode::OK);
 
     let ta2 = launch_test_agent(|conf| conf.build(), tripwire.clone()).await?;
-    let (status_code, _body) = api_v1_db_schema(
-        Extension(ta2.agent.clone()),
-        axum::Json(vec![corro_tests::TEST_SCHEMA.into()]),
-    )
-    .await;
-    assert_eq!(status_code, StatusCode::OK);
 
     for i in 1..=5_i64 {
         let (status_code, _) = api_v1_transactions(
@@ -1011,22 +983,6 @@ async fn test_process_multiple_changes() -> eyre::Result<()> {
     let ta1 = launch_test_agent(|conf| conf.build(), tripwire.clone()).await?;
     let ta2 = launch_test_agent(|conf| conf.build(), tripwire.clone()).await?;
     let tx_timeout = Duration::from_secs(60);
-
-    // setup the schema, for both nodes
-    let (status_code, _body) = api_v1_db_schema(
-        Extension(ta1.agent.clone()),
-        axum::Json(vec![corro_tests::TEST_SCHEMA.into()]),
-    )
-    .await;
-
-    assert_eq!(status_code, StatusCode::OK);
-
-    let (status_code, _body) = api_v1_db_schema(
-        Extension(ta2.agent.clone()),
-        axum::Json(vec![corro_tests::TEST_SCHEMA.into()]),
-    )
-    .await;
-    assert_eq!(status_code, StatusCode::OK);
 
     // make about 50 transactions to ta1
     insert_rows(ta1.agent.clone(), 1, 50).await;

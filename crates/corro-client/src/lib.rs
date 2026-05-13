@@ -318,47 +318,6 @@ impl CorrosionApiClient {
 
         Ok(serde_json::from_slice(&res.bytes().await?)?)
     }
-
-    /// Update the schema on the Corrosion node.
-    ///
-    /// Wraps `POST /v1/migrations` endpoint
-    pub async fn schema(&self, statements: &[Statement]) -> Result<ExecResponse, Error> {
-        let res = self
-            .api_client
-            .post(format!("http://{}/v1/migrations", self.api_addr))
-            .header(http::header::CONTENT_TYPE, "application/json")
-            .header(http::header::ACCEPT, "application/json")
-            .body(serde_json::to_vec(statements)?)
-            .send()
-            .await?;
-
-        if !res.status().is_success() {
-            return Err(Error::UnexpectedStatusCode(res.status()));
-        }
-
-        Ok(serde_json::from_slice(&res.bytes().await?)?)
-    }
-
-    /// Read schema files from disk and submit them via [`Self::schema`].
-    ///
-    /// Each path can be a single `.sql` file or a directory of files;
-    pub async fn schema_from_paths<P: AsRef<Path>>(
-        &self,
-        schema_paths: &[P],
-    ) -> Result<Option<ExecResponse>, Error> {
-        let statements: Vec<Statement> = corro_utils::read_files_from_paths(schema_paths)
-            .await
-            .map_err(|e| Error::ResponseError(e.to_string()))?
-            .into_iter()
-            .map(Statement::Simple)
-            .collect();
-
-        if statements.is_empty() {
-            return Ok(None);
-        }
-
-        Ok(Some(self.schema(&statements).await?))
-    }
 }
 
 /// Convenience client that combines a [`CorrosionApiClient`] with a local

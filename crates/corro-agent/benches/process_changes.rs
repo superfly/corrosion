@@ -50,7 +50,7 @@ struct BenchConfig {
 async fn setup_test_agent_with_data(config: &BenchConfig) -> eyre::Result<corro_tests::TestAgent> {
     // The tripwire will be tripped when exiting this function
     let (tripwire, _tripwire_worker, _tripwire_tx) = Tripwire::new_simple();
-    let ta = launch_test_agent(|conf| conf.build(), tripwire.clone()).await?;
+    let ta = launch_test_agent(|conf| conf.build(), None, tripwire.clone()).await?;
 
     for table_idx in 0..config.number_of_bench_tables {
         let table_name = format!("bench_test_{table_idx}");

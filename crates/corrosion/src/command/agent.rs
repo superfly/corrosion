@@ -77,24 +77,6 @@ pub async fn run(
         tripwire,
     )?;
 
-    if !config.db.schema_paths.is_empty() {
-        let client = corro_client::CorrosionApiClient::new(*config.api.bind_addr.first().unwrap())?;
-        match client
-            .schema_from_paths(config.db.schema_paths.as_slice())
-            .await
-        {
-            Ok(Some(res)) => {
-                info!("Applied schema in {}s", res.time);
-            }
-            Ok(None) => {
-                info!("No schema files to apply, skipping.");
-            }
-            Err(e) => {
-                error!("could not apply schema: {e}");
-            }
-        }
-    }
-
     antithesis_init();
     send_systemd_ready();
 

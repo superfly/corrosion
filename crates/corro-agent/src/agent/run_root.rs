@@ -2,7 +2,7 @@
 
 use std::time::Instant;
 
-use crate::api::public::execute_schema;
+use crate::agent::util::execute_schema_from_paths;
 use crate::{
     agent::{
         handlers::{self, spawn_handle_db_maintenance},
@@ -109,11 +109,8 @@ async fn run(
     util::initialise_foca(&agent, member_states).await;
 
     // Load schema from paths
-    let stmts = corro_utils::read_files_from_paths(&agent.config().db.schema_paths).await?;
-    if !stmts.is_empty() {
-        if let Err(e) = execute_schema(&agent, stmts).await {
-            error!("could not execute schema: {e}");
-        }
+    if let Err(e) = execute_schema_from_paths(&agent).await {
+        error!("could not execute schema: {e}");
     }
 
     let mut handles = vec![];

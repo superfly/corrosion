@@ -5,6 +5,7 @@ use std::{
 };
 
 use camino::Utf8PathBuf;
+use corro_agent::agent::util::execute_schema_from_paths;
 use corro_types::{
     actor::{ActorId, ClusterId},
     agent::{Agent, BookedVersions, Bookie, WriteConn},
@@ -37,6 +38,8 @@ use uuid::Uuid;
 pub enum AdminError {
     #[error(transparent)]
     Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Report(#[from] eyre::Report),
 }
 
 #[derive(Debug, Clone)]
@@ -108,6 +111,7 @@ pub enum Command {
     Actor(ActorCommand),
     Subs(SubsCommand),
     Log(LogCommand),
+    Reload,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -213,6 +217,15 @@ async fn handle_conn(
         match stream.try_next().await {
             Ok(Some(cmd)) => match cmd {
                 Command::Ping => send_success(&mut stream).await,
+                Command::Reload => {
+                    info_log(&mut stream, "reloading schema from configured paths...").await;
+                    if let Err(e) = execute_schema_from_paths(&agent).await {
+                        send_error(&mut stream, e).await;
+                        continue;
+                    }
+                    info_log(&mut stream, "schema reload finished").await;
+                    send_success(&mut stream).await;
+                }
                 Command::Sync(SyncCommand::Generate) => {
                     info_log(&mut stream, "generating sync...").await;
                     let sync_state = generate_sync(bookie, agent.actor_id()).await;

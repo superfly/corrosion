@@ -21,6 +21,7 @@ config = { workspace = true }
 consul-client = { version = "0.1.0-alpha.0", path = "../consul-client" }
 corro-api-types = { version = "0.1.0-alpha.1", path = "../corro-api-types" }
 corro-base-types = { version = "0.1.0-alpha.1", path = "../corro-base-types" }
+corro-utils = { path = "../corro-utils"}
 deadpool = { workspace = true }
 papaya = { workspace = true }
 enquote = { workspace = true }
