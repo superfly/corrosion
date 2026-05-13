@@ -541,6 +541,10 @@ impl ChangeError {
     pub fn is_oom_error(&self) -> bool {
         self.sqlite_error_code() == Some(rusqlite::ErrorCode::OutOfMemory)
     }
+
+    pub fn is_interrupt_error(&self) -> bool {
+        self.sqlite_error_code() == Some(rusqlite::ErrorCode::OperationInterrupted)
+    }
 }
 
 #[derive(Debug, thiserror::Error)]

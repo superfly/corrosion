@@ -630,6 +630,10 @@ struct HandleChangesState {
     max_wait: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
     drop_log_count: u64,
 
+    /// When emergency halving last occurred; prevents batch size re-inflation
+    /// during the grace period to avoid oscillation (halve → burst → halve …)
+    halved_at: Option<Instant>,
+
     // Configuration
     max_queue_len: usize,
     min_batch_size: usize,
@@ -656,6 +660,7 @@ impl HandleChangesState {
             current_batch_size: min_batch_size,
             processing_task: None,
             max_wait: Some(Box::pin(tokio::time::sleep(timeout_duration))),
+            halved_at: None,
             min_batch_size,
             step_base,
             max_batch_size,
@@ -667,13 +672,32 @@ impl HandleChangesState {
         }
     }
 
-    /// Calculate exponential batch size based on cost
+    /// Duration after emergency halving during which batch size increases are blocked.
+    /// Uses the transaction timeout as a reasonable proxy for "one full processing cycle".
+    fn grace_period(&self) -> Duration {
+        self.tx_timeout
+    }
+
+    /// Whether we're still in the grace period after an emergency halving.
+    fn in_grace_period(&self) -> bool {
+        self.halved_at
+            .is_some_and(|t| t.elapsed() < self.grace_period())
+    }
+
+    /// Calculate exponential batch size based on cost.
+    /// During the grace period after emergency halving, the result is clamped
+    /// to `current_batch_size` to prevent re-inflation and oscillation.
     fn calculate_batch_size(&self, cost: usize) -> usize {
-        if self.step_base == 0 || cost < self.step_base {
+        let computed = if self.step_base == 0 || cost < self.step_base {
             self.min_batch_size
         } else {
             let size = self.step_base * (1 << (cost / self.step_base).ilog2());
             size.clamp(self.min_batch_size, self.max_batch_size)
+        };
+        if self.in_grace_period() {
+            computed.min(self.current_batch_size)
+        } else {
+            computed
         }
     }
 
@@ -740,7 +764,7 @@ impl HandleChangesState {
             Ok(Ok(())) => {
                 debug!("batch processing completed successfully");
             }
-            Ok(Err(e)) => {
+            Ok(Err(ref e)) => {
                 error!("error processing batch: {e}");
 
                 if let Some(issue) = e.fatal_db_issue() {
@@ -750,13 +774,18 @@ impl HandleChangesState {
 
                 // Check for memory errors and emergency reduce batch size
                 // TODO: requeue the changes
-                if e.is_oom_error() {
-                    error!("memory error detected, halving batch size");
+                if e.is_oom_error() || e.is_interrupt_error() {
+                    if self.current_batch_size == self.min_batch_size {
+                        error!(?e, current_batch_size = %self.current_batch_size, min_batch_size = %self.min_batch_size, "batch too large for the database to process, but already at min_batch_size — min_batch_size may be too large or transaction timeout may be misconfigured");
+                    } else {
+                        error!(?e, current_batch_size = %self.current_batch_size, "batch too large for the database to process, halving batch size");
+                    }
                     self.current_batch_size =
                         (self.current_batch_size / 2).max(self.min_batch_size);
+                    self.halved_at = Some(Instant::now());
                 }
             }
-            Err(e) => {
+            Err(ref e) => {
                 error!("batch processing task panicked: {e}");
             }
         }
@@ -1183,6 +1212,7 @@ mod tests {
     use corro_tests::TEST_SCHEMA;
     use corro_types::api::{ColumnName, TableName};
     use corro_types::{
+        agent::ChangeError,
         base::{dbsr, dbvr, CrsqlDbVersion},
         broadcast::Changeset,
         change::Change,
@@ -1619,6 +1649,244 @@ mod tests {
         assert_eq!(state.queue.len(), 0);
         assert_eq!(state.current_batch_size, 100);
         assert!(state.max_wait.is_some());
+
+        Ok(())
+    }
+
+    /// Build a synthetic ChangeError mimicking a SQLite interrupt
+    /// (e.g. a transaction timeout firing).
+    fn synthetic_interrupt_error() -> ChangeError {
+        ChangeError::Rusqlite {
+            source: rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error {
+                    code: rusqlite::ErrorCode::OperationInterrupted,
+                    extended_code: 9, // SQLITE_INTERRUPT
+                },
+                Some("interrupted".to_string()),
+            ),
+            actor_id: None,
+            version: None,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn test_handle_task_completion_halves_batch_on_interrupt_error() -> eyre::Result<()> {
+        _ = tracing_subscriber::fmt::try_init();
+        let (tripwire, _tripwire_worker, _tripwire_tx) = Tripwire::new_simple();
+        let dir = tempfile::tempdir()?;
+
+        let mut config = Config::builder()
+            .db_path(dir.path().join("corrosion.db").display().to_string())
+            .gossip_addr("127.0.0.1:0".parse()?)
+            .api_addr("127.0.0.1:0".parse()?)
+            .build()?;
+
+        config.perf.apply_queue_min_batch_size = 100;
+        config.perf.apply_queue_step_base = 500;
+        config.perf.apply_queue_max_batch_size = 16000;
+        config.perf.apply_queue_batch_threshold_ratio = 0.9;
+        config.perf.apply_queue_timeout = 10;
+        config.perf.processing_queue_len = 50000;
+
+        let (agent, _agent_options) = setup(config.clone(), tripwire.clone()).await?;
+
+        let (status_code, _res) =
+            api_v1_db_schema(Extension(agent.clone()), Json(vec![TEST_SCHEMA.to_owned()])).await;
+        assert_eq!(status_code, StatusCode::OK);
+
+        let bookie = Bookie::new(Default::default());
+
+        let mut state = HandleChangesState::new(
+            config.perf.apply_queue_min_batch_size,
+            config.perf.apply_queue_step_base,
+            config.perf.apply_queue_max_batch_size,
+            config.perf.apply_queue_batch_threshold_ratio,
+            Duration::from_millis(config.perf.apply_queue_timeout as u64),
+            Duration::from_millis(200),
+            config.perf.processing_queue_len,
+        );
+
+        // Phase 1: Halving from well above min halves cleanly.
+        // We don't need a real running task — handle_task_completion is fed
+        // a synthetic Err result directly.
+        state.current_batch_size = 2000;
+        state.handle_task_completion(&agent, &bookie, Ok(Err(synthetic_interrupt_error())));
+        assert_eq!(state.current_batch_size, 1000);
+        assert!(state.halved_at.is_some());
+        assert!(state.in_grace_period());
+
+        // Phase 2: Halving clamps to min_batch_size.
+        state.current_batch_size = config.perf.apply_queue_min_batch_size;
+        state.halved_at = None;
+        assert!(!state.in_grace_period());
+        state.handle_task_completion(&agent, &bookie, Ok(Err(synthetic_interrupt_error())));
+        assert_eq!(
+            state.current_batch_size,
+            config.perf.apply_queue_min_batch_size
+        );
+        assert!(state.in_grace_period());
+
+        // Phase 3: Grace period allows deflation.
+        state.current_batch_size = 2000;
+        assert!(state.in_grace_period());
+        state.handle_task_completion(&agent, &bookie, Ok(Err(synthetic_interrupt_error())));
+        assert_eq!(state.current_batch_size, 1000);
+        assert!(state.halved_at.is_some());
+        assert!(state.in_grace_period());
+
+        // Waiting will reset the grace period
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(!state.in_grace_period());
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn test_grace_period_prevents_batch_size_re_inflation() -> eyre::Result<()> {
+        _ = tracing_subscriber::fmt::try_init();
+        let (tripwire, _tripwire_worker, _tripwire_tx) = Tripwire::new_simple();
+        let dir = tempfile::tempdir()?;
+
+        let mut config = Config::builder()
+            .db_path(dir.path().join("corrosion.db").display().to_string())
+            .gossip_addr("127.0.0.1:0".parse()?)
+            .api_addr("127.0.0.1:0".parse()?)
+            .build()?;
+
+        config.perf.apply_queue_min_batch_size = 100;
+        config.perf.apply_queue_step_base = 500;
+        config.perf.apply_queue_max_batch_size = 16000;
+        config.perf.apply_queue_batch_threshold_ratio = 0.9;
+        config.perf.apply_queue_timeout = 10;
+        config.perf.processing_queue_len = 50000;
+
+        let (agent, _agent_options) = setup(config.clone(), tripwire.clone()).await?;
+
+        let (status_code, _res) =
+            api_v1_db_schema(Extension(agent.clone()), Json(vec![TEST_SCHEMA.to_owned()])).await;
+        assert_eq!(status_code, StatusCode::OK);
+
+        let other_actor = ActorId(uuid::Uuid::new_v4());
+        let bookie = Bookie::new(Default::default());
+
+        let mut state = HandleChangesState::new(
+            config.perf.apply_queue_min_batch_size,
+            config.perf.apply_queue_step_base,
+            config.perf.apply_queue_max_batch_size,
+            config.perf.apply_queue_batch_threshold_ratio,
+            Duration::from_millis(config.perf.apply_queue_timeout as u64),
+            Duration::from_secs(config.perf.sql_tx_timeout as u64),
+            config.perf.processing_queue_len,
+        );
+
+        // Same mock-change helper as test_handle_changes_batch_size_bursting.
+        let create_change = |version: u64| -> ChangeV1 {
+            let crsql_row = Change {
+                table: TableName("tests".into()),
+                pk: pack_columns(&vec![(version as i64).into()]).unwrap(),
+                cid: ColumnName("text".into()),
+                val: "test value".into(),
+                col_version: 1,
+                db_version: CrsqlDbVersion(version),
+                seq: CrsqlSeq(0),
+                site_id: other_actor.to_bytes(),
+                cl: 1,
+            };
+            let change = ChangeV1 {
+                actor_id: other_actor,
+                changeset: Changeset::Full {
+                    version: CrsqlDbVersion(version),
+                    changes: vec![crsql_row],
+                    seqs: dbsr!(0, 0),
+                    last_seq: CrsqlSeq(0),
+                    ts: agent.clock().new_timestamp().into(),
+                },
+            };
+            assert!(change.processing_cost() == 1);
+            change
+        };
+
+        let mut version = 1;
+        let mut simulate_burst = |state: &mut HandleChangesState, count: u64| {
+            for _ in 1..=count {
+                state.handle_new_change(
+                    &agent,
+                    &bookie,
+                    create_change(version),
+                    ChangeSource::Sync,
+                );
+                version += 1;
+            }
+        };
+
+        // Phase 1: A burst inflates the batch size normally.
+        // Same setup as test_handle_changes_batch_size_bursting: first drain a
+        // small below-threshold batch via timeout so the subsequent 2001-item
+        // burst fully queues while the task runs. On completion, buf_cost=2001
+        // drives calculate_batch_size(2001) = 500 * (1 << ilog2(4)) = 2000.
+        simulate_burst(&mut state, 5);
+        state.handle_timeout(&agent, &bookie);
+        simulate_burst(&mut state, 2001);
+        let task = state.processing_task.take().unwrap();
+        let _ = task.await;
+        state.handle_task_completion(&agent, &bookie, Ok(Ok(())));
+        assert_eq!(state.current_batch_size, 2000);
+        assert!(state.halved_at.is_none());
+
+        // Phase 2: Emergency halving due to interrupt error.
+        // Batch size halves to 1000 and enters grace period.
+        let task = state.processing_task.take().unwrap();
+        let _ = task.await;
+        state.handle_task_completion(&agent, &bookie, Ok(Err(synthetic_interrupt_error())));
+        assert_eq!(state.current_batch_size, 1000);
+        assert!(state.in_grace_period());
+
+        // Phase 3: Grace period blocks re-inflation in handle_task_completion.
+        // Queue up a burst that would normally drive calculate_batch_size way
+        // above 1000. Complete the currently-running task with Ok(Ok(())) —
+        // handle_task_completion's "immediate-after-completion" burst path
+        // would normally set batch_size = calculate_batch_size(buf_cost) but
+        // grace period clamps it to current_batch_size (1000).
+        simulate_burst(&mut state, 5000);
+        assert!(
+            state.buf_cost >= 4000,
+            "burst must be big enough to force inflation attempt"
+        );
+        let task = state.processing_task.take().unwrap();
+        let _ = task.await;
+        state.handle_task_completion(&agent, &bookie, Ok(Ok(())));
+        assert_eq!(
+            state.current_batch_size, 1000,
+            "grace period must prevent inflation even on successful completion"
+        );
+        assert!(
+            state.in_grace_period(),
+            "successful completion must NOT clear grace period"
+        );
+
+        // Clean up the spawned task from Phase 3.
+        if let Some(task) = state.processing_task.take() {
+            let _ = task.await;
+        }
+
+        // Phase 4: Once the grace period expires, calculate_batch_size is
+        // free to inflate again. Force expiry by backdating halved_at past
+        // tx_timeout.
+        assert!(state.in_grace_period());
+        let clamped = state.calculate_batch_size(5000);
+        assert_eq!(
+            clamped, state.current_batch_size,
+            "during grace period, calculate_batch_size must clamp to current_batch_size"
+        );
+        state.halved_at =
+            Some(Instant::now() - Duration::from_secs(config.perf.sql_tx_timeout as u64 + 1));
+        assert!(!state.in_grace_period());
+        let inflated = state.calculate_batch_size(5000);
+        assert!(
+            inflated > state.current_batch_size,
+            "after grace period, calculate_batch_size must be free to inflate (got {inflated}, current {})",
+            state.current_batch_size,
+        );
 
         Ok(())
     }
