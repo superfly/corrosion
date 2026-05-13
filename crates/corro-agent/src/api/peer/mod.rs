@@ -1666,7 +1666,7 @@ pub async fn serve_sync(
 #[cfg(test)]
 mod tests {
     use crate::api::public::api_v1_transactions;
-    use axum::{Extension, Json};
+    use axum::Extension;
     use camino::Utf8PathBuf;
     use corro_tests::launch_test_agent;
     use corro_tests::TEST_SCHEMA;
@@ -1685,8 +1685,8 @@ mod tests {
     use tripwire::Tripwire;
 
     use crate::{
-        agent::{process_multiple_changes, setup},
-        api::public::{api_v1_db_schema, TimeoutParams},
+        agent::{process_multiple_changes, setup, util::execute_schema},
+        api::public::TimeoutParams,
     };
 
     use super::*;
@@ -1764,10 +1764,7 @@ mod tests {
         )
         .await?;
 
-        let (status_code, _res) =
-            api_v1_db_schema(Extension(agent.clone()), Json(vec![TEST_SCHEMA.to_owned()])).await;
-
-        assert_eq!(status_code, StatusCode::OK);
+        execute_schema(&agent, vec![TEST_SCHEMA.to_owned()]).await?;
 
         let actor_id = ActorId(uuid::Uuid::new_v4());
 

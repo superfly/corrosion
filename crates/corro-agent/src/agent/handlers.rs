@@ -1205,10 +1205,9 @@ pub async fn handle_sync(
 #[cfg(test)]
 mod tests {
     use crate::agent::setup;
-    use crate::api::public::api_v1_db_schema;
+    use crate::agent::util::execute_schema;
 
     use super::*;
-    use axum::{http::StatusCode, Extension, Json};
     use corro_tests::TEST_SCHEMA;
     use corro_types::api::{ColumnName, TableName};
     use corro_types::{
@@ -1260,9 +1259,7 @@ mod tests {
 
         let (agent, agent_options) = setup(config, tripwire.clone()).await?;
 
-        let (status_code, _res) =
-            api_v1_db_schema(Extension(agent.clone()), Json(vec![TEST_SCHEMA.to_owned()])).await;
-        assert_eq!(status_code, StatusCode::OK);
+        execute_schema(&agent, vec![TEST_SCHEMA.to_owned()]).await?;
 
         let other_actor = ActorId(uuid::Uuid::new_v4());
         let bookie = Bookie::new(Default::default());
@@ -1458,9 +1455,7 @@ mod tests {
 
         let (agent, _agent_options) = setup(config.clone(), tripwire.clone()).await?;
 
-        let (status_code, _res) =
-            api_v1_db_schema(Extension(agent.clone()), Json(vec![TEST_SCHEMA.to_owned()])).await;
-        assert_eq!(status_code, StatusCode::OK);
+        execute_schema(&agent, vec![TEST_SCHEMA.to_owned()]).await?;
 
         let other_actor = ActorId(uuid::Uuid::new_v4());
         let bookie = Bookie::new(Default::default());
@@ -1690,9 +1685,7 @@ mod tests {
 
         let (agent, _agent_options) = setup(config.clone(), tripwire.clone()).await?;
 
-        let (status_code, _res) =
-            api_v1_db_schema(Extension(agent.clone()), Json(vec![TEST_SCHEMA.to_owned()])).await;
-        assert_eq!(status_code, StatusCode::OK);
+        execute_schema(&agent, vec![TEST_SCHEMA.to_owned()]).await?;
 
         let bookie = Bookie::new(Default::default());
 
@@ -1762,9 +1755,7 @@ mod tests {
 
         let (agent, _agent_options) = setup(config.clone(), tripwire.clone()).await?;
 
-        let (status_code, _res) =
-            api_v1_db_schema(Extension(agent.clone()), Json(vec![TEST_SCHEMA.to_owned()])).await;
-        assert_eq!(status_code, StatusCode::OK);
+        execute_schema(&agent, vec![TEST_SCHEMA.to_owned()]).await?;
 
         let other_actor = ActorId(uuid::Uuid::new_v4());
         let bookie = Bookie::new(Default::default());

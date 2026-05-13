@@ -5,7 +5,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::{agent::util::execute_schema, api::utils::CountedBody};
+use crate::api::utils::CountedBody;
 use antithesis_sdk::assert_sometimes;
 use axum::{
     extract::{ConnectInfo, Query},
@@ -526,54 +526,6 @@ pub async fn api_v1_queries(
     }
 }
 
-pub async fn api_v1_db_schema(
-    Extension(agent): Extension<Agent>,
-    axum::extract::Json(statements): axum::extract::Json<Vec<String>>,
-) -> (StatusCode, axum::Json<ExecResponse>) {
-    let actor_id = agent.actor_id().to_string();
-    if statements.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            axum::Json(ExecResponse {
-                results: vec![ExecResult::Error {
-                    error: "at least 1 statement is required".into(),
-                }],
-                time: 0.0,
-                version: None,
-                actor_id: Some(actor_id),
-            }),
-        );
-    }
-
-    let start = Instant::now();
-
-    assert_sometimes!(true, "Corrosion applies schema");
-    if let Err(e) = execute_schema(&agent, statements).await {
-        error!("could not merge schemas: {e}");
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            axum::Json(ExecResponse {
-                results: vec![ExecResult::Error {
-                    error: e.to_string(),
-                }],
-                time: 0.0,
-                version: None,
-                actor_id: Some(actor_id),
-            }),
-        );
-    }
-
-    (
-        StatusCode::OK,
-        axum::Json(ExecResponse {
-            results: vec![],
-            time: start.elapsed().as_secs_f64(),
-            version: None,
-            actor_id: Some(actor_id),
-        }),
-    )
-}
-
 pub async fn api_v1_health(
     Extension(agent): Extension<Agent>,
     Query(query): Query<HealthQuery>,
@@ -726,7 +678,7 @@ mod tests {
 
     use super::*;
 
-    use crate::agent::setup;
+    use crate::{agent::setup, agent::util::execute_schema};
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn test_api_db_execute() -> eyre::Result<()> {
@@ -748,13 +700,7 @@ mod tests {
 
         let rx_bcast = &mut agent_options.rx_bcast;
 
-        let (status_code, _body) = api_v1_db_schema(
-            Extension(agent.clone()),
-            axum::Json(vec![corro_tests::TEST_SCHEMA.into()]),
-        )
-        .await;
-
-        assert_eq!(status_code, StatusCode::OK);
+        execute_schema(&agent, vec![corro_tests::TEST_SCHEMA.to_owned()]).await?;
 
         let (status_code, body) = api_v1_transactions(
             Extension(agent.clone()),
@@ -832,13 +778,7 @@ mod tests {
         )
         .await?;
 
-        let (status_code, _body) = api_v1_db_schema(
-            Extension(agent.clone()),
-            axum::Json(vec![corro_tests::TEST_SCHEMA.into()]),
-        )
-        .await;
-
-        assert_eq!(status_code, StatusCode::OK);
+        execute_schema(&agent, vec![corro_tests::TEST_SCHEMA.to_owned()]).await?;
 
         let (status_code, body) = api_v1_transactions(
             Extension(agent.clone()),
@@ -944,15 +884,14 @@ mod tests {
         )
         .await?;
 
-        let (status_code, _body) = api_v1_db_schema(
-            Extension(agent.clone()),
-            axum::Json(vec![
+        execute_schema(
+            &agent,
+            vec![
+                "CREATE TABLE tests2 (id BIGINT NOT NULL PRIMARY KEY, foo TEXT);".into(),
                 "CREATE TABLE tests (id BIGINT NOT NULL PRIMARY KEY, foo TEXT);".into(),
-            ]),
+            ],
         )
-        .await;
-
-        assert_eq!(status_code, StatusCode::OK);
+        .await?;
 
         // scope the schema reader in here
         {
@@ -975,16 +914,14 @@ mod tests {
             assert!(!foo_col.primary_key);
         }
 
-        let (status_code, _body) = api_v1_db_schema(
-            Extension(agent.clone()),
-            axum::Json(vec![
+        execute_schema(
+            &agent,
+            vec![
                 "CREATE TABLE tests2 (id BIGINT NOT NULL PRIMARY KEY, foo TEXT);".into(),
                 "CREATE TABLE tests (id BIGINT NOT NULL PRIMARY KEY, foo TEXT);".into(),
-            ]),
+            ],
         )
-        .await;
-
-        assert_eq!(status_code, StatusCode::OK);
+        .await?;
 
         {
             let schema = agent.schema().read();
@@ -1048,13 +985,7 @@ mod tests {
             );
         }
 
-        let (status_code, _body) = api_v1_db_schema(
-            Extension(agent.clone()),
-            axum::Json(vec![create_stmt.into()]),
-        )
-        .await;
-
-        assert_eq!(status_code, StatusCode::OK);
+        execute_schema(&agent, vec![create_stmt.to_owned()]).await?;
 
         {
             let schema = agent.schema().read();

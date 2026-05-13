@@ -916,9 +916,10 @@ mod tests {
 
     use super::*;
     use crate::agent::process_multiple_changes;
+    use crate::agent::util::execute_schema;
+    use crate::api::public::api_v1_transactions;
     use crate::api::public::update::{api_v1_updates, SharedUpdateBroadcastCache};
     use crate::api::public::TimeoutParams;
-    use crate::api::public::{api_v1_db_schema, api_v1_transactions};
     use corro_tests::launch_test_agent;
     use corro_types::api::SqliteValue::Integer;
 
@@ -2196,12 +2197,7 @@ mod tests {
             col2 text
          );";
 
-        let (status_code, _body) = api_v1_db_schema(
-            Extension(ta1.agent.clone()),
-            axum::Json(vec![schema.into()]),
-        )
-        .await;
-        assert_eq!(status_code, StatusCode::OK);
+        execute_schema(&ta1.agent, vec![schema.to_owned()]).await?;
 
         let actor_id = ActorId(uuid::Uuid::new_v4());
 
