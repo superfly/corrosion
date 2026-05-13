@@ -14,10 +14,18 @@ v1.0.0 is packed with a lot of new features and bug fixes. Some high-level detai
 - **Observability:** richer metrics and logging for various parts of Corrosion (including subscription and channel-capacity signals) ([#468](https://github.com/superfly/corrosion/pull/468), [#472](https://github.com/superfly/corrosion/pull/472)), and stronger Antithesis coverage ([#463](https://github.com/superfly/corrosion/pull/463))
 - **Garbage Collection**: Add optional garage collection for tables that don't reuse primary keys ([418](https://github.com/superfly/corrosion/pull/418))
 
-**Breaking changes include**:
-- Persist subscriptions across reboots, including many reliability improvements ([#69](https://github.com/superfly/corrosion/pull/69))
-- Schema of internal cr-sqlite tables in the database has changed ([#320](https://github.com/superfly/corrosion/pull/320))
-- New wire format for sending changes during sync and broadcasts to reduce duplication ([#373](https://github.com/superfly/corrosion/pull/363))
+**Migrating from Corrosion v0.1.0 to v1.0.0**:
+
+v1.0.0 introduces some breaking changes, notably the database schema has changed. The most significant database changes are:
+
+- The clock tables (`<table>__crsql_clock`) have a new schema.
+- The `__corro_bookkeeping` table has been removed.
+
+Because of these schema differences, a running v0 cluster cannot be upgraded
+in-place. Instead, the entire cluster must be re-bootstrapped from a single
+snapshot. Please see [reseeding corrosion](doc/reseeding.md)
+
+Thanks to everyone who made a contribution!
 
 ## v0.1.0
 

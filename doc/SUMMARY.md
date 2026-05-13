@@ -14,6 +14,7 @@
 - [Schema](schema.md)
 - [Subscriptions]() (to come)
 - [Synchronization]() (to come)
+- [Reseeding Corrosion](reseeding.md)
 - [Telemetry](telemetry/README.md)
     - [Prometheus](telemetry/prometheus.md)
 - [Templates]() (to come)

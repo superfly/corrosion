@@ -1,18 +1,13 @@
-# Migrating from Corrosion v0.1.0 to v1.0.0
+# Reseeding Corrosion
 
-The schema of cr-sqlite's internal tables changed between Corrosion v0 and v1. The most significant changes are:
-
-- The clock tables (`<table>__crsql_clock`) have a new schema.
-- The `__corro_bookkeeping` table has been removed.
-
-Because of these schema differences, a running v0 cluster cannot be upgraded
-in-place. Instead, the entire cluster must be re-bootstrapped from a single
-snapshot that contains no cr-sqlite internal tables and no corrosion
-bookkeeping table. When the v1 nodes start against that snapshot, they
-recreate the internal state from scratch using the v1 schema.
+You may need to restart every Corrosion node back from a earlier snapshot.
+Some common reasons are version upgrades where the database schema of internal tables have changed
+, or bad / unwanted data is spreading through the cluster and restoring a known-good
+snapshot is faster than trying to delete or repair data. We call this restore-from-snapshot
+workflow is called a reseed; the rest of this document outlines how to do it safely.
 
 ```admonish warning
-Re-bootstrapping the cluster from a snapshot means that any writes accepted
+Reseeding the cluster from a snapshot means that any writes accepted
 after the snapshot was taken will be lost. Either stop all writes before
 taking the snapshot, or be prepared to replay the missing writes after the
 migration (see [Re-insert any missing data](#re-insert-any-missing-data)).
@@ -22,9 +17,9 @@ migration (see [Re-insert any missing data](#re-insert-any-missing-data)).
 
 The migration is performed in three phases:
 
-1. On a single v0 node, produce a clean snapshot suitable for v1.
-2. Distribute the snapshot and restore it on every node, running v1.
-3. Re-apply any writes that happened after the snapshot was taken.
+1. On a single old node, prepare a clean snapshot suitable (Skip this if you already have a snapshot).
+2. Distribute the snapshot, stop corrosion and restore it on every node.
+3. Start corrosion and re-apply any writes that happened after the snapshot was taken.
 
 ## 1. Prepare a clean snapshot
 
@@ -36,7 +31,7 @@ snapshot. All other nodes will be restored from the backup created from this nod
 While the corrosion agent is still running on the source node:
 
 ```bash
-corrosion backup /path/to/v0-snapshot.db
+corrosion backup /path/to/prev-snapshot.db
 ```
 
 `corrosion backup` runs `VACUUM INTO` and strips per-node state
@@ -46,11 +41,11 @@ so the backup is often smaller than the running database.
 ### 1.2 Bump the cluster id
 
 A new `cluster_id` ensures nodes that come up with the new snapshot don't
-accidentally talk to any nodes still on the old version. Run this against
+accidentally talk to any nodes still on the old snapshot. Run this against
 the backup you just created:
 
 ```bash
-sqlite3 /path/to/v0-snapshot.db <<'SQL'
+sqlite3 /path/to/old-snapshot.db <<'SQL'
 INSERT INTO __corro_state(key, value)
 VALUES ('cluster_id', 1)
 ON CONFLICT(key)
@@ -61,19 +56,19 @@ SQL
 If no `cluster_id` is set (it defaults to `0` when unset) this inserts `1`;
 otherwise it increments the existing value by one.
 
-### 1.3 Drop cr-sqlite internal tables
+### 1.3 Drop cr-sqlite internal tables (optional)
 
-The backup still contains cr-sqlite internal tables. Drop them so that
-v1 can recreate them under the new schema. Run the following against the
-snapshot file (not the live database):
+If this is due to version upgrade and the schema of the cr-sqlite internal or your database is getting big
+and you want to do a reset, then drop them so that so the tables will be recreated them under the new schema. 
+Run the following against the snapshot file (not the live database):
 
 ```bash
 # Drop every internal cr-sqlite table.
-sqlite3 v0-snapshot.db ".mode list" "SELECT 'DROP TABLE ' || name || ';' \
+sqlite3 old-snapshot.db ".mode list" "SELECT 'DROP TABLE ' || name || ';' \
 FROM sqlite_schema \
 WHERE type = 'table' \
   AND (name LIKE '%__crsql_clock' \
-    OR name LIKE '%__crsql_pks');" | sqlite3 v0-snapshot.db
+    OR name LIKE '%__crsql_pks');" | sqlite3 old-snapshot.db
 ```
 
 This first queries SQLite to generate the `DROP TABLE` statements, then
@@ -82,7 +77,7 @@ pipes them back into `sqlite3` to execute them.
 Delete the `__corro_bookkeeping` table and vacuum the backup:
 
 ```bash
-sqlite3 /path/to/v0-snapshot.db <<'SQL'
+sqlite3 /path/to/old-snapshot.db <<'SQL'
 DROP TABLE IF EXISTS __corro_bookkeeping;
 
 VACUUM;
@@ -97,21 +92,21 @@ the snapshot small for transfer.
 Compress the snapshot and upload it to a location every node can reach (S3, an internal artifact store, etc.):
 
 ```bash
-pigz /path/to/v0-snapshot.db
-# upload /path/to/v0-snapshot.db.gz somewhere
+pigz /path/to/old-snapshot.db
+# upload /path/to/old-snapshot.db.gz somewhere
 ```
 
 ## 2. Restore every node from the snapshot
 
 For each node in the cluster:
 
-1. Install the `corrosion` v1 binary.
+1. (if this is a version upgrade) Install the new `corrosion` binary .
 2. Download and decompress the snapshot to a local path.
 3. Stop the Corrosion agent. `corrosion restore` refuses to run while the agent is up.
 4. Restore it:
 
    ```bash
-   corrosion restore /path/to/v0-snapshot.db
+   corrosion restore /path/to/old-snapshot.db
    ```
 
 5. Start the v1 agent.
