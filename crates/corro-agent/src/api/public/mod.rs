@@ -105,10 +105,17 @@ where
         let ret = f(&tx)?;
 
         let insert_info = insert_local_changes(agent, &tx, &mut book_writer)?;
-        tx.commit().map_err(|source| ChangeError::Rusqlite {
-            source,
-            actor_id: Some(actor_id),
-            version: insert_info.as_ref().map(|info| info.db_version),
+        tx.commit().map_err(|source| {
+            let ce = ChangeError::Rusqlite {
+                source,
+                actor_id: Some(actor_id),
+                version: insert_info.as_ref().map(|info| info.db_version),
+            };
+            if let Some(issue) = ce.fatal_db_issue() {
+                error!("fatal DB issue detected: {issue}");
+                agent.mark_unhealthy(issue);
+            }
+            ce
         })?;
 
         let elapsed = start.elapsed();

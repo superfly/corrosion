@@ -14,6 +14,7 @@ use tokio::{
     },
     time::Instant,
 };
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info};
 use tripwire::Tripwire;
 
@@ -208,6 +209,8 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
         updates_manager,
         metrics_tracker,
         tripwire,
+        fatal_issue: Default::default(),
+        shutdown_token: CancellationToken::new(),
     });
 
     Ok((agent, opts))
