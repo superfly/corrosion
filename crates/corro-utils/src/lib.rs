@@ -100,14 +100,23 @@ pub struct ThrottleMap<K> {
     inner: HashMap<K, ThrottleEntry>,
     throttle_min: Duration,
     throttle_max: Duration,
+
+    max_pow: u32,
 }
 
-/// Wait duration after `consecutive_failures` slow failures (after incrementing the counter).
 #[inline]
-pub fn exponential_increase(pow: u32, throttle_min: Duration, throttle_max: Duration) -> Duration {
-    let pow = pow.saturating_sub(1).min(24);
+fn exponential_increase(pow: u32, throttle_min: Duration, throttle_max: Duration) -> Duration {
     let mult = 1u32.checked_shl(pow).unwrap_or(u32::MAX);
     (throttle_min * mult).min(throttle_max)
+}
+
+#[inline]
+fn max_pow(throttle_min: Duration, throttle_max: Duration) -> u32 {
+    if throttle_min > throttle_max {
+        return 0;
+    }
+    let ratio = throttle_max.as_secs() / throttle_min.as_secs();
+    ratio.ilog2()
 }
 
 impl<K> ThrottleMap<K>
@@ -119,6 +128,7 @@ where
             inner: HashMap::new(),
             throttle_min,
             throttle_max,
+            max_pow: max_pow(throttle_min, throttle_max),
         }
     }
 
@@ -129,8 +139,11 @@ where
             .unwrap_or(false)
     }
 
-    pub fn throttle_count(&self, key: &K) -> u32 {
-        self.inner.get(key).map(|e| e.throttle_count).unwrap_or(0)
+    pub fn throttle_count(&self, key: &K) -> u64 {
+        self.inner
+            .get(key)
+            .map(|e| e.throttle_count as u64)
+            .unwrap_or(0)
     }
 
     pub fn throttle(&mut self, key: K) {
@@ -140,7 +153,9 @@ where
             throttle_count: 0,
         });
 
-        let wait = exponential_increase(entry.throttle_count, self.throttle_min, self.throttle_max);
+        // we calculate max pow so we can clamp things and not worry about overflow
+        let pow = entry.throttle_count.min(self.max_pow);
+        let wait = exponential_increase(pow, self.throttle_min, self.throttle_max);
 
         entry.blocked_until = now + wait;
         entry.throttle_count = entry.throttle_count.saturating_add(1);
@@ -168,11 +183,15 @@ mod tests {
     fn exponential_increase_doubles_until_cap() {
         let min = Duration::from_secs(5);
         let max = Duration::from_secs(60);
-        assert_eq!(exponential_increase(1, min, max), min);
-        assert_eq!(exponential_increase(2, min, max), Duration::from_secs(10));
-        assert_eq!(exponential_increase(3, min, max), Duration::from_secs(20));
-        assert_eq!(exponential_increase(4, min, max), Duration::from_secs(40));
-        assert_eq!(exponential_increase(5, min, max), max);
+
+        let max_pow = max_pow(min, max);
+        assert_eq!(max_pow, 3);
+
+        assert_eq!(exponential_increase(0, min, max), min);
+        assert_eq!(exponential_increase(1, min, max), Duration::from_secs(10));
+        assert_eq!(exponential_increase(2, min, max), Duration::from_secs(20));
+        assert_eq!(exponential_increase(3, min, max), Duration::from_secs(40));
+        assert_eq!(exponential_increase(4, min, max), max);
         assert_eq!(exponential_increase(99, min, max), max);
     }
 

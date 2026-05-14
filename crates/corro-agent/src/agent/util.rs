@@ -484,9 +484,10 @@ pub async fn apply_fully_buffered_changes_loop(
     mut tripwire: Tripwire,
 ) {
     info!("Starting apply_fully_buffered_changes loop");
-    let sql_tx_timeout_secs = agent.config().perf.sql_tx_timeout as u64;
-    let max_tx_timeout = Duration::from_secs(sql_tx_timeout_secs.saturating_mul(2));
-    let timeout_increase = Duration::from_secs(20);
+    let sql_tx_timeout_secs = Duration::from_secs(agent.config().perf.sql_tx_timeout as u64);
+    // we can burst timeout up to an additional 1min
+    let max_timeout_increase: u64 = 6;
+    let step_timeout_secs: u64 = 10;
 
     let throttle_min = Duration::from_secs(5 * 60);
     let throttle_max = Duration::from_secs(60 * 60);
@@ -528,10 +529,13 @@ pub async fn apply_fully_buffered_changes_loop(
         }
 
         let (actor_id, version) = partial_version;
-        let throttle_count = limit_retries.throttle_count(&(actor_id, version));
-        let tx_timeout = (max_tx_timeout + timeout_increase * throttle_count).min(max_tx_timeout);
+        let throttle_count = limit_retries
+            .throttle_count(&(actor_id, version))
+            .min(max_timeout_increase);
+        let tx_timeout =
+            sql_tx_timeout_secs + Duration::from_secs(step_timeout_secs * throttle_count);
 
-        debug!(%actor_id, %version, throttle_count, ?tx_timeout, "picked up background apply of buffered changes");
+        debug!(%actor_id, %version, ?tx_timeout, "picked up background apply of buffered changes");
         let start = Instant::now();
         let res =
             process_fully_buffered_changes(&agent, &bookie, actor_id, version, tx_timeout).await;
