@@ -554,7 +554,7 @@ pub async fn apply_fully_buffered_changes_loop(
             }
             Err(e) => {
                 let is_interrupt_error = e.is_interrupt_error();
-                error!(%actor_id, %version, "could not apply fully buffered changes with timeout {tx_timeout:?} {throttle_count} times (is_interrupt_error: {is_interrupt_error}): {e}");
+                error!(%actor_id, %version, "could not apply fully buffered changes with timeout {tx_timeout:?}: {e}");
                 if let Some(issue) = e.fatal_db_issue() {
                     error!("fatal DB issue detected: {issue}");
                     agent.mark_unhealthy(issue);
