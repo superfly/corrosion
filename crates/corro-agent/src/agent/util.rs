@@ -559,7 +559,8 @@ pub async fn apply_fully_buffered_changes_loop(
                 limit_retries.remove(&(actor_id, version));
             }
             Err(e) => {
-                error!(%actor_id, %version, "could not apply fully buffered changes with timeout {tx_timeout:?}: {e}");
+                let is_interrupt_error = e.is_interrupt_error();
+                error!(%actor_id, %version, "could not apply fully buffered changes with timeout {tx_timeout:?} (is_interrupt_error: {is_interrupt_error}): {e}");
                 if let Some(issue) = e.fatal_db_issue() {
                     error!("fatal DB issue detected: {issue}");
                     agent.mark_unhealthy(issue);
@@ -568,7 +569,7 @@ pub async fn apply_fully_buffered_changes_loop(
                     assert_unreachable!("could not apply fully buffered changes", &details);
                 }
                 // processing time came close to timeout, limit retry with exponential backoff
-                if e.is_interrupt_error() {
+                if is_interrupt_error {
                     limit_retries.throttle((actor_id, version));
                 }
             }
