@@ -115,7 +115,11 @@ fn max_pow(throttle_min: Duration, throttle_max: Duration) -> u32 {
     if throttle_min > throttle_max {
         return 0;
     }
-    let ratio = throttle_max.as_secs() / throttle_min.as_secs();
+    let ratio = if throttle_min.is_zero() {
+        throttle_max.as_nanos()
+    } else {
+        throttle_max.as_nanos() / throttle_min.as_nanos()
+    };
     ratio.ilog2()
 }
 
