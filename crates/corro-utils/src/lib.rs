@@ -136,11 +136,14 @@ where
         }
     }
 
-    pub fn is_throttled(&self, key: &K) -> bool {
-        self.inner
-            .get(key)
-            .map(|e| Instant::now() < e.blocked_until)
-            .unwrap_or(false)
+    pub fn is_throttled(&self, key: &K) -> Option<Instant> {
+        if let Some(e) = self.inner.get(key) {
+            if Instant::now() < e.blocked_until {
+                return Some(e.blocked_until);
+            }
+        }
+    
+        None
     }
 
     pub fn throttle_count(&self, key: &K) -> u64 {
@@ -207,11 +210,11 @@ mod tests {
 
         m.throttle("a");
         assert_eq!(m.throttle_count(&"a"), 1);
-        assert!(m.is_throttled(&"a"));
-        assert!(!m.is_throttled(&"b"));
+        assert!(m.is_throttled(&"a").is_some());
+        assert!(m.is_throttled(&"b").is_none());
 
         std::thread::sleep(Duration::from_millis(55));
-        assert!(!m.is_throttled(&"a"));
+        assert!(m.is_throttled(&"a").is_none());
         assert_eq!(
             m.throttle_count(&"a"),
             1,
@@ -220,9 +223,9 @@ mod tests {
 
         m.throttle("a");
         assert_eq!(m.throttle_count(&"a"), 2);
-        assert!(m.is_throttled(&"a"));
+        assert!(m.is_throttled(&"a").is_some());
         std::thread::sleep(Duration::from_millis(95));
-        assert!(!m.is_throttled(&"a"));
+        assert!(m.is_throttled(&"a").is_none());
 
         m.remove(&"a");
         assert_eq!(m.throttle_count(&"a"), 0);
