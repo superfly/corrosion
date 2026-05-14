@@ -486,8 +486,8 @@ pub async fn apply_fully_buffered_changes_loop(
     info!("Starting apply_fully_buffered_changes loop");
     let sql_tx_timeout_secs = Duration::from_secs(agent.config().perf.sql_tx_timeout as u64);
     // we can burst timeout up to an additional 2 min
-    let max_timeout_increase: u64 = 8;
-    let step_timeout_secs: u64 = 10;
+    let max_timeout_increase: u64 = 6;
+    let step_timeout_secs: u64 = 20;
 
     let throttle_min = Duration::from_secs(5 * 60);
     let throttle_max = Duration::from_secs(60 * 60);
