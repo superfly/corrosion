@@ -1,13 +1,13 @@
-use std::{net::SocketAddr, path::Path};
+use std::path::Path;
 
-use corro_client::CorrosionApiClient;
+use crate::admin::AdminConn;
+use corro_admin::Command;
 use tracing::info;
 
-pub async fn run<P: AsRef<Path>>(api_addr: SocketAddr, schema_paths: &[P]) -> eyre::Result<()> {
-    let client = CorrosionApiClient::new(api_addr)?;
-
-    client.schema_from_paths(schema_paths).await?;
-    info!("Successfully reloaded Corrosion's schema from paths!");
+pub async fn run<P: AsRef<Path>>(admin_path: P) -> eyre::Result<()> {
+    let mut conn = AdminConn::connect(admin_path).await?;
+    conn.send_command(Command::Reload).await?;
+    info!("Successfully reloaded Corrosion's schema from configured paths!");
     Ok(())
 }
 
@@ -15,6 +15,7 @@ pub async fn run<P: AsRef<Path>>(api_addr: SocketAddr, schema_paths: &[P]) -> ey
 mod tests {
     use super::*;
 
+    use corro_admin::{start_server, AdminConfig};
     use corro_tests::launch_test_agent;
     use spawn::wait_for_all_pending_handles;
     use tripwire::Tripwire;
@@ -24,11 +25,6 @@ mod tests {
         _ = tracing_subscriber::fmt::try_init();
         let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
         let ta = launch_test_agent(|conf| conf.build(), tripwire.clone()).await?;
-
-        let client = ta.api_client();
-        client
-            .schema_from_paths(&ta.agent.config().db.schema_paths)
-            .await?;
 
         let mut conf = ta.agent.config().as_ref().clone();
         let new_path = ta.tmpdir.path().join("schema2");
@@ -45,8 +41,20 @@ mod tests {
             .push(new_path.display().to_string().into());
 
         println!("conf: {conf:?}");
+        ta.agent.set_config(conf);
 
-        run(ta.agent.api_addr(), &conf.db.schema_paths).await?;
+        start_server(
+            ta.agent.clone(),
+            ta.bookie.clone(),
+            AdminConfig {
+                listen_path: ta.agent.config().admin.uds_path.clone(),
+                config_path: ta.agent.config().db.path.clone(),
+            },
+            None,
+            tripwire.clone(),
+        )?;
+
+        run(ta.agent.config().admin.uds_path.as_std_path()).await?;
 
         assert!(ta.agent.schema().read().tables.contains_key("blah"));
 

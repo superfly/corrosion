@@ -482,9 +482,7 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
                 }
             }
         }
-        Command::Reload => {
-            command::reload::run(cli.api_addr()?, &cli.config()?.db.schema_paths).await?
-        }
+        Command::Reload => command::reload::run(cli.admin_path()).await?,
         Command::Sync(SyncCommand::Generate) => {
             let mut conn = AdminConn::connect(cli.admin_path()).await?;
             conn.send_command(corro_admin::Command::Sync(
@@ -729,7 +727,7 @@ enum Command {
         timeout: Option<u64>,
     },
 
-    /// Reload the config
+    /// Reload Corrosion schema
     Reload,
 
     /// Sync-related commands

@@ -1,4 +1,4 @@
-use corro_agent::api::public::api_v1_db_schema;
+use corro_agent::agent::util::execute_schema;
 use criterion::{
     black_box, criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput,
 };
@@ -54,9 +54,9 @@ async fn setup_test_agent_with_data(config: &BenchConfig) -> eyre::Result<corro_
 
     for table_idx in 0..config.number_of_bench_tables {
         let table_name = format!("bench_test_{table_idx}");
-        let (status, _) = api_v1_db_schema(
-            Extension(ta.agent.clone()),
-            axum::Json(vec![format!(
+        execute_schema(
+            &ta.agent,
+            vec![format!(
                 "CREATE TABLE IF NOT EXISTS {table_name} (
                 id INTEGER NOT NULL PRIMARY KEY,
                 value TEXT,
@@ -64,10 +64,9 @@ async fn setup_test_agent_with_data(config: &BenchConfig) -> eyre::Result<corro_
                 random INTEGER
             ) WITHOUT ROWID;
             "
-            )]),
+            )],
         )
-        .await;
-        assert_eq!(status, StatusCode::OK);
+        .await?;
 
         // Insert initial data using a single CTE query for efficiency
         // Uses an simple LCG for deterministic results
