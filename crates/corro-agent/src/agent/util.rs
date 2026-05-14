@@ -484,16 +484,17 @@ pub async fn apply_fully_buffered_changes_loop(
     mut tripwire: Tripwire,
 ) {
     info!("Starting apply_fully_buffered_changes loop");
-    // use slightly higher timeout (1.5 x perf timeout) since we could have a lot of buffered changes.
-    let timeout = (agent.config().perf.sql_tx_timeout as u64 * 3) / 2;
-    let tx_timeout: Duration = Duration::from_secs(timeout);
-    let timeout_proximity = tx_timeout.saturating_sub(Duration::from_secs(3));
+    let sql_tx_timeout_secs = agent.config().perf.sql_tx_timeout as u64;
+    let max_tx_timeout = Duration::from_secs(sql_tx_timeout_secs.saturating_mul(2));
+    let timeout_increase = Duration::from_secs(20);
+
+    let throttle_min = Duration::from_secs(5 * 60);
+    let throttle_max = Duration::from_secs(60 * 60);
 
     let mut retry_interval = tokio::time::interval(Duration::from_secs(60));
-    let mut clear_limit_interval = tokio::time::interval(Duration::from_secs(5 * 60));
 
     // map to throttle retries for failed versions that took too long to apply
-    let mut limit_retries = ThrottleMap::new(Duration::from_secs(5 * 60));
+    let mut limit_retries = ThrottleMap::new(throttle_min, throttle_max);
 
     retry_interval.tick().await;
 
@@ -516,11 +517,6 @@ pub async fn apply_fully_buffered_changes_loop(
                     },
                 }
             },
-
-            _ = clear_limit_interval.tick() => {
-                limit_retries.clear_expired();
-                continue;
-            }
         };
 
         if limit_retries.is_throttled(&partial_version) {
@@ -532,7 +528,10 @@ pub async fn apply_fully_buffered_changes_loop(
         }
 
         let (actor_id, version) = partial_version;
-        debug!(%actor_id, %version, "picked up background apply of buffered changes");
+        let throttle_count = limit_retries.throttle_count(&(actor_id, version));
+        let tx_timeout = (max_tx_timeout + timeout_increase * throttle_count).min(max_tx_timeout);
+
+        debug!(%actor_id, %version, throttle_count, ?tx_timeout, "picked up background apply of buffered changes");
         let start = Instant::now();
         let res =
             process_fully_buffered_changes(&agent, &bookie, actor_id, version, tx_timeout).await;
@@ -540,11 +539,13 @@ pub async fn apply_fully_buffered_changes_loop(
         match res {
             Ok(false) => {
                 warn!(%actor_id, %version, "did not apply buffered changes");
+                limit_retries.remove(&(actor_id, version));
             }
             Ok(true) => {
                 debug!(%actor_id, %version, "succesfully applied buffered changes");
                 histogram!("corro.agent.changes.processing.time.seconds", "source" => "buffered")
                     .record(elapsed.as_secs_f64());
+                limit_retries.remove(&(actor_id, version));
             }
             Err(e) => {
                 error!(%actor_id, %version, "could not apply fully buffered changes: {e}");
@@ -555,8 +556,8 @@ pub async fn apply_fully_buffered_changes_loop(
                     let details = json!({"error": e.to_string()});
                     assert_unreachable!("could not apply fully buffered changes", &details);
                 }
-                // processing time came close to timeout, limit retry
-                if elapsed >= timeout_proximity {
+                // processing time came close to timeout, limit retry with exponential backoff
+                if e.is_interrupt_error() {
                     limit_retries.throttle((actor_id, version));
                 }
             }
