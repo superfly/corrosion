@@ -1,0 +1,32 @@
+name: Publish crates
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  # Release unpublished packages.
+  release-plz-release:
+    name: Release-plz release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: read
+    steps:
+      - &checkout
+        name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: rui314/setup-mold@v1
+      - &install-rust
+        name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Run release-plz
+        uses: release-plz/action@v0.5
+        with:
+          command: release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
