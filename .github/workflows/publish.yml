@@ -10,9 +10,11 @@ jobs:
   release-plz-release:
     name: Release-plz release
     runs-on: ubuntu-latest
+    if: ${{ github.repository_owner == 'superfly' }}
     permissions:
       contents: write
       pull-requests: read
+      id-token: write
     steps:
       - &checkout
         name: Checkout repository
