@@ -142,7 +142,7 @@ where
                 return Some(e.blocked_until);
             }
         }
-    
+
         None
     }
 
