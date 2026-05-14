@@ -1521,7 +1521,7 @@ CREATE TABLE IF NOT EXISTS test_reload2 (
     {
         let schema = ta.agent.schema().read();
         assert!(schema.tables.get("test_reload").is_some());
-        assert!(schema.tables.get("test_reload2").is_some());    
+        assert!(schema.tables.get("test_reload2").is_some());
     }
 
     tripwire_tx.send(()).await.ok();
