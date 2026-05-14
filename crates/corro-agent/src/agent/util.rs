@@ -471,16 +471,18 @@ pub async fn apply_fully_buffered_changes_loop(
     mut tripwire: Tripwire,
 ) {
     info!("Starting apply_fully_buffered_changes loop");
-    // use slightly higher timeout (1.5 x perf timeout) since we could have a lot of buffered changes.
-    let timeout = (agent.config().perf.sql_tx_timeout as u64 * 3) / 2;
-    let tx_timeout: Duration = Duration::from_secs(timeout);
-    let timeout_proximity = tx_timeout.saturating_sub(Duration::from_secs(3));
+    let sql_tx_timeout_secs = Duration::from_secs(agent.config().perf.sql_tx_timeout as u64);
+    // we can burst timeout up to an additional 2 min
+    let max_timeout_increase: u64 = 6;
+    let step_timeout_secs: u64 = 20;
 
-    let mut retry_interval = tokio::time::interval(Duration::from_secs(60));
-    let mut clear_limit_interval = tokio::time::interval(Duration::from_secs(5 * 60));
+    let throttle_min = Duration::from_secs(5 * 60);
+    let throttle_max = Duration::from_secs(60 * 60);
+
+    let mut retry_interval = tokio::time::interval(Duration::from_secs(5 * 60));
 
     // map to throttle retries for failed versions that took too long to apply
-    let mut limit_retries = ThrottleMap::new(Duration::from_secs(5 * 60));
+    let mut limit_retries = ThrottleMap::new(throttle_min, throttle_max);
 
     retry_interval.tick().await;
 
@@ -503,23 +505,25 @@ pub async fn apply_fully_buffered_changes_loop(
                     },
                 }
             },
-
-            _ = clear_limit_interval.tick() => {
-                limit_retries.clear_expired();
-                continue;
-            }
         };
 
-        if limit_retries.is_throttled(&partial_version) {
+        if let Some(blocked_until) = limit_retries.is_throttled(&partial_version) {
+            let next_retry = blocked_until.duration_since(Instant::now()).as_secs();
             warn!(
                 ?partial_version,
-                "previous attempt to apply buffered changes took too long, skipping retry"
+                "previous attempt to apply buffered changes took too long, will retry in {next_retry} seconds"
             );
             continue;
         }
 
         let (actor_id, version) = partial_version;
-        debug!(%actor_id, %version, "picked up background apply of buffered changes");
+        let throttle_count = limit_retries
+            .throttle_count(&(actor_id, version))
+            .min(max_timeout_increase);
+        let tx_timeout =
+            sql_tx_timeout_secs + Duration::from_secs(step_timeout_secs * throttle_count);
+
+        debug!(%actor_id, %version, ?tx_timeout, "picked up background apply of buffered changes");
         let start = Instant::now();
         let res =
             process_fully_buffered_changes(&agent, &bookie, actor_id, version, tx_timeout).await;
@@ -527,14 +531,17 @@ pub async fn apply_fully_buffered_changes_loop(
         match res {
             Ok(false) => {
                 warn!(%actor_id, %version, "did not apply buffered changes");
+                limit_retries.remove(&(actor_id, version));
             }
             Ok(true) => {
                 debug!(%actor_id, %version, "succesfully applied buffered changes");
                 histogram!("corro.agent.changes.processing.time.seconds", "source" => "buffered")
                     .record(elapsed.as_secs_f64());
+                limit_retries.remove(&(actor_id, version));
             }
             Err(e) => {
-                error!(%actor_id, %version, "could not apply fully buffered changes: {e}");
+                let is_interrupt_error = e.is_interrupt_error();
+                error!(%actor_id, %version, "could not apply fully buffered changes with timeout {tx_timeout:?}: {e}");
                 if let Some(issue) = e.fatal_db_issue() {
                     error!("fatal DB issue detected: {issue}");
                     agent.mark_unhealthy(issue);
@@ -542,8 +549,8 @@ pub async fn apply_fully_buffered_changes_loop(
                     let details = json!({"error": e.to_string()});
                     assert_unreachable!("could not apply fully buffered changes", &details);
                 }
-                // processing time came close to timeout, limit retry
-                if elapsed >= timeout_proximity {
+                // processing time came close to timeout, limit retry with exponential backoff
+                if is_interrupt_error {
                     limit_retries.throttle((actor_id, version));
                 }
             }
