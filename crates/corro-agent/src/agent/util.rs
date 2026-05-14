@@ -527,10 +527,10 @@ pub async fn apply_fully_buffered_changes_loop(
         };
 
         if let Some(blocked_until) = limit_retries.is_throttled(&partial_version) {
+            let next_retry = blocked_until.duration_since(Instant::now()).as_secs();
             warn!(
                 ?partial_version,
-                ?blocked_until,
-                "previous attempt to apply buffered changes took too long, skipping retry"
+                "previous attempt to apply buffered changes took too long, will retry in {next_retry} seconds"
             );
             continue;
         }
