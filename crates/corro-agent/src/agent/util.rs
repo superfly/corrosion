@@ -550,17 +550,17 @@ pub async fn apply_fully_buffered_changes_loop(
         match res {
             Ok(false) => {
                 warn!(%actor_id, %version, "did not apply buffered changes");
-                limit_retries.remove(&(actor_id, version));
+                // limit_retries.remove(&(actor_id, version));
             }
             Ok(true) => {
                 debug!(%actor_id, %version, "succesfully applied buffered changes");
                 histogram!("corro.agent.changes.processing.time.seconds", "source" => "buffered")
                     .record(elapsed.as_secs_f64());
-                limit_retries.remove(&(actor_id, version));
+                // limit_retries.remove(&(actor_id, version));
             }
             Err(e) => {
                 let is_interrupt_error = e.is_interrupt_error();
-                error!(%actor_id, %version, "could not apply fully buffered changes with timeout {tx_timeout:?} (is_interrupt_error: {is_interrupt_error}): {e}");
+                error!(%actor_id, %version, "could not apply fully buffered changes with timeout {tx_timeout:?} {throttle_count} times (is_interrupt_error: {is_interrupt_error}): {e}");
                 if let Some(issue) = e.fatal_db_issue() {
                     error!("fatal DB issue detected: {issue}");
                     agent.mark_unhealthy(issue);
