@@ -123,6 +123,7 @@ pub struct Limits {
 
 impl Agent {
     pub fn new(config: AgentConfig) -> Self {
+        let max_concurrent_syncs = config.config.load().perf.max_concurrent_syncs;
         Self(Arc::new(AgentInner {
             actor_id: config.actor_id,
             pool: config.pool,
@@ -144,7 +145,7 @@ impl Agent {
             schema: config.schema,
             cluster_id: ArcSwap::from_pointee(config.cluster_id),
             limits: Limits {
-                sync: Arc::new(Semaphore::new(3)),
+                sync: Arc::new(Semaphore::new(max_concurrent_syncs)),
             },
             subs_manager: config.subs_manager,
             updates_manager: config.updates_manager,

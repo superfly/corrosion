@@ -47,6 +47,10 @@ const fn default_processing_queue() -> usize {
     20000
 }
 
+const fn default_max_concurrent_syncs() -> usize {
+    3
+}
+
 /// Used for the apply channel
 const fn default_huge_channel() -> usize {
     2048
@@ -278,6 +282,11 @@ pub struct PerfConfig {
     // It's used to decide whether to wait for more changes for apply_queue_timeout ms or spawn a batch immediately
     #[serde(default = "default_batch_threshold_ratio")]
     pub apply_queue_batch_threshold_ratio: f64,
+    // Cap on concurrent inbound sync handlers. Enforced at the bi-stream
+    // accept site; further peers receive `MaxConcurrencyReached` and the
+    // stream is closed.
+    #[serde(default = "default_max_concurrent_syncs")]
+    pub max_concurrent_syncs: usize,
 }
 
 impl Default for PerfConfig {
@@ -302,6 +311,7 @@ impl Default for PerfConfig {
             apply_queue_step_base: default_apply_batch_step(),
             apply_queue_max_batch_size: default_apply_batch_max(),
             apply_queue_batch_threshold_ratio: default_batch_threshold_ratio(),
+            max_concurrent_syncs: default_max_concurrent_syncs(),
         }
     }
 }
