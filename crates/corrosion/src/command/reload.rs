@@ -6,7 +6,10 @@ use tracing::info;
 
 pub async fn run<P: AsRef<Path>>(admin_path: P) -> eyre::Result<()> {
     let mut conn = AdminConn::connect(admin_path).await?;
-    conn.send_command(Command::Reload).await?;
+    if let Err(e) = conn.send_command(Command::Reload).await {
+        error!("Failed to reload schema: {e}");
+        return Err(eyre!("Failed to reload schema: {e}"));
+    }
     info!("Successfully reloaded Corrosion's schema from configured paths!");
     Ok(())
 }
