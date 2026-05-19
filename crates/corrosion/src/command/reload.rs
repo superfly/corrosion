@@ -2,7 +2,8 @@ use std::path::Path;
 
 use crate::admin::AdminConn;
 use corro_admin::Command;
-use tracing::info;
+use eyre::eyre;
+use tracing::{error, info};
 
 pub async fn run<P: AsRef<Path>>(admin_path: P) -> eyre::Result<()> {
     let mut conn = AdminConn::connect(admin_path).await?;
