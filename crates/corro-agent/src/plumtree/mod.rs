@@ -1,28 +1,42 @@
-use std::{cmp, collections::HashMap, net::SocketAddr, ops::RangeInclusive, time::Duration};
+use std::{
+    cmp,
+    collections::{HashMap, VecDeque},
+    net::SocketAddr,
+    num::NonZeroU32,
+    ops::RangeInclusive,
+    time::Duration,
+};
 
-use bytes::{BufMut, BytesMut};
+use bytes::{BufMut, Bytes, BytesMut};
 use corro_types::{
-    actor::ActorId,
+    actor::{ActorId, ClusterId},
     agent::{Agent, Bookie},
     base::{CrsqlDbVersion, CrsqlSeq},
     broadcast::{
         ChangeId, ChangeSource, ChangeV1, ChangesetId, PlumtreeInput, PlumtreeMsg, PlumtreeMsgV1,
         PlumtreeUpdates, UniPayload, UniPayloadV1,
     },
-    channel::{CorroReceiver, CorroSender},
+    channel::{bounded, CorroReceiver, CorroSender},
 };
+use governor::{Quota, RateLimiter};
 use indexmap::IndexMap;
 use metrics::counter;
-use plum_foca::{Payload, PeerTopologyInfo, PlumtreeState, PlumtreeStats, SeenStore, Timer};
+use plum_foca::{
+    Payload, PeerTopologyInfo, PlumPrio, PlumtreeState, PlumtreeStats, SeenStore, Timer,
+};
 use rangemap::RangeInclusiveSet;
 use speedy::Writable;
 use strum::EnumDiscriminants;
-use tokio::{sync::mpsc, time::interval};
+use tokio::{sync::mpsc, task::JoinSet, time::interval};
 use tokio_util::codec::{Encoder, LengthDelimitedCodec};
-use tracing::{debug, error, info, trace, warn};
+use tracing::{error, info, trace, warn};
 use tripwire::Tripwire;
 
-use crate::{broadcast::TimerSpawner, transport::TransportExt};
+use crate::{
+    agent::util::log_at_pow_10,
+    broadcast::{try_transmit_uni, TimerSpawner, TransmitError, TransmitRateLimiter},
+    transport::TransportExt,
+};
 
 #[derive(Debug)]
 struct SeenEntry {
@@ -188,118 +202,42 @@ impl ChangeSeenStore {
 
 /// Implements `plum_foca::Runtime` for Corrosion, bridging the generic protocol
 /// to Corrosion's transport, change processing, and timer infrastructure.
-struct CorrosionPlumtreeRuntime<T: TransportExt> {
-    agent: Agent,
-    transport: T,
+struct CorrosionPlumtreeRuntime {
     tx_changes: CorroSender<(ChangeV1, ChangeSource)>,
     timer_spawner: TimerSpawner<plum_foca::Timer<ChangeId, ActorId>>,
-    bcast_codec: LengthDelimitedCodec,
-    ser_buf: BytesMut,
-    actors: HashMap<ActorId, SocketAddr>,
+    tx_msgs: CorroSender<(PlumPrio, Vec<ActorId>, PlumtreeMsgV1)>,
 }
 
-impl<T: TransportExt> CorrosionPlumtreeRuntime<T> {
-    fn update_actor(&mut self, actor_id: ActorId, addr: SocketAddr) {
-        self.actors.insert(actor_id, addr);
-    }
-
-    fn remove_actor(&mut self, actor_id: ActorId) {
-        self.actors.remove(&actor_id);
+impl CorrosionPlumtreeRuntime {
+    fn new(
+        tx_changes: CorroSender<(ChangeV1, ChangeSource)>,
+        timer_spawner: TimerSpawner<plum_foca::Timer<ChangeId, ActorId>>,
+        tx_msgs: CorroSender<(PlumPrio, Vec<ActorId>, PlumtreeMsgV1)>,
+    ) -> Self {
+        Self {
+            tx_changes,
+            timer_spawner,
+            tx_msgs,
+        }
     }
 }
 
-impl<T: TransportExt + Clone + Send + 'static> plum_foca::Runtime<ChangeId, ChangeV1, ActorId>
-    for CorrosionPlumtreeRuntime<T>
-{
+impl plum_foca::Runtime<ChangeId, ChangeV1, ActorId> for CorrosionPlumtreeRuntime {
     fn send_all(
         &mut self,
         peers: Vec<ActorId>,
         msg: plum_foca::PlumtreeMsg<ChangeId, ChangeV1, ActorId>,
+        priority: PlumPrio,
     ) {
-        let addrs = peers
-            .iter()
-            .filter_map(|p| self.actors.get(p).map(|a| *a))
-            .collect::<Vec<_>>();
-
-        let payload = UniPayload::V1 {
-            data: UniPayloadV1::PlumTree(PlumtreeMsg::V1 { data: msg }),
-            cluster_id: self.agent.cluster_id(),
-        };
-
-        self.ser_buf.clear();
-        if let Err(e) = payload.write_to_stream((&mut self.ser_buf).writer()) {
-            error!("plumtree: failed to serialize wire msg: {e}");
-            return;
-        }
-
-        let mut frame_buf = BytesMut::new();
-        if let Err(e) = self
-            .bcast_codec
-            .encode(self.ser_buf.split().freeze(), &mut frame_buf)
-        {
-            error!("plumtree: failed to frame wire msg: {e}");
-            return;
-        }
-
-        let data = frame_buf.freeze();
-        for addr in addrs {
-            let transport = self.transport.clone();
-            let data = data.clone();
-            tokio::spawn(async move {
-                match tokio::time::timeout(Duration::from_secs(5), transport.send_uni(addr, data))
-                    .await
-                {
-                    Err(_) => warn!("plumtree: timed out sending to {addr}"),
-                    Ok(Err(e)) => debug!("plumtree: send error to {addr}: {e}"),
-                    Ok(Ok(())) => {
-                        counter!("corro.plumtree.send.total").increment(1);
-                    }
-                }
-            });
+        if let Err(e) = self.tx_msgs.try_send((priority, peers, msg)) {
+            error!("plumtree: could not send message: {e}");
         }
     }
 
-    fn send(&mut self, to: ActorId, msg: PlumtreeMsgV1) {
-        let addr = match self.actors.get(&to) {
-            Some(a) => *a,
-            None => {
-                debug!("plumtree: no address for peer {to}, dropping message");
-                return;
-            }
-        };
-
-        let payload = UniPayload::V1 {
-            data: UniPayloadV1::PlumTree(PlumtreeMsg::V1 { data: msg }),
-            cluster_id: self.agent.cluster_id(),
-        };
-
-        self.ser_buf.clear();
-        if let Err(e) = payload.write_to_stream((&mut self.ser_buf).writer()) {
-            error!("plumtree: failed to serialize wire msg: {e}");
-            return;
+    fn send(&mut self, to: ActorId, msg: PlumtreeMsgV1, prio: PlumPrio) {
+        if let Err(e) = self.tx_msgs.try_send((prio, vec![to], msg)) {
+            error!("plumtree: could not send message: {e}");
         }
-
-        let mut frame_buf = BytesMut::new();
-        if let Err(e) = self
-            .bcast_codec
-            .encode(self.ser_buf.split().freeze(), &mut frame_buf)
-        {
-            error!("plumtree: failed to frame wire msg: {e}");
-            return;
-        }
-
-        let data = frame_buf.freeze();
-        let transport = self.transport.clone();
-        tokio::spawn(async move {
-            match tokio::time::timeout(Duration::from_secs(5), transport.send_uni(addr, data)).await
-            {
-                Err(_) => warn!("plumtree: timed out sending to {addr}"),
-                Ok(Err(e)) => debug!("plumtree: send error to {addr}: {e}"),
-                Ok(Ok(())) => {
-                    counter!("corro.plumtree.send.total").increment(1);
-                }
-            }
-        });
     }
 
     fn deliver(&mut self, payload: ChangeV1) {
@@ -369,32 +307,24 @@ pub async fn plumtree_loop<T: TransportExt + Clone + Send + 'static>(
     let (plumtree_timer_tx, mut plumtree_timer_rx) = mpsc::channel(10);
     let timer_spawner = TimerSpawner::new(plumtree_timer_tx);
 
+    let (tx_msgs, rx_msgs) = bounded(agent.config().perf.bcast_channel_len, "plumtree_msgs");
+
+    let send_agent = agent.clone();
+    let send_transport = transport.clone();
+    let send_tripwire = tripwire.clone();
+    tokio::spawn(send_messages_loop(
+        send_agent,
+        send_transport,
+        rx_msgs,
+        send_tripwire,
+    ));
+
     let mut tick_interval = interval(Duration::from_millis(200));
     let mut maintenance_interval = interval(Duration::from_secs(10));
-    let mut metrics_interval = interval(Duration::from_secs(10));
-    // do we need this if we aren't batching?
-    let bcast_codec = LengthDelimitedCodec::builder()
-        .max_frame_length(10 * 1_024 * 1_024)
-        .new_codec();
 
-    let actors: HashMap<ActorId, SocketAddr> = agent
-        .members()
-        .read()
-        .states
-        .iter()
-        .map(|(id, state)| (id.clone(), state.addr))
-        .collect();
+    let actors_keys: Vec<ActorId> = agent.members().read().states.keys().cloned().collect();
 
-    let actors_keys: Vec<ActorId> = actors.keys().cloned().collect();
-    let mut rt = CorrosionPlumtreeRuntime {
-        agent: agent.clone(),
-        transport: transport,
-        tx_changes: tx_changes,
-        timer_spawner: timer_spawner,
-        bcast_codec: bcast_codec,
-        ser_buf: BytesMut::with_capacity(10 * 1_024 * 1_024),
-        actors,
-    };
+    let mut rt = CorrosionPlumtreeRuntime::new(tx_changes, timer_spawner, tx_msgs);
 
     let len = actors_keys.len();
     state.add_peers_bulk(actors_keys, &mut rt);
@@ -469,12 +399,10 @@ pub async fn plumtree_loop<T: TransportExt + Clone + Send + 'static>(
                 }
             },
             Branch::Updates(updates) => match updates {
-                PlumtreeUpdates::MemberUp { actor_id, addr } => {
-                    rt.update_actor(actor_id, addr);
+                PlumtreeUpdates::MemberUp { actor_id, addr: _ } => {
                     state.peer_up(actor_id, &mut rt);
                 }
                 PlumtreeUpdates::MemberDown(actor_id) => {
-                    rt.remove_actor(actor_id);
                     state.peer_down(&actor_id, &mut rt);
                 }
             },
@@ -488,13 +416,229 @@ pub async fn plumtree_loop<T: TransportExt + Clone + Send + 'static>(
                 let topo = plumtree_topology_map(&agent);
                 state.maintain_topology(&mut rt, topo);
                 state.seen_evict_if_needed();
-            } // Branch::Metrics => {
-              //     todo!("metrics");
-              // }
+            }
         }
     }
 
     return state.stats().clone();
+}
+
+#[derive(Debug)]
+struct PendingPlumtreeSend {
+    peers: Vec<ActorId>,
+    payload: Bytes,
+}
+
+async fn send_messages_loop<T: TransportExt + Clone + Send + 'static>(
+    agent: Agent,
+    transport: T,
+    mut rx_msgs: CorroReceiver<(PlumPrio, Vec<ActorId>, PlumtreeMsgV1)>,
+    mut tripwire: Tripwire,
+) {
+    let cluster_id = agent.cluster_id();
+    let max_queue_len = agent.config().perf.processing_queue_len;
+    const MAX_INFLIGHT: usize = 500;
+
+    let mut codec = LengthDelimitedCodec::builder()
+        .max_frame_length(10 * 1_024 * 1_024)
+        .new_codec();
+    let mut ser_buf = BytesMut::new();
+    let mut frame_buf = BytesMut::new();
+
+    let mut p0_queue: VecDeque<PendingPlumtreeSend> = VecDeque::new();
+    let mut p1_queue: VecDeque<PendingPlumtreeSend> = VecDeque::new();
+    let mut join_set = JoinSet::new();
+    let mut limited_log_count = 0;
+    let mut drop_log_count = 0;
+
+    let bytes_per_sec: TransmitRateLimiter = RateLimiter::direct(Quota::per_second(unsafe {
+        NonZeroU32::new_unchecked(10 * 1024 * 1024)
+    }))
+    .with_middleware();
+
+    let mut rate_limited = false;
+
+    loop {
+        let recv = tokio::select! {
+            biased;
+            _ = &mut tripwire => {
+                info!("plumtree send loop: tripwire fired, shutting down");
+                break;
+            },
+            _ = join_set.join_next(), if !join_set.is_empty() => {
+                continue;
+            },
+            msg = rx_msgs.recv() => match msg {
+                Some(msg) => Some(msg),
+                None => {
+                    warn!("plumtree send loop: message channel closed");
+                    break;
+                }
+            },
+        };
+
+        if let Some((prio, peers, msg)) = recv {
+            let payload = match encode_plumtree_wire(
+                cluster_id,
+                &mut codec,
+                &mut ser_buf,
+                &mut frame_buf,
+                msg,
+            ) {
+                Ok(payload) => payload,
+                Err(()) => continue,
+            };
+            let pending = PendingPlumtreeSend { peers, payload };
+            match prio {
+                PlumPrio::P0 => p0_queue.push_back(pending),
+                PlumPrio::P1 => p1_queue.push_back(pending),
+            }
+        }
+
+        drain_plumtree_queue(
+            &agent,
+            &transport,
+            &bytes_per_sec,
+            &mut join_set,
+            &mut p0_queue,
+            MAX_INFLIGHT,
+            &mut rate_limited,
+            &mut limited_log_count,
+        );
+        if !rate_limited {
+            drain_plumtree_queue(
+                &agent,
+                &transport,
+                &bytes_per_sec,
+                &mut join_set,
+                &mut p1_queue,
+                MAX_INFLIGHT,
+                &mut rate_limited,
+                &mut limited_log_count,
+            );
+        }
+
+        if drop_oldest_plumtree_send(&mut p0_queue, &mut p1_queue, max_queue_len).is_some() {
+            log_at_pow_10(
+                "dropped old plumtree message from send queue",
+                &mut drop_log_count,
+            );
+            counter!("corro.plumtree.send.dropped").increment(1);
+        }
+    }
+
+    info!("plumtree send loop is done");
+}
+
+fn encode_plumtree_wire(
+    cluster_id: ClusterId,
+    codec: &mut LengthDelimitedCodec,
+    ser_buf: &mut BytesMut,
+    frame_buf: &mut BytesMut,
+    msg: PlumtreeMsgV1,
+) -> Result<Bytes, ()> {
+    ser_buf.clear();
+    if let Err(e) = (UniPayload::V1 {
+        data: UniPayloadV1::PlumTree(PlumtreeMsg::V1 { data: msg }),
+        cluster_id,
+    })
+    .write_to_stream(ser_buf.writer())
+    {
+        error!("plumtree: failed to serialize wire msg: {e}");
+        return Err(());
+    }
+
+    frame_buf.clear();
+    if let Err(e) = codec.encode(ser_buf.split().freeze(), frame_buf) {
+        error!("plumtree: failed to frame wire msg: {e}");
+        return Err(());
+    }
+
+    Ok(frame_buf.split().freeze())
+}
+
+fn resolve_peer_addrs(agent: &Agent, peers: &[ActorId]) -> Vec<SocketAddr> {
+    let members = agent.members().read();
+    peers
+        .iter()
+        .filter_map(|id| members.states.get(id).map(|st| st.addr))
+        .collect()
+}
+
+fn drain_plumtree_queue<T: TransportExt + Clone + Send + 'static>(
+    agent: &Agent,
+    transport: &T,
+    bytes_per_sec: &TransmitRateLimiter,
+    join_set: &mut JoinSet<()>,
+    queue: &mut VecDeque<PendingPlumtreeSend>,
+    max_inflight: usize,
+    rate_limited: &mut bool,
+    limited_log_count: &mut u64,
+) {
+    while !queue.is_empty() && join_set.len() < max_inflight {
+        let pending = queue.pop_front().unwrap();
+        let addrs = resolve_peer_addrs(agent, &pending.peers);
+        if addrs.is_empty() {
+            trace!(
+                peers = ?pending.peers,
+                "plumtree: no addresses for peers, dropping message"
+            );
+            continue;
+        }
+
+        let mut spawn_count = 0;
+        let addr_count = addrs.len();
+        for addr in addrs {
+            if join_set.len() >= max_inflight {
+                break;
+            }
+
+            match try_transmit_uni(
+                bytes_per_sec,
+                pending.payload.clone(),
+                transport.clone(),
+                addr,
+            ) {
+                Err(e) => match e {
+                    TransmitError::TooBig(_) | TransmitError::InsufficientCapacity(_) => {
+                        error!("plumtree: could not spawn transmission: {e}");
+                    }
+                    TransmitError::QuotaExceeded(_) => {
+                        *rate_limited = true;
+                        counter!("corro.plumtree.send.rate_limited").increment(1);
+                        log_at_pow_10("plumtree sends rate limited", limited_log_count);
+                        break;
+                    }
+                },
+                Ok(fut) => {
+                    join_set.spawn(async move {
+                        fut.await;
+                        counter!("corro.plumtree.send.total").increment(1);
+                    });
+                    spawn_count += 1;
+                }
+            }
+        }
+
+        if *rate_limited && spawn_count == 0 && addr_count > 0 {
+            queue.push_front(pending);
+            break;
+        }
+
+        counter!("corro.plumtree.send.spawn").increment(spawn_count);
+    }
+}
+
+fn drop_oldest_plumtree_send(
+    p0_queue: &mut VecDeque<PendingPlumtreeSend>,
+    p1_queue: &mut VecDeque<PendingPlumtreeSend>,
+    max: usize,
+) -> Option<PendingPlumtreeSend> {
+    if p0_queue.len() + p1_queue.len() <= max {
+        return None;
+    }
+    // drop from low-priority queue first
+    p1_queue.pop_back().or_else(|| p0_queue.pop_back())
 }
 
 /// Ring + RTT snapshot from [`Members`] for [`PlumtreeState::maintain_topology`].
