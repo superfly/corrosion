@@ -24,6 +24,7 @@ impl<T> NodeId for T where T: Clone + Eq + Hash + Ord + Debug + Send + 'static {
 
 pub type Round = u32;
 
+#[derive(Clone, Copy)]
 pub enum PlumPrio {
     P0,
     P1,
@@ -75,7 +76,12 @@ pub struct Config {
     pub max_received_entries: usize,
     // cap on cached payload used to respond to GRAFT requests.
     pub max_cached_payloads: usize,
+    /// Max message ids per GRAFT wire message (IHave timeout batches are chunked).
+    pub max_graft_ids_per_msg: usize,
 }
+
+/// Default max ids per [`GraftMsg`].
+pub const DEFAULT_MAX_GRAFT_IDS_PER_MSG: usize = 10;
 
 impl Default for Config {
     fn default() -> Self {
@@ -88,6 +94,7 @@ impl Default for Config {
             max_lazy: 20,
             prune_threshold: 1,
             max_received_entries: 10000,
+            max_graft_ids_per_msg: DEFAULT_MAX_GRAFT_IDS_PER_MSG,
         }
     }
 }
@@ -102,10 +109,10 @@ pub trait SeenStore<I: MessageId> {
 /// (e.g. via tokio) and calls `PlumtreeState::timer_fired` when they expire.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Timer<I: MessageId, N: NodeId> {
-    /// Fires after `config.ihave_timeout`. If the message still hasn't
-    /// arrived, the node sends a GRAFT to the IHave sender.
-    IHaveTimeout {
-        id: I,
+    /// Fires after `config.ihave_timeout`. For each id still missing, the node
+    /// sends a GRAFT (one timer per IHave batch, including retries).
+    IHaveTimeoutBatch {
+        ids: Vec<I>,
         retries: u32,
         senders: Vec<N>,
     },
@@ -185,15 +192,21 @@ pub struct IHaveDigest<I: MessageId> {
 }
 
 #[derive(Debug, Clone, Readable, Writable)]
+pub struct GraftRequest<I: MessageId> {
+    pub id: I,
+    pub round: Round,
+}
+
+#[derive(Debug, Clone, Readable, Writable)]
 pub struct GraftMsg<I, N>
 where
     I: MessageId,
     N: NodeId,
 {
     pub sender: N,
-    pub id: I,
-    pub round: Round,
+    /// When true, respond with GOSSIP for each cached request id.
     pub send: bool,
+    pub requests: Vec<GraftRequest<I>>,
 }
 
 #[derive(Debug, Clone, Readable, Writable)]
@@ -430,9 +443,11 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
                         entry.ihave_sender.clone(),
                         PlumtreeMsg::Graft(GraftMsg {
                             sender: self.local_id.clone(),
-                            id: id.clone(),
-                            round: entry.round,
                             send: false,
+                            requests: vec![GraftRequest {
+                                id: id.clone(),
+                                round: entry.round,
+                            }],
                         }),
                         PlumPrio::P0,
                     );
@@ -445,23 +460,25 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
     /// Handle an incoming IHave digest batch.
     ///
     /// For each digest we haven't already received, record it in the
-    /// `missing` set and schedule an `IHaveTimeout` timer. If the full
+    /// `missing` set and schedule one `IHaveTimeoutBatch` timer. If the full
     /// GOSSIP doesn't arrive before the timer fires, we'll GRAFT.
     pub fn handle_ihave(&mut self, msg: IHaveMsg<I, N>, rt: &mut impl Runtime<I, P, N>) {
         self.stats.ihave += 1;
         let IHaveMsg { sender, digests } = msg;
         let count = digests.len();
-        let mut new_missing = 0u32;
 
         let mut rng = rand::rng();
-        let mut senders = vec![sender.clone()];
-        senders.extend(
-            self.eager_peers
-                .iter()
-                .filter(|p| **p != sender)
-                .choose(&mut rng)
-                .cloned(),
-        );
+        let senders: Vec<N> = std::iter::once(sender.clone())
+            .chain(
+                self.eager_peers
+                    .iter()
+                    .filter(|p| **p != sender)
+                    .choose(&mut rng)
+                    .cloned(),
+            )
+            .collect();
+
+        let mut new_ids = Vec::new();
         for digest in digests {
             if self.seen.contains(&digest.id) {
                 continue;
@@ -470,65 +487,81 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
                 continue;
             }
 
-            new_missing += 1;
+            new_ids.push(digest.id.clone());
             self.missing.insert(
-                digest.id.clone(),
+                digest.id,
                 MissingEntry {
                     ihave_sender: sender.clone(),
                     round: digest.round,
                 },
             );
+        }
+
+        if !new_ids.is_empty() {
+            debug!(
+                local = ?self.local_id,
+                ?sender,
+                count,
+                new_missing = new_ids.len(),
+                total_missing = self.missing.len(),
+                "handle_ihave → scheduled graft timeout batch"
+            );
             rt.schedule(
-                Timer::IHaveTimeout {
-                    id: digest.id,
+                Timer::IHaveTimeoutBatch {
+                    ids: new_ids,
                     retries: 0,
-                    senders: senders.clone(),
+                    senders,
                 },
                 self.config.ihave_timeout,
             );
-        }
-        if new_missing > 0 {
-            debug!(local = ?self.local_id, ?sender, count, new_missing,
-                   total_missing = self.missing.len(), "handle_ihave → scheduled grafts");
         }
     }
 
     /// Handle an incoming GRAFT request.
     ///
     /// The sender is asking us to add them back to our eager set and
-    /// (re)send the full payload for a specific message.
+    /// (re)send the full payload for each requested message.
     pub fn handle_graft(&mut self, msg: GraftMsg<I, N>, rt: &mut impl Runtime<I, P, N>) {
         self.stats.graft += 1;
-        let GraftMsg { sender, id, .. } = msg;
+        let GraftMsg {
+            sender,
+            send,
+            requests,
+        } = msg;
 
         self.move_to_eager(&sender, rt);
 
-        if !msg.send {
+        if !send {
             return;
         }
-        if let Some((payload, round)) = self.cache.get(&id).cloned() {
-            debug!(
-                ?id,
-                "local={:?} sender={:?} graft → sending cached payload", self.local_id, sender
-            );
-            rt.send(
-                sender,
-                PlumtreeMsg::Gossip(GossipMsg {
-                    round,
-                    sender: self.local_id.clone(),
-                    payload,
-                }),
-                PlumPrio::P0,
-            );
-        } else {
-            debug!(
-                ?id,
-                cache_size = self.cache.entries.len(),
-                "local={:?} sender={:?} graft → NOT CACHED",
-                self.local_id,
-                sender
-            );
-            rt.notify(Notification::PayloadNotCached(id));
+
+        for req in requests {
+            if let Some((payload, round)) = self.cache.get(&req.id).cloned() {
+                debug!(
+                    id = ?req.id,
+                    "local={:?} sender={:?} graft → sending cached payload",
+                    self.local_id,
+                    sender
+                );
+                rt.send(
+                    sender.clone(),
+                    PlumtreeMsg::Gossip(GossipMsg {
+                        round,
+                        sender: self.local_id.clone(),
+                        payload,
+                    }),
+                    PlumPrio::P0,
+                );
+            } else {
+                debug!(
+                    id = ?req.id,
+                    cache_size = self.cache.entries.len(),
+                    "local={:?} sender={:?} graft → NOT CACHED",
+                    self.local_id,
+                    sender
+                );
+                rt.notify(Notification::PayloadNotCached(req.id));
+            }
         }
     }
 
@@ -585,63 +618,98 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
 
     /// Handle a fired timer.
     ///
-    /// `IHaveTimeout`: if the message is still missing, send GRAFT to
-    /// the peer that told us about it and promote them to eager.
+    /// `IHaveTimeoutBatch`: for each id still missing, send GRAFT and promote
+    /// the target peer to eager; re-schedule a batch for ids still missing.
     pub fn timer_fired(&mut self, timer: Timer<I, N>, rt: &mut impl Runtime<I, P, N>) {
         match timer {
-            Timer::IHaveTimeout {
-                id,
+            Timer::IHaveTimeoutBatch {
+                ids,
                 retries,
                 senders,
-            } => {
-                if self.seen.contains(&id) {
-                    debug!(
-                        ?id,
-                        "local={:?} timer fired → already received, noop", self.local_id
-                    );
-                    self.missing.remove(&id);
-                    return;
-                }
+            } => self.timer_fired_ihave_timeout_batch(ids, retries, senders, rt),
+        }
+    }
 
-                let entry = self.missing.get(&id).cloned();
-                if let Some(entry) = entry {
-                    debug!(
-                        ?id,
-                        "local={:?} send_to={:?} IHave timeout → GRAFT",
-                        self.local_id,
-                        entry.ihave_sender
-                    );
-                    if retries >= senders.len() as u32 {
-                        self.missing.remove(&id);
-                    }
-                    let sender = senders[retries as usize].clone();
-                    rt.send(
-                        sender.clone(),
-                        PlumtreeMsg::Graft(GraftMsg {
-                            sender: self.local_id.clone(),
-                            id: id.clone(),
-                            round: entry.round,
-                            send: true,
-                        }),
-                        PlumPrio::P0,
-                    );
-                    // todo: maybe move to eager when we get a graft response?
-                    self.move_to_eager(&sender, rt);
-                    rt.schedule(
-                        Timer::IHaveTimeout {
-                            id: id.clone(),
-                            retries: retries + 1,
-                            senders: senders.clone(),
-                        },
-                        self.config.ihave_timeout / 2,
-                    );
-                } else {
-                    trace!(
-                        ?id,
-                        "local={:?} IHave timeout → already received, noop", self.local_id
-                    );
-                }
+    fn timer_fired_ihave_timeout_batch(
+        &mut self,
+        ids: Vec<I>,
+        retries: u32,
+        senders: Vec<N>,
+        rt: &mut impl Runtime<I, P, N>,
+    ) {
+        if senders.is_empty() {
+            return;
+        }
+
+        if retries >= senders.len() as u32 {
+            for id in ids {
+                self.missing.remove(&id);
             }
+            return;
+        }
+
+        let peer = senders[retries as usize].clone();
+        let mut graft_requests = Vec::new();
+        let mut still_missing = Vec::new();
+
+        for id in ids {
+            if self.seen.contains(&id) {
+                debug!(
+                    ?id,
+                    "local={:?} timer fired → already received, noop",
+                    self.local_id
+                );
+                self.missing.remove(&id);
+                continue;
+            }
+
+            let Some(entry) = self.missing.get(&id).cloned() else {
+                trace!(
+                    ?id,
+                    "local={:?} IHave timeout → no longer missing, noop",
+                    self.local_id
+                );
+                continue;
+            };
+
+            graft_requests.push(GraftRequest {
+                id: id.clone(),
+                round: entry.round,
+            });
+            still_missing.push(id);
+        }
+
+        if !graft_requests.is_empty() {
+            debug!(
+                count = graft_requests.len(),
+                ?peer,
+                "local={:?} IHave timeout → GRAFT batch",
+                self.local_id
+            );
+            self.move_to_eager(&peer, rt);
+            let chunk_size = self.config.max_graft_ids_per_msg.max(1);
+            for chunk in graft_requests.chunks(chunk_size) {
+                rt.send(
+                    peer.clone(),
+                    PlumtreeMsg::Graft(GraftMsg {
+                        sender: self.local_id.clone(),
+                        send: true,
+                        requests: chunk.to_vec(),
+                    }),
+                    PlumPrio::P0,
+                );
+            }
+        }
+
+        if !still_missing.is_empty() {
+            rt.schedule(
+                Timer::IHaveTimeoutBatch {
+                    ids: still_missing,
+                    retries: retries + 1,
+                    senders,
+                },
+                self.config.ihave_timeout / 2,
+            );
         }
     }
 
@@ -1117,6 +1185,22 @@ mod tests {
             max_lazy: 10,
             prune_threshold: 1,
             max_received_entries: 10000,
+            max_graft_ids_per_msg: DEFAULT_MAX_GRAFT_IDS_PER_MSG,
+        }
+    }
+
+    fn graft_msg(
+        sender: TestNodeId,
+        send: bool,
+        requests: Vec<(TestMsgId, Round)>,
+    ) -> GraftMsg<TestMsgId, TestNodeId> {
+        GraftMsg {
+            sender,
+            send,
+            requests: requests
+                .into_iter()
+                .map(|(id, round)| GraftRequest { id, round })
+                .collect(),
         }
     }
 
@@ -1564,7 +1648,8 @@ mod tests {
         let (to, m) = &grafts[0];
         assert_eq!(*to, 5);
         let graft = unwrap_graft(m);
-        assert_eq!(graft.round, 1);
+        assert_eq!(graft.requests[0].round, 1);
+        assert!(!graft.send);
 
         // Peer 5 promoted to eager
         assert!(s.eager_peers.contains(&5));
@@ -1639,13 +1724,13 @@ mod tests {
         );
 
         assert_eq!(s.missing.len(), 2);
-        assert_eq!(rt.scheduled.len(), 2);
+        assert_eq!(rt.scheduled.len(), 1);
         assert_eq!(
             rt.scheduled[0].0,
-            Timer::IHaveTimeout {
-                id: msg(1),
+            Timer::IHaveTimeoutBatch {
+                ids: vec![msg(1), msg(2)],
                 retries: 0,
-                senders: vec![5]
+                senders: vec![5],
             }
         );
         assert_eq!(rt.scheduled[0].1, Duration::from_secs(3));
@@ -1720,15 +1805,7 @@ mod tests {
         rt.sent.clear();
 
         // Peer 5 sends GRAFT
-        s.handle_graft(
-            GraftMsg {
-                sender: 5,
-                id: msg(1),
-                round: 0,
-                send: true,
-            },
-            &mut rt,
-        );
+        s.handle_graft(graft_msg(5, true, vec![(msg(1), 0)]), &mut rt);
 
         // Peer 5 promoted to eager
         assert!(s.eager_peers.contains(&5));
@@ -1746,15 +1823,7 @@ mod tests {
         let mut s = state();
         let mut rt = AccumulatingRuntime::default();
 
-        s.handle_graft(
-            GraftMsg {
-                sender: 5,
-                id: msg(999),
-                round: 0,
-                send: true,
-            },
-            &mut rt,
-        );
+        s.handle_graft(graft_msg(5, true, vec![(msg(999), 0)]), &mut rt);
 
         // No GOSSIP sent
         let gossips: Vec<_> = rt
@@ -1819,11 +1888,12 @@ mod tests {
             &mut rt,
         );
         rt.sent.clear();
+        rt.scheduled.clear();
 
         // Fire the timer
         s.timer_fired(
-            Timer::IHaveTimeout {
-                id: msg(1),
+            Timer::IHaveTimeoutBatch {
+                ids: vec![msg(1)],
                 retries: 0,
                 senders: vec![5],
             },
@@ -1835,14 +1905,135 @@ mod tests {
         let (to, m) = &rt.sent[0];
         assert_eq!(*to, 5);
         let graft = unwrap_graft(m);
-        assert_eq!(graft.id, msg(1));
-        assert_eq!(graft.round, 2);
+        assert_eq!(graft.requests.len(), 1);
+        assert_eq!(graft.requests[0].id, msg(1));
+        assert_eq!(graft.requests[0].round, 2);
 
         // Peer 5 promoted to eager
         assert!(s.eager_peers.contains(&5));
 
-        // Missing entry removed
+        // Still missing until received or retries exhausted; retry batch scheduled
+        assert!(s.missing.contains_key(&msg(1)));
+        assert_eq!(rt.scheduled.len(), 1);
+        assert_eq!(
+            rt.scheduled[0].0,
+            Timer::IHaveTimeoutBatch {
+                ids: vec![msg(1)],
+                retries: 1,
+                senders: vec![5],
+            }
+        );
+        assert_eq!(rt.scheduled[0].1, Duration::from_secs(3) / 2);
+    }
+
+    #[test]
+    fn timer_fired_ihave_timeout_batch_partial_noop() {
+        let mut s = state();
+        let mut rt = AccumulatingRuntime::default();
+
+        s.handle_ihave(
+            IHaveMsg {
+                sender: 5,
+                digests: vec![
+                    IHaveDigest {
+                        id: msg(1),
+                        round: 0,
+                    },
+                    IHaveDigest {
+                        id: msg(2),
+                        round: 0,
+                    },
+                ],
+            },
+            &mut rt,
+        );
+        s.seen.observe(msg(1), 0);
+        rt.sent.clear();
+        rt.scheduled.clear();
+
+        s.timer_fired(
+            Timer::IHaveTimeoutBatch {
+                ids: vec![msg(1), msg(2)],
+                retries: 0,
+                senders: vec![5],
+            },
+            &mut rt,
+        );
+
+        assert_eq!(rt.sent.len(), 1);
+        let graft = unwrap_graft(&rt.sent[0].1);
+        assert_eq!(graft.requests.len(), 1);
+        assert_eq!(graft.requests[0].id, msg(2));
         assert!(!s.missing.contains_key(&msg(1)));
+        assert!(s.missing.contains_key(&msg(2)));
+        assert_eq!(rt.scheduled.len(), 1);
+        assert_eq!(
+            rt.scheduled[0].0,
+            Timer::IHaveTimeoutBatch {
+                ids: vec![msg(2)],
+                retries: 1,
+                senders: vec![5],
+            }
+        );
+    }
+
+    #[test]
+    fn timer_fired_ihave_timeout_chunks_graft_requests() {
+        let mut s = state();
+        let mut rt = AccumulatingRuntime::default();
+
+        let digests: Vec<_> = (1..=15)
+            .map(|n| IHaveDigest {
+                id: msg(n),
+                round: 0,
+            })
+            .collect();
+
+        s.handle_ihave(IHaveMsg { sender: 5, digests }, &mut rt);
+        rt.sent.clear();
+        rt.scheduled.clear();
+
+        let ids: Vec<_> = (1..=15).map(msg).collect();
+        s.timer_fired(
+            Timer::IHaveTimeoutBatch {
+                ids,
+                retries: 0,
+                senders: vec![5],
+            },
+            &mut rt,
+        );
+
+        assert_eq!(rt.sent.len(), 2);
+        let g0 = unwrap_graft(&rt.sent[0].1);
+        let g1 = unwrap_graft(&rt.sent[1].1);
+        assert_eq!(g0.requests.len(), 10);
+        assert_eq!(g1.requests.len(), 5);
+        assert!(rt
+            .sent
+            .iter()
+            .all(|(to, _)| *to == 5));
+    }
+
+    #[test]
+    fn handle_graft_batch_sends_multiple_cached_payloads() {
+        let mut s = state();
+        let mut rt = AccumulatingRuntime::default();
+
+        s.broadcast(msg(1), payload(1), &mut rt);
+        s.broadcast(msg(2), payload(2), &mut rt);
+        rt.sent.clear();
+
+        s.handle_graft(
+            graft_msg(5, true, vec![(msg(1), 0), (msg(2), 0)]),
+            &mut rt,
+        );
+
+        let gossips: Vec<_> = rt
+            .sent
+            .iter()
+            .filter(|(_, m)| matches!(m, PlumtreeMsg::Gossip(_)))
+            .collect();
+        assert_eq!(gossips.len(), 2);
     }
 
     #[test]
@@ -1874,8 +2065,8 @@ mod tests {
 
         // Timer fires — but missing entry already removed
         s.timer_fired(
-            Timer::IHaveTimeout {
-                id: msg(1),
+            Timer::IHaveTimeoutBatch {
+                ids: vec![msg(1)],
                 retries: 0,
                 senders: vec![5],
             },
@@ -2064,8 +2255,8 @@ mod tests {
 
         // Timer fires — B sends GRAFT to C
         b.timer_fired(
-            Timer::IHaveTimeout {
-                id: msg(2),
+            Timer::IHaveTimeoutBatch {
+                ids: vec![msg(2)],
                 retries: 0,
                 senders: vec![30],
             },
@@ -2123,15 +2314,7 @@ mod tests {
         rt.notifications.clear();
 
         // GRAFT for evicted msg(1)
-        s.handle_graft(
-            GraftMsg {
-                sender: 5,
-                id: msg(1),
-                round: 0,
-                send: true,
-            },
-            &mut rt,
-        );
+        s.handle_graft(graft_msg(5, true, vec![(msg(1), 0)]), &mut rt);
 
         // No GOSSIP sent (payload gone)
         let gossips: Vec<_> = rt

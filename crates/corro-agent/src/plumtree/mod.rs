@@ -276,6 +276,7 @@ pub async fn spawn_plumtree_loop<T: TransportExt + Clone + Send + 'static>(
         min_lazy: 5,
         prune_threshold: 3,
         max_received_entries: 10000,
+        max_graft_ids_per_msg: plum_foca::DEFAULT_MAX_GRAFT_IDS_PER_MSG,
     };
 
     plumtree_loop(
@@ -767,6 +768,7 @@ mod tests {
             max_lazy: 10,
             prune_threshold: 2,
             max_received_entries: 10000,
+            max_graft_ids_per_msg: plum_foca::DEFAULT_MAX_GRAFT_IDS_PER_MSG,
         };
 
         let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
@@ -798,6 +800,7 @@ mod tests {
                     max_lazy: 10,
                     prune_threshold: 3,
                     max_received_entries: 10000,
+                    max_graft_ids_per_msg: plum_foca::DEFAULT_MAX_GRAFT_IDS_PER_MSG,
                 };
                 let stats = plumtree_loop(
                     agent_clone.clone(),
