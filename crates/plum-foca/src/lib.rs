@@ -56,45 +56,36 @@ pub struct Config {
     /// if the full message hasn't arrived yet.
     pub ihave_timeout: Duration,
     /// Optimization threshold in rounds. Controls when a node receiving
-    /// a duplicate GOSSIP will attempt to GRAFT a shorter-path peer
-    /// discovered via IHave.
+    /// a GOSSIP will attempt to GRAFT a shorter-path peer (via IHave)
     pub optimization_threshold: Option<Round>,
     /// Maximum number of eager peers (fanout). Peers beyond this limit
-    /// are placed in the lazy set instead. Paper recommends ~4-5.
+    /// are placed in the lazy set instead. .
     pub max_eager: usize,
-    /// Minimum number of lazy peers. When lazy falls below this floor,
-    /// rebalance proactively pulls from known_peers to maintain a
-    /// minimum IHave fanout so the repair mechanism can function.
+    /// Minimum number of lazy peers.
     pub min_lazy: usize,
     /// Maximum number of lazy peers. Peers beyond this limit are
     /// evicted randomly. Recommended: 4 * max_eager.
     pub max_lazy: usize,
     /// Maximum number of times a message can be received before pruning sender.
-    /// We trade of some duplication for tree stability.
+    /// We trade some duplication for tree stability.
     pub prune_threshold: u32,
     /// cap on seen entries; oldest are evicted when exceeded.
     pub max_received_entries: usize,
-    // cap on cached payload used to respond to GRAFT requests.
+    /// cap on cached payload used to respond to GRAFT requests.
     pub max_cached_payloads: usize,
-    /// Max message ids per GRAFT wire message (IHave timeout batches are chunked).
-    pub max_graft_ids_per_msg: usize,
 }
-
-/// Default max ids per [`GraftMsg`].
-pub const DEFAULT_MAX_GRAFT_IDS_PER_MSG: usize = 10;
 
 impl Default for Config {
     fn default() -> Self {
         Self {
             ihave_timeout: Duration::from_secs(1),
             optimization_threshold: Some(3),
-            max_cached_payloads: 8192,
             max_eager: 5,
             min_lazy: 5,
             max_lazy: 20,
             prune_threshold: 1,
             max_received_entries: 10000,
-            max_graft_ids_per_msg: DEFAULT_MAX_GRAFT_IDS_PER_MSG,
+            max_cached_payloads: 8192,
         }
     }
 }
@@ -105,8 +96,8 @@ pub trait SeenStore<I: MessageId> {
     fn observe(&mut self, id: I, round: Round) -> Option<u32>;
 }
 
-/// Timers produced by the protocol. The caller schedules these externally
-/// (e.g. via tokio) and calls `PlumtreeState::timer_fired` when they expire.
+/// Timers produced by the protocol, these are handle with the `schedule` method.
+/// The runtime schedules these externally and calls `PlumtreeState::timer_fired` when they expire.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Timer<I: MessageId, N: NodeId> {
     /// Fires after `config.ihave_timeout`. For each id still missing, the node
@@ -354,7 +345,7 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
     /// In a multi-sender network, the peer that forwarded sender A's
     /// message fast may be a poor path for sender B. Eager promotion
     /// only happens through intentional GRAFT (IHave timeout or
-    /// optimization path), which proves the peer is genuinely needed.
+    /// optimization path).
     pub fn handle_gossip(&mut self, msg: GossipMsg<I, P, N>, rt: &mut impl Runtime<I, P, N>) {
         let GossipMsg {
             round,
@@ -402,13 +393,16 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
         rt.deliver(payload.clone());
 
         let next_round = round + 1;
-        let mut fwd_count = 0u32;
-        for peer in &self.eager_peers {
-            if *peer == sender || *peer == self.local_id || payload.origin() == *peer {
-                continue;
-            }
-            rt.send(
-                peer.clone(),
+        let peers: Vec<N> = self
+            .eager_peers
+            .iter()
+            .filter(|p| **p != sender && **p != self.local_id && payload.origin() != **p)
+            .cloned()
+            .collect();
+        let fwd_count = peers.len();
+        if fwd_count > 0 {
+            rt.send_all(
+                peers,
                 PlumtreeMsg::Gossip(GossipMsg {
                     round: next_round,
                     sender: self.local_id.clone(),
@@ -416,22 +410,15 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
                 }),
                 PlumPrio::P1,
             );
-            fwd_count += 1;
         }
         trace!(?id, fwd_count, "local={:?} gossip forwarded", self.local_id);
 
         self.enqueue_ihave(id.clone(), round);
 
-        // Do NOT promote sender to eager here. In multi-sender networks,
-        // one successful delivery doesn't make a peer a good eager
-        // candidate for all senders. Eager promotion happens only via
-        // intentional GRAFT (IHave timeout or optimization).
-        //
         // But do ensure the sender is at least in lazy so they receive
-        // IHaves and can be grafted later if they prove useful.
+        // IHaves and can be grafted later.
         self.ensure_in_lazy(&sender);
 
-        // this
         if let Some(entry) = self.missing.remove(&id) {
             if let Some(optimization_threshold) = self.config.optimization_threshold {
                 if entry.round + optimization_threshold < round && entry.ihave_sender != sender {
@@ -656,8 +643,7 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
             if self.seen.contains(&id) {
                 debug!(
                     ?id,
-                    "local={:?} timer fired → already received, noop",
-                    self.local_id
+                    "local={:?} timer fired → already received, noop", self.local_id
                 );
                 self.missing.remove(&id);
                 continue;
@@ -666,8 +652,7 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
             let Some(entry) = self.missing.get(&id).cloned() else {
                 trace!(
                     ?id,
-                    "local={:?} IHave timeout → no longer missing, noop",
-                    self.local_id
+                    "local={:?} IHave timeout → no longer missing, noop", self.local_id
                 );
                 continue;
             };
@@ -687,8 +672,7 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
                 self.local_id
             );
             self.move_to_eager(&peer, rt);
-            let chunk_size = self.config.max_graft_ids_per_msg.max(1);
-            for chunk in graft_requests.chunks(chunk_size) {
+            for chunk in graft_requests.chunks(10) {
                 rt.send(
                     peer.clone(),
                     PlumtreeMsg::Graft(GraftMsg {
@@ -715,7 +699,7 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
 
     /// Periodic maintenance — flush all pending IHave digests to lazy peers.
     ///
-    /// The caller should invoke this on a regular interval (e.g. 200-500ms).
+    /// The caller should invoke this on a regular interval.
     pub fn tick(&mut self, rt: &mut impl Runtime<I, P, N>) {
         let peers: Vec<N> = self.lazy_peers.iter().cloned().collect();
         if let Some(digests) = self.drain_lazy_queue() {
@@ -839,7 +823,7 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
 
         let locked: HashSet<N> = self.ring_locked.clone();
         for p in locked.iter().cloned() {
-            if self.known_peers.contains(&p) && !self.eager_peers.contains(&p) {
+            if !self.eager_peers.contains(&p) {
                 self.move_to_eager(&p, rt);
             }
         }
@@ -1185,7 +1169,6 @@ mod tests {
             max_lazy: 10,
             prune_threshold: 1,
             max_received_entries: 10000,
-            max_graft_ids_per_msg: DEFAULT_MAX_GRAFT_IDS_PER_MSG,
         }
     }
 
@@ -2008,10 +1991,7 @@ mod tests {
         let g1 = unwrap_graft(&rt.sent[1].1);
         assert_eq!(g0.requests.len(), 10);
         assert_eq!(g1.requests.len(), 5);
-        assert!(rt
-            .sent
-            .iter()
-            .all(|(to, _)| *to == 5));
+        assert!(rt.sent.iter().all(|(to, _)| *to == 5));
     }
 
     #[test]
@@ -2023,10 +2003,7 @@ mod tests {
         s.broadcast(msg(2), payload(2), &mut rt);
         rt.sent.clear();
 
-        s.handle_graft(
-            graft_msg(5, true, vec![(msg(1), 0), (msg(2), 0)]),
-            &mut rt,
-        );
+        s.handle_graft(graft_msg(5, true, vec![(msg(1), 0), (msg(2), 0)]), &mut rt);
 
         let gossips: Vec<_> = rt
             .sent

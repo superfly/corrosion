@@ -430,15 +430,24 @@ struct PendingPlumtreeSend {
     payload: Bytes,
 }
 
+/// Coalesced P1 relay gossip frames destined for the same peer set.
+struct P1GossipBatch {
+    peers: Vec<ActorId>,
+    buf: BytesMut,
+}
+
 async fn send_messages_loop<T: TransportExt + Clone + Send + 'static>(
     agent: Agent,
     transport: T,
     mut rx_msgs: CorroReceiver<(PlumPrio, Vec<ActorId>, PlumtreeMsgV1)>,
     mut tripwire: Tripwire,
 ) {
+    const MAX_INFLIGHT: usize = 500;
+    const P1_GOSSIP_BATCH_INTERVAL: Duration = Duration::from_millis(20);
+    const P1_GOSSIP_BATCH_CUTOFF: usize = 64 * 1024;
+
     let cluster_id = agent.cluster_id();
     let max_queue_len = agent.config().perf.processing_queue_len;
-    const MAX_INFLIGHT: usize = 500;
 
     let mut codec = LengthDelimitedCodec::builder()
         .max_frame_length(10 * 1_024 * 1_024)
@@ -448,6 +457,11 @@ async fn send_messages_loop<T: TransportExt + Clone + Send + 'static>(
 
     let mut p0_queue: VecDeque<PendingPlumtreeSend> = VecDeque::new();
     let mut p1_queue: VecDeque<PendingPlumtreeSend> = VecDeque::new();
+    let mut p1_gossip_batch = P1GossipBatch {
+        peers: Vec::new(),
+        buf: BytesMut::new(),
+    };
+    let mut gossip_batch_interval = interval(P1_GOSSIP_BATCH_INTERVAL);
     let mut join_set = JoinSet::new();
     let mut limited_log_count = 0;
     let mut drop_log_count = 0;
@@ -460,39 +474,70 @@ async fn send_messages_loop<T: TransportExt + Clone + Send + 'static>(
     let mut rate_limited = false;
 
     loop {
-        let recv = tokio::select! {
+        enum Branch {
+            Msg((PlumPrio, Vec<ActorId>, PlumtreeMsgV1)),
+            GossipBatchDeadline,
+        }
+
+        let branch = tokio::select! {
             biased;
             _ = &mut tripwire => {
-                info!("plumtree send loop: tripwire fired, shutting down");
+                info!("plumtree send messages loop: tripwire fired, shutting down");
                 break;
             },
             _ = join_set.join_next(), if !join_set.is_empty() => {
                 continue;
             },
             msg = rx_msgs.recv() => match msg {
-                Some(msg) => Some(msg),
+                Some(msg) => Branch::Msg(msg),
                 None => {
                     warn!("plumtree send loop: message channel closed");
                     break;
                 }
             },
+            _ = gossip_batch_interval.tick() => Branch::GossipBatchDeadline,
         };
 
-        if let Some((prio, peers, msg)) = recv {
-            let payload = match encode_plumtree_wire(
-                cluster_id,
-                &mut codec,
-                &mut ser_buf,
-                &mut frame_buf,
-                msg,
-            ) {
-                Ok(payload) => payload,
-                Err(()) => continue,
-            };
-            let pending = PendingPlumtreeSend { peers, payload };
-            match prio {
-                PlumPrio::P0 => p0_queue.push_back(pending),
-                PlumPrio::P1 => p1_queue.push_back(pending),
+        match branch {
+            Branch::GossipBatchDeadline => {
+                if !p1_gossip_batch.buf.is_empty() {
+                    p1_queue.push_back(PendingPlumtreeSend {
+                        peers: std::mem::take(&mut p1_gossip_batch.peers),
+                        payload: p1_gossip_batch.buf.split().freeze(),
+                    });
+                }
+            }
+            Branch::Msg((prio, peers, msg)) => {
+                let p1_gossip =
+                    matches!(prio, PlumPrio::P1) && matches!(&msg, PlumtreeMsgV1::Gossip(_));
+                let payload = match encode_plumtree_wire(
+                    cluster_id,
+                    &mut codec,
+                    &mut ser_buf,
+                    &mut frame_buf,
+                    msg,
+                ) {
+                    Ok(payload) => payload,
+                    Err(()) => continue,
+                };
+
+                if p1_gossip {
+                    // gossip is sent to latest eager peers
+                    p1_gossip_batch.peers = peers;
+                    p1_gossip_batch.buf.extend_from_slice(&payload);
+                    if p1_gossip_batch.buf.len() >= P1_GOSSIP_BATCH_CUTOFF {
+                        p1_queue.push_back(PendingPlumtreeSend {
+                            peers: std::mem::take(&mut p1_gossip_batch.peers),
+                            payload: p1_gossip_batch.buf.split().freeze(),
+                        });
+                    }
+                } else {
+                    let pending = PendingPlumtreeSend { peers, payload };
+                    match prio {
+                        PlumPrio::P0 => p0_queue.push_back(pending),
+                        PlumPrio::P1 => p1_queue.push_back(pending),
+                    }
+                }
             }
         }
 
