@@ -24,6 +24,11 @@ impl<T> NodeId for T where T: Clone + Eq + Hash + Ord + Debug + Send + 'static {
 
 pub type Round = u32;
 
+pub enum PlumPrio {
+    P0,
+    P1,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PeerTopologyInfo {
     /// Semantics are caller-defined; `Some(0)` typically means lowest-latency bucket.
@@ -119,10 +124,10 @@ pub enum Notification<I: MessageId, N: NodeId> {
 
 pub trait Runtime<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId> {
     /// Send a protocol message to a specific peer.
-    fn send(&mut self, to: N, msg: PlumtreeMsg<I, P, N>);
+    fn send(&mut self, to: N, msg: PlumtreeMsg<I, P, N>, prio: PlumPrio);
 
     // Send a message to a group of peers
-    fn send_all(&mut self, peers: Vec<N>, msg: PlumtreeMsg<I, P, N>);
+    fn send_all(&mut self, peers: Vec<N>, msg: PlumtreeMsg<I, P, N>, prio: PlumPrio);
 
     /// Deliver a received message to the application layer.
     fn deliver(&mut self, payload: P);
@@ -361,6 +366,7 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
                         sender: self.local_id.clone(),
                         triggered_by: id.clone(),
                     }),
+                    PlumPrio::P1,
                 );
                 self.move_to_lazy(&sender, rt);
                 self.replenish_eager_from_lazy_avoiding(&sender, rt);
@@ -395,6 +401,7 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
                     sender: self.local_id.clone(),
                     payload: payload.clone(),
                 }),
+                PlumPrio::P1,
             );
             fwd_count += 1;
         }
@@ -427,6 +434,7 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
                             round: entry.round,
                             send: false,
                         }),
+                        PlumPrio::P0,
                     );
                     self.move_to_eager(&entry.ihave_sender, rt);
                 }
@@ -510,6 +518,7 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
                     sender: self.local_id.clone(),
                     payload,
                 }),
+                PlumPrio::P0,
             );
         } else {
             debug!(
@@ -557,7 +566,6 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
 
         let peers = self
             .eager_peers
-            .clone()
             .iter()
             .filter(|p| **p != self.local_id)
             .cloned()
@@ -569,6 +577,7 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
                 sender: self.local_id.clone(),
                 payload,
             }),
+            PlumPrio::P0,
         );
 
         self.enqueue_ihave(id, 0);
@@ -614,6 +623,7 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
                             round: entry.round,
                             send: true,
                         }),
+                        PlumPrio::P0,
                     );
                     // todo: maybe move to eager when we get a graft response?
                     self.move_to_eager(&sender, rt);
@@ -647,6 +657,7 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
                     sender: self.local_id.clone(),
                     digests,
                 }),
+                PlumPrio::P1,
             );
         }
     }
@@ -1127,13 +1138,19 @@ mod tests {
             &mut self,
             peers: Vec<TestNodeId>,
             msg: PlumtreeMsg<TestMsgId, TestPayload, TestNodeId>,
+            _prio: PlumPrio,
         ) {
             for peer in peers {
-                self.send(peer, msg.clone());
+                self.send(peer, msg.clone(), PlumPrio::P0);
             }
         }
 
-        fn send(&mut self, to: TestNodeId, msg: PlumtreeMsg<TestMsgId, TestPayload, TestNodeId>) {
+        fn send(
+            &mut self,
+            to: TestNodeId,
+            msg: PlumtreeMsg<TestMsgId, TestPayload, TestNodeId>,
+            _prio: PlumPrio,
+        ) {
             self.sent.push((to, msg));
         }
 

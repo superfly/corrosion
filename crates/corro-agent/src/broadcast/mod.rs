@@ -404,7 +404,7 @@ pub fn runtime_loop(
     ));
 }
 
-type BroadcastRateLimiter = RateLimiter<
+pub(crate) type TransmitRateLimiter = RateLimiter<
     governor::state::NotKeyed,
     governor::state::InMemoryState,
     governor::clock::QuantaClock,
@@ -476,7 +476,7 @@ async fn handle_broadcasts(
 
     let mut limited_log_count = 0;
 
-    let bytes_per_sec: BroadcastRateLimiter = RateLimiter::direct(Quota::per_second(unsafe {
+    let bytes_per_sec: TransmitRateLimiter = RateLimiter::direct(Quota::per_second(unsafe {
         NonZeroU32::new_unchecked(10 * 1024 * 1024)
     }))
     .with_middleware();
@@ -626,12 +626,7 @@ async fn handle_broadcasts(
                 ring0_count += 1;
                 ring0.insert(addr);
 
-                match try_transmit_broadcast(
-                    &bytes_per_sec,
-                    payload.clone(),
-                    transport.clone(),
-                    addr,
-                ) {
+                match try_transmit_uni(&bytes_per_sec, payload.clone(), transport.clone(), addr) {
                     Err(e) => {
                         log_at_pow_10(
                             "could not spawn broadcast transmission: {e}",
@@ -735,7 +730,7 @@ async fn handle_broadcasts(
                 let mut spawn_count = 0;
                 trace!("broadcasting to: {:?}", broadcast_to);
                 for addr in broadcast_to {
-                    match try_transmit_broadcast(
+                    match try_transmit_uni(
                         &bytes_per_sec,
                         pending.payload.clone(),
                         transport.clone(),
@@ -1066,7 +1061,7 @@ impl PendingBroadcast {
 }
 
 #[derive(Debug, thiserror::Error)]
-enum TransmitError {
+pub(crate) enum TransmitError {
     #[error("payload > u32::MAX: {0}")]
     TooBig(usize),
     #[error(transparent)]
@@ -1076,8 +1071,8 @@ enum TransmitError {
 }
 
 #[tracing::instrument(skip(payload, transport), fields(buf_size = payload.len()), level = "debug")]
-fn try_transmit_broadcast(
-    bytes_per_sec: &BroadcastRateLimiter,
+pub(crate) fn try_transmit_uni(
+    bytes_per_sec: &TransmitRateLimiter,
     payload: Bytes,
     transport: impl TransportExt + Send + 'static,
     addr: SocketAddr,
