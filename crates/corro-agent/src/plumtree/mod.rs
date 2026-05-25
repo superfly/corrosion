@@ -276,7 +276,6 @@ pub async fn spawn_plumtree_loop<T: TransportExt + Clone + Send + 'static>(
         min_lazy: 5,
         prune_threshold: 3,
         max_received_entries: 10000,
-        max_graft_ids_per_msg: plum_foca::DEFAULT_MAX_GRAFT_IDS_PER_MSG,
     };
 
     plumtree_loop(
