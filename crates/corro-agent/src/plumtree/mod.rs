@@ -17,13 +17,12 @@ use corro_types::{
         PlumtreeUpdates, UniPayload, UniPayloadV1,
     },
     channel::{bounded, CorroReceiver, CorroSender},
+    members::ring_from_rtt_ms,
 };
 use governor::{Quota, RateLimiter};
 use indexmap::IndexMap;
 use metrics::counter;
-use plum_foca::{
-    Payload, PeerTopologyInfo, PlumPrio, PlumtreeState, PlumtreeStats, SeenStore, Timer,
-};
+use plum_foca::{Payload, PlumPrio, PlumtreeState, PlumtreeStats, RttInfo, SeenStore, Timer};
 use rangemap::RangeInclusiveSet;
 use speedy::Writable;
 use strum::EnumDiscriminants;
@@ -322,13 +321,11 @@ pub async fn plumtree_loop<T: TransportExt + Clone + Send + 'static>(
     let mut tick_interval = interval(Duration::from_millis(200));
     let mut maintenance_interval = interval(Duration::from_secs(10));
 
-    let actors_keys: Vec<ActorId> = agent.members().read().states.keys().cloned().collect();
-
     let mut rt = CorrosionPlumtreeRuntime::new(tx_changes, timer_spawner, tx_msgs);
 
-    let len = actors_keys.len();
-    state.add_peers_bulk(actors_keys, &mut rt);
-    info!("added {} peers to plumtree", len);
+    let bootstrap_peers = plumtree_bootstrap_peers(&agent).await;
+    info!("added {} peers to plumtree", bootstrap_peers.len());
+    state.add_peers_bulk_with_rtt(bootstrap_peers, &mut rt);
 
     #[derive(EnumDiscriminants)]
     #[strum_discriminants(derive(strum::IntoStaticStr))]
@@ -399,8 +396,13 @@ pub async fn plumtree_loop<T: TransportExt + Clone + Send + 'static>(
                 }
             },
             Branch::Updates(updates) => match updates {
-                PlumtreeUpdates::MemberUp { actor_id, addr: _ } => {
-                    state.peer_up(actor_id, &mut rt);
+                PlumtreeUpdates::MemberUp {
+                    actor_id,
+                    addr: _,
+                    ring,
+                    rtt_ms,
+                } => {
+                    state.peer_up(actor_id, Some(RttInfo { ring, rtt_ms }), &mut rt);
                 }
                 PlumtreeUpdates::MemberDown(actor_id) => {
                     state.peer_down(&actor_id, &mut rt);
@@ -413,8 +415,7 @@ pub async fn plumtree_loop<T: TransportExt + Clone + Send + 'static>(
                 state.tick(&mut rt);
             }
             Branch::MaintenanceTick => {
-                let topo = plumtree_topology_map(&agent);
-                state.maintain_topology(&mut rt, topo);
+                state.update_peer_topology(plumtree_topology_map(&agent), &mut rt);
                 state.seen_evict_if_needed();
             }
         }
@@ -686,8 +687,8 @@ fn drop_oldest_plumtree_send(
     p1_queue.pop_back().or_else(|| p0_queue.pop_back())
 }
 
-/// Ring + RTT snapshot from [`Members`] for [`PlumtreeState::maintain_topology`].
-fn plumtree_topology_map(agent: &Agent) -> HashMap<ActorId, PeerTopologyInfo> {
+/// Ring + RTT snapshot from in-memory [`Members`].
+fn plumtree_topology_map(agent: &Agent) -> HashMap<ActorId, RttInfo> {
     let members = agent.members().read();
     members
         .states
@@ -696,12 +697,46 @@ fn plumtree_topology_map(agent: &Agent) -> HashMap<ActorId, PeerTopologyInfo> {
             let rtt_ms = members.avg_rtt_ms(id).unwrap_or(u64::MAX);
             (
                 *id,
-                PeerTopologyInfo {
+                RttInfo {
                     ring: st.ring,
                     rtt_ms,
                 },
             )
         })
+        .collect()
+}
+
+async fn plumtree_topology_from_db(agent: &Agent) -> eyre::Result<HashMap<ActorId, RttInfo>> {
+    let conn = agent.pool().read().await?;
+    let mut stmt =
+        conn.prepare("SELECT actor_id, rtt_min FROM __corro_members WHERE rtt_min IS NOT NULL")?;
+    let rows = stmt
+        .query_map([], |row| {
+            let rtt_ms: i64 = row.get(1)?;
+            let rtt_info = RttInfo {
+                ring: ring_from_rtt_ms(rtt_ms as u64),
+                rtt_ms: rtt_ms as u64,
+            };
+            let actor_id: ActorId = row.get(0)?;
+            Ok((actor_id, rtt_info))
+        })?
+        .collect::<rusqlite::Result<HashMap<ActorId, RttInfo>>>()?;
+
+    Ok(rows)
+}
+
+async fn plumtree_bootstrap_peers(agent: &Agent) -> Vec<(ActorId, RttInfo)> {
+    let local_id = agent.actor_id();
+    let rtts = plumtree_topology_from_db(agent).await.unwrap_or_default();
+
+    agent
+        .members()
+        .read()
+        .states
+        .keys()
+        .into_iter()
+        .filter(|id| **id != local_id)
+        .map(|id| (*id, rtts.get(id).copied().unwrap_or_default()))
         .collect()
 }
 
@@ -803,18 +838,6 @@ mod tests {
             tas.push((agent, opts));
         }
 
-        let plum_config = plum_foca::Config {
-            ihave_timeout: Duration::from_millis(500),
-            optimization_threshold: Some(5),
-            max_cached_payloads: 4096,
-            max_eager: 5,
-            min_lazy: 2,
-            max_lazy: 10,
-            prune_threshold: 2,
-            max_received_entries: 10000,
-            max_graft_ids_per_msg: plum_foca::DEFAULT_MAX_GRAFT_IDS_PER_MSG,
-        };
-
         let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
         // let mut tx_bcasts: Vec<_> = Vec::new();
         let cancel_token = CancellationToken::new();
@@ -844,7 +867,6 @@ mod tests {
                     max_lazy: 10,
                     prune_threshold: 3,
                     max_received_entries: 10000,
-                    max_graft_ids_per_msg: plum_foca::DEFAULT_MAX_GRAFT_IDS_PER_MSG,
                 };
                 let stats = plumtree_loop(
                     agent_clone.clone(),
