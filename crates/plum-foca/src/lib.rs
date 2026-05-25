@@ -606,7 +606,7 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
     /// Handle a fired timer.
     ///
     /// `IHaveTimeoutBatch`: for each id still missing, send GRAFT and promote
-    /// the target peer to eager; re-schedule a batch for ids still missing.
+    /// the target peer to eager; schedule retry at a shorter timeout.
     pub fn timer_fired(&mut self, timer: Timer<I, N>, rt: &mut impl Runtime<I, P, N>) {
         match timer {
             Timer::IHaveTimeoutBatch {
