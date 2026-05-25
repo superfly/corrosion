@@ -1343,7 +1343,7 @@ mod tests {
     fn peer_up_starts_eager() {
         let mut s = state();
         let mut rt = AccumulatingRuntime::default();
-        s.peer_up(1, &mut rt);
+        s.peer_up(1, None, &mut rt);
         assert!(s.eager_peers.contains(&1));
         assert!(!s.lazy_peers.contains(&1));
     }
@@ -1353,11 +1353,11 @@ mod tests {
         let mut s = state(); // max_eager=5
         let mut rt = AccumulatingRuntime::default();
         for i in 1..=5 {
-            s.peer_up(i, &mut rt);
+            s.peer_up(i, None, &mut rt);
         }
         assert_eq!(s.eager_peers.len(), 5);
 
-        s.peer_up(6, &mut rt);
+        s.peer_up(6, None, &mut rt);
         assert!(s.known_peers.contains(&6));
         // Sixth peer may be ring-locked (must be eager) or placed in lazy.
         assert!(s.eager_peers.contains(&6) || s.lazy_peers.contains(&6));
@@ -1373,11 +1373,11 @@ mod tests {
             PlumtreeState::new_with_store(0u8, cfg, TestSeenStore::default());
         let mut rt = AccumulatingRuntime::default();
 
-        s.peer_up(1, &mut rt); // eager
-        s.peer_up(2, &mut rt); // eager
-        s.peer_up(3, &mut rt); // lazy
-        s.peer_up(4, &mut rt); // lazy
-        s.peer_up(5, &mut rt); // one peer remains only in known_peers (caps exceeded)
+        s.peer_up(1, None, &mut rt); // eager
+        s.peer_up(2, None, &mut rt); // eager
+        s.peer_up(3, None, &mut rt); // lazy
+        s.peer_up(4, None, &mut rt); // lazy
+        s.peer_up(5, None, &mut rt); // one peer remains only in known_peers (caps exceeded)
 
         assert_eq!(s.known_peers.len(), 5);
         assert_eq!(s.eager_peers.len(), 2);
@@ -1394,8 +1394,8 @@ mod tests {
     fn peer_up_idempotent() {
         let mut s = state();
         let mut rt = AccumulatingRuntime::default();
-        s.peer_up(1, &mut rt);
-        s.peer_up(1, &mut rt);
+        s.peer_up(1, None, &mut rt);
+        s.peer_up(1, None, &mut rt);
         assert_eq!(s.eager_peers.len(), 1);
         assert_eq!(s.lazy_peers.len(), 0);
     }
@@ -1406,8 +1406,8 @@ mod tests {
         cfg.max_eager = 5;
         let mut s = PlumtreeState::new_with_store(0u8, cfg, TestSeenStore::default());
         let mut rt = AccumulatingRuntime::default();
-        s.peer_up(1, &mut rt);
-        s.peer_up(2, &mut rt);
+        s.peer_up(1, None, &mut rt);
+        s.peer_up(2, None, &mut rt);
         s.peer_down(&1, &mut rt);
         assert_eq!(s.eager_peers.len(), 1);
         assert!(s.eager_peers.contains(&2));
@@ -1420,7 +1420,7 @@ mod tests {
     fn handle_prune_does_not_demote_ring_locked_peer() {
         let mut s = state();
         let mut rt = AccumulatingRuntime::default();
-        s.peer_up(1, &mut rt);
+        s.peer_up(1, None, &mut rt);
         assert!(s.ring_locked_peers().contains(&1));
         assert!(s.eager_peers.contains(&1));
         s.handle_prune(
@@ -1442,10 +1442,10 @@ mod tests {
         cfg.max_eager = 2;
         let mut s = PlumtreeState::new_with_store(0u8, cfg, TestSeenStore::default());
         let mut rt = AccumulatingRuntime::default();
-        s.peer_up(1, &mut rt);
-        s.peer_up(2, &mut rt);
+        s.peer_up(1, None, &mut rt);
+        s.peer_up(2, None, &mut rt);
         assert_eq!(s.eager_peers.len(), 2);
-        s.peer_up(3, &mut rt);
+        s.peer_up(3, None, &mut rt);
         assert!(s.ring_locked_peers().contains(&3));
         assert!(
             s.eager_peers.contains(&3),
@@ -1463,11 +1463,11 @@ mod tests {
             PlumtreeState::new_with_store(0u8, cfg, TestSeenStore::default());
         let mut rt = AccumulatingRuntime::default();
 
-        s.peer_up(1, &mut rt); // eager
-        s.peer_up(2, &mut rt); // eager
-        s.peer_up(3, &mut rt); // eager (full)
-        s.peer_up(4, &mut rt); // lazy
-        s.peer_up(5, &mut rt); // lazy
+        s.peer_up(1, None, &mut rt); // eager
+        s.peer_up(2, None, &mut rt); // eager
+        s.peer_up(3, None, &mut rt); // eager (full)
+        s.peer_up(4, None, &mut rt); // lazy
+        s.peer_up(5, None, &mut rt); // lazy
         assert_eq!(s.eager_peers.len(), 3);
         assert_eq!(s.lazy_peers.len(), 2);
 
@@ -1500,8 +1500,8 @@ mod tests {
         let mut s = state();
         let mut rt = AccumulatingRuntime::default();
 
-        s.peer_up(1, &mut rt); // eager
-        s.peer_up(2, &mut rt); // eager
+        s.peer_up(1, None, &mut rt); // eager
+        s.peer_up(2, None, &mut rt); // eager
         // manually move 3 to lazy
         s.lazy_peers.insert(3);
 
@@ -1528,7 +1528,7 @@ mod tests {
     fn broadcast_dedup_ignores_second_call() {
         let mut s = state();
         let mut rt = AccumulatingRuntime::default();
-        s.peer_up(1, &mut rt);
+        s.peer_up(1, None, &mut rt);
 
         s.broadcast(msg(1), payload(1), &mut rt);
         assert_eq!(rt.sent.len(), 1);
@@ -1547,8 +1547,8 @@ mod tests {
         let mut s = state();
         let mut rt = AccumulatingRuntime::default();
 
-        s.peer_up(2, &mut rt); // eager
-        s.peer_up(3, &mut rt); // eager
+        s.peer_up(2, None, &mut rt); // eager
+        s.peer_up(3, None, &mut rt); // eager
         s.lazy_peers.insert(4);
 
         // Receive a GOSSIP from peer 1 (not yet in our peer set)
@@ -1601,7 +1601,7 @@ mod tests {
         let mut s = PlumtreeState::new_with_store(0u8, cfg, TestSeenStore::default());
         let mut rt = AccumulatingRuntime::default();
 
-        s.peer_up(10, &mut rt);
+        s.peer_up(10, None, &mut rt);
         // First receive
         s.handle_gossip(
             GossipMsg {
@@ -1616,9 +1616,9 @@ mod tests {
         rt.notifications.clear();
 
         // Known [10..=13]: ring locks 10 and 13; 11 is eager and not ring-locked.
-        s.peer_up(11, &mut rt);
-        s.peer_up(12, &mut rt);
-        s.peer_up(13, &mut rt);
+        s.peer_up(11, None, &mut rt);
+        s.peer_up(12, None, &mut rt);
+        s.peer_up(13, None, &mut rt);
         s.handle_gossip(
             GossipMsg {
                 round: 1,
@@ -1666,7 +1666,7 @@ mod tests {
         rt.scheduled.clear();
 
         // Now the GOSSIP arrives from peer 1 at round 10 (1 + 3 < 10)
-        s.peer_up(1, &mut rt);
+        s.peer_up(1, None, &mut rt);
         s.handle_gossip(
             GossipMsg {
                 round: 10,
@@ -1889,9 +1889,9 @@ mod tests {
         let mut rt = AccumulatingRuntime::default();
 
         // Ring locks min/max only; exactly one discretionary eager → no shuffle ambiguity.
-        s.peer_up(100, &mut rt);
-        s.peer_up(200, &mut rt);
-        s.peer_up(210, &mut rt);
+        s.peer_up(100, None, &mut rt);
+        s.peer_up(200, None, &mut rt);
+        s.peer_up(210, None, &mut rt);
         assert!(s.eager_peers.contains(&200));
         assert!(!s.ring_locked_peers().contains(&200));
         s.handle_prune(
@@ -2158,8 +2158,8 @@ mod tests {
         let mut s = PlumtreeState::new_with_store(0u8, cfg, TestSeenStore::default());
         let mut rt = AccumulatingRuntime::default();
 
-        s.peer_up(1, &mut rt); // eager
-        s.peer_up(2, &mut rt); // eager (full)
+        s.peer_up(1, None, &mut rt); // eager
+        s.peer_up(2, None, &mut rt); // eager (full)
         s.lazy_peers.insert(3);
 
         // handle_prune will try move_to_lazy then handle_gossip tries
@@ -2190,10 +2190,10 @@ mod tests {
         let mut rt = AccumulatingRuntime::default();
 
         // Ring locks 7 and 4; pool {5,6} → one discretionary eager, one lazy (shuffle picks which).
-        s.peer_up(4, &mut rt);
-        s.peer_up(5, &mut rt);
-        s.peer_up(6, &mut rt);
-        s.peer_up(7, &mut rt);
+        s.peer_up(4, None, &mut rt);
+        s.peer_up(5, None, &mut rt);
+        s.peer_up(6, None, &mut rt);
+        s.peer_up(7, None, &mut rt);
 
         let dup_sender = *s
             .eager_peers
@@ -2239,10 +2239,10 @@ mod tests {
             );
         let mut rt_b = AccumulatingRuntime::default();
 
-        b.peer_up(1, &mut rt_b); // A
-        b.peer_up(4, &mut rt_b);
-        b.peer_up(10, &mut rt_b);
-        b.peer_up(30, &mut rt_b); // C — not successor/predecessor of B on the ring
+        b.peer_up(1, None, &mut rt_b); // A
+        b.peer_up(4, None, &mut rt_b);
+        b.peer_up(10, None, &mut rt_b);
+        b.peer_up(30, None, &mut rt_b); // C — not successor/predecessor of B on the ring
 
         // B receives GOSSIP from A
         b.handle_gossip(
@@ -2373,7 +2373,7 @@ mod tests {
         let mut s = PlumtreeState::new_with_store(0u8, cfg, TestSeenStore::default());
         let mut rt = AccumulatingRuntime::default();
         for i in 1u8..=9u8 {
-            s.peer_up(i, &mut rt);
+            s.peer_up(i, None, &mut rt);
         }
         let mut topo = HashMap::new();
         for i in 1u8..=9u8 {
