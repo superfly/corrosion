@@ -1,6 +1,6 @@
 use indexmap::IndexSet;
 use rand::Rng;
-use rand::seq::{IteratorRandom, SliceRandom};
+use rand::seq::IteratorRandom;
 use speedy::{Readable, Writable};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Debug;
@@ -31,22 +31,18 @@ pub enum PlumPrio {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PeerTopologyInfo {
-    /// Semantics are caller-defined; `Some(0)` typically means lowest-latency bucket.
+pub struct RttInfo {
     pub ring: Option<u8>,
-    /// Lower is better for ordering within the same ring.
     pub rtt_ms: u64,
 }
 
-#[inline]
-fn topology_get<N: Eq + Hash + Clone>(
-    topology: &HashMap<N, PeerTopologyInfo>,
-    p: &N,
-) -> PeerTopologyInfo {
-    topology.get(p).copied().unwrap_or(PeerTopologyInfo {
-        ring: None,
-        rtt_ms: u64::MAX,
-    })
+impl Default for RttInfo {
+    fn default() -> Self {
+        Self {
+            ring: None,
+            rtt_ms: u64::MAX,
+        }
+    }
 }
 
 /// Tunable parameters for the Plumtree protocol.
@@ -280,6 +276,7 @@ pub struct PlumtreeState<
     lazy_peers: IndexSet<N>,
     known_peers: HashSet<N>,
     ring_locked: HashSet<N>,
+    peer_topology: HashMap<N, RttInfo>,
 
     lazy_queue: Vec<IHaveDigest<I>>,
     missing: HashMap<I, MissingEntry<N>>,
@@ -301,6 +298,7 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
             lazy_peers: IndexSet::new(),
             known_peers: HashSet::new(),
             ring_locked: HashSet::new(),
+            peer_topology: HashMap::new(),
             lazy_queue: Vec::new(),
             missing: HashMap::new(),
             seen,
@@ -718,23 +716,54 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
 
     /// Add multiple peers at once (e.g. during bootstrap).
     pub fn add_peers_bulk(&mut self, peers: Vec<N>, rt: &mut impl Runtime<I, P, N>) {
-        for peer in peers {
+        let entries = peers.into_iter().map(|p| (p, RttInfo::default())).collect();
+        self.add_peers_bulk_with_rtt(entries, rt);
+    }
+
+    /// Bootstrap peers together with RTT ring info for [`Self::rebalance`].
+    pub fn add_peers_bulk_with_rtt(
+        &mut self,
+        peers: Vec<(N, RttInfo)>,
+        rt: &mut impl Runtime<I, P, N>,
+    ) {
+        for (peer, info) in peers {
             if peer != self.local_id {
-                self.known_peers.insert(peer);
+                self.known_peers.insert(peer.clone());
+                self.peer_topology.insert(peer, info);
             }
         }
         self.rebalance(rt);
     }
 
     /// A new peer has come online and wants to join the overlay.
-    pub fn peer_up(&mut self, peer: N, rt: &mut impl Runtime<I, P, N>) {
+    pub fn peer_up(&mut self, peer: N, rtt: Option<RttInfo>, rt: &mut impl Runtime<I, P, N>) {
         if peer == self.local_id || self.known_peers.contains(&peer) {
             return;
         }
 
+        self.peer_topology
+            .insert(peer.clone(), rtt.unwrap_or_default());
         self.stats.peer_up += 1;
         self.known_peers.insert(peer);
         self.rebalance(rt);
+    }
+
+    /// Refresh RTT ring info for known peers (e.g. after members recalculates rings).
+    pub fn update_peer_topology(
+        &mut self,
+        updates: impl IntoIterator<Item = (N, RttInfo)>,
+        rt: &mut impl Runtime<I, P, N>,
+    ) {
+        let mut changed = false;
+        for (peer, info) in updates {
+            if self.known_peers.contains(&peer) {
+                self.peer_topology.insert(peer, info);
+                changed = true;
+            }
+        }
+        if changed {
+            self.rebalance(rt);
+        }
     }
 
     /// Peer leaves or is detected as failed.
@@ -743,46 +772,64 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
         self.eager_peers.remove(peer);
         self.lazy_peers.swap_remove(peer);
         self.known_peers.remove(peer);
+        self.peer_topology.remove(peer);
         self.rebalance(rt);
     }
 
     // --- Rebalance ---
 
-    /// Single function that restores all overlay invariants after any
-    /// change to known_peers. Called by peer_up, peer_down, and
-    /// add_peers_bulk.
-    ///
-    /// Ring neighbors are deterministic (sorted ring). Discretionary eager and lazy
-    /// peers are picked from a **shuffled** pool so nodes do not all converge on the
-    /// same lowest-`NodeId` neighbors.
+    /// clears existing lazy / eager peers and selects them again
+    /// We can probably do something more intereseting with rtt info
+    /// for now let's just randomly pick from both ring0 and other nodes
+    /// TODO: what happens on a rolling restart were we'll try to rebalance repeatedly
     fn rebalance(&mut self, _rt: &mut impl Runtime<I, P, N>) {
         self.eager_peers.clear();
         self.lazy_peers.clear();
 
         self.set_ring_neighbors();
 
-        // Ring neighbors must be eager for the overlay ring.
         for p in self.ring_locked.iter().cloned() {
             self.eager_peers.insert(p);
         }
 
-        let mut pool: Vec<N> = self
+        let ring0_pool: Vec<N> = self
             .known_peers
             .iter()
+            .filter(|p| !self.eager_peers.contains(*p) && self.peer_is_ring0(p))
             .cloned()
-            .filter(|p| !self.eager_peers.contains(p))
+            .collect();
+        let remote_pool: Vec<N> = self
+            .known_peers
+            .iter()
+            .filter(|p| !self.eager_peers.contains(*p) && !self.peer_is_ring0(p))
+            .cloned()
             .collect();
 
-        let mut rng = rand::rng();
-        pool.shuffle(&mut rng);
+        let eager_left = self.config.max_eager.saturating_sub(self.eager_peers.len());
+        let need_ring0 = (eager_left / 2).min(ring0_pool.len());
+        let need_remote = eager_left - need_ring0;
+        self.eager_peers
+            .extend(ring0_pool.iter().take(need_ring0).cloned());
+        self.eager_peers
+            .extend(remote_pool.iter().take(need_remote).cloned());
 
-        let slots = self.config.max_eager.saturating_sub(self.eager_peers.len());
-        self.eager_peers.extend(pool.iter().take(slots).cloned());
-
-        let mut rest: Vec<N> = pool.into_iter().skip(slots).collect();
-        rest.shuffle(&mut rng);
-        let lazy_cap = self.config.min_lazy.min(self.config.max_lazy);
-        self.lazy_peers.extend(rest.iter().take(lazy_cap).cloned());
+        let lazy_peer = self.config.min_lazy;
+        let need_lazy_ring0 = (lazy_peer / 2).min(ring0_pool.len().saturating_sub(need_ring0));
+        let need_lazy_remote = lazy_peer - need_lazy_ring0;
+        self.lazy_peers.extend(
+            ring0_pool
+                .iter()
+                .skip(need_ring0)
+                .take(need_lazy_ring0)
+                .cloned(),
+        );
+        self.lazy_peers.extend(
+            remote_pool
+                .iter()
+                .skip(need_remote)
+                .take(need_lazy_remote)
+                .cloned(),
+        );
 
         trace!(
             local = ?self.local_id,
@@ -795,8 +842,16 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
     }
 
     #[inline]
-    fn topology_peer_is_ring0(topology: &HashMap<N, PeerTopologyInfo>, p: &N) -> bool {
-        topology_get(topology, p).ring == Some(0)
+    fn peer_is_ring0(&self, p: &N) -> bool {
+        self.peer_topology
+            .get(p)
+            .map(|r| r.ring == Some(0))
+            .unwrap_or(false)
+    }
+
+    #[inline]
+    fn topology_peer_is_ring0(topology: &HashMap<N, RttInfo>, p: &N) -> bool {
+        topology.get(p).map(|r| r.ring == Some(0)).unwrap_or(false)
     }
 
     pub fn seen_evict_if_needed(&mut self) {
@@ -817,7 +872,7 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
     pub fn maintain_topology(
         &mut self,
         rt: &mut impl Runtime<I, P, N>,
-        topology: HashMap<N, PeerTopologyInfo>,
+        topology: HashMap<N, RttInfo>,
     ) {
         self.set_ring_neighbors();
 
@@ -2325,7 +2380,7 @@ mod tests {
             let ring = if i <= 3 { 0u8 } else { 3u8 };
             topo.insert(
                 i,
-                PeerTopologyInfo {
+                RttInfo {
                     ring: Some(ring),
                     rtt_ms: u64::from(i),
                 },

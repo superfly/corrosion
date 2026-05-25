@@ -339,7 +339,7 @@ pub async fn handle_notifications(
                 info!("Member Up {actor:?} (result: {member_added_res:?})");
 
                 match member_added_res {
-                    MemberAddedResult::NewMember | MemberAddedResult::Removed => {
+                    MemberAddedResult::NewMember(_) | MemberAddedResult::Removed => {
                         if matches!(member_added_res, MemberAddedResult::Removed) {
                             debug!("Member Removed {actor:?} due to member id mismatch");
                             counter!(
@@ -368,9 +368,19 @@ pub async fn handle_notifications(
                         {
                             PlumtreeUpdates::MemberDown(actor.id())
                         } else {
+                            let MemberAddedResult::NewMember(state) = member_added_res else {
+                                unreachable!("handled above");
+                            };
+                            let rtt_ms = agent
+                                .members()
+                                .read()
+                                .avg_rtt_ms(&actor.id())
+                                .unwrap_or(u64::MAX);
                             PlumtreeUpdates::MemberUp {
                                 actor_id: actor.id(),
-                                addr: actor.addr(),
+                                addr: state.addr,
+                                ring: state.ring,
+                                rtt_ms,
                             }
                         };
 
@@ -381,9 +391,10 @@ pub async fn handle_notifications(
                             }
                         });
                     }
-                    MemberAddedResult::Updated => {
+                    MemberAddedResult::Updated(_) => {
                         debug!("Member Updated {actor:?}");
                         // anything else to do here?
+                        // TODO: do we want to send rtt updates to plumtree
                     }
                     MemberAddedResult::Ignored => {
                         // TODO: it's unclear if this is needed or
@@ -446,13 +457,17 @@ pub async fn handle_notifications(
                     MemberAddedResult::Removed => {
                         msgs.push(PlumtreeUpdates::MemberDown(b.id()));
                     }
-                    MemberAddedResult::NewMember | MemberAddedResult::Updated => {
+                    MemberAddedResult::NewMember(ref state)
+                    | MemberAddedResult::Updated(ref state) => {
+                        let rtt_ms = lock.avg_rtt_ms(&b.id()).unwrap_or(u64::MAX);
                         msgs.push(PlumtreeUpdates::MemberUp {
                             actor_id: b.id(),
-                            addr: b.addr(),
+                            addr: state.addr,
+                            ring: state.ring,
+                            rtt_ms,
                         });
                     }
-                    _ => {}
+                    MemberAddedResult::Ignored => {}
                 }
 
                 drop(lock);

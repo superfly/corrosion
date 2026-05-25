@@ -136,7 +136,14 @@ pub enum PlumtreeInput {
 
 #[derive(Debug)]
 pub enum PlumtreeUpdates {
-    MemberUp { actor_id: ActorId, addr: SocketAddr },
+    MemberUp {
+        actor_id: ActorId,
+        addr: SocketAddr,
+        /// RTT ring bucket from [`crate::members::Members`], if known.
+        ring: Option<u8>,
+        /// Rolling average RTT in ms; `u64::MAX` when unknown.
+        rtt_ms: u64,
+    },
     MemberDown(ActorId),
 }
 

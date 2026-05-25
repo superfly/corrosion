@@ -48,6 +48,16 @@ impl MemberState {
 
 const RING_BUCKETS: [Range<u64>; 6] = [0..6, 6..15, 15..50, 50..100, 100..200, 200..300];
 
+/// Map an RTT sample (ms) to the same ring bucket index used by [`Members::recalculate_rings`].
+pub fn ring_from_rtt_ms(rtt_ms: u64) -> Option<u8> {
+    for (ring, range) in RING_BUCKETS.iter().enumerate() {
+        if range.contains(&rtt_ms) {
+            return Some(ring as u8);
+        }
+    }
+    None
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct Rtt {
     pub buf: CircularBuffer<20, u64>,
@@ -61,11 +71,11 @@ pub struct Members {
     pub rtts: BTreeMap<SocketAddr, Rtt>,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug)]
 pub enum MemberAddedResult {
-    NewMember,
+    NewMember(MemberState),
     Removed,
-    Updated,
+    Updated(MemberState),
     Ignored,
 }
 
@@ -121,8 +131,8 @@ impl Members {
             };
         }
 
+        let is_new = !self.states.contains_key(&actor_id);
         let member = self.states.entry(actor_id).or_insert_with(|| {
-            ret = MemberAddedResult::NewMember;
             MemberState::new(
                 actor.addr(),
                 actor.ts(),
@@ -130,6 +140,10 @@ impl Members {
                 actor.member_id(),
             )
         });
+
+        if is_new {
+            ret = MemberAddedResult::NewMember(member.clone());
+        }
 
         trace!("member: {member:?}");
 
@@ -150,12 +164,12 @@ impl Members {
             member.ts = actor.ts();
             member.cluster_id = actor.cluster_id();
             member.member_id = actor.member_id();
-            ret = MemberAddedResult::Updated;
+            ret = MemberAddedResult::Updated(member.clone());
         }
 
         // If we just inserted, add the actor to the by_addr set and
         // recalculate the RTT rings.
-        if ret == MemberAddedResult::NewMember {
+        if matches!(ret, MemberAddedResult::NewMember(_)) {
             self.by_addr.insert(actor.addr(), actor.id());
             self.recalculate_rings(actor.addr());
         }
