@@ -28,7 +28,7 @@ use speedy::Writable;
 use strum::EnumDiscriminants;
 use tokio::{sync::mpsc, task::JoinSet, time::interval};
 use tokio_util::codec::{Encoder, LengthDelimitedCodec};
-use tracing::{error, info, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 use tripwire::Tripwire;
 
 use crate::{
@@ -319,7 +319,7 @@ pub async fn plumtree_loop<T: TransportExt + Clone + Send + 'static>(
     ));
 
     let mut tick_interval = interval(Duration::from_millis(200));
-    let mut maintenance_interval = interval(Duration::from_secs(10));
+    let mut maintenance_interval = interval(Duration::from_secs(30));
 
     let mut rt = CorrosionPlumtreeRuntime::new(tx_changes, timer_spawner, tx_msgs);
 
@@ -369,15 +369,13 @@ pub async fn plumtree_loop<T: TransportExt + Clone + Send + 'static>(
             _ = maintenance_interval.tick() => {
                 Branch::MaintenanceTick
             }
-            // _ = metrics_interval.tick() => {
-            //     Branch::Metrics
-            // }
         };
 
         match branch {
             Branch::Input(input) => match input {
                 PlumtreeInput::Wire(msg) => match msg {
                     PlumtreeMsgV1::Gossip(g) => {
+                        debug!("plumtree: gossip: {g:?}");
                         state.handle_gossip(g, &mut rt);
                     }
                     PlumtreeMsgV1::IHave(ih) => {
@@ -402,6 +400,7 @@ pub async fn plumtree_loop<T: TransportExt + Clone + Send + 'static>(
                     ring,
                     rtt_ms,
                 } => {
+                    debug!("plumtree: member up: {actor_id}, ring: {ring:?}, rtt_ms: {rtt_ms}");
                     state.peer_up(actor_id, Some(RttInfo { ring, rtt_ms }), &mut rt);
                 }
                 PlumtreeUpdates::MemberDown(actor_id) => {
@@ -471,8 +470,6 @@ async fn send_messages_loop<T: TransportExt + Clone + Send + 'static>(
     }))
     .with_middleware();
 
-    let mut rate_limited = false;
-
     loop {
         enum Branch {
             Msg((PlumPrio, Vec<ActorId>, PlumtreeMsgV1)),
@@ -498,6 +495,8 @@ async fn send_messages_loop<T: TransportExt + Clone + Send + 'static>(
             _ = gossip_batch_interval.tick() => Branch::GossipBatchDeadline,
         };
 
+        let mut rate_limited = false;
+
         match branch {
             Branch::GossipBatchDeadline => {
                 if !p1_gossip_batch.buf.is_empty() {
@@ -508,6 +507,7 @@ async fn send_messages_loop<T: TransportExt + Clone + Send + 'static>(
                 }
             }
             Branch::Msg((prio, peers, msg)) => {
+                debug!("plumtree: msg: {msg:?}, peers: {peers:?}");
                 let p1_gossip =
                     matches!(prio, PlumPrio::P1) && matches!(&msg, PlumtreeMsgV1::Gossip(_));
                 let payload = match encode_plumtree_wire(
