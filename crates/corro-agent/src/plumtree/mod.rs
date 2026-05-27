@@ -102,11 +102,14 @@ impl SeenStore<ChangeId> for ChangeSeenStore {
 
                     let incoming = RangeInclusive::from(*seqs);
                     let stored = entry.seqs.as_mut().unwrap();
+
                     if stored.gaps(&incoming).next().is_none() {
+                        // we already seen this seqs, increase duplicate count if change is complete
                         let full = CrsqlSeq(0)..=*last_seq;
                         let is_complete = stored.gaps(&full).next().is_none();
 
-                        // if we seen this partial change, but we are still incomplete. We don't want partials to cause a prune
+                        // if we seen this partial change, but we are still incomplete, return zero duplicates.
+                        // We don't want partials to cause a prune while we are in the middle of receiving the change.
                         if !is_complete {
                             return Some(0);
                         }
@@ -119,6 +122,7 @@ impl SeenStore<ChangeId> for ChangeSeenStore {
                     return None;
                 }
             },
+            // Empty changesets are actually not used rn
             ChangesetId::Empty { versions } => {
                 let min_seen = versions
                     .clone()
@@ -270,10 +274,10 @@ pub async fn spawn_plumtree_loop<T: TransportExt + Clone + Send + 'static>(
         optimization_threshold: Some(5),
         max_cached_payloads: 4096,
         // todo: have plumtree decide on these values
-        max_eager: 5,
-        max_lazy: 10,
-        min_lazy: 5,
-        prune_threshold: 3,
+        num_eager: 8,
+        min_lazy: 15,
+        max_lazy: 30,
+        prune_threshold: 5,
         max_received_entries: 10000,
     };
 
@@ -289,7 +293,6 @@ pub async fn spawn_plumtree_loop<T: TransportExt + Clone + Send + 'static>(
     .await;
 }
 
-/// The main Plumtree event loop. Runs alongside the existing `handle_broadcasts`.
 pub async fn plumtree_loop<T: TransportExt + Clone + Send + 'static>(
     agent: Agent,
     transport: T,
@@ -318,8 +321,9 @@ pub async fn plumtree_loop<T: TransportExt + Clone + Send + 'static>(
         send_tripwire,
     ));
 
-    let mut tick_interval = interval(Duration::from_millis(200));
-    let mut maintenance_interval = interval(Duration::from_secs(30));
+    // send out ihave digests to lazy peers
+    let mut ihave_tick_interval = interval(Duration::from_millis(200));
+    let mut maintenance_interval = interval(Duration::from_secs(60));
 
     let mut rt = CorrosionPlumtreeRuntime::new(tx_changes, timer_spawner, tx_msgs);
 
@@ -362,8 +366,7 @@ pub async fn plumtree_loop<T: TransportExt + Clone + Send + 'static>(
             Some((timer, _seq)) = plumtree_timer_rx.recv() => {
                 Branch::HandleTimer(timer)
             }
-            // todo batch this on all timers
-            _ = tick_interval.tick() => {
+            _ = ihave_tick_interval.tick() => {
                 Branch::IHaveTick
             }
             _ = maintenance_interval.tick() => {
@@ -375,21 +378,25 @@ pub async fn plumtree_loop<T: TransportExt + Clone + Send + 'static>(
             Branch::Input(input) => match input {
                 PlumtreeInput::Wire(msg) => match msg {
                     PlumtreeMsgV1::Gossip(g) => {
-                        debug!("plumtree: gossip: {g:?}");
+                        trace!("handling plumtree gossip");
                         state.handle_gossip(g, &mut rt);
                     }
                     PlumtreeMsgV1::IHave(ih) => {
+                        trace!("handling plumtree ihave");
                         state.handle_ihave(ih, &mut rt);
                     }
                     PlumtreeMsgV1::Graft(g) => {
+                        trace!("handling plumtree graft");
                         state.handle_graft(g, &mut rt);
                     }
                     PlumtreeMsgV1::Prune(p) => {
+                        trace!("handling plumtree prune");
                         state.handle_prune(p, &mut rt);
                     }
                 },
                 PlumtreeInput::Broadcast(change) => {
                     let id = change.message_id();
+                    trace!("plumtree: broadcasting change: {id:?}");
                     state.broadcast(id, change, &mut rt);
                 }
             },
@@ -400,10 +407,11 @@ pub async fn plumtree_loop<T: TransportExt + Clone + Send + 'static>(
                     ring,
                     rtt_ms,
                 } => {
-                    debug!("plumtree: member up: {actor_id}, ring: {ring:?}, rtt_ms: {rtt_ms}");
+                    debug!("plumtree: receieved member up: {actor_id}, ring: {ring:?}, rtt_ms: {rtt_ms}");
                     state.peer_up(actor_id, Some(RttInfo { ring, rtt_ms }), &mut rt);
                 }
                 PlumtreeUpdates::MemberDown(actor_id) => {
+                    debug!("plumtree: receieved member down: {actor_id}");
                     state.peer_down(&actor_id, &mut rt);
                 }
             },
@@ -411,11 +419,13 @@ pub async fn plumtree_loop<T: TransportExt + Clone + Send + 'static>(
                 state.timer_fired(timer, &mut rt);
             }
             Branch::IHaveTick => {
+                trace!("plumtree: sending out ihave digests");
                 state.tick(&mut rt);
             }
             Branch::MaintenanceTick => {
+                trace!("plumtree: updating peer topology");
                 state.update_peer_topology(plumtree_topology_map(&agent), &mut rt);
-                state.seen_evict_if_needed();
+                state.cache_evict_if_needed();
             }
         }
     }
@@ -429,7 +439,6 @@ struct PendingPlumtreeSend {
     payload: Bytes,
 }
 
-/// Coalesced P1 relay gossip frames destined for the same peer set.
 struct P1GossipBatch {
     peers: Vec<ActorId>,
     buf: BytesMut,
@@ -443,7 +452,7 @@ async fn send_messages_loop<T: TransportExt + Clone + Send + 'static>(
 ) {
     const MAX_INFLIGHT: usize = 500;
     const P1_GOSSIP_BATCH_INTERVAL: Duration = Duration::from_millis(20);
-    const P1_GOSSIP_BATCH_CUTOFF: usize = 64 * 1024;
+    const P1_GOSSIP_BATCH_CUTOFF: usize = 1 * 1024 * 1024;
 
     let cluster_id = agent.cluster_id();
     let max_queue_len = agent.config().perf.processing_queue_len;
@@ -625,13 +634,14 @@ fn drain_plumtree_queue<T: TransportExt + Clone + Send + 'static>(
         let pending = queue.pop_front().unwrap();
         let addrs = resolve_peer_addrs(agent, &pending.peers);
         if addrs.is_empty() {
-            trace!(
+            warn!(
                 peers = ?pending.peers,
                 "plumtree: no addresses for peers, dropping message"
             );
             continue;
         }
 
+        debug!("plumtree: sending plumtree msg to {addrs:?}");
         let mut spawn_count = 0;
         let addr_count = addrs.len();
         for addr in addrs {
@@ -652,7 +662,7 @@ fn drain_plumtree_queue<T: TransportExt + Clone + Send + 'static>(
                     TransmitError::QuotaExceeded(_) => {
                         *rate_limited = true;
                         counter!("corro.plumtree.send.rate_limited").increment(1);
-                        log_at_pow_10("plumtree sends rate limited", limited_log_count);
+                        log_at_pow_10("plumtree broadcasts rate limited", limited_log_count);
                         break;
                     }
                 },
@@ -706,6 +716,21 @@ fn plumtree_topology_map(agent: &Agent) -> HashMap<ActorId, RttInfo> {
         .collect()
 }
 
+async fn plumtree_bootstrap_peers(agent: &Agent) -> Vec<(ActorId, RttInfo)> {
+    let local_id = agent.actor_id();
+    let rtts = plumtree_topology_from_db(agent).await.unwrap_or_default();
+
+    agent
+        .members()
+        .read()
+        .states
+        .keys()
+        .into_iter()
+        .filter(|id| **id != local_id)
+        .map(|id| (*id, rtts.get(id).copied().unwrap_or_default()))
+        .collect()
+}
+
 async fn plumtree_topology_from_db(agent: &Agent) -> eyre::Result<HashMap<ActorId, RttInfo>> {
     let conn = agent.pool().read().await?;
     let mut stmt =
@@ -723,21 +748,6 @@ async fn plumtree_topology_from_db(agent: &Agent) -> eyre::Result<HashMap<ActorI
         .collect::<rusqlite::Result<HashMap<ActorId, RttInfo>>>()?;
 
     Ok(rows)
-}
-
-async fn plumtree_bootstrap_peers(agent: &Agent) -> Vec<(ActorId, RttInfo)> {
-    let local_id = agent.actor_id();
-    let rtts = plumtree_topology_from_db(agent).await.unwrap_or_default();
-
-    agent
-        .members()
-        .read()
-        .states
-        .keys()
-        .into_iter()
-        .filter(|id| **id != local_id)
-        .map(|id| (*id, rtts.get(id).copied().unwrap_or_default()))
-        .collect()
 }
 
 #[cfg(test)]
@@ -862,9 +872,9 @@ mod tests {
                     ihave_timeout: Duration::from_millis(500),
                     optimization_threshold: Some(5),
                     max_cached_payloads: 4096,
-                    max_eager: 3,
+                    num_eager: 3,
                     min_lazy: 5,
-                    max_lazy: 10,
+                    max_lazy: 5,
                     prune_threshold: 3,
                     max_received_entries: 10000,
                 };
