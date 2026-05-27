@@ -900,7 +900,8 @@ impl BookieDbParams {
             let len = self.partials_deletes.len();
             if count != len {
                 warn!("did not delete some partial seqs from db, expected {len}, got {count}");
-                let details = json!({"count": count, "expected": len, "params": self.partials_deletes});
+                let details =
+                    json!({"count": count, "expected": len, "params": self.partials_deletes});
                 assert_unreachable!("ineffective deletion of partial seqs in-db", &details);
             }
         }
