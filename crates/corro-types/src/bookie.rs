@@ -265,7 +265,7 @@ impl BookedVersions {
             }
             btree_map::Entry::Occupied(mut entry) => {
                 let got = entry.get_mut();
-                let details = json!({"version": version, "current": got.last_seq, "received": partial.last_seq});
+                let details = json!({"version": version, "actor_id": self.actor_id, "current": got.last_seq, "received": partial.last_seq});
                 assert_always!(
                     got.last_seq == partial.last_seq,
                     "last_seq matches for partial version",
@@ -833,7 +833,8 @@ impl BookieDbParams {
             let len = self.gap_deletes.len();
             if count != len {
                 warn!("did not delete some gaps from db, expected {len}, got {count}");
-                let details = json!({"count": count, "expected": len});
+                let details =
+                    json!({"count": count, "expected": len, "versions": self.gap_deletes});
                 assert_unreachable!("ineffective deletion of gaps in-db", &details);
             }
         }
@@ -842,7 +843,7 @@ impl BookieDbParams {
             let actors = unnest_param(self.gap_inserts.iter().map(|(a, _, _)| a));
             let starts = unnest_param(self.gap_inserts.iter().map(|(_, s, _)| s));
             let ends = unnest_param(self.gap_inserts.iter().map(|(_, _, e)| e));
-            let res = conn
+            let count = conn
                 .prepare_cached(
                     "INSERT INTO __corro_bookkeeping_gaps (actor_id, start, end)
                      SELECT value0, value1, value2 FROM unnest(:actors, :starts, :ends)",
@@ -851,12 +852,12 @@ impl BookieDbParams {
                     ":actors": actors,
                     ":starts": starts,
                     ":ends": ends,
-                });
-            if let Err(e) = res {
-                warn!("error when inserting gaps into db: {e}");
-                let details = json!({"error": e.to_string()});
-                assert_unreachable!("error when inserting gaps into db", &details);
-                return Err(e);
+                })?;
+            let len = self.gap_inserts.len();
+            if count != len {
+                warn!("did not insert some gaps into db, expected {len}, got {count}");
+                let details = json!({"count": count, "expected": len, "params": self.gap_inserts});
+                assert_unreachable!("ineffective insertion of gaps in-db", &details);
             }
         }
 
@@ -875,7 +876,7 @@ impl BookieDbParams {
             let len = self.complete_version_deletes.len();
             if count != len {
                 warn!("did not delete some complete versions from db, expected {len}, got {count}");
-                let details = json!({"count": count, "expected": len});
+                let details = json!({"count": count, "expected": len, "versions": self.complete_version_deletes});
                 assert_unreachable!("ineffective deletion of complete versions in-db", &details);
             }
         }
@@ -899,7 +900,8 @@ impl BookieDbParams {
             let len = self.partials_deletes.len();
             if count != len {
                 warn!("did not delete some partial seqs from db, expected {len}, got {count}");
-                let details = json!({"count": count, "expected": len});
+                let details =
+                    json!({"count": count, "expected": len, "params": self.partials_deletes});
                 assert_unreachable!("ineffective deletion of partial seqs in-db", &details);
             }
         }
@@ -929,7 +931,7 @@ impl BookieDbParams {
 
             if let Err(e) = res {
                 warn!("error when inserting partial seqs into db: {e}");
-                let details = json!({"error": e.to_string()});
+                let details = json!({"error": e.to_string(), "params": self.partial_inserts});
                 assert_unreachable!("ineffective insertion of partial seqs in-db", &details);
                 return Err(e);
             }

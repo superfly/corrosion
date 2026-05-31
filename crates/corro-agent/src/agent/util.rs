@@ -545,10 +545,10 @@ pub async fn apply_fully_buffered_changes_loop(
                 if let Some(issue) = e.fatal_db_issue() {
                     error!("fatal DB issue detected: {issue}");
                     agent.mark_unhealthy(issue);
-                } else {
-                    let details = json!({"error": e.to_string()});
-                    assert_unreachable!("could not apply fully buffered changes", &details);
                 }
+                let details = json!({"error": e.to_string()});
+                assert_unreachable!("could not apply fully buffered changes", &details);
+
                 // processing time came close to timeout, limit retry with exponential backoff
                 if is_interrupt_error {
                     limit_retries.throttle((actor_id, version));
