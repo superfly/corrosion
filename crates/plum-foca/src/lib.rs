@@ -125,8 +125,9 @@ pub enum Timer<I: MessageId, N: NodeId> {
 pub enum Notification<I: MessageId, N: NodeId> {
     PeerMovedToEager(N),
     PeerMovedToLazy(N),
-    MessageAlreadyReceived(I),
+    DuplicateMessage(I),
     PayloadNotCached(I),
+    MessageMissing(usize),
 }
 
 pub trait Runtime<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId> {
@@ -148,7 +149,8 @@ pub trait Runtime<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId
 }
 
 /// Messages exchanged between Plumtree peers.
-#[derive(Debug, Clone, Readable, Writable)]
+#[derive(Debug, Clone, Readable, Writable, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
 pub enum PlumtreeMsg<I, P, N>
 where
     I: MessageId,
@@ -254,21 +256,6 @@ impl<I: MessageId, P: Payload> PayloadCache<I, P> {
     }
 }
 
-#[derive(Debug, Default, Clone)]
-pub struct PlumtreeStats {
-    pub gossip: u64,
-    pub ihave: u64,
-    pub graft: u64,
-    pub prune: u64,
-
-    pub peer_up: u64,
-    pub peer_down: u64,
-    pub lazy_peers: u64,
-    pub eager_peers: u64,
-    // pub duplicate_gossip: u64,
-    // pub payload_not_cached: u64,
-}
-
 /// Full Plumtree protocol state for one local node.
 #[derive(Debug)]
 pub struct PlumtreeState<
@@ -291,7 +278,6 @@ pub struct PlumtreeState<
 
     seen: S,
     cache: PayloadCache<I, P>,
-    stats: PlumtreeStats,
 }
 
 impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStore<I>>
@@ -311,7 +297,6 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
             missing: HashMap::new(),
             seen,
             cache: PayloadCache::new(cache_size),
-            stats: PlumtreeStats::default(),
         }
     }
 
@@ -331,8 +316,12 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
         &self.lazy_peers
     }
 
-    pub fn stats(&self) -> &PlumtreeStats {
-        &self.stats
+    pub fn known_peers(&self) -> &HashSet<N> {
+        &self.known_peers
+    }
+
+    pub fn lazy_queue(&self) -> &Vec<IHaveDigest<I>> {
+        &self.lazy_queue
     }
 
     pub fn config(&self) -> &Config {
@@ -360,7 +349,6 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
         } = msg;
         let id = payload.message_id();
 
-        self.stats.gossip += 1;
         if let Some(duplicates) = self.seen.observe(id.clone(), round) {
             if duplicates > self.config.prune_threshold && !self.ring_locked.contains(&sender) {
                 trace!(?self.local_id, ?sender, "sending PRUNE due to duplicate gossip");
@@ -374,7 +362,7 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
                 );
                 self.move_to_lazy(&sender, rt);
             }
-            rt.notify(Notification::MessageAlreadyReceived(id));
+            rt.notify(Notification::DuplicateMessage(id));
             return;
         }
 
@@ -444,7 +432,6 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
     /// `missing` set and schedule one `IHaveTimeoutBatch` timer. If the full
     /// GOSSIP doesn't arrive before the timer fires, we'll GRAFT.
     pub fn handle_ihave(&mut self, msg: IHaveMsg<I, N>, rt: &mut impl Runtime<I, P, N>) {
-        self.stats.ihave += 1;
         let IHaveMsg { sender, digests } = msg;
         let count = digests.len();
 
@@ -495,7 +482,6 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
     /// The sender is asking us to add them back to our eager set and
     /// (re)send the full payload for each requested message.
     pub fn handle_graft(&mut self, msg: GraftMsg<I, N>, rt: &mut impl Runtime<I, P, N>) {
-        self.stats.graft += 1;
         let GraftMsg {
             sender,
             send,
@@ -527,11 +513,8 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
                 );
             } else {
                 debug!(
-                    id = ?req.id,
-                    cache_size = self.cache.entries.len(),
                     "local={:?} sender={:?} graft → NOT CACHED",
-                    self.local_id,
-                    sender
+                    self.local_id, sender
                 );
                 rt.notify(Notification::PayloadNotCached(req.id));
             }
@@ -541,7 +524,6 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
     /// Handle an incoming PRUNE.
     ///
     pub fn handle_prune(&mut self, msg: PruneMsg<I, N>, rt: &mut impl Runtime<I, P, N>) {
-        self.stats.prune += 1;
         debug!(local = ?self.local_id, sender = ?msg.sender, triggered_by = ?msg.triggered_by, "handle_prune");
         if !self.ring_locked.contains(&msg.sender) {
             self.move_to_lazy(&msg.sender, rt);
@@ -608,7 +590,9 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
             return;
         }
 
+        // we weren't able to get a response from sender
         if retries >= senders.len() as u32 {
+            rt.notify(Notification::MessageMissing(ids.len()));
             for id in ids {
                 self.missing.remove(&id);
             }
@@ -728,7 +712,6 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
 
         self.peer_topology
             .insert(peer.clone(), rtt.unwrap_or_default());
-        self.stats.peer_up += 1;
         self.known_peers.insert(peer);
         self.rebalance(rt);
     }
@@ -754,7 +737,6 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
     }
 
     pub fn peer_down(&mut self, peer: &N, rt: &mut impl Runtime<I, P, N>) {
-        self.stats.peer_down += 1;
         let was_eager = self.eager_peers.remove(peer);
         let was_lazy = self.lazy_peers.swap_remove(peer);
         self.known_peers.remove(peer);
@@ -768,10 +750,9 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
     /// Clears existing lazy / eager peers and selects them again.
     ///
     /// Ring neighbors are always eager. Remaining eager slots are split across
-    /// near, mid, and far RTT buckets, with one sticky exploratory slot when
-    /// fanout is large enough. Locked peers count toward the bucket targets.
+    /// near, mid, and far RTT bucket. Locked peers count toward the bucket targets.
     ///
-    /// todo: leave special slots with unknown rtt
+    /// TODO: leave special slots with for unknown rtt peers
     fn rebalance(&mut self, _rt: &mut impl Runtime<I, P, N>) {
         self.eager_peers.clear();
         self.lazy_peers.clear();
@@ -957,8 +938,6 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
     /// Insert a peer into the lazy set, evicting a random non-ring-locked
     /// peer if at capacity. Returns true if the peer was inserted.
     ///
-    /// This is the single point of lazy insertion — all code paths that
-    /// add to lazy go through here so the eviction policy lives in one place.
     fn insert_into_lazy(&mut self, peer: N) -> bool {
         if self.lazy_peers.contains(&peer) {
             return true;
@@ -1380,12 +1359,6 @@ mod tests {
         // Message should be marked received
         assert!(s.has_message(&msg(42)));
     }
-
-    #[test]
-
-    // -----------------------------------------------------------------------
-    // handle_gossip
-    // -----------------------------------------------------------------------
 
     #[test]
     fn handle_gossip_new_delivers_and_forwards() {

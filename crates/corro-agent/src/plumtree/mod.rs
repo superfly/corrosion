@@ -21,11 +21,10 @@ use corro_types::{
 };
 use governor::{Quota, RateLimiter};
 use indexmap::IndexMap;
-use metrics::counter;
-use plum_foca::{Payload, PlumPrio, PlumtreeState, PlumtreeStats, RttInfo, SeenStore, Timer};
+use metrics::{counter, gauge};
+use plum_foca::{Payload, PlumPrio, PlumtreeState, RttInfo, SeenStore, Timer};
 use rangemap::RangeInclusiveSet;
 use speedy::Writable;
-use strum::EnumDiscriminants;
 use tokio::{sync::mpsc, task::JoinSet, time::interval};
 use tokio_util::codec::{Encoder, LengthDelimitedCodec};
 use tracing::{debug, error, info, trace, warn};
@@ -258,6 +257,23 @@ impl plum_foca::Runtime<ChangeId, ChangeV1, ActorId> for CorrosionPlumtreeRuntim
 
     fn notify(&mut self, notification: plum_foca::Notification<ChangeId, ActorId>) {
         trace!("plumtree notification: {notification:?}");
+        match notification {
+            plum_foca::Notification::PeerMovedToEager(_) => {
+                counter!("corro.plumtree.peer_to_eager").increment(1);
+            }
+            plum_foca::Notification::PeerMovedToLazy(_) => {
+                counter!("corro.plumtree.peer_to_lazy").increment(1);
+            }
+            plum_foca::Notification::DuplicateMessage(_) => {
+                counter!("corro.plumtree.duplicate_message").increment(1);
+            }
+            plum_foca::Notification::PayloadNotCached(_) => {
+                counter!("corro.plumtree.payload_not_cached").increment(1);
+            }
+            plum_foca::Notification::MessageMissing(count) => {
+                counter!("corro.plumtree.message_missing").increment(count as u64);
+            }
+        }
     }
 }
 
@@ -301,7 +317,7 @@ pub async fn plumtree_loop<T: TransportExt + Clone + Send + 'static>(
     tx_changes: CorroSender<(ChangeV1, ChangeSource)>,
     config: plum_foca::Config,
     mut tripwire: Tripwire,
-) -> PlumtreeStats {
+) {
     let seen = ChangeSeenStore::new(config.max_received_entries, agent.bookie().clone());
     let mut state: PlumtreeState<ChangeId, ChangeV1, ActorId, ChangeSeenStore> =
         PlumtreeState::new_with_store(agent.actor_id(), config, seen);
@@ -331,15 +347,12 @@ pub async fn plumtree_loop<T: TransportExt + Clone + Send + 'static>(
     info!("added {} peers to plumtree", bootstrap_peers.len());
     state.add_peers_bulk_with_rtt(bootstrap_peers, &mut rt);
 
-    #[derive(EnumDiscriminants)]
-    #[strum_discriminants(derive(strum::IntoStaticStr))]
     enum Branch {
         Input(PlumtreeInput),
         Updates(PlumtreeUpdates),
         HandleTimer(Timer<ChangeId, ActorId>),
         IHaveTick,
         MaintenanceTick,
-        // Metrics,
     }
 
     loop {
@@ -376,24 +389,29 @@ pub async fn plumtree_loop<T: TransportExt + Clone + Send + 'static>(
 
         match branch {
             Branch::Input(input) => match input {
-                PlumtreeInput::Wire(msg) => match msg {
-                    PlumtreeMsgV1::Gossip(g) => {
-                        trace!("handling plumtree gossip");
-                        state.handle_gossip(g, &mut rt);
+                PlumtreeInput::Wire(msg) => {
+                    let msg_type: &'static str = (&msg).into();
+                    trace!("plumtree: received {msg_type} message");
+                    counter!("corro.plumtree.messages", "msg_type" => msg_type).increment(1);
+                    match msg {
+                        PlumtreeMsgV1::Gossip(g) => {
+                            trace!("handling plumtree gossip");
+                            state.handle_gossip(g, &mut rt);
+                        }
+                        PlumtreeMsgV1::IHave(ih) => {
+                            trace!("handling plumtree ihave");
+                            state.handle_ihave(ih, &mut rt);
+                        }
+                        PlumtreeMsgV1::Graft(g) => {
+                            trace!("handling plumtree graft");
+                            state.handle_graft(g, &mut rt);
+                        }
+                        PlumtreeMsgV1::Prune(p) => {
+                            trace!("handling plumtree prune");
+                            state.handle_prune(p, &mut rt);
+                        }
                     }
-                    PlumtreeMsgV1::IHave(ih) => {
-                        trace!("handling plumtree ihave");
-                        state.handle_ihave(ih, &mut rt);
-                    }
-                    PlumtreeMsgV1::Graft(g) => {
-                        trace!("handling plumtree graft");
-                        state.handle_graft(g, &mut rt);
-                    }
-                    PlumtreeMsgV1::Prune(p) => {
-                        trace!("handling plumtree prune");
-                        state.handle_prune(p, &mut rt);
-                    }
-                },
+                }
                 PlumtreeInput::Broadcast(change) => {
                     let id = change.message_id();
                     trace!("plumtree: broadcasting change: {id:?}");
@@ -426,11 +444,16 @@ pub async fn plumtree_loop<T: TransportExt + Clone + Send + 'static>(
                 trace!("plumtree: updating peer topology");
                 state.update_peer_topology(plumtree_topology_map(&agent), &mut rt);
                 state.cache_evict_if_needed();
+
+                gauge!("corro.plumtree.eager_peers").set(state.eager_peers().len() as f64);
+                gauge!("corro.plumtree.lazy_peers").set(state.lazy_peers().len() as f64);
+                gauge!("corro.plumtree.ring_locked_peers")
+                    .set(state.ring_locked_peers().len() as f64);
+                gauge!("corro.plumtree.known_peers").set(state.known_peers().len() as f64);
+                gauge!("corro.plumtree.lazy_queue").set(state.lazy_queue().len() as f64);
             }
         }
     }
-
-    return state.stats().clone();
 }
 
 #[derive(Debug)]
@@ -866,8 +889,7 @@ mod tests {
             let tx_plumtree = agent_clone.tx_plumtree().clone();
             let transport_clone = transport.clone();
             let tripwire_clone = tripwire.clone();
-            plumtree_join_set.spawn(async move {
-                let agent_id = agent_clone.actor_id();
+            tokio::spawn(async move {
                 let config = plum_foca::Config {
                     ihave_timeout: Duration::from_millis(500),
                     optimization_threshold: Some(5),
@@ -878,7 +900,7 @@ mod tests {
                     prune_threshold: 3,
                     max_received_entries: 10000,
                 };
-                let stats = plumtree_loop(
+                plumtree_loop(
                     agent_clone.clone(),
                     transport_clone,
                     opts.rx_plumtree,
@@ -888,12 +910,19 @@ mod tests {
                     tripwire_clone,
                 )
                 .await;
-
-                return (agent_id, stats);
             });
 
+            #[derive(Default)]
+            struct PlumStats {
+                gossip: u64,
+                ihave: u64,
+                graft: u64,
+                prune: u64,
+            }
+
             let cancel_clone = cancel.clone();
-            tokio::spawn(async move {
+            plumtree_join_set.spawn(async move {
+                let mut stats = PlumStats::default();
                 loop {
                     tokio::select! {
                         biased;
@@ -912,15 +941,26 @@ mod tests {
                                 }) = UniPayload::read_from_buffer(&frame)
                                 {
                                     let PlumtreeMsg::V1 { data } = msg;
+
+                                    let msg_type: &'static str = (&data).into();
+                                    match msg_type {
+                                        "gossip" => stats.gossip += 1,
+                                        "ihave" => stats.ihave += 1,
+                                        "graft" => stats.graft += 1,
+                                        "prune" => stats.prune += 1,
+                                        _ => warn!("unexpected message type: {msg_type}"),
+                                    }
                                     tx_plumtree
                                         .send(PlumtreeInput::Wire(data))
                                         .await
                                         .ok();
                                 }
                             }
+
                         }
                     }
                 }
+                return stats;
             });
 
             // let agent_clone: Agent = agent.clone();
@@ -1007,10 +1047,8 @@ mod tests {
             .map(|(actor_id, duplicate, seen_map)| (actor_id, (duplicate, seen_map)))
             .collect::<HashMap<_, _>>();
 
-        let plumstats_map = plumtree_results
-            .into_iter()
-            .map(|(agent_id, stats)| (agent_id, stats))
-            .collect::<HashMap<_, _>>();
+        let plumstats_map = plumtree_results.into_iter().collect::<Vec<_>>();
+
         for change in all_changes {
             let (_, seen_map) = total_map
                 .entry(change.actor_id)
@@ -1036,7 +1074,7 @@ mod tests {
 
         let (total_gossip, total_ihave, total_graft, total_prune) = plumstats_map.iter().fold(
             (0, 0, 0, 0),
-            |(acc_gossip, acc_ihave, acc_graft, acc_prune), (_, stats)| {
+            |(acc_gossip, acc_ihave, acc_graft, acc_prune), stats| {
                 (
                     acc_gossip + stats.gossip,
                     acc_ihave + stats.ihave,
@@ -1045,10 +1083,6 @@ mod tests {
                 )
             },
         );
-        // let total_gossip = stats.gossip.load(Ordering::Relaxed);
-        // let total_ihave = stats.ihave.load(Ordering::Relaxed);
-        // let total_graft = stats.graft.load(Ordering::Relaxed);
-        // let total_prune = stats.prune.load(Ordering::Relaxed);
         let total_control = total_ihave + total_graft + total_prune;
 
         println!();
@@ -1073,13 +1107,8 @@ mod tests {
         println!();
         println!("gossip messages:  {total_gossip}");
         println!(
-            "  per change:     {:.1}",
-            total_gossip as f64 / total_expected as f64
-        );
-
-        println!(
             "gossip duplicates: {:.1}",
-            total_gossip as f64 / total_expected as f64 * 100.0
+            total_gossip as f64 / total_expected a
         );
         println!("ihave messages:   {total_ihave}");
         println!("graft messages:   {total_graft}");
