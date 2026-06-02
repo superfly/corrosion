@@ -1108,7 +1108,7 @@ mod tests {
         println!("gossip messages:  {total_gossip}");
         println!(
             "gossip duplicates: {:.1}",
-            total_gossip as f64 / total_expected a
+            total_gossip as f64 / total_expected as f64
         );
         println!("ihave messages:   {total_ihave}");
         println!("graft messages:   {total_graft}");
