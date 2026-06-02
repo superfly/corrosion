@@ -945,7 +945,7 @@ mod tests {
                                     let msg_type: &'static str = (&data).into();
                                     match msg_type {
                                         "gossip" => stats.gossip += 1,
-                                        "ihave" => stats.ihave += 1,
+                                        "i_have" => stats.ihave += 1,
                                         "graft" => stats.graft += 1,
                                         "prune" => stats.prune += 1,
                                         _ => warn!("unexpected message type: {msg_type}"),
