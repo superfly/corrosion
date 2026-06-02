@@ -14,7 +14,7 @@ use camino::Utf8PathBuf;
 use metrics::{gauge, histogram};
 use parking_lot::RwLock;
 use rangemap::RangeInclusiveSet;
-use rusqlite::{Connection, OpenFlags, Transaction};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sqlite_pool::SqliteConn;
@@ -27,7 +27,7 @@ use tokio::{
     time::timeout,
 };
 use tokio_util::sync::{CancellationToken, DropGuard};
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 use tripwire::Tripwire;
 
 use crate::{
@@ -408,6 +408,18 @@ fn crsqlite_v0_17_migration(
     let ts = Timestamp::from(clock.new_timestamp()).as_u64().to_string();
 
     move |tx: &Transaction| -> rusqlite::Result<()> {
+        let version: Option<i64> = tx
+            .query_row(
+                "SELECT value FROM crsql_master WHERE key = 'version'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        // we only want to run this migration if the version is less than 17_00_00
+        if version.is_none_or(|v| v >= 17_00_00) {
+            return Ok(());
+        }
+
         let tables: Vec<String> = tx.prepare("SELECT tbl_name FROM sqlite_master WHERE type='table' AND tbl_name LIKE '%__crsql_clock'")?.query_map([], |row| row.get(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
 
         for table in tables {
