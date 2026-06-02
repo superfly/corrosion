@@ -27,7 +27,7 @@ use tokio::{
     time::timeout,
 };
 use tokio_util::sync::{CancellationToken, DropGuard};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, warn};
 use tripwire::Tripwire;
 
 use crate::{
