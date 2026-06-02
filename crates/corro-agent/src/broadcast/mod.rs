@@ -40,6 +40,7 @@ use corro_types::{
     agent::Agent,
     broadcast::{BroadcastInput, DispatchRuntime, FocaCmd, FocaInput, UniPayload, UniPayloadV1},
     channel::{bounded, CorroReceiver, CorroSender},
+    config::BroadcastMethod,
     sqlite::unnest_param,
 };
 
@@ -394,14 +395,16 @@ pub fn runtime_loop(
         }
     });
 
-    spawn_counted(handle_broadcasts(
-        agent,
-        rx_bcast,
-        transport,
-        config,
-        tripwire,
-        Default::default(),
-    ));
+    if agent.broadcast_method() == BroadcastMethod::Gossip {
+        spawn_counted(handle_broadcasts(
+            agent,
+            rx_bcast,
+            transport,
+            config,
+            tripwire,
+            Default::default(),
+        ));
+    }
 }
 
 pub(crate) type TransmitRateLimiter = RateLimiter<
@@ -1117,8 +1120,8 @@ pub(crate) fn try_transmit_uni(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::spawn_unipayload_handler;
-    use corro_tests::launch_test_agent;
+    use crate::agent::{setup, spawn_unipayload_handler};
+    use corro_tests::test_config;
     use corro_types::{
         base::{dbsr, CrsqlDbVersion, CrsqlSeq},
         broadcast::{BroadcastV1, ChangeV1, Changeset},
@@ -1183,13 +1186,15 @@ mod tests {
             .with_max_level(tracing::Level::DEBUG)
             .try_init();
         let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
-        let ta1 = launch_test_agent(|conf| conf.build(), tripwire.clone()).await?;
+        let (_tmpdir, conf) = test_config(|c| c.build())?;
+        let (ta1_agent, opts) = setup(conf, tripwire.clone()).await?;
+        let mut rx_changes = opts.rx_changes;
 
         let (tx_bcast, rx_bcast) = bounded(100, "bcast");
         let (tx_rtt, _) = mpsc::channel(100);
 
-        let config = Arc::new(RwLock::new(make_foca_config(1.try_into().unwrap(), None)));
-        let transport = Transport::new(&ta1.config.gossip, tx_rtt).await?;
+        let config = Arc::new(RwLock::new(make_foca_config(1.try_into().unwrap())));
+        let transport = Transport::new(&ta1_agent.config().gossip, tx_rtt).await?;
 
         let server_config = quinn_plaintext::server_config();
         let endpoint = quinn::Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap())?;
@@ -1200,13 +1205,13 @@ mod tests {
             ActorId(Uuid::new_v4()),
             ta2_gossip_addr,
             Default::default(),
-            ta1.agent.cluster_id(),
+            ta1_agent.cluster_id(),
             None,
         );
-        ta1.agent.members().write().add_member(&ta2_actor);
+        ta1_agent.members().write().add_member(&ta2_actor);
 
         let bcast = BroadcastV1::Change(ChangeV1 {
-            actor_id: ta1.agent.actor_id(),
+            actor_id: ta1_agent.actor_id(),
             changeset: Changeset::Full {
                 version: CrsqlDbVersion(0),
                 changes: vec![],
@@ -1218,13 +1223,13 @@ mod tests {
         let mut ser_buf = BytesMut::new();
         UniPayload::V1 {
             data: UniPayloadV1::Broadcast(bcast),
-            cluster_id: ta1.agent.cluster_id(),
+            cluster_id: ta1_agent.cluster_id(),
         }
         .write_to_stream((&mut ser_buf).writer())?;
         let estimated_size = ser_buf.len();
 
         tokio::spawn(handle_broadcasts(
-            ta1.agent.clone(),
+            ta1_agent.clone(),
             rx_bcast,
             transport,
             config,
@@ -1235,7 +1240,7 @@ mod tests {
             },
         ));
 
-        let actor_id = ta1.agent.actor_id();
+        let actor_id = ta1_agent.actor_id();
         for i in 0..5 {
             tx_bcast
                 .send(BroadcastInput::Rebroadcast(BroadcastV1::Change(ChangeV1 {
@@ -1255,15 +1260,7 @@ mod tests {
             info!("accepting connection");
             let conn = conn.await.unwrap();
 
-            let (tx_changes, mut rx_changes) = bounded(100, "changes");
-            let (tx_plumtree, _rx_plumtree) = bounded(100, "plumtree_test");
-            spawn_unipayload_handler(
-                &tripwire,
-                &conn,
-                ta1.agent.cluster_id(),
-                tx_changes,
-                tx_plumtree,
-            );
+            spawn_unipayload_handler(&tripwire, &conn, ta1_agent.clone());
 
             // we should receive five items starting from the biggest version
             for i in (0..5).rev() {

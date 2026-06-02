@@ -24,8 +24,9 @@ use corro_types::{
     actor::{Actor, ActorId},
     agent::{Agent, Bookie, SplitPool},
     base::CrsqlSeq,
-    broadcast::{BroadcastInput, BroadcastV1, ChangeSource, ChangeV1, FocaInput, PlumtreeUpdates},
+    broadcast::{disseminate_change, ChangeSource, ChangeV1, FocaInput, PlumtreeUpdates},
     channel::CorroReceiver,
+    config::BroadcastMethod,
     members::MemberAddedResult,
     sqlite::log_slow_inflight_queries,
     sync::generate_sync,
@@ -133,13 +134,7 @@ pub fn spawn_incoming_connection_handlers(
 
         // Spawn handler tasks for this connection
         spawn_foca_handler(&agent, &tripwire, &conn);
-        uni::spawn_unipayload_handler(
-            &tripwire,
-            &conn,
-            agent.cluster_id(),
-            agent.tx_changes().clone(),
-            agent.tx_plumtree().clone(),
-        );
+        uni::spawn_unipayload_handler(&tripwire, &conn, agent.clone());
         bi::spawn_bipayload_handler(&agent, &bookie, &tripwire, &conn);
     });
 }
@@ -384,12 +379,14 @@ pub async fn handle_notifications(
                             }
                         };
 
-                        let tx_plumtree_up = agent.tx_plumtree_updates().clone();
-                        tokio::spawn(async move {
-                            if let Err(e) = tx_plumtree_up.send(plumtree_msg).await {
-                                error!("could not forward MemberUp to plumtree: {e}");
-                            }
-                        });
+                        if agent.broadcast_method() == BroadcastMethod::Plumtree {
+                            let tx_plumtree_up = agent.tx_plumtree_updates().clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = tx_plumtree_up.send(plumtree_msg).await {
+                                    error!("could not forward MemberUp to plumtree: {e}");
+                                }
+                            });
+                        }
                     }
                     MemberAddedResult::Updated(_) => {
                         debug!("Member Updated {actor:?}");
@@ -432,16 +429,17 @@ pub async fn handle_notifications(
                         }
                     }
 
-                    // todo: not tokio spawn this?
-                    let tx_plumtree_op = agent.tx_plumtree_updates().clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = tx_plumtree_op
-                            .send(PlumtreeUpdates::MemberDown(actor.id()))
-                            .await
-                        {
-                            error!("could not forward MemberDown to plumtree: {e}");
-                        }
-                    });
+                    if agent.broadcast_method() == BroadcastMethod::Plumtree {
+                        let tx_plumtree_op = agent.tx_plumtree_updates().clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = tx_plumtree_op
+                                .send(PlumtreeUpdates::MemberDown(actor.id()))
+                                .await
+                            {
+                                error!("could not forward MemberDown to plumtree: {e}");
+                            }
+                        });
+                    }
                 }
                 counter!("corro.swim.notification", "type" => "memberdown").increment(1);
             }
@@ -471,14 +469,16 @@ pub async fn handle_notifications(
                 }
 
                 drop(lock);
-                let tx_plumtree_up = agent.tx_plumtree_updates().clone();
-                tokio::spawn(async move {
-                    for msg in msgs {
-                        if let Err(e) = tx_plumtree_up.send(msg).await {
-                            error!("could not forward Plumtree message: {e}");
+                if agent.broadcast_method() == BroadcastMethod::Plumtree {
+                    let tx_plumtree_up = agent.tx_plumtree_updates().clone();
+                    tokio::spawn(async move {
+                        for msg in msgs {
+                            if let Err(e) = tx_plumtree_up.send(msg).await {
+                                error!("could not forward Plumtree message: {e}");
+                            }
                         }
-                    }
-                });
+                    });
+                }
 
                 info!("Member Rename {a:?} to {b:?} (del_res: {del_res:?}, add_res: {add_res:?})");
             }
@@ -1145,18 +1145,11 @@ pub async fn handle_changes(
             matches!(src, ChangeSource::Sync),
             "Corrosion receives changes through sync"
         );
-        // Rebroadcast changes received from broadcast
+
+        // Rebroadcast changes received from broadcast (gossip method).
         if matches!(src, ChangeSource::Broadcast) && !change.is_empty() {
             assert_sometimes!(true, "Corrosion rebroadcasts changes");
-            if let Err(_e) =
-                agent
-                    .tx_bcast()
-                    .try_send(BroadcastInput::Rebroadcast(BroadcastV1::Change(
-                        change.clone(),
-                    )))
-            {
-                debug!("broadcasts are full or done!");
-            }
+            disseminate_change(&agent, change.clone());
         }
 
         // Handle the new change - queue it and potentially spawn a batch

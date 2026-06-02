@@ -211,6 +211,17 @@ pub enum AuthzConfig {
     BearerToken(String),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BroadcastMethod {
+    Gossip,
+    Plumtree,
+}
+
+fn default_broadcast_method() -> BroadcastMethod {
+    BroadcastMethod::Gossip
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GossipConfig {
     #[serde(alias = "addr")]
@@ -232,6 +243,8 @@ pub struct GossipConfig {
     pub disable_gso: bool,
     #[serde(default)]
     pub member_id: Option<MemberId>,
+    #[serde(default = "default_broadcast_method")]
+    pub broadcast_method: BroadcastMethod,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -418,6 +431,7 @@ pub struct ConfigBuilder {
     member_id: Option<MemberId>,
     max_mtu: Option<u16>,
     disable_gso: bool,
+    broadcast_method: Option<BroadcastMethod>,
 }
 
 impl ConfigBuilder {
@@ -497,6 +511,11 @@ impl ConfigBuilder {
         self
     }
 
+    pub fn broadcast_method(mut self, method: BroadcastMethod) -> Self {
+        self.broadcast_method = Some(method);
+        self
+    }
+
     /// Disable Generic Segmentation Offload (GSO) for the QUIC gossip transport.
     pub fn disable_gso(mut self, disable: bool) -> Self {
         self.disable_gso = disable;
@@ -543,6 +562,9 @@ impl ConfigBuilder {
                 max_mtu: self.max_mtu,
                 disable_gso: self.disable_gso,
                 member_id: self.member_id,
+                broadcast_method: self
+                    .broadcast_method
+                    .unwrap_or_else(default_broadcast_method),
             },
             perf: self.perf.unwrap_or_default(),
             admin: AdminConfig {

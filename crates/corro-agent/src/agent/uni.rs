@@ -1,9 +1,6 @@
 use corro_types::{
-    actor::ClusterId,
-    broadcast::{
-        BroadcastV1, ChangeSource, ChangeV1, PlumtreeInput, PlumtreeMsg, UniPayload, UniPayloadV1,
-    },
-    channel::CorroSender,
+    agent::Agent,
+    broadcast::{BroadcastV1, ChangeSource, PlumtreeInput, PlumtreeMsg, UniPayload, UniPayloadV1},
 };
 use metrics::counter;
 use speedy::Readable;
@@ -14,13 +11,11 @@ use tripwire::Tripwire;
 
 /// Spawn a task that accepts unidirectional broadcast streams, then
 /// spawns another task for each incoming stream to handle.
-pub fn spawn_unipayload_handler(
-    tripwire: &Tripwire,
-    conn: &quinn::Connection,
-    cluster_id: ClusterId,
-    tx_changes: CorroSender<(ChangeV1, ChangeSource)>,
-    tx_plumtree: CorroSender<PlumtreeInput>,
-) {
+pub fn spawn_unipayload_handler(tripwire: &Tripwire, conn: &quinn::Connection, agent: Agent) {
+    let cluster_id = agent.cluster_id();
+    let tx_changes = agent.tx_changes().clone();
+    let tx_plumtree = agent.tx_plumtree().clone();
+
     tokio::spawn({
         let conn = conn.clone();
         let mut tripwire = tripwire.clone();

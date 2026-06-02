@@ -38,7 +38,7 @@ use crate::{
         Timestamp,
     },
     channel::{bounded, CorroSender},
-    config::Config,
+    config::{BroadcastMethod, Config},
     metrics_tracker::MetricsTracker,
     pubsub::SubsManager,
     schema::Schema,
@@ -266,6 +266,10 @@ impl Agent {
 
     pub fn config(&self) -> arc_swap::Guard<Arc<Config>, arc_swap::strategy::DefaultStrategy> {
         self.0.config.load()
+    }
+
+    pub fn broadcast_method(&self) -> BroadcastMethod {
+        self.config().gossip.broadcast_method
     }
 
     pub fn set_config(&self, new_conf: Config) {

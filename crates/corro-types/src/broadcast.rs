@@ -31,6 +31,7 @@ use crate::{
     base::{CrsqlDbVersion, CrsqlSeq},
     change::{row_to_change, Change, ChunkedChanges, MAX_CHANGES_BYTE_SIZE},
     channel::CorroSender,
+    config::BroadcastMethod,
     pubsub::MatchableChange,
     sqlite::SqlitePoolError,
     sync::SyncTraceContextV1,
@@ -693,6 +694,39 @@ pub enum BroadcastInput {
     AddBroadcast(BroadcastV1),
 }
 
+/// Queue a change for cluster dissemination according to [`BroadcastMethod`].
+pub fn disseminate_change(agent: &Agent, change: ChangeV1) {
+    let is_local = change.actor_id == agent.actor_id();
+    match agent.broadcast_method() {
+        BroadcastMethod::Gossip => {
+            let input = if is_local {
+                BroadcastInput::AddBroadcast(BroadcastV1::Change(change.clone()))
+            } else {
+                BroadcastInput::Rebroadcast(BroadcastV1::Change(change.clone()))
+            };
+            let tx = agent.tx_bcast().clone();
+            tokio::spawn(async move {
+                if let Err(e) = tx.send(input).await {
+                    debug!("could not queue change for gossip broadcast: {e}");
+                }
+            });
+        }
+        BroadcastMethod::Plumtree => {
+            // re-broadcast happen through plumtree gossip
+            if !is_local {
+                return;
+            }
+
+            let tx = agent.tx_plumtree().clone();
+            tokio::spawn(async move {
+                if let Err(e) = tx.send(PlumtreeInput::Broadcast(change)).await {
+                    error!("could not send change message for plumtree broadcast: {e}");
+                }
+            });
+        }
+    }
+}
+
 pub struct DispatchRuntime<T> {
     pub to_send: CorroSender<(T, Bytes)>,
     pub to_schedule: CorroSender<(Duration, Timer<T>)>,
@@ -808,19 +842,14 @@ pub async fn broadcast_changes(
                     match_changes(agent.subs_manager(), &changeset, db_version);
                     match_changes(agent.updates_manager(), &changeset, db_version);
 
-                    let tx_plumtree = agent.tx_plumtree().clone();
                     assert_sometimes!(true, "Corrosion broadcasts changes");
-                    tokio::spawn(async move {
-                        if let Err(e) = tx_plumtree
-                            .send(PlumtreeInput::Broadcast(ChangeV1 {
-                                actor_id,
-                                changeset,
-                            }))
-                            .await
-                        {
-                            error!("could not send change message for broadcast: {e}");
-                        }
-                    });
+                    disseminate_change(
+                        &agent,
+                        ChangeV1 {
+                            actor_id,
+                            changeset,
+                        },
+                    );
                 }
                 Err(e) => {
                     error!("could not process crsql change (db_version: {db_version}) for broadcast: {e}");

@@ -668,7 +668,7 @@ mod tests {
         api::RowId,
         base::CrsqlDbVersion,
         broadcast::{ChangeV1, Changeset, PlumtreeInput},
-        config::Config,
+        config::{BroadcastMethod, Config},
         schema::SqliteType,
     };
     use futures::StreamExt;
@@ -693,6 +693,7 @@ mod tests {
                 .db_path(dir.path().join("corrosion.db").display().to_string())
                 .gossip_addr("127.0.0.1:0".parse()?)
                 .api_addr("127.0.0.1:0".parse()?)
+                .broadcast_method(BroadcastMethod::Plumtree)
                 .build()?,
             tripwire,
         )

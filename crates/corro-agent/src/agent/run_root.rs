@@ -19,7 +19,7 @@ use corro_types::{
     agent::{Agent, Bookie},
     base::CrsqlSeq,
     channel::bounded,
-    config::{Config, PerfConfig},
+    config::{BroadcastMethod, Config, PerfConfig},
 };
 
 use futures::FutureExt;
@@ -208,18 +208,19 @@ async fn run(
 
     info!("Starting peer API on udp/{gossip_addr} (QUIC)");
 
-    //// Start the Plumtree broadcast tree loop
-    spawn_counted(
-        spawn_plumtree_loop(
-            agent.clone(),
-            transport.clone(),
-            rx_plumtree,
-            rx_plumtree_updates,
-            agent.tx_changes().clone(),
-            tripwire.clone(),
-        )
-        .inspect(|_| info!("plumtree loop is done")),
-    );
+    if agent.broadcast_method() == BroadcastMethod::Plumtree {
+        spawn_counted(
+            spawn_plumtree_loop(
+                agent.clone(),
+                transport.clone(),
+                rx_plumtree,
+                rx_plumtree_updates,
+                agent.tx_changes().clone(),
+                tripwire.clone(),
+            )
+            .inspect(|_| info!("plumtree loop is done")),
+        );
+    }
 
     //// Start an incoming (corrosion) connection handler.  This
     //// future tree spawns additional message type sub-handlers
