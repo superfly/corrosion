@@ -14,6 +14,11 @@ use tokio::{task::block_in_place, time::interval};
 use tracing::{debug, error, info, trace};
 use tripwire::{Outcome, PreemptibleFutureExt, Tripwire};
 
+struct ReaperCfg {
+    row_limit: usize,
+    check_orphaned_pks: bool,
+}
+
 /// Parse a time string like "14d", "1m", "2h", "30s" into a Duration
 fn parse_duration(s: &str) -> eyre::Result<Duration> {
     if s.is_empty() {
@@ -47,6 +52,11 @@ pub fn spawn_reaper(agent: &Agent, mut tripwire: Tripwire) -> eyre::Result<()> {
         if config.tables.is_empty() {
             return Ok(());
         }
+
+        let reaper_cfg = ReaperCfg {
+            row_limit: config.row_limit,
+            check_orphaned_pks: config.check_orphaned_pks,
+        };
 
         let tables: HashMap<String, (Duration, Option<String>)> = config
             .tables
@@ -88,6 +98,7 @@ pub fn spawn_reaper(agent: &Agent, mut tripwire: Tripwire) -> eyre::Result<()> {
                         *retention,
                         filter.as_deref(),
                         clock,
+                        &reaper_cfg,
                     )
                     .preemptible(&mut tripwire)
                     .await
@@ -127,9 +138,12 @@ async fn reap_table(
     retention: Duration,
     filter: Option<&str>,
     clock: &uhlc::HLC,
+    config: &ReaperCfg,
 ) -> Result<(usize, usize), ReaperError> {
     let read_conn = pool.read().await.map_err(ReaperError::ReadPool)?;
 
+    let limit = config.row_limit;
+    let check_orphaned_pks = config.check_orphaned_pks;
     let now = Timestamp::from(clock.new_timestamp()).to_ntp64();
     let cutoff = Timestamp::from(now - uhlc::NTP64::from(retention));
 
@@ -141,20 +155,22 @@ async fn reap_table(
                 "SELECT key FROM {table}__crsql_clock
                 LEFT JOIN {table}__crsql_pks ON key = __crsql_key
                 WHERE col_name = -1 AND col_version % 2 = 0
-                AND ts < ? {filter_clause} LIMIT 200"
+                AND ts < ? {filter_clause} LIMIT {limit}"
             ))?
             .query_map([&cutoff], |row| row.get::<_, u64>(0))?
             .collect::<Result<Vec<u64>, rusqlite::Error>>()?;
 
-        let orphaned_pks = read_conn
-            .prepare_cached(&format!(
-                "SELECT __crsql_key FROM {table}__crsql_pks
-                WHERE NOT EXISTS 
-                    (SELECT 1 FROM {table}__crsql_clock WHERE __crsql_key = key) 
-                LIMIT 200",
-            ))?
-            .query_map([], |row| row.get::<_, u64>(0))?
-            .collect::<Result<Vec<u64>, rusqlite::Error>>()?;
+        let orphaned_pks = if check_orphaned_pks {
+            read_conn
+                .prepare_cached(&format!(
+                    "SELECT __crsql_key FROM {table}__crsql_pks
+                    WHERE NOT EXISTS (SELECT 1 FROM {table}__crsql_clock WHERE __crsql_key = key) LIMIT {limit}",
+                ))?
+                .query_map([], |row| row.get::<_, u64>(0))?
+                .collect::<Result<Vec<u64>, rusqlite::Error>>()?
+        } else {
+            Vec::new()
+        };
 
         Ok::<_, rusqlite::Error>((sentinel_pks, orphaned_pks))
     })?;

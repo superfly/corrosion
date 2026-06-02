@@ -21,6 +21,14 @@ How often (in seconds) the reaper wakes up and scans configured tables. Defaults
 check_interval = 3600
 ```
 
+#### `reaper.check_orphaned_pks`
+
+When `true`, each tick also scans for PK rows in `<table>__crsql_pks` with no matching clock rows and deletes them. Set to `false` to skip that scan (for example when orphaned PKs are rare or the `NOT EXISTS` query is expensive on large tables).
+
+#### `reaper.row_limit`
+
+Maximum number of expired clock rows to reap per table per tick. Defaults to `500`.
+
 #### `reaper.tables`
 
 
@@ -55,7 +63,9 @@ match_filter = "id LIKE 'tmp-%'"
 
 ```toml
 [reaper]
-check_interval = 3600  # optional, seconds, defaults to 3600
+check_interval = 3600           # optional, seconds, defaults to 3600
+check_orphaned_pks = true       # optional, defaults to true
+row_limit = 200   # optional, defaults to 200
 
 # Reap primary keys of `sessions` 7 days after deletion, but only those whose id was prefixed with `tmp-`.
 [reaper.tables.sessions]
