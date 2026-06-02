@@ -11,8 +11,8 @@ use eyre::eyre;
 use metrics::{counter, histogram};
 use rusqlite::params;
 use tokio::{task::block_in_place, time::interval};
-use tracing::{debug, error, info, trace};
-use tripwire::{Outcome, PreemptibleFutureExt, Tripwire};
+use tracing::{debug, error, info, trace, warn};
+use tripwire::{Outcome, PreemptibleFutureExt, TimeoutFutureExt, Tripwire};
 
 struct ReaperCfg {
     row_limit: usize,
@@ -74,10 +74,12 @@ pub fn spawn_reaper(agent: &Agent, mut tripwire: Tripwire) -> eyre::Result<()> {
             })
             .collect::<Result<HashMap<String, (Duration, Option<String>)>, eyre::Error>>()?;
 
+        let check_timeout = Duration::from_secs(60);
+        let check_interval = config.check_interval;
         let agent = agent.clone();
 
         tokio::spawn(async move {
-            let mut interval = interval(Duration::from_secs(config.check_interval as u64));
+            let mut interval = interval(Duration::from_secs(check_interval as u64));
             // skip first tick so we don't run reaper immediately
             interval.tick().await;
             let clock = agent.clock();
@@ -100,13 +102,16 @@ pub fn spawn_reaper(agent: &Agent, mut tripwire: Tripwire) -> eyre::Result<()> {
                         clock,
                         &reaper_cfg,
                     )
+                    .with_timeout(check_timeout)
                     .preemptible(&mut tripwire)
                     .await
                     {
-                        Outcome::Preempted(_) => {
-                            return;
+                        Outcome::Preempted(()) => return,
+                        Outcome::Completed(Outcome::Preempted(())) => {
+                            warn!("reaper timed out checking table {table_name}");
+                            Err(ReaperError::Timeout)
                         }
-                        Outcome::Completed(res) => res,
+                        Outcome::Completed(Outcome::Completed(res)) => res,
                     };
 
                     match result {
@@ -215,6 +220,8 @@ async fn reap_table(
 
 #[derive(Debug, thiserror::Error)]
 pub enum ReaperError {
+    #[error("reaper timed out")]
+    Timeout,
     #[error("read pool error: {0}")]
     ReadPool(#[from] SqlitePoolError),
     #[error("write pool error: {0}")]
@@ -328,6 +335,10 @@ mod tests {
             })?;
         }
 
+        let reaper_cfg = ReaperCfg {
+            row_limit: 500,
+            check_orphaned_pks: true,
+        };
         let filter = "AND id > 100";
         let (clocks, pks) = reap_table(
             &pool,
@@ -335,6 +346,7 @@ mod tests {
             parse_duration("1w").unwrap(),
             Some(filter),
             &clock,
+            &reaper_cfg,
         )
         .await?;
         assert_eq!(clocks, 2, "should delete 2 old clock entries");
@@ -356,16 +368,30 @@ mod tests {
             "should only delete filtered deleted entries"
         );
 
-        let (clocks, pks) =
-            reap_table(&pool, table, parse_duration("1w").unwrap(), None, &clock).await?;
+        let (clocks, pks) = reap_table(
+            &pool,
+            table,
+            parse_duration("1w").unwrap(),
+            None,
+            &clock,
+            &reaper_cfg,
+        )
+        .await?;
         assert_eq!(
             clocks, 2,
             "should delete 2 old clock entries that are not filtered"
         );
         assert_eq!(pks, 2, "should delete 2 old PKs");
 
-        let (clocks, pks) =
-            reap_table(&pool, table, parse_duration("2d").unwrap(), None, &clock).await?;
+        let (clocks, pks) = reap_table(
+            &pool,
+            table,
+            parse_duration("2d").unwrap(),
+            None,
+            &clock,
+            &reaper_cfg,
+        )
+        .await?;
         assert_eq!(clocks, 0, "no more entries to delete");
         assert_eq!(pks, 0, "no more entries to delete");
 
