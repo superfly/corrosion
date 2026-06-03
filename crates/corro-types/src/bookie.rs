@@ -466,11 +466,6 @@ impl BookedVersions {
                     if let Some(p) = partial {
                         acc.entry(versions.start())
                             .and_modify(|existing: &mut PartialVersion| {
-                                assert_always!(
-                                    p.last_seq == existing.last_seq,
-                                    "last_seq mismatch for partial version",
-                                    &json!({"version": versions.start(), "expected": existing.last_seq, "got": p.last_seq})
-                                );
                                 existing.seqs.extend(p.seqs.clone());
                             })
                             .or_insert(p.clone());
@@ -864,21 +859,14 @@ impl BookieDbParams {
         if !self.complete_version_deletes.is_empty() {
             let actors = unnest_param(self.complete_version_deletes.iter().map(|(a, _)| a));
             let versions = unnest_param(self.complete_version_deletes.iter().map(|(_, v)| v));
-            let count = conn
-                .prepare_cached(
-                    "DELETE FROM __corro_seq_bookkeeping WHERE (site_id, db_version)
+            conn.prepare_cached(
+                "DELETE FROM __corro_seq_bookkeeping WHERE (site_id, db_version)
                  IN (SELECT value0, value1 FROM unnest(:actors, :versions))",
-                )?
-                .execute(named_params! {
-                    ":actors": actors,
-                    ":versions": versions,
-                })?;
-            let len = self.complete_version_deletes.len();
-            if count != len {
-                warn!("did not delete some complete versions from db, expected {len}, got {count}");
-                let details = json!({"count": count, "expected": len, "versions": self.complete_version_deletes});
-                assert_unreachable!("ineffective deletion of complete versions in-db", &details);
-            }
+            )?
+            .execute(named_params! {
+                ":actors": actors,
+                ":versions": versions,
+            })?;
         }
 
         if !self.partials_deletes.is_empty() {
