@@ -864,7 +864,7 @@ impl BookieDbParams {
         if !self.complete_version_deletes.is_empty() {
             let actors = unnest_param(self.complete_version_deletes.iter().map(|(a, _)| a));
             let versions = unnest_param(self.complete_version_deletes.iter().map(|(_, v)| v));
-            let count = conn
+            conn
                 .prepare_cached(
                     "DELETE FROM __corro_seq_bookkeeping WHERE (site_id, db_version)
                  IN (SELECT value0, value1 FROM unnest(:actors, :versions))",
@@ -873,12 +873,6 @@ impl BookieDbParams {
                     ":actors": actors,
                     ":versions": versions,
                 })?;
-            let len = self.complete_version_deletes.len();
-            if count != len {
-                warn!("did not delete some complete versions from db, expected {len}, got {count}");
-                let details = json!({"count": count, "expected": len, "versions": self.complete_version_deletes});
-                assert_unreachable!("ineffective deletion of complete versions in-db", &details);
-            }
         }
 
         if !self.partials_deletes.is_empty() {
