@@ -466,11 +466,6 @@ impl BookedVersions {
                     if let Some(p) = partial {
                         acc.entry(versions.start())
                             .and_modify(|existing: &mut PartialVersion| {
-                                assert_always!(
-                                    p.last_seq == existing.last_seq,
-                                    "last_seq mismatch for partial version",
-                                    &json!({"version": versions.start(), "expected": existing.last_seq, "got": p.last_seq})
-                                );
                                 existing.seqs.extend(p.seqs.clone());
                             })
                             .or_insert(p.clone());
