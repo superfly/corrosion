@@ -859,15 +859,14 @@ impl BookieDbParams {
         if !self.complete_version_deletes.is_empty() {
             let actors = unnest_param(self.complete_version_deletes.iter().map(|(a, _)| a));
             let versions = unnest_param(self.complete_version_deletes.iter().map(|(_, v)| v));
-            conn
-                .prepare_cached(
-                    "DELETE FROM __corro_seq_bookkeeping WHERE (site_id, db_version)
+            conn.prepare_cached(
+                "DELETE FROM __corro_seq_bookkeeping WHERE (site_id, db_version)
                  IN (SELECT value0, value1 FROM unnest(:actors, :versions))",
-                )?
-                .execute(named_params! {
-                    ":actors": actors,
-                    ":versions": versions,
-                })?;
+            )?
+            .execute(named_params! {
+                ":actors": actors,
+                ":versions": versions,
+            })?;
         }
 
         if !self.partials_deletes.is_empty() {
