@@ -38,6 +38,10 @@ const fn default_reaper_interval() -> usize {
     3600
 }
 
+const fn default_reaper_limit() -> usize {
+    500
+}
+
 const fn default_wal_threshold() -> usize {
     // Default of 5GB
     5 * 1024
@@ -588,6 +592,12 @@ pub struct ReaperConfig {
     pub tables: HashMap<String, TableReapConfig>,
     #[serde(default = "default_reaper_interval")]
     pub check_interval: usize,
+    /// When false, skip scanning for PK rows with no clock entries.
+    #[serde(default)]
+    pub check_orphaned_pks: bool,
+    /// Max orphaned PK rows to reap per table per tick.
+    #[serde(default = "default_reaper_limit")]
+    pub row_limit: usize,
 }
 
 /// Per-table reaper config.

@@ -11,8 +11,13 @@ use eyre::eyre;
 use metrics::{counter, histogram};
 use rusqlite::params;
 use tokio::{task::block_in_place, time::interval};
-use tracing::{debug, error, info, trace};
-use tripwire::{Outcome, PreemptibleFutureExt, Tripwire};
+use tracing::{debug, error, info, trace, warn};
+use tripwire::{Outcome, PreemptibleFutureExt, TimeoutFutureExt, Tripwire};
+
+struct ReaperCfg {
+    row_limit: usize,
+    check_orphaned_pks: bool,
+}
 
 /// Parse a time string like "14d", "1m", "2h", "30s" into a Duration
 fn parse_duration(s: &str) -> eyre::Result<Duration> {
@@ -48,6 +53,11 @@ pub fn spawn_reaper(agent: &Agent, mut tripwire: Tripwire) -> eyre::Result<()> {
             return Ok(());
         }
 
+        let reaper_cfg = ReaperCfg {
+            row_limit: config.row_limit,
+            check_orphaned_pks: config.check_orphaned_pks,
+        };
+
         let tables: HashMap<String, (Duration, Option<String>)> = config
             .tables
             .into_iter()
@@ -64,10 +74,12 @@ pub fn spawn_reaper(agent: &Agent, mut tripwire: Tripwire) -> eyre::Result<()> {
             })
             .collect::<Result<HashMap<String, (Duration, Option<String>)>, eyre::Error>>()?;
 
+        let check_timeout = Duration::from_secs(75);
+        let check_interval = config.check_interval;
         let agent = agent.clone();
 
         tokio::spawn(async move {
-            let mut interval = interval(Duration::from_secs(config.check_interval as u64));
+            let mut interval = interval(Duration::from_secs(check_interval as u64));
             // skip first tick so we don't run reaper immediately
             interval.tick().await;
             let clock = agent.clock();
@@ -88,14 +100,18 @@ pub fn spawn_reaper(agent: &Agent, mut tripwire: Tripwire) -> eyre::Result<()> {
                         *retention,
                         filter.as_deref(),
                         clock,
+                        &reaper_cfg,
                     )
+                    .with_timeout(check_timeout)
                     .preemptible(&mut tripwire)
                     .await
                     {
-                        Outcome::Preempted(_) => {
-                            return;
+                        Outcome::Preempted(()) => return,
+                        Outcome::Completed(Outcome::Preempted(())) => {
+                            warn!("reaper timed out checking table {table_name}");
+                            Err(ReaperError::Timeout)
                         }
-                        Outcome::Completed(res) => res,
+                        Outcome::Completed(Outcome::Completed(res)) => res,
                     };
 
                     match result {
@@ -127,9 +143,12 @@ async fn reap_table(
     retention: Duration,
     filter: Option<&str>,
     clock: &uhlc::HLC,
+    config: &ReaperCfg,
 ) -> Result<(usize, usize), ReaperError> {
     let read_conn = pool.read().await.map_err(ReaperError::ReadPool)?;
 
+    let limit = config.row_limit;
+    let check_orphaned_pks = config.check_orphaned_pks;
     let now = Timestamp::from(clock.new_timestamp()).to_ntp64();
     let cutoff = Timestamp::from(now - uhlc::NTP64::from(retention));
 
@@ -141,20 +160,22 @@ async fn reap_table(
                 "SELECT key FROM {table}__crsql_clock
                 LEFT JOIN {table}__crsql_pks ON key = __crsql_key
                 WHERE col_name = -1 AND col_version % 2 = 0
-                AND ts < ? {filter_clause} LIMIT 200"
+                AND ts < ? {filter_clause} LIMIT {limit}"
             ))?
             .query_map([&cutoff], |row| row.get::<_, u64>(0))?
             .collect::<Result<Vec<u64>, rusqlite::Error>>()?;
 
-        let orphaned_pks = read_conn
-            .prepare_cached(&format!(
-                "SELECT __crsql_key FROM {table}__crsql_pks
-                WHERE NOT EXISTS 
-                    (SELECT 1 FROM {table}__crsql_clock WHERE __crsql_key = key) 
-                LIMIT 200",
-            ))?
-            .query_map([], |row| row.get::<_, u64>(0))?
-            .collect::<Result<Vec<u64>, rusqlite::Error>>()?;
+        let orphaned_pks = if check_orphaned_pks {
+            read_conn
+                .prepare_cached(&format!(
+                    "SELECT __crsql_key FROM {table}__crsql_pks
+                    WHERE NOT EXISTS (SELECT 1 FROM {table}__crsql_clock WHERE __crsql_key = key) LIMIT {limit}",
+                ))?
+                .query_map([], |row| row.get::<_, u64>(0))?
+                .collect::<Result<Vec<u64>, rusqlite::Error>>()?
+        } else {
+            Vec::new()
+        };
 
         Ok::<_, rusqlite::Error>((sentinel_pks, orphaned_pks))
     })?;
@@ -199,6 +220,8 @@ async fn reap_table(
 
 #[derive(Debug, thiserror::Error)]
 pub enum ReaperError {
+    #[error("reaper timed out")]
+    Timeout,
     #[error("read pool error: {0}")]
     ReadPool(#[from] SqlitePoolError),
     #[error("write pool error: {0}")]
@@ -312,6 +335,10 @@ mod tests {
             })?;
         }
 
+        let reaper_cfg = ReaperCfg {
+            row_limit: 500,
+            check_orphaned_pks: true,
+        };
         let filter = "AND id > 100";
         let (clocks, pks) = reap_table(
             &pool,
@@ -319,6 +346,7 @@ mod tests {
             parse_duration("1w").unwrap(),
             Some(filter),
             &clock,
+            &reaper_cfg,
         )
         .await?;
         assert_eq!(clocks, 2, "should delete 2 old clock entries");
@@ -340,16 +368,30 @@ mod tests {
             "should only delete filtered deleted entries"
         );
 
-        let (clocks, pks) =
-            reap_table(&pool, table, parse_duration("1w").unwrap(), None, &clock).await?;
+        let (clocks, pks) = reap_table(
+            &pool,
+            table,
+            parse_duration("1w").unwrap(),
+            None,
+            &clock,
+            &reaper_cfg,
+        )
+        .await?;
         assert_eq!(
             clocks, 2,
             "should delete 2 old clock entries that are not filtered"
         );
         assert_eq!(pks, 2, "should delete 2 old PKs");
 
-        let (clocks, pks) =
-            reap_table(&pool, table, parse_duration("2d").unwrap(), None, &clock).await?;
+        let (clocks, pks) = reap_table(
+            &pool,
+            table,
+            parse_duration("2d").unwrap(),
+            None,
+            &clock,
+            &reaper_cfg,
+        )
+        .await?;
         assert_eq!(clocks, 0, "no more entries to delete");
         assert_eq!(pks, 0, "no more entries to delete");
 
