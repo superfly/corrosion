@@ -74,7 +74,7 @@ pub fn spawn_reaper(agent: &Agent, mut tripwire: Tripwire) -> eyre::Result<()> {
             })
             .collect::<Result<HashMap<String, (Duration, Option<String>)>, eyre::Error>>()?;
 
-        let check_timeout = Duration::from_secs(60);
+        let check_timeout = Duration::from_secs(75);
         let check_interval = config.check_interval;
         let agent = agent.clone();
 
