@@ -4,7 +4,7 @@ use std::{
     time::{Instant, SystemTime},
 };
 
-use enquote::unquote;
+use corro_utils::enquote::unquote;
 use fallible_iterator::FallibleIterator;
 use indexmap::{IndexMap, IndexSet};
 use rusqlite::{Connection, Transaction};
@@ -713,10 +713,8 @@ pub fn parse_sql_to_schema(schema: &mut Schema, sql: &str) -> Result<(), Box<Sch
                     where_clause,
                     ..
                 } => {
-                    let tbl_name =
-                        unquote(tbl_name.0.as_str()).unwrap_or_else(|_| tbl_name.0.clone());
-                    let idx_name = unquote(idx_name.name.0.as_str())
-                        .unwrap_or_else(|_| idx_name.name.0.clone());
+                    let tbl_name = unquote(tbl_name.0.as_str());
+                    let idx_name = unquote(idx_name.name.0.as_str());
                     if let Some(table) = schema.tables.get_mut(tbl_name.as_str()) {
                         table.indexes.insert(
                             idx_name.clone(),
@@ -768,9 +766,7 @@ fn prepare_table(
                         columns
                             .iter()
                             .filter_map(|col| match &col.expr {
-                                Expr::Id(id) => {
-                                    Some(unquote(&id.0).unwrap_or_else(|_| id.0.clone()))
-                                }
+                                Expr::Id(id) => Some(unquote(&id.0)),
                                 _ => None,
                             })
                             .collect::<IndexSet<_>>(),
@@ -786,12 +782,12 @@ fn prepare_table(
                         matches!(named.constraint, ColumnConstraint::PrimaryKey { .. })
                     })
                 })
-                .map(|def| unquote(&def.col_name.0).unwrap_or_else(|_| def.col_name.0.clone()))
+                .map(|def| unquote(&def.col_name.0))
                 .collect()
         });
 
     Table {
-        name: unquote(&tbl_name.name.0).unwrap_or_else(|_| tbl_name.name.0.clone()),
+        name: unquote(&tbl_name.name.0),
         indexes: IndexMap::new(),
         columns: columns
             .iter()
@@ -818,7 +814,7 @@ fn prepare_table(
 
                 let primary_key = pk.contains(&def.col_name.0);
 
-                let col_name = unquote(&def.col_name.0).unwrap_or_else(|_| def.col_name.0.clone());
+                let col_name = unquote(&def.col_name.0);
 
                 (
                     col_name.clone(),
@@ -898,7 +894,7 @@ fn extract_expr_columns(expr: &Expr, cols: &mut Vec<String>) {
             }
         }
         Expr::Id(colname) => {
-            cols.push(unquote(&colname.0).ok().unwrap_or(colname.0.clone()));
+            cols.push(unquote(&colname.0));
         }
         _ => {}
     }
