@@ -442,6 +442,7 @@ pub async fn catch_up_sub(
     // just in case...
     let _drop_guard = cancel.clone().drop_guard();
 
+    let sub_id = matcher.id();
     let queue_task = tokio::spawn({
         let cancel = cancel.clone();
         async move {
@@ -456,6 +457,7 @@ pub async fn catch_up_sub(
 
                 if let QueryEventMeta::Change(change_id) = meta {
                     if let Err(_e) = queue_tx.try_send((buf, change_id)) {
+                        error!(%sub_id, "subs catching up too slowly, giving up");
                         return Err(eyre::eyre!("catching up too slowly, gave up after buffering {MAX_EVENTS_BUFFER_SIZE} events"));
                     }
                 }
