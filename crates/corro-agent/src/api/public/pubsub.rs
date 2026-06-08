@@ -546,6 +546,7 @@ pub async fn catch_up_sub(
                 match res {
                     Ok(new_last_change_id) => last_change_id = new_last_change_id,
                     Err(e) => {
+                        error!(sub_id = %matcher.id(), "error catching up subscription: {e}");
                         if !matches!(e, CatchUpError::Send(_)) {
                             _ = evt_tx
                                 .send(error_to_query_event_bytes_with_meta(&mut buf, e))
@@ -561,6 +562,7 @@ pub async fn catch_up_sub(
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         if change_id >= min_change_id {
+            error!(sub_id = %matcher.id(), "could not catch up subs in 5 attempts");
             _ = evt_tx
                 .send(error_to_query_event_bytes_with_meta(
                     &mut buf,
