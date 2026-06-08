@@ -1,6 +1,7 @@
 use indexmap::{IndexMap, IndexSet};
-use rand::Rng;
+use rand::rngs::SmallRng;
 use rand::seq::{IteratorRandom, SliceRandom};
+use rand::{Rng, SeedableRng};
 use speedy::{Readable, Writable};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
@@ -278,12 +279,22 @@ pub struct PlumtreeState<
 
     seen: S,
     cache: PayloadCache<I, P>,
+    rng: SmallRng,
 }
 
 impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStore<I>>
     PlumtreeState<I, P, N, S>
 {
     pub fn new_with_store(local_id: N, config: Config, seen: S) -> Self {
+        Self::new_with_store_seeded(local_id, config, seen, rand::rng().random())
+    }
+
+    /// Like [`Self::new_with_store`] but with a deterministic RNG seed.
+    ///
+    /// All randomized decisions (eager/lazy selection, lazy eviction, graft
+    /// sender choice) draw from this RNG, so simulations and tests are
+    /// reproducible given the same seed and event order.
+    pub fn new_with_store_seeded(local_id: N, config: Config, seen: S, seed: u64) -> Self {
         let cache_size = config.max_cached_payloads;
         Self {
             local_id,
@@ -297,6 +308,7 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
             missing: HashMap::new(),
             seen,
             cache: PayloadCache::new(cache_size),
+            rng: SmallRng::seed_from_u64(seed),
         }
     }
 
@@ -678,12 +690,11 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
         );
     }
 
-    fn random_eager_peers(&self, count: usize, exclude: &N) -> Vec<N> {
-        let mut rng = rand::rng();
+    fn random_eager_peers(&mut self, count: usize, exclude: &N) -> Vec<N> {
         self.eager_peers
             .iter()
             .filter(|p| *p != exclude)
-            .choose_multiple(&mut rng, count)
+            .choose_multiple(&mut self.rng, count)
             .into_iter()
             .cloned()
             .collect()
@@ -861,7 +872,7 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
         RingBucket::of(self.peer_topology.get(p).copied().unwrap_or_default())
     }
 
-    fn bucket_pools(&self) -> (Vec<N>, Vec<N>, Vec<N>) {
+    fn bucket_pools(&mut self) -> (Vec<N>, Vec<N>, Vec<N>) {
         let mut near = Vec::new();
         let mut mid = Vec::new();
         let mut far = Vec::new();
@@ -878,10 +889,9 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
             }
         }
 
-        let mut rng = rand::rng();
-        near.shuffle(&mut rng);
-        mid.shuffle(&mut rng);
-        far.shuffle(&mut rng);
+        near.shuffle(&mut self.rng);
+        mid.shuffle(&mut self.rng);
+        far.shuffle(&mut self.rng);
         (near, mid, far)
     }
 
@@ -1013,7 +1023,7 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
             return None;
         }
 
-        let idx = evictable[rand::rng().random_range(0..evictable.len())];
+        let idx = evictable[self.rng.random_range(0..evictable.len())];
         let evicted = self.lazy_peers.swap_remove_index(idx);
         evicted
     }
