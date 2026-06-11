@@ -30,7 +30,11 @@ use opentelemetry_sdk as os;
 use rusqlite::{Connection, OptionalExtension};
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::{
-    fmt::format::Format, prelude::__tracing_subscriber_SubscriberExt, util::SubscriberInitExt,
+    filter::LevelFilter,
+    fmt::format::Format,
+    layer::Layer,
+    prelude::__tracing_subscriber_SubscriberExt,
+    util::SubscriberInitExt,
     EnvFilter,
 };
 use uuid::Uuid;
@@ -64,9 +68,9 @@ fn init_tracing(cli: &Cli) -> Result<Option<TracingHandle>, ConfigError> {
         // Tracing
         let (env_filter, handle) = tracing_subscriber::reload::Layer::new(filter.layer());
         tracing_handle = Some(handle);
-        let sub = tracing_subscriber::registry::Registry::default().with(env_filter);
 
         if let Some(otel) = &config.telemetry.open_telemetry {
+            let sub = tracing_subscriber::registry::Registry::default().with(env_filter);
             let otlp_exporter = opentelemetry_otlp::SpanExporter::builder().with_tonic();
             let otlp_exporter = match otel {
                 OtelConfig::FromEnv => otlp_exporter,
@@ -114,29 +118,45 @@ fn init_tracing(cli: &Cli) -> Result<Option<TracingHandle>, ConfigError> {
             let sub = sub.with(tracing_opentelemetry::layer().with_tracer(tracer));
             match config.log.format {
                 LogFormat::Plaintext => {
-                    sub.with(tracing_subscriber::fmt::Layer::new().with_ansi(config.log.colors))
-                        .init();
+                    sub.with(
+                        tracing_subscriber::fmt::Layer::new()
+                            .with_ansi(config.log.colors)
+                            .with_filter(LevelFilter::INFO),
+                    )
+                    .init();
                 }
                 LogFormat::Json => {
                     sub.with(
                         tracing_subscriber::fmt::Layer::new()
                             .json()
-                            .with_span_list(false),
+                            .with_span_list(false)
+                            .with_filter(LevelFilter::INFO),
                     )
                     .init();
                 }
             }
         } else {
+            let console_layer = console_subscriber::ConsoleLayer::builder()
+                .with_default_env()
+                .spawn();
+            let sub = tracing_subscriber::registry::Registry::default()
+                .with(env_filter)
+                .with(console_layer);
             match config.log.format {
                 LogFormat::Plaintext => {
-                    sub.with(tracing_subscriber::fmt::Layer::new().with_ansi(config.log.colors))
-                        .init();
+                    sub.with(
+                        tracing_subscriber::fmt::Layer::new()
+                            .with_ansi(config.log.colors)
+                            .with_filter(LevelFilter::INFO),
+                    )
+                    .init();
                 }
                 LogFormat::Json => {
                     sub.with(
                         tracing_subscriber::fmt::Layer::new()
                             .json()
-                            .with_span_list(false),
+                            .with_span_list(false)
+                            .with_filter(LevelFilter::INFO),
                     )
                     .init();
                 }

@@ -14,6 +14,7 @@ camino = { workspace = true }
 clap = { workspace = true }
 config = { workspace = true }
 consul-client = { path = "../consul-client" }
+console-subscriber = { workspace = true }
 corro-admin = { path = "../corro-admin" }
 corro-agent = { path = "../corro-agent" }
 corro-api-types = { path = "../corro-api-types" }
