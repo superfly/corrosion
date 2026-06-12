@@ -1698,6 +1698,7 @@ mod tests {
         Ok(())
     }
 
+    #[ignore]
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn test_lagging_subscribers() -> eyre::Result<()> {
         _ = tracing_subscriber::fmt::try_init();

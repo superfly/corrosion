@@ -30,12 +30,8 @@ use opentelemetry_sdk as os;
 use rusqlite::{Connection, OptionalExtension};
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::{
-    filter::LevelFilter,
-    fmt::format::Format,
-    layer::Layer,
-    prelude::__tracing_subscriber_SubscriberExt,
-    util::SubscriberInitExt,
-    EnvFilter,
+    filter::LevelFilter, fmt::format::Format, layer::Layer,
+    prelude::__tracing_subscriber_SubscriberExt, util::SubscriberInitExt, EnvFilter,
 };
 use uuid::Uuid;
 
