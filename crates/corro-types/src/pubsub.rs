@@ -487,11 +487,11 @@ impl MatcherHandle {
         let min_change_id: u64 = prepped.query_row([], |row| row.get(0))?;
 
         // return error if we've cleared changes after the received change id
-        if since.0 + 1 < min_change_id {
-            return Err(rusqlite::Error::ModuleError(format!(
-                "subscription already deleted older changes, min change id: {min_change_id}",
-            )));
-        }
+        // if since.0 + 1 < min_change_id {
+        //     return Err(rusqlite::Error::ModuleError(format!(
+        //         "subscription already deleted older changes, min change id: {min_change_id}",
+        //     )));
+        // }
 
         let mut query_cols = vec![];
         for i in 0..(self.parsed_columns().len()) {
