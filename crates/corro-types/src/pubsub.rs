@@ -406,6 +406,10 @@ impl MatcherHandle {
         &self.inner.hash
     }
 
+    pub fn cancel_token(&self) -> CancellationToken {
+        self.inner.cancel.clone()
+    }
+
     pub fn parsed_columns(&self) -> &[ResultColumn] {
         &self.inner.parsed.columns
     }
