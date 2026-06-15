@@ -462,6 +462,7 @@ pub async fn api_v1_queries(
 ) -> impl IntoResponse {
     let (mut tx, body) = CountedBody::channel(
         persistent_gauge!("corro.api.active.streams", "source" => "queries", "protocol" => "http"),
+        "queries",
     );
 
     counter!("corro.api.queries.count").increment(1);

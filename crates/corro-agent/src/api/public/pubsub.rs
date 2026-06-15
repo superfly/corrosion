@@ -102,6 +102,7 @@ async fn sub_by_id(
 
     let (tx, body) = CountedBody::channel(
         persistent_gauge!("corro.api.active.streams", "source" => "subscriptions", "protocol" => "http"),
+        query_hash.clone(),
     );
 
     tokio::spawn(forward_bytes_to_body_sender(id, evt_rx, tx, tripwire));
@@ -710,8 +711,11 @@ pub async fn api_v1_subs(
         Err(e) => return hyper::Response::from(MatcherUpsertError::from(e)),
     };
 
+    let query_hash = handle.hash().to_owned();
+
     let (tx, body) = CountedBody::channel(
         persistent_gauge!("corro.api.active.streams", "source" => "subscriptions", "protocol" => "http"),
+        query_hash.clone(),
     );
     let (forward_tx, forward_rx) = mpsc::channel(10240);
 
@@ -722,7 +726,6 @@ pub async fn api_v1_subs(
         tripwire,
     ));
 
-    let query_hash = handle.hash().to_owned();
     let matcher_id = match upsert_sub(
         handle,
         maybe_created,

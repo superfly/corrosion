@@ -1,6 +1,7 @@
 use metrics::{counter, gauge, histogram, Counter, Histogram};
 use std::{
     fmt::{self, Debug, Formatter},
+    task::{Context, Poll},
     time::{Duration, Instant},
 };
 use tokio::{
@@ -54,20 +55,23 @@ impl<T: Debug> Debug for CorroReceiver<T> {
 /// Create a bounded channel which tracks capacity with a label
 pub fn bounded<T: Send + 'static>(
     capacity: usize,
-    label: &'static str,
+    label: impl Into<metrics::SharedString>,
 ) -> (CorroSender<T>, CorroReceiver<T>) {
-    persistent_gauge!("corro.runtime.channel.max_capacity", "channel_name" => label)
+    let label: metrics::SharedString = label.into();
+
+    persistent_gauge!("corro.runtime.channel.max_capacity", "channel_name" => label.clone())
         .set(capacity as f64);
 
     // Count the number of sends and receives going through the channel
-    let send_count = counter!("corro.runtime.channel.send_count", "channel_name" => label);
-    let recv_count = counter!("corro.runtime.channel.recv_count", "channel_name" => label);
+    let send_count = counter!("corro.runtime.channel.send_count", "channel_name" => label.clone());
+    let recv_count = counter!("corro.runtime.channel.recv_count", "channel_name" => label.clone());
 
     // How many times did we fail to send
-    let failed_sends = counter!("corro.runtime.channel.failed_send_count", "channel_name" => label);
+    let failed_sends =
+        counter!("corro.runtime.channel.failed_send_count", "channel_name" => label.clone());
 
     // Track current capacity and send time over time
-    let capacity_gauge = gauge!("corro.runtime.channel.capacity", "channel_name" => label);
+    let capacity_gauge = gauge!("corro.runtime.channel.capacity", "channel_name" => label.clone());
     let send_time = histogram!("corro.runtime.channel.send_delay", "channel_name" => label);
 
     let (tx, rx) = channel(capacity);
@@ -167,6 +171,14 @@ impl<T> CorroSender<T> {
                 self.failed_sends.increment(1);
             })
     }
+
+    pub fn is_closed(&self) -> bool {
+        self.inner.is_closed()
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.inner.capacity()
+    }
 }
 
 impl<T> CorroReceiver<T> {
@@ -186,5 +198,15 @@ impl<T> CorroReceiver<T> {
         self.inner.blocking_recv().inspect(|_r| {
             self.recv_count.increment(1);
         })
+    }
+
+    pub fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Option<T>> {
+        match self.inner.poll_recv(cx) {
+            Poll::Ready(Some(value)) => {
+                self.recv_count.increment(1);
+                Poll::Ready(Some(value))
+            }
+            other => other,
+        }
     }
 }
