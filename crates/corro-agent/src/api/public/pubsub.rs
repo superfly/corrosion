@@ -398,7 +398,7 @@ async fn catch_up_sub_from(
         }
     });
 
-    let changes_res = {
+    let last_change_id_res = {
         let mut conn = matcher.pool().get().await?;
         block_in_place(|| {
             let conn_tx = conn.transaction()?;
@@ -413,7 +413,7 @@ async fn catch_up_sub_from(
 
     task.await??;
 
-    Ok(changes_res?)
+    Ok(last_change_id_res?)
 }
 
 pub async fn catch_up_sub(
