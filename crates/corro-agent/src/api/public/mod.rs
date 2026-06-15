@@ -500,6 +500,7 @@ pub async fn api_v1_queries(
         debug!("query body channel done");
     });
 
+    trace!("building query rows response...");
     assert_sometimes!(true, "Corrosion accepts queries");
 
     match build_query_rows_response(&agent, client_addr, data_tx, stmt, params.timeout).await {
