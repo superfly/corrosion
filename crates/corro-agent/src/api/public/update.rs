@@ -56,6 +56,7 @@ pub async fn api_v1_updates(
 
     let (tx, body) = CountedBody::channel(
         persistent_gauge!("corro.api.active.streams", "source" => "updates", "protocol" => "http"),
+        "updates",
     );
 
     let (update_id, sub_rx) =
