@@ -77,14 +77,24 @@ pub fn bounded<T: Send + 'static>(
     let (tx, rx) = channel(capacity);
 
     let threshold = (capacity as f64 * 0.9) as usize;
-    let inner_channel = tx.clone();
+    // Use a weak sender for monitoring so the reporter task never keeps the
+    // channel's sender count above zero. Holding a strong `Sender` clone here
+    // would prevent the receiver from ever observing closure once every real
+    // sender is dropped (e.g. HTTP body streams that terminate by dropping the
+    // sender would hang forever).
+    let weak_tx = tx.downgrade();
     tokio::spawn(async move {
         let mut ticks_since_report = 0;
         let mut tick = interval(Duration::from_secs(1));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut prev = inner_channel.capacity();
+        let mut prev = capacity;
         loop {
             tick.tick().await;
+            // Stop once all real senders are gone (or the receiver is closed),
+            // so we don't artificially keep the channel alive.
+            let Some(inner_channel) = weak_tx.upgrade() else {
+                break;
+            };
             if inner_channel.is_closed() {
                 break;
             }
