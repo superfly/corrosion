@@ -339,6 +339,8 @@ pub enum CatchUpError {
     Matcher(#[from] MatcherError),
     #[error(transparent)]
     Join(#[from] JoinError),
+    #[error("subscription cancelled")]
+    Cancelled,
 }
 
 fn error_to_query_event_bytes<E: ToCompactString>(buf: &mut BytesMut, e: E) -> Bytes {
@@ -363,66 +365,55 @@ fn error_to_query_event_bytes_with_meta<E: ToCompactString>(
     (error_to_query_event_bytes(buf, e), QueryEventMeta::Error)
 }
 
-async fn catch_up_sub_anew(
+async fn catch_up_sub_from(
     matcher: &MatcherHandle,
     evt_tx: &mpsc::Sender<(Bytes, QueryEventMeta)>,
+    from: Option<ChangeId>,
 ) -> Result<ChangeId, CatchUpError> {
     let (q_tx, mut q_rx) = mpsc::channel(10240);
 
+    let cancel = matcher.cancel_token();
     let task = tokio::spawn({
         let evt_tx = evt_tx.clone();
         async move {
             let mut buf = BytesMut::new();
-            while let Some(event) = q_rx.recv().await {
-                evt_tx
-                    .send(make_query_event_bytes(&mut buf, &event)?)
-                    .await?;
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => {
+                        debug!("subscription cancelled, stopping catch_up_sub_anew queue task");
+                        return Err(CatchUpError::Cancelled);
+                    }
+                    maybe_event = q_rx.recv() => match maybe_event {
+                        Some(event) => {
+                            evt_tx
+                                .send(make_query_event_bytes(&mut buf, &event)?)
+                                .await?;
+                        }
+                        None => break,
+                    },
+                }
             }
             Ok::<_, CatchUpError>(())
         }
     });
 
-    let last_change_id = {
+    let last_change_id_res = {
         let mut conn = matcher.pool().get().await?;
         block_in_place(|| {
             let conn_tx = conn.transaction()?;
-            matcher.all_rows(&conn_tx, q_tx)
-        })?
-    };
-
-    task.await??;
-
-    Ok(last_change_id)
-}
-
-async fn catch_up_sub_from(
-    matcher: &MatcherHandle,
-    from: ChangeId,
-    evt_tx: &mpsc::Sender<(Bytes, QueryEventMeta)>,
-) -> Result<ChangeId, CatchUpError> {
-    let (q_tx, mut q_rx) = mpsc::channel(10240);
-
-    let task = tokio::spawn({
-        let evt_tx = evt_tx.clone();
-        async move {
-            let mut buf = BytesMut::new();
-            while let Some(event) = q_rx.recv().await {
-                evt_tx
-                    .send(make_query_event_bytes(&mut buf, &event)?)
-                    .await?;
+            match from {
+                Some(from) => matcher
+                    .changes_since(from, &conn_tx, q_tx)
+                    .map_err(MatcherError::Sqlite),
+                None => matcher.all_rows(&conn_tx, q_tx),
             }
-            Ok::<_, CatchUpError>(())
-        }
-    });
-
-    let last_change_id = {
-        let conn = matcher.pool().get().await?;
-        block_in_place(|| matcher.changes_since(from, &conn, q_tx))?
+        })
     };
 
     task.await??;
 
-    Ok(last_change_id)
+    Ok(last_change_id_res?)
 }
 
 pub async fn catch_up_sub(
@@ -479,16 +470,16 @@ pub async fn catch_up_sub(
                     };
                     block_in_place(|| matcher.max_change_id(&conn)).map_err(CatchUpError::from)
                 } else {
-                    catch_up_sub_anew(&matcher, &evt_tx).await
+                    catch_up_sub_from(&matcher, &evt_tx, None).await
                 }
             }
-            Some(from) => catch_up_sub_from(&matcher, from, &evt_tx).await,
+            Some(from) => catch_up_sub_from(&matcher, &evt_tx, Some(from)).await,
         };
 
         match res {
             Ok(change_id) => change_id,
             Err(e) => {
-                if !matches!(e, CatchUpError::Send(_)) {
+                if !matches!(e, CatchUpError::Send(_) | CatchUpError::Cancelled) {
                     _ = evt_tx
                         .send(error_to_query_event_bytes_with_meta(&mut buf, e))
                         .await;
@@ -541,12 +532,12 @@ pub async fn catch_up_sub(
                 // missed some updates!
                 info!(sub_id = %matcher.id(), "attempt #{} to catch up subcription from change id: {change_id:?} (last: {last_change_id:?})", i+1);
 
-                let res = catch_up_sub_from(&matcher, last_change_id, &evt_tx).await;
+                let res = catch_up_sub_from(&matcher, &evt_tx, Some(last_change_id)).await;
 
                 match res {
                     Ok(new_last_change_id) => last_change_id = new_last_change_id,
                     Err(e) => {
-                        if !matches!(e, CatchUpError::Send(_)) {
+                        if !matches!(e, CatchUpError::Send(_) | CatchUpError::Cancelled) {
                             _ = evt_tx
                                 .send(error_to_query_event_bytes_with_meta(&mut buf, e))
                                 .await;
