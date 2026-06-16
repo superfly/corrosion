@@ -19,7 +19,7 @@ use corro_types::{
     actor::{ActorId, ClusterId},
     api::{ExecResult, QueryEvent, Statement},
     base::CrsqlDbVersion,
-    config::{default_admin_path, Config, ConfigError, LogFormat, OtelConfig},
+    config::{default_admin_path, AuthzConfig, Config, ConfigError, LogFormat, OtelConfig},
     sqlite::CrConn,
 };
 use futures::StreamExt;
@@ -636,7 +636,15 @@ impl Cli {
     fn api_client(&self) -> Result<CorrosionApiClient, ConfigError> {
         API_CLIENT
             .get_or_try_init(|| {
-                CorrosionApiClient::new(self.api_addr()?)
+                // Best-effort read of the bearer token from config. If `--api-addr`
+                // is provided without a usable config file, fall through to an
+                // unauthenticated client rather than failing here.
+                let auth_token = self.config().ok().and_then(|c| {
+                    c.api.authorization.map(|authz| match authz {
+                        AuthzConfig::BearerToken(token) => token,
+                    })
+                });
+                CorrosionApiClient::with_auth_token(self.api_addr()?, auth_token)
                     .map_err(|err| config::ConfigError::Foreign(Box::new(err)).into())
             })
             .cloned()
