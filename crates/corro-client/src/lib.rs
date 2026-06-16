@@ -48,6 +48,33 @@ impl CorrosionApiClient {
         })
     }
 
+    /// Build a client that sets `Authorization: Bearer <auth_token>` on every request when
+    /// `auth_token` is set. Passing `None` is equivalent to [`Self::new`].
+    pub fn with_auth_token(
+        api_addr: SocketAddr,
+        auth_token: Option<String>,
+    ) -> Result<Self, Error> {
+        let mut builder = reqwest::ClientBuilder::new()
+            .http2_prior_knowledge()
+            .connect_timeout(HTTP2_CONNECT_TIMEOUT)
+            .http2_keep_alive_interval(Some(HTTP2_KEEP_ALIVE_INTERVAL))
+            .http2_keep_alive_timeout(HTTP2_KEEP_ALIVE_INTERVAL / 2);
+
+        if let Some(token) = auth_token {
+            let mut value = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
+                .map_err(|_| Error::InvalidAuthToken)?;
+            value.set_sensitive(true);
+            let mut headers = reqwest::header::HeaderMap::new();
+            headers.insert(reqwest::header::AUTHORIZATION, value);
+            builder = builder.default_headers(headers);
+        }
+
+        Ok(Self {
+            api_addr,
+            api_client: builder.build()?,
+        })
+    }
+
     /// Execute a single query against a Corrosion node, deserializing each row into `T`.
     /// Optionally accepts a timeout for the request.
     ///
@@ -673,6 +700,9 @@ pub enum Error {
 
     #[error("could not retrieve subscription id from headers")]
     ExpectedQueryId,
+
+    #[error("auth token contains characters that are not valid in an HTTP header value")]
+    InvalidAuthToken,
 }
 
 #[cfg(test)]
