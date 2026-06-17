@@ -793,6 +793,49 @@ struct TestRecord {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn test_bi_stream_rejects_when_sync_at_capacity() -> eyre::Result<()> {
+    _ = tracing_subscriber::fmt::try_init();
+    let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
+
+    let ta1 = launch_test_agent(|conf| conf.build(), tripwire.clone()).await?;
+    let ta2 = launch_test_agent(|conf| conf.build(), tripwire.clone()).await?;
+
+    // Pre-acquire all 3 sync permits on ta1 so the next inbound bi-stream
+    // must be rejected by `spawn_bipayload_handler`'s new acquire-or-reject
+    // path. Permits are released when the test ends (RAII).
+    let sem = ta1.agent.limits().sync.clone();
+    let _p1 = sem.clone().try_acquire_owned().expect("permit 1");
+    let _p2 = sem.clone().try_acquire_owned().expect("permit 2");
+    let _p3 = sem.try_acquire_owned().expect("permit 3");
+
+    let (rtt_tx, _rtt_rx) = mpsc::channel(1024);
+    let ta2_transport = Transport::new(&ta2.agent.config().gossip, rtt_tx.clone()).await?;
+
+    let res = parallel_sync(
+        &ta2.agent,
+        &ta2_transport,
+        vec![(ta1.agent.actor_id(), ta1.agent.gossip_addr())],
+        generate_sync(&ta2.bookie, ta2.agent.actor_id()).await,
+    )
+    .await;
+
+    // The rejection variant is decoded on the client side in
+    // `parallel_sync` (peer/mod.rs) and propagated via `SyncError::Rejection`.
+    let err = res.expect_err("sync should be rejected at capacity");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.to_lowercase().contains("max concurrency"),
+        "unexpected error: {msg}"
+    );
+
+    drop((_p1, _p2, _p3));
+    tripwire_tx.send(()).await.ok();
+    tripwire_worker.await;
+    wait_for_all_pending_handles().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn test_clear_empty_versions() -> eyre::Result<()> {
     _ = tracing_subscriber::fmt::try_init();
 

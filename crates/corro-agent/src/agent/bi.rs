@@ -1,7 +1,9 @@
-use crate::api::peer::serve_sync;
+use crate::api::peer::{encode_write_sync_msg, serve_sync};
+use bytes::BytesMut;
 use corro_types::{
     agent::{Agent, Bookie},
     broadcast::{BiPayload, BiPayloadV1},
+    sync::{SyncMessage, SyncMessageV1, SyncRejectionV1},
 };
 use metrics::counter;
 use speedy::Readable;
@@ -9,7 +11,7 @@ use std::time::Duration;
 use tokio::time::timeout;
 use tokio_stream::StreamExt;
 use tokio_util::codec::{FramedRead, LengthDelimitedCodec};
-use tracing::{debug, error, trace, warn};
+use tracing::{debug, error, info_span, trace, warn, Instrument};
 use tripwire::Tripwire;
 
 /// Spawn a task that listens for incoming bi-directional sync streams
@@ -51,11 +53,61 @@ pub fn spawn_bipayload_handler(
                 conn.remote_address()
             );
 
-            // TODO: implement concurrency limit for sync requests
+            // Bound the number of in-flight bi-handler tasks. All bi-streams
+            // are sync requests today, so we reuse `Limits.sync` rather than
+            // adding a parallel counter. Acquiring before `tokio::spawn`
+            // prevents an unbounded peer from exhausting tasks/memory just
+            // by opening streams.
+            let permit = match agent.limits().sync.clone().try_acquire_owned() {
+                Ok(p) => p,
+                Err(_) => {
+                    counter!("corro.peer.stream.accept.rejected.total", "type" => "bi")
+                        .increment(1);
+                    warn!(
+                        "rejecting bi-stream from {}: sync concurrency limit reached",
+                        conn.remote_address()
+                    );
+
+                    // Best-effort: tell the peer why we rejected, then drop
+                    // both stream halves. A slow peer must not wedge the
+                    // accept loop, hence the timeout.
+                    let mut tx = tx;
+                    let _ = timeout(Duration::from_secs(5), async {
+                        let mut codec = LengthDelimitedCodec::builder()
+                            .max_frame_length(100 * 1_024 * 1_024)
+                            .new_codec();
+                        let mut send_buf = BytesMut::new();
+                        let mut encode_buf = BytesMut::new();
+                        if let Err(e) = encode_write_sync_msg(
+                            &mut codec,
+                            &mut encode_buf,
+                            &mut send_buf,
+                            SyncMessage::V1(SyncMessageV1::Rejection(
+                                SyncRejectionV1::MaxConcurrencyReached,
+                            )),
+                            &mut tx,
+                        )
+                        .instrument(info_span!("write_bi_rejection"))
+                        .await
+                        {
+                            debug!("could not write bi-stream rejection: {e}");
+                        }
+                        let _ = tx.finish();
+                    })
+                    .await;
+
+                    // `rx` is dropped at scope end, closing the receive side.
+                    continue;
+                }
+            };
+
             tokio::spawn({
                 let agent = agent.clone();
                 let bookie = bookie.clone();
                 async move {
+                    // Hold the permit for the task's lifetime; drops on exit
+                    // (including panic), releasing capacity for the next peer.
+                    let _permit = permit;
                     let mut framed = FramedRead::new(
                         rx,
                         LengthDelimitedCodec::builder()
