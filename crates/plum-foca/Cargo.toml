@@ -11,5 +11,8 @@ strum = { workspace = true }
 tracing = { workspace = true }
 rand = { workspace = true }
 
+[dev-dependencies]
+tracing-subscriber = { workspace = true }
+
 [lints]
 workspace = true

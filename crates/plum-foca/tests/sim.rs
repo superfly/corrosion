@@ -16,7 +16,12 @@
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
 use std::fmt;
-use std::time::Duration;
+use std::sync::LazyLock;
+use std::time::{Duration, Instant};
+
+/// Fixed epoch so the sim can map virtual µs to a monotonic `Instant` for
+/// `Runtime::now()` — keeps time-windowed protocol logic deterministic.
+static SIM_EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
 
 use indexmap::IndexMap;
 use plum_foca::{
@@ -157,6 +162,8 @@ struct Outbox {
     scheduled: Vec<(Timer<MId, NId>, Duration)>,
     delivered: Vec<SimPayload>,
     notifications: Vec<Notification<MId, NId>>,
+    /// current virtual time in µs, kept in sync with `Sim::now`
+    now_us: u64,
 }
 
 impl Runtime<MId, SimPayload, NId> for Outbox {
@@ -185,6 +192,10 @@ impl Runtime<MId, SimPayload, NId> for Outbox {
 
     fn notify(&mut self, notification: Notification<MId, NId>) {
         self.notifications.push(notification);
+    }
+
+    fn now(&self) -> Instant {
+        *SIM_EPOCH + Duration::from_micros(self.now_us)
     }
 }
 
@@ -248,6 +259,8 @@ struct Params {
     rtt_aware: bool,
     /// Probability that any protocol message is dropped in flight.
     loss: f64,
+    /// PRUNE throttle window; `None` = prune every over-threshold duplicate.
+    prune_throttle: Option<Duration>,
     seed: u64,
 }
 
@@ -261,6 +274,7 @@ impl Params {
             broadcast_window: Duration::from_millis(n as u64 * 5),
             rtt_aware: true,
             loss: 0.0,
+            prune_throttle: None,
             seed: 42,
         }
     }
@@ -277,6 +291,7 @@ impl Params {
             prune_threshold: 5,
             max_received_entries: (self.n as u32 * self.msgs_per_node) as usize + 1,
             max_cached_payloads: 4096,
+            prune_throttle: self.prune_throttle,
         }
     }
 
@@ -309,6 +324,7 @@ struct Stats {
     not_cached: u64,
     promotions: u64,
     demotions: u64,
+    prune_suppressed: u64,
     /// One entry per delivery: number of gossip hops from the origin.
     hops: Vec<u32>,
     /// One entry per delivery: broadcast-to-delivery latency in µs.
@@ -444,6 +460,7 @@ impl Sim {
         while let Some(Scheduled { at, ev, .. }) = self.queue.pop() {
             debug_assert!(at >= self.now);
             self.now = at;
+            self.outbox.now_us = at;
             match ev {
                 Event::Originate { node, seq } => {
                     let payload = SimPayload { origin: node, seq };
@@ -512,7 +529,10 @@ impl Sim {
                 Notification::MessageMissing(count) => self.stats.missing += count as u64,
                 Notification::PayloadNotCached(_) => self.stats.not_cached += 1,
                 Notification::PeerMovedToEager(_) => self.stats.promotions += 1,
-                Notification::PeerMovedToLazy(_) => self.stats.demotions += 1,
+                Notification::PeerDroppedFromEager(_) => self.stats.demotions += 1,
+                // lazy-set insert; the real eager→lazy demotion is counted above
+                Notification::PeerMovedToLazy(_) => {}
+                Notification::PruneSuppressed(_) => self.stats.prune_suppressed += 1,
             }
         }
 
@@ -641,6 +661,7 @@ impl Sim {
             sent_ihave: self.stats.sent_ihave,
             sent_graft: self.stats.sent_graft,
             sent_prune: self.stats.sent_prune,
+            prune_suppressed: self.stats.prune_suppressed,
             longhaul_frac: self.stats.longhaul_gossip as f64 / self.stats.sent_gossip.max(1) as f64,
             duplicates: self.stats.duplicates,
             dropped: self.stats.dropped,
@@ -677,6 +698,7 @@ struct Report {
     sent_ihave: u64,
     sent_graft: u64,
     sent_prune: u64,
+    prune_suppressed: u64,
     longhaul_frac: f64,
     duplicates: u64,
     dropped: u64,
@@ -719,11 +741,12 @@ impl fmt::Display for Report {
         )?;
         writeln!(
             f,
-            "  traffic    gossip={} ihave={} graft={} prune={} dropped={}  longhaul-gossip={:.1}%",
+            "  traffic    gossip={} ihave={} graft={} prune={} prune_suppressed={} dropped={}  longhaul-gossip={:.1}%",
             self.sent_gossip,
             self.sent_ihave,
             self.sent_graft,
             self.sent_prune,
+            self.prune_suppressed,
             self.dropped,
             self.longhaul_frac * 100.0,
         )?;
@@ -1118,6 +1141,7 @@ impl GossipSim {
             sent_ihave: 0,
             sent_graft: 0,
             sent_prune: 0,
+            prune_suppressed: 0,
             longhaul_frac: self.stats.longhaul_gossip as f64 / self.stats.sent_gossip.max(1) as f64,
             duplicates: self.stats.duplicates,
             dropped: self.stats.dropped,
@@ -1131,6 +1155,41 @@ impl GossipSim {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+/// Install a tracing subscriber driven by `RUST_LOG` (no-op if RUST_LOG is
+/// unset or a subscriber is already installed). The plumtree state machine
+/// logs every graft/prune and eager<->lazy move via `trace!`, independent of
+/// the sim's runtime, so this surfaces them. Each line carries `self_actor_id`
+/// and `peer`, so repeated churn on the same pair is visible.
+fn init_trace_logging() {
+    use tracing_subscriber::EnvFilter;
+    let _ = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_env_filter(EnvFilter::from_default_env())
+        .with_target(false)
+        // virtual time, not wall-clock — line order is the sim's causal order.
+        .without_time()
+        .try_init();
+}
+
+/// Emit plum-foca trace logs for a single 2k plumtree run so tree stability —
+/// whether we keep grafting/pruning the same node pairs — can be inspected.
+/// Full `plum_foca=trace` is ~18M lines (dominated by per-forward gossip), so
+/// filter to the topology-churn events. Run with:
+///
+/// ```text
+/// RUST_LOG=plum_foca=trace cargo test --release -p plum-foca --test sim \
+///   sim_2k_tree_stability -- --ignored --nocapture 2>/dev/null \
+///   | grep -E 'moved to eager|moved to lazy|PRUNE|graft|evicted' \
+///   > /tmp/plumtree_2k_stability.log
+/// ```
+#[test]
+#[ignore = "emits trace logs; run in release with RUST_LOG=plum_foca=trace"]
+fn sim_2k_tree_stability() {
+    init_trace_logging();
+    let report = Sim::new(Params::new(2000, 8)).run();
+    eprintln!("{report}");
+}
 
 /// Every node broadcasts once; every message must reach every other node.
 #[test]
@@ -1320,4 +1379,39 @@ fn sim_2k_rtt_awareness() {
     assert_eq!(aware.delivered, aware.expected);
     assert_eq!(blind.delivered, blind.expected);
     assert!(aware.longhaul_frac < blind.longhaul_frac);
+}
+
+/// Measure the prune-throttle (B2): same 2k run with throttling off vs a 1s
+/// per-peer PRUNE window. Expect prune traffic to drop sharply with delivery
+/// and full-cluster latency preserved (the in-flight duplicate bursts no longer
+/// each draw a PRUNE). Run with:
+///   cargo test --release -p plum-foca --test sim sim_2k_prune_throttle -- --ignored --nocapture
+#[test]
+#[ignore = "slow; run in release mode"]
+fn sim_2k_prune_throttle() {
+    let baseline = Sim::new(Params::new(2000, 8)).run();
+    let mut throttled_params = Params::new(2000, 8);
+    throttled_params.prune_throttle = Some(Duration::from_secs(1));
+    let throttled = Sim::new(throttled_params).run();
+    println!("prune-throttle OFF:\n{baseline}");
+    println!("prune-throttle 1s:\n{throttled}");
+
+    // delivery must be unharmed
+    assert_eq!(throttled.delivered, throttled.expected, "throttle broke delivery");
+    assert_eq!(throttled.missing, 0);
+    // prune traffic should fall substantially
+    assert!(
+        throttled.sent_prune < baseline.sent_prune / 2,
+        "throttle didn't cut prune traffic: {} -> {}",
+        baseline.sent_prune,
+        throttled.sent_prune
+    );
+    assert!(throttled.prune_suppressed > 0, "nothing was suppressed");
+    // convergence shouldn't regress (allow a small margin for timing shifts)
+    assert!(
+        throttled.full_p99_ms <= baseline.full_p99_ms + baseline.full_p99_ms / 10,
+        "full-cluster p99 regressed: {}ms -> {}ms",
+        baseline.full_p99_ms,
+        throttled.full_p99_ms
+    );
 }

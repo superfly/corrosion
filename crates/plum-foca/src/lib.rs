@@ -6,8 +6,8 @@ use speedy::{Readable, Writable};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
 use std::hash::Hash;
-use std::time::Duration;
-use tracing::{debug, trace};
+use std::time::{Duration, Instant};
+use tracing::{debug, trace, warn};
 
 pub trait MessageId: Clone + Eq + Hash + Debug + Send + 'static {}
 
@@ -85,6 +85,12 @@ pub struct Config {
     pub max_received_entries: usize,
     /// cap on cached payload used to respond to GRAFT requests.
     pub max_cached_payloads: usize,
+    /// If set, suppress repeat PRUNEs to the same peer within this window.
+    /// A peer that keeps eager-pushing in-flight messages after we prune it
+    /// would otherwise draw one PRUNE per duplicate; this collapses that burst
+    /// to one PRUNE per window. `None` disables throttling (prune every
+    /// over-threshold duplicate, the original behavior).
+    pub prune_throttle: Option<Duration>,
 }
 
 impl Default for Config {
@@ -98,6 +104,7 @@ impl Default for Config {
             prune_threshold: 1,
             max_received_entries: 10000,
             max_cached_payloads: 8192,
+            prune_throttle: None,
         }
     }
 }
@@ -125,10 +132,13 @@ pub enum Timer<I: MessageId, N: NodeId> {
 #[derive(Debug, Clone)]
 pub enum Notification<I: MessageId, N: NodeId> {
     PeerMovedToEager(N),
+    PeerDroppedFromEager(N),
     PeerMovedToLazy(N),
     DuplicateMessage(I),
     PayloadNotCached(I),
     MessageMissing(usize),
+    /// A PRUNE to this peer was suppressed by the prune-throttle window.
+    PruneSuppressed(N),
 }
 
 pub trait Runtime<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId> {
@@ -147,6 +157,12 @@ pub trait Runtime<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId
 
     /// Observable protocol event.
     fn notify(&mut self, notification: Notification<I, N>);
+
+    /// Current time. The state machine is sans-IO and owns no clock, so the
+    /// runtime supplies one — used for time-windowed decisions like the
+    /// prune throttle. In production this is `Instant::now()`; the simulator
+    /// returns virtual time so behavior stays deterministic.
+    fn now(&self) -> Instant;
 }
 
 /// Messages exchanged between Plumtree peers.
@@ -257,6 +273,40 @@ impl<I: MessageId, P: Payload> PayloadCache<I, P> {
     }
 }
 
+/// Per-peer PRUNE suppression: records, per peer, the instant until which a
+/// repeat PRUNE should be suppressed. Bounded by the set of peers pruned within
+/// the window (expired entries are dropped on insert).
+#[derive(Debug)]
+struct PruneThrottle<N: NodeId> {
+    until: HashMap<N, Instant>,
+}
+
+// Manual impl: derive(Default) would wrongly require `N: Default`.
+impl<N: NodeId> Default for PruneThrottle<N> {
+    fn default() -> Self {
+        Self {
+            until: HashMap::new(),
+        }
+    }
+}
+
+impl<N: NodeId> PruneThrottle<N> {
+    fn throttled(&self, peer: &N, now: Instant) -> bool {
+        self.until.get(peer).is_some_and(|t| now < *t)
+    }
+
+    fn record(&mut self, peer: N, now: Instant, ttl: Duration) {
+        self.until.insert(peer, now + ttl);
+    }
+
+    /// Drop expired entries. Called periodically from `tick` so `record` stays
+    /// O(1) on the hot path; the map holds only peers throttled within the
+    /// window between sweeps.
+    fn sweep(&mut self, now: Instant) {
+        self.until.retain(|_, t| *t > now);
+    }
+}
+
 /// Full Plumtree protocol state for one local node.
 #[derive(Debug)]
 pub struct PlumtreeState<
@@ -280,6 +330,7 @@ pub struct PlumtreeState<
     seen: S,
     cache: PayloadCache<I, P>,
     rng: SmallRng,
+    prune_throttle: PruneThrottle<N>,
 }
 
 impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStore<I>>
@@ -309,6 +360,7 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
             seen,
             cache: PayloadCache::new(cache_size),
             rng: SmallRng::seed_from_u64(seed),
+            prune_throttle: PruneThrottle::default(),
         }
     }
 
@@ -364,19 +416,41 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
         let self_actor_id = self.local_id.clone();
         if let Some(duplicates) = self.seen.observe(id.clone(), round) {
             if duplicates > self.config.prune_threshold && !self.ring_locked.contains(&sender) {
-                trace!(
-                    ?self_actor_id,
-                    ?sender,
-                    "sending PRUNE due to duplicate gossip, triggered_by: {id:?}"
-                );
-                rt.send(
-                    sender.clone(),
-                    PlumtreeMsg::Prune(PruneMsg {
-                        sender: self.local_id.clone(),
-                        triggered_by: id.clone(),
-                    }),
-                    PlumPrio::P1,
-                );
+                // Suppress the PRUNE *send* (not the demotion) if we already
+                // pruned this peer within the throttle window — the burst of
+                // in-flight duplicates after a prune would otherwise draw one
+                // PRUNE each. Local state still moves the peer to lazy.
+                // TODO: suppress prunes for recently grafted peers? this would help 
+                // with tree stability
+                let suppressed = match self.config.prune_throttle {
+                    Some(ttl) => {
+                        let now = rt.now();
+                        if self.prune_throttle.throttled(&sender, now) {
+                            true
+                        } else {
+                            self.prune_throttle.record(sender.clone(), now, ttl);
+                            false
+                        }
+                    }
+                    None => false,
+                };
+                if suppressed {
+                    rt.notify(Notification::PruneSuppressed(sender.clone()));
+                } else {
+                    trace!(
+                        ?self_actor_id,
+                        ?sender,
+                        "sending PRUNE due to duplicate gossip, triggered_by: {id:?}"
+                    );
+                    rt.send(
+                        sender.clone(),
+                        PlumtreeMsg::Prune(PruneMsg {
+                            sender: self.local_id.clone(),
+                            triggered_by: id.clone(),
+                        }),
+                        PlumPrio::P1,
+                    );
+                }
                 self.move_to_lazy(&sender, rt);
             }
             rt.notify(Notification::DuplicateMessage(id));
@@ -676,6 +750,8 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
     ///
     /// The caller should invoke this on a regular interval.
     pub fn tick(&mut self, rt: &mut impl Runtime<I, P, N>) {
+        self.prune_throttle.sweep(rt.now());
+
         let digests = self.drain_lazy_queue();
         if self.lazy_peers.is_empty() || digests.is_none() {
             return;
@@ -949,21 +1025,31 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
 
     fn move_to_lazy(&mut self, peer: &N, rt: &mut impl Runtime<I, P, N>) {
         if self.ring_locked.contains(peer) {
-            trace!(
+            warn!(
                 self_actor_id = ?self.local_id,
                 ?peer,
                 "move_to_lazy skipped (ring-locked eager peer)"
             );
             return;
         }
+
+        if self.lazy_peers().contains(peer) {
+            return
+        }
+
         let was_eager = self.eager_peers.remove(peer);
-        self.insert_into_lazy(peer.clone());
+        if was_eager {
+            rt.notify(Notification::PeerDroppedFromEager(peer.clone()));
+        }
+        let inserted = self.insert_into_lazy(peer.clone());
         trace!(
             self_actor_id = ?self.local_id,
             ?peer,
             "peer moved to lazy: (was_eager: {was_eager})"
         );
-        rt.notify(Notification::PeerMovedToLazy(peer.clone()));
+        if inserted {
+            rt.notify(Notification::PeerMovedToLazy(peer.clone()));
+        }
     }
 
     /// Ensure a peer is at least in the lazy set so they receive IHave
@@ -1093,6 +1179,7 @@ mod tests {
             max_lazy: 15,
             prune_threshold: 1,
             max_received_entries: 10000,
+            prune_throttle: None,
         }
     }
 
@@ -1155,6 +1242,10 @@ mod tests {
 
         fn notify(&mut self, notification: Notification<TestMsgId, TestNodeId>) {
             self.notifications.push(notification);
+        }
+
+        fn now(&self) -> Instant {
+            Instant::now()
         }
     }
 

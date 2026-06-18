@@ -4,7 +4,7 @@ use std::{
     net::SocketAddr,
     num::NonZeroU32,
     ops::RangeInclusive,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use bytes::{BufMut, Bytes, BytesMut};
@@ -264,6 +264,9 @@ impl plum_foca::Runtime<ChangeId, ChangeV1, ActorId> for CorrosionPlumtreeRuntim
             plum_foca::Notification::PeerMovedToLazy(_) => {
                 counter!("corro.plumtree.peer_to_lazy").increment(1);
             }
+            plum_foca::Notification::PeerDroppedFromEager(_) => {
+                counter!("corro.plumtree.peer_dropped_from_eager").increment(1);
+            }
             plum_foca::Notification::DuplicateMessage(_) => {
                 counter!("corro.plumtree.duplicate_message").increment(1);
             }
@@ -273,7 +276,14 @@ impl plum_foca::Runtime<ChangeId, ChangeV1, ActorId> for CorrosionPlumtreeRuntim
             plum_foca::Notification::MessageMissing(count) => {
                 counter!("corro.plumtree.message_missing").increment(count as u64);
             }
+            plum_foca::Notification::PruneSuppressed(_) => {
+                counter!("corro.plumtree.prune_suppressed").increment(1);
+            }
         }
+    }
+
+    fn now(&self) -> Instant {
+        Instant::now()
     }
 }
 
@@ -295,6 +305,10 @@ pub async fn spawn_plumtree_loop<T: TransportExt + Clone + Send + 'static>(
         max_lazy: 30,
         prune_threshold: 5,
         max_received_entries: 10000,
+        // Suppress repeat PRUNEs to a peer within this window: at 2k the sim
+        // (plum-foca sim_2k_prune_throttle) cut PRUNE traffic ~83% with delivery
+        // and full-cluster latency unchanged.
+        prune_throttle: Some(Duration::from_secs(1)),
     };
 
     plumtree_loop(
@@ -899,6 +913,7 @@ mod tests {
                     max_lazy: 5,
                     prune_threshold: 3,
                     max_received_entries: 10000,
+                    prune_throttle: None,
                 };
                 plumtree_loop(
                     agent_clone.clone(),
