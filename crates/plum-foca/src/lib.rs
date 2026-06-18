@@ -18,10 +18,10 @@ pub trait Payload: Clone + Debug + Send + 'static {
     fn origin(&self) -> Self::NodeId;
 }
 
-pub trait NodeId: Clone + Eq + Hash + Ord + Debug + Send + 'static {}
+pub trait NodeId: Clone + Eq + Hash + Ord + Debug + Send + Copy + 'static {}
 
 impl<T> MessageId for T where T: Clone + Eq + Hash + Debug + Send + 'static {}
-impl<T> NodeId for T where T: Clone + Eq + Hash + Ord + Debug + Send + 'static {}
+impl<T> NodeId for T where T: Clone + Eq + Hash + Ord + Debug + Send + Copy + 'static {}
 
 pub type Round = u32;
 
@@ -361,9 +361,14 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
         } = msg;
         let id = payload.message_id();
 
+        let self_actor_id = self.local_id.clone();
         if let Some(duplicates) = self.seen.observe(id.clone(), round) {
             if duplicates > self.config.prune_threshold && !self.ring_locked.contains(&sender) {
-                trace!(?self.local_id, ?sender, "sending PRUNE due to duplicate gossip");
+                trace!(
+                    ?self_actor_id,
+                    ?sender,
+                    "sending PRUNE due to duplicate gossip, triggered_by: {id:?}"
+                );
                 rt.send(
                     sender.clone(),
                     PlumtreeMsg::Prune(PruneMsg {
@@ -378,10 +383,6 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
             return;
         }
 
-        trace!(
-            ?self.local_id, ?sender, ?id, "forwarding gossip to eager peers",
-        );
-
         self.cache.insert(id.clone(), payload.clone(), round);
         rt.deliver(payload.clone());
 
@@ -392,8 +393,13 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
             .filter(|p| **p != sender && **p != self.local_id && payload.origin() != **p)
             .cloned()
             .collect();
-        let fwd_count = peers.len();
-        if fwd_count > 0 {
+        trace!(
+            ?self_actor_id,
+            ?sender,
+            "forwarding gossip to {} eager peers (id: {id:?}, peers: {peers:?})",
+            peers.len(),
+        );
+        if peers.len() > 0 {
             rt.send_all(
                 peers,
                 PlumtreeMsg::Gossip(GossipMsg {
@@ -404,7 +410,6 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
                 PlumPrio::P1,
             );
         }
-        trace!(?self.local_id, ?id, fwd_count, "gossip forwarded to eager peers");
 
         // if peer is not eager, ensure they are in lazy
         if !self.eager_peers.contains(&sender) {
@@ -414,12 +419,13 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
         if let Some(entry) = self.missing.remove(&id) {
             if let Some(optimization_threshold) = self.config.optimization_threshold {
                 if entry.round + optimization_threshold < round && entry.ihave_sender != sender {
-                    debug!(?id,
-                        ihave_round = entry.round, gossip_round = round,
-                        ihave_sender = ?entry.ihave_sender,
-                        "local={:?} optimization → GRAFT shorter path", self.local_id);
+                    let sender = &entry.ihave_sender;
+                    debug!(
+                        ?self_actor_id,
+                        "got better path for message {id:?} with round {round}, sending graft to {sender:?} "
+                    );
                     rt.send(
-                        entry.ihave_sender.clone(),
+                        sender.clone(),
                         PlumtreeMsg::Graft(GraftMsg {
                             sender: self.local_id.clone(),
                             send: false,
@@ -448,7 +454,6 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
     /// GOSSIP doesn't arrive before the timer fires, we'll GRAFT.
     pub fn handle_ihave(&mut self, msg: IHaveMsg<I, N>, rt: &mut impl Runtime<I, P, N>) {
         let IHaveMsg { sender, digests } = msg;
-        let count = digests.len();
 
         let mut senders = vec![sender.clone()];
         senders.extend(self.random_eager_peers(1, &sender));
@@ -472,14 +477,13 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
             );
         }
 
+        let self_actor_id = &self.local_id;
         if !new_ids.is_empty() {
-            debug!(
-                local = ?self.local_id,
+            trace!(
+                ?self_actor_id,
                 ?sender,
-                count,
-                new_missing = new_ids.len(),
-                total_missing = self.missing.len(),
-                "handle_ihave → scheduled graft timeout batch"
+                "handle_ihave, scheduling graft timeout for {}",
+                new_ids.len(),
             );
             rt.schedule(
                 Timer::IHaveTimeoutBatch {
@@ -509,13 +513,14 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
             return;
         }
 
+        let self_actor_id = &self.local_id;
         for req in requests {
             if let Some((payload, round)) = self.cache.get(&req.id).cloned() {
                 debug!(
-                    id = ?req.id,
-                    "local={:?} sender={:?} graft → sending cached payload",
-                    self.local_id,
-                    sender
+                    ?self_actor_id,
+                    ?sender,
+                    "sending cached payloads requested through graft ({:?})",
+                    req.id
                 );
                 rt.send(
                     sender.clone(),
@@ -528,8 +533,10 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
                 );
             } else {
                 debug!(
-                    "local={:?} sender={:?} graft → NOT CACHED",
-                    self.local_id, sender
+                    ?self_actor_id,
+                    ?sender,
+                    "requested payload no longer cached ({:?})",
+                    req.id,
                 );
                 rt.notify(Notification::PayloadNotCached(req.id));
             }
@@ -539,7 +546,7 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
     /// Handle an incoming PRUNE.
     ///
     pub fn handle_prune(&mut self, msg: PruneMsg<I, N>, rt: &mut impl Runtime<I, P, N>) {
-        debug!(local = ?self.local_id, sender = ?msg.sender, triggered_by = ?msg.triggered_by, "handle_prune");
+        debug!(self_actor_id = ?self.local_id, sender = ?msg.sender, "received prune, triggered by {:?}", msg.triggered_by);
         if !self.ring_locked.contains(&msg.sender) {
             self.move_to_lazy(&msg.sender, rt);
         }
@@ -551,11 +558,10 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
     /// eager peers (round 0), and enqueues IHave for lazy peers.
     pub fn broadcast(&mut self, id: I, payload: P, rt: &mut impl Runtime<I, P, N>) {
         debug!(
-            ?id,
-            eager = self.eager_peers.len(),
-            lazy = self.lazy_peers.len(),
-            "local={:?} broadcast originate",
-            self.local_id
+            self_actor_id = ?self.local_id,
+            "broadcasting message to {} eager and {} lazy",
+            self.eager_peers.len(),
+            self.lazy_peers.len()
         );
 
         self.seen.observe(id.clone(), 0);
@@ -616,7 +622,6 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
 
         let send_to = senders[retries as usize].clone();
         let mut graft_requests = Vec::new();
-        let mut still_missing = Vec::new();
 
         for id in ids {
             if self.seen.contains(&id) {
@@ -634,15 +639,12 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
                 id: id.clone(),
                 round: entry.round,
             });
-            still_missing.push(id);
         }
 
         if !graft_requests.is_empty() {
             debug!(
-                count = graft_requests.len(),
-                ?send_to,
-                "local={:?} IHave timeout → GRAFT batch",
-                self.local_id
+                self_actor_id = ?self.local_id,
+                "Handling ihave time out for {} requests", graft_requests.len(),
             );
             // todo: maybe move this after we actually receive a response?
             self.move_to_eager(&send_to, rt);
@@ -657,12 +659,11 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
                     PlumPrio::P0,
                 );
             }
-        }
 
-        if !still_missing.is_empty() {
+            let ids = graft_requests.iter().map(|r| r.id.clone()).collect();
             rt.schedule(
                 Timer::IHaveTimeoutBatch {
-                    ids: still_missing,
+                    ids: ids,
                     retries: retries + 1,
                     senders,
                 },
@@ -671,7 +672,7 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
         }
     }
 
-    /// Periodic maintenance — flush all pending IHave digests to lazy peers.
+    /// Periodic maintenance — send all pending IHave digests to lazy peers.
     ///
     /// The caller should invoke this on a regular interval.
     pub fn tick(&mut self, rt: &mut impl Runtime<I, P, N>) {
@@ -841,12 +842,12 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
         self.lazy_peers
             .extend(far_pool.iter().skip(eager_far).take(lazy_far).cloned());
         trace!(
-            local = ?self.local_id,
+            self_actor_id = ?self.local_id,
             eager = self.eager_peers.len(),
             lazy = self.lazy_peers.len(),
             ring_locked = self.ring_locked.len(),
             known = self.known_peers.len(),
-            "rebalance complete"
+            "rebalance complete "
         );
     }
 
@@ -939,10 +940,9 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
         self.eager_peers.insert(peer.clone());
         let was_lazy = self.lazy_peers.swap_remove(peer);
         trace!(
-            ?self.local_id,
+            self_actor_id = ?self.local_id,
             ?peer,
-            was_lazy,
-            "peer moved to eager"
+            "peer moved to eager (was_lazy: {was_lazy})"
         );
         rt.notify(Notification::PeerMovedToEager(peer.clone()));
     }
@@ -950,7 +950,7 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
     fn move_to_lazy(&mut self, peer: &N, rt: &mut impl Runtime<I, P, N>) {
         if self.ring_locked.contains(peer) {
             trace!(
-                local = ?self.local_id,
+                self_actor_id = ?self.local_id,
                 ?peer,
                 "move_to_lazy skipped (ring-locked eager peer)"
             );
@@ -959,10 +959,9 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
         let was_eager = self.eager_peers.remove(peer);
         self.insert_into_lazy(peer.clone());
         trace!(
-            ?self.local_id,
+            self_actor_id = ?self.local_id,
             ?peer,
-            was_eager,
-            "peer moved to lazy"
+            "peer moved to lazy: (was_eager: {was_eager})"
         );
         rt.notify(Notification::PeerMovedToLazy(peer.clone()));
     }
@@ -992,16 +991,15 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
         // Lazy is full — evict a random non-ring-locked peer.
         if let Some(evicted) = self.evict_from_lazy() {
             trace!(
-                local = ?self.local_id,
-                ?evicted,
-                new = ?peer,
-                "lazy full → evicted peer to make room"
+                self_actor_id = ?self.local_id,
+                ?peer,
+                "inserted into lazy, evicted peer {evicted:?} to make room"
             );
             self.lazy_peers.insert(peer);
             true
         } else {
             debug!(
-                local = ?self.local_id,
+                self_actor_id = ?self.local_id,
                 ?peer,
                 "lazy full and all ring-locked, peer dropped"
             );
