@@ -23,14 +23,17 @@ use corro_types::{
     base::{CrsqlDbVersion, CrsqlDbVersionRange, CrsqlSeq},
     bookie::BookieDbParams,
     broadcast::{ChangeSource, ChangeV1, Changeset, ChangesetParts, FocaCmd, FocaInput},
+    change::{Change, SqliteValue},
     channel::CorroReceiver,
     config::AuthzConfig,
-    pubsub::SubsManager,
+    pubsub::{pack_columns, unpack_columns, SubsManager},
     schema::{apply_schema, parse_sql},
     sqlite::unnest_param,
     updates::{match_changes, match_changes_from_db_version},
 };
 use corro_utils::ThrottleMap;
+use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
 use super::BcastCache;
 use crate::api::public::update::api_v1_updates;
@@ -56,7 +59,7 @@ use spawn::spawn_counted;
 use sqlite_pool::{Committable, InterruptibleTransaction};
 use std::{
     cmp,
-    collections::{BTreeMap, HashSet},
+    collections::BTreeMap,
     convert::Infallible,
     net::SocketAddr,
     ops::Deref,
@@ -1329,6 +1332,132 @@ pub fn process_complete_version<T: Deref<Target = rusqlite::Connection> + Commit
     // );
     debug_assert!(len <= seqs.len(), "change from actor {actor_id} version {version} has len {len} but seqs range is {seqs:?} and last_seq is {last_seq}");
 
+    // Preflight query: check which rows currently exist in the actual tables
+    // so we can classify inserts vs updates vs resurrections afterwards.
+    let schema = agent.schema().read();
+    let mut changes_by_table: BTreeMap<TableName, Vec<&Change>> = BTreeMap::new();
+    for change in &changes {
+        changes_by_table
+            .entry(change.table.clone())
+            .or_default()
+            .push(change);
+    }
+
+    let mut existing_pks: HashMap<TableName, HashSet<Vec<u8>>> = HashMap::new();
+
+    for (table_name, table_changes) in &changes_by_table {
+        let Some(table) = schema.tables.get(table_name.as_str()) else {
+            continue;
+        };
+
+        let pk_cols: Vec<&String> = table
+            .columns
+            .iter()
+            .filter_map(|(name, col)| if col.primary_key { Some(name) } else { None })
+            .collect();
+
+        if pk_cols.is_empty() {
+            continue;
+        }
+
+        let num_pk_cols = pk_cols.len();
+
+        // Unpack PKs for all changes targeting this table
+        let mut col_arrays: Vec<Vec<SqliteValue>> = vec![Vec::new(); num_pk_cols];
+        let mut any_unpacked = false;
+
+        for change in table_changes {
+            match unpack_columns(&change.pk) {
+                Ok(pk_values) if pk_values.len() == num_pk_cols => {
+                    any_unpacked = true;
+                    for (i, val) in pk_values.iter().enumerate() {
+                        col_arrays[i].push(val.to_owned());
+                    }
+                }
+                _ => continue,
+            }
+        }
+
+        if !any_unpacked {
+            continue;
+        }
+
+        // Build subquery: SELECT value0 AS c0, value1 AS c1, ... FROM unnest(?, ?, ...)
+        let subquery_cols: Vec<String> = (0..num_pk_cols)
+            .map(|i| format!("value{i} AS c{i}"))
+            .collect();
+
+        let join_conditions: Vec<String> = pk_cols
+            .iter()
+            .enumerate()
+            .map(|(i, col)| format!("t.\"{col}\" = p.c{i}"))
+            .collect();
+
+        let select_cols = pk_cols
+            .iter()
+            .map(|c| format!("t.\"{c}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let unnest_params = (0..num_pk_cols).map(|_| "?").collect::<Vec<_>>().join(", ");
+
+        let subquery_cols_str = subquery_cols.join(", ");
+        let join_conditions_str = join_conditions.join(" AND ");
+
+        let sql = format!(
+            "SELECT DISTINCT {select_cols} FROM \"{table_name}\" t \
+             JOIN (SELECT {subquery_cols_str} FROM unnest({unnest_params})) p ON {join_conditions_str}"
+        );
+
+        let unnest_params_owned: Vec<Rc<Vec<rusqlite::types::Value>>> = col_arrays
+            .iter()
+            .map(|arr| unnest_param(arr.iter()))
+            .collect();
+
+        let params_refs: Vec<&dyn rusqlite::ToSql> = unnest_params_owned
+            .iter()
+            .map(|p| p as &dyn rusqlite::ToSql)
+            .collect();
+
+        let mut prepped = match sp.prepare_cached(&sql) {
+            Ok(p) => p,
+            Err(e) => {
+                warn!("could not prepare preflight query for table {table_name}: {e}");
+                continue;
+            }
+        };
+
+        let rows = match prepped.query_map(&params_refs[..], |row| {
+            let mut pk_values = Vec::with_capacity(num_pk_cols);
+            for i in 0..num_pk_cols {
+                pk_values.push(row.get::<_, SqliteValue>(i)?);
+            }
+            Ok(pk_values)
+        }) {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("could not execute preflight query for table {table_name}: {e}");
+                continue;
+            }
+        };
+
+        let mut existing = HashSet::new();
+        for row in rows {
+            let pk_values = match row {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!("error reading preflight row for table {table_name}: {e}");
+                    continue;
+                }
+            };
+            if let Ok(packed) = pack_columns(&pk_values) {
+                existing.insert(packed);
+            }
+        }
+
+        existing_pks.insert(table_name.clone(), existing);
+    }
+
     // Insert all the changes in a single statement
     // This will return a non zero rowid only if the change impacted the database
     let mut stmt = sp.prepare_cached(
@@ -1386,6 +1515,29 @@ pub fn process_complete_version<T: Deref<Target = rusqlite::Connection> + Commit
         assert!(seq == change.seq);
         if rowid != 0 {
             let table_name = change.table.clone();
+
+            let existed_before = existing_pks
+                .get(&table_name)
+                .map(|set| set.contains(&change.pk))
+                .unwrap_or(false);
+
+            if change.cid.is_crsql_sentinel() {
+                counter!("corro.changes.impacted.delete", "table" => table_name.to_string())
+                    .increment(1);
+            } else if existed_before {
+                counter!("corro.changes.impacted.update", "table" => table_name.to_string())
+                    .increment(1);
+            } else {
+                // Row did not exist before → it's a new row.
+                // Use CL heuristic to guess resurrection vs fresh insert.
+                if change.cl > 2 && change.cl % 2 == 1 {
+                    counter!("corro.changes.impacted.resurrection", "table" => table_name.to_string()).increment(1);
+                } else {
+                    counter!("corro.changes.impacted.insert", "table" => table_name.to_string())
+                        .increment(1);
+                }
+            }
+
             impactful_changeset.push(change);
             changes_per_table
                 .entry(table_name)
