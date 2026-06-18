@@ -24,6 +24,7 @@ use plum_foca::{
     SeenStore, Timer,
 };
 use rand::rngs::StdRng;
+use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng};
 
 type NId = u32;
@@ -100,6 +101,7 @@ struct Region {
     weight: u32,
 }
 
+#[rustfmt::skip]
 const REGIONS: &[Region] = &[
     Region { name: "ams", lat: 52.31, lon: 4.76, weight: 274 },
     Region { name: "arn", lat: 59.65, lon: 17.92, weight: 20 },
@@ -162,7 +164,12 @@ impl Runtime<MId, SimPayload, NId> for Outbox {
         self.sent.push((to, msg));
     }
 
-    fn send_all(&mut self, peers: Vec<NId>, msg: PlumtreeMsg<MId, SimPayload, NId>, _prio: PlumPrio) {
+    fn send_all(
+        &mut self,
+        peers: Vec<NId>,
+        msg: PlumtreeMsg<MId, SimPayload, NId>,
+        _prio: PlumPrio,
+    ) {
         for peer in peers {
             self.sent.push((peer, msg.clone()));
         }
@@ -191,28 +198,33 @@ enum Event {
         timer: Timer<MId, NId>,
     },
     /// Flush this node's lazy IHave queue (`PlumtreeState::tick`).
-    Tick { node: NId },
-    Originate { node: NId, seq: u32 },
+    Tick {
+        node: NId,
+    },
+    Originate {
+        node: NId,
+        seq: u32,
+    },
 }
 
-struct Scheduled {
+struct Scheduled<E> {
     at: u64,
     seq: u64,
-    ev: Event,
+    ev: E,
 }
 
-impl PartialEq for Scheduled {
+impl<E> PartialEq for Scheduled<E> {
     fn eq(&self, other: &Self) -> bool {
         (self.at, self.seq) == (other.at, other.seq)
     }
 }
-impl Eq for Scheduled {}
-impl PartialOrd for Scheduled {
+impl<E> Eq for Scheduled<E> {}
+impl<E> PartialOrd for Scheduled<E> {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
-impl Ord for Scheduled {
+impl<E> Ord for Scheduled<E> {
     // reversed so the BinaryHeap pops the earliest event first; seq breaks
     // ties deterministically.
     fn cmp(&self, other: &Self) -> Ordering {
@@ -307,7 +319,7 @@ struct Sim {
     params: Params,
     now: u64, // virtual time, µs
     next_seq: u64,
-    queue: BinaryHeap<Scheduled>,
+    queue: BinaryHeap<Scheduled<Event>>,
     states: Vec<PlumtreeState<MId, SimPayload, NId, SimSeenStore>>,
     region_of: Vec<u8>,
     rtt_ms: Vec<Vec<u64>>,
@@ -406,6 +418,7 @@ impl Sim {
                 sim.push(at, Event::Originate { node, seq });
             }
         }
+
         sim
     }
 
@@ -481,7 +494,10 @@ impl Sim {
     /// Apply everything the node just asked the runtime to do.
     fn drain(&mut self, from: NId) {
         for payload in std::mem::take(&mut self.outbox.delivered) {
-            let stat = self.msgs.get_mut(&payload.id()).expect("delivered unknown msg");
+            let stat = self
+                .msgs
+                .get_mut(&payload.id())
+                .expect("delivered unknown msg");
             stat.deliveries += 1;
             stat.last_delivery_at = self.now;
             self.stats.latencies_us.push(self.now - stat.sent_at);
@@ -716,6 +732,403 @@ impl fmt::Display for Report {
 }
 
 // ---------------------------------------------------------------------------
+// Gossip (foca) broadcast baseline
+// ---------------------------------------------------------------------------
+//
+// Recreates the dissemination logic of `corro-agent`'s `handle_broadcasts`
+// (the `BroadcastMethod::Gossip` path that plumtree is meant to replace) so we
+// have concrete numbers to compare plumtree against on the same topology.
+//
+// The model (see crates/corro-agent/src/broadcast/mod.rs):
+//   * Every node originates one change, exactly like the plumtree sim, so the
+//     two are measured on an identical workload. We deliberately do NOT model
+//     the byte-batching / broadcast_cutoff buffering — that only packs several
+//     changes into one datagram, it doesn't change *who* receives a change — so
+//     messages disseminate independently of one another. That independence lets
+//     `run` process originators in memory-bounded chunks: identical per-message
+//     results, bounded peak RAM at 2k scale (all-at-once would be >1GB).
+//   * Originator (`AddBroadcast`, is_local): floods ALL of its ring0 peers once
+//     (the "local broadcast"), plus a global pending that EXCLUDES ring0.
+//   * Any node, on first receipt of a change that isn't its own
+//     (`Rebroadcast`, is_local=false): a global pending only; ring0 is NOT
+//     excluded and is NOT specially flooded.
+//   * A global pending sends to `choose_count` freshly-chosen random peers
+//     (deduped via `sent_to`), then re-queues itself up to `max_transmissions`
+//     times with `100ms * send_count` backoff.
+//       choose_count   = max(num_indirect_probes=3, (N - ring0)/(max_tx*10))
+//       max_transmissions = foca Config::compute_max_tx(cluster_size)
+//   * We don't model the 10MB/s rate limiter (messages are tiny) or the
+//     anti-entropy SYNC path that mops up gossip stragglers — so the reported
+//     delivery% is the broadcast layer alone, and may sit just under 100%.
+
+const NUM_INDIRECT_PROBES: usize = 3;
+/// `sleep_ms_base` between successive transmissions of a pending broadcast.
+const GOSSIP_RESEND_BASE: Duration = Duration::from_millis(100);
+
+/// foca `Config::compute_max_tx`: log10(cluster_size+1) * 4, clamped to [1,255].
+fn compute_max_tx(cluster_size: u32) -> u8 {
+    let max_tx = f64::from(cluster_size.saturating_add(1)).log10() * 4.0;
+    if max_tx <= 1.0 {
+        1
+    } else if max_tx >= 255.0 {
+        255
+    } else {
+        max_tx as u8
+    }
+}
+
+#[derive(Clone)]
+struct GossipParams {
+    n: usize,
+    /// With RTT info each node has a ring0 (peers < 6ms) to flood; blind means
+    /// no ring assignment, so ring0 is empty and everything is random gossip.
+    rtt_aware: bool,
+    loss: f64,
+    seed: u64,
+}
+
+impl GossipParams {
+    fn new(n: usize) -> Self {
+        Self {
+            n,
+            rtt_aware: true,
+            loss: 0.0,
+            seed: 42,
+        }
+    }
+}
+
+enum GEvent {
+    Originate {
+        node: NId,
+        mid: MId,
+    },
+    /// One transmission round of a pending broadcast on `node`.
+    Send {
+        node: NId,
+        mid: MId,
+        send_count: u8,
+        sent_to: std::collections::HashSet<NId>,
+        hop: u32,
+    },
+    Recv {
+        to: NId,
+        mid: MId,
+        hop: u32,
+    },
+}
+
+struct GossipSim {
+    params: GossipParams,
+    now: u64,
+    next_seq: u64,
+    queue: BinaryHeap<Scheduled<GEvent>>,
+    region_of: Vec<u8>,
+    rtt_ms: Vec<Vec<u64>>,
+    /// ring0 peers (RTT ring 0) per node; empty when topology-blind.
+    ring0: Vec<Vec<NId>>,
+    seen: Vec<std::collections::HashSet<MId>>,
+    rng: StdRng,
+    max_tx: u8,
+    msgs: HashMap<MId, MsgStat>,
+    stats: Stats,
+}
+
+impl GossipSim {
+    fn new(params: GossipParams) -> Self {
+        let mut rng = StdRng::seed_from_u64(params.seed);
+        let n = params.n;
+
+        let nregions = REGIONS.len();
+        let rtt_ms: Vec<Vec<u64>> = (0..nregions)
+            .map(|a| (0..nregions).map(|b| region_rtt_ms(a, b)).collect())
+            .collect();
+
+        let total_weight: u32 = REGIONS.iter().map(|r| r.weight).sum();
+        let region_of: Vec<u8> = (0..n)
+            .map(|_| {
+                let mut pick = rng.random_range(0..total_weight);
+                for (i, r) in REGIONS.iter().enumerate() {
+                    if pick < r.weight {
+                        return i as u8;
+                    }
+                    pick -= r.weight;
+                }
+                unreachable!()
+            })
+            .collect();
+
+        // ring0(i) = peers within ring 0 (RTT < 6ms). Blind => no rings => empty.
+        let ring0: Vec<Vec<NId>> = (0..n)
+            .map(|i| {
+                if !params.rtt_aware {
+                    return Vec::new();
+                }
+                (0..n)
+                    .filter(|&j| j != i)
+                    .filter(|&j| {
+                        let rtt = rtt_ms[region_of[i] as usize][region_of[j] as usize];
+                        ring_from_rtt_ms(rtt) == Some(0)
+                    })
+                    .map(|j| j as NId)
+                    .collect()
+            })
+            .collect();
+
+        Self {
+            now: 0,
+            next_seq: 0,
+            queue: BinaryHeap::new(),
+            region_of,
+            rtt_ms,
+            ring0,
+            seen: vec![std::collections::HashSet::new(); n],
+            rng,
+            max_tx: compute_max_tx(n as u32),
+            msgs: HashMap::new(),
+            stats: Stats::default(),
+            params,
+        }
+    }
+
+    fn push(&mut self, at: u64, ev: GEvent) {
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        self.queue.push(Scheduled { at, seq, ev });
+    }
+
+    fn link_rtt_ms(&self, from: NId, to: NId) -> u64 {
+        self.rtt_ms[self.region_of[from as usize] as usize][self.region_of[to as usize] as usize]
+    }
+
+    fn flight_us(&mut self, from: NId, to: NId) -> u64 {
+        let rtt = self.link_rtt_ms(from, to);
+        let jitter = self.rng.random_range(1.0..1.15);
+        ((rtt * 1000) as f64 / 2.0 * jitter) as u64
+    }
+
+    /// Transmit one copy of `mid` from->to, applying loss; schedules the Recv.
+    fn send_one(&mut self, from: NId, to: NId, mid: MId, hop: u32) {
+        self.stats.sent_gossip += 1;
+        if self.link_rtt_ms(from, to) > LONGHAUL_RTT_MS {
+            self.stats.longhaul_gossip += 1;
+        }
+        if let Some(s) = self.msgs.get_mut(&mid) {
+            s.gossip_sends += 1;
+        }
+        if self.params.loss > 0.0 && self.rng.random_bool(self.params.loss) {
+            self.stats.dropped += 1;
+            return;
+        }
+        let at = self.now + self.flight_us(from, to);
+        self.push(at, GEvent::Recv { to, mid, hop });
+    }
+
+    /// `choose_count` random peers not already in `exclude`.
+    fn sample_excluding(
+        &mut self,
+        exclude: &std::collections::HashSet<NId>,
+        take: usize,
+    ) -> Vec<NId> {
+        let mut out = Vec::with_capacity(take);
+        let mut picked = std::collections::HashSet::new();
+        let n = self.params.n as NId;
+        let mut attempts = 0usize;
+        // rejection sampling: sent_to stays far below N, so collisions are rare.
+        while out.len() < take && attempts < take.saturating_mul(50).max(1) {
+            attempts += 1;
+            let c = self.rng.random_range(0..n);
+            if exclude.contains(&c) || !picked.insert(c) {
+                continue;
+            }
+            out.push(c);
+        }
+        out
+    }
+
+    fn run(mut self) -> Report {
+        // Every node originates one change (matching the plumtree sim). Because
+        // gossip messages disseminate independently (no shared tree, no modeled
+        // bandwidth contention), originators are processed in memory-bounded
+        // chunks: identical per-message results, bounded peak RAM at 2k scale.
+        const CHUNK: usize = 128;
+        let mut origins: Vec<NId> = (0..self.params.n as NId).collect();
+        // shuffle so a chunk isn't correlated with region/node-id ordering.
+        origins.shuffle(&mut self.rng);
+
+        for chunk in origins.chunks(CHUNK) {
+            for &node in chunk {
+                let mid = (node as u64) << 32;
+                let at = self.now;
+                self.push(at, GEvent::Originate { node, mid });
+            }
+            self.drain_queue();
+            // messages are independent across chunks; clear per-node seen so
+            // memory doesn't grow with the number of chunks processed.
+            for s in &mut self.seen {
+                s.clear();
+            }
+        }
+        self.report()
+    }
+
+    /// Run the event queue to quiescence for the currently-pending messages.
+    fn drain_queue(&mut self) {
+        while let Some(Scheduled { at, ev, .. }) = self.queue.pop() {
+            debug_assert!(at >= self.now);
+            self.now = at;
+            match ev {
+                GEvent::Originate { node, mid } => {
+                    self.seen[node as usize].insert(mid);
+                    self.msgs.insert(
+                        mid,
+                        MsgStat {
+                            sent_at: self.now,
+                            gossip_sends: 0,
+                            deliveries: 0,
+                            last_delivery_at: 0,
+                        },
+                    );
+                    // local broadcast: flood every ring0 peer once (hop 1).
+                    let r0 = self.ring0[node as usize].clone();
+                    for &peer in &r0 {
+                        self.send_one(node, peer, mid, 1);
+                    }
+                    // global pending excluding ring0 (is_local=true).
+                    let mut sent_to: std::collections::HashSet<NId> = r0.into_iter().collect();
+                    sent_to.insert(node);
+                    self.do_send(node, mid, 0, sent_to, 1);
+                }
+                GEvent::Send {
+                    node,
+                    mid,
+                    send_count,
+                    sent_to,
+                    hop,
+                } => {
+                    self.do_send(node, mid, send_count, sent_to, hop);
+                }
+                GEvent::Recv { to, mid, hop, .. } => {
+                    if self.seen[to as usize].contains(&mid) {
+                        self.stats.duplicates += 1;
+                        continue;
+                    }
+                    self.seen[to as usize].insert(mid);
+                    let stat = self.msgs.get_mut(&mid).expect("recv unknown msg");
+                    stat.deliveries += 1;
+                    stat.last_delivery_at = self.now;
+                    self.stats.latencies_us.push(self.now - stat.sent_at);
+                    self.stats.hops.push(hop);
+                    // rebroadcast (is_local=false): global pending, ring0 NOT excluded.
+                    let mut sent_to = std::collections::HashSet::new();
+                    sent_to.insert(to);
+                    self.do_send(to, mid, 0, sent_to, hop + 1);
+                }
+            }
+        }
+    }
+
+    /// One transmission round of a pending broadcast, then re-queue with backoff.
+    fn do_send(
+        &mut self,
+        node: NId,
+        mid: MId,
+        send_count: u8,
+        mut sent_to: std::collections::HashSet<NId>,
+        hop: u32,
+    ) {
+        let ring0_count = self.ring0[node as usize].len();
+        let dynamic = self.params.n.saturating_sub(ring0_count) / (self.max_tx as usize * 10);
+        let choose_count = NUM_INDIRECT_PROBES.max(dynamic);
+        let take = choose_count.min(self.params.n.saturating_sub(sent_to.len()));
+        for p in self.sample_excluding(&sent_to, take) {
+            sent_to.insert(p);
+            self.send_one(node, p, mid, hop);
+        }
+
+        let next = send_count + 1;
+        if next < self.max_tx {
+            let at = self.now + GOSSIP_RESEND_BASE.as_micros() as u64 * next as u64;
+            self.push(
+                at,
+                GEvent::Send {
+                    node,
+                    mid,
+                    send_count: next,
+                    sent_to,
+                    hop,
+                },
+            );
+        }
+    }
+
+    fn report(&self) -> Report {
+        // every node originates once, so expected deliveries = N*(N-1).
+        let expected = self.params.n as u64 * (self.params.n as u64 - 1);
+        let delivered = self.stats.latencies_us.len() as u64;
+
+        let mut hops = self.stats.hops.clone();
+        hops.sort_unstable();
+        let mut lat = self.stats.latencies_us.clone();
+        lat.sort_unstable();
+
+        let mut full: Vec<u64> = self
+            .msgs
+            .values()
+            .filter(|m| m.deliveries as u64 == self.params.n as u64 - 1)
+            .map(|m| m.last_delivery_at - m.sent_at)
+            .collect();
+        full.sort_unstable();
+
+        // RMR over all messages (relative message redundancy).
+        let total_sends: u64 = self.msgs.values().map(|m| m.gossip_sends).sum();
+        let rmr = if self.msgs.is_empty() {
+            0.0
+        } else {
+            total_sends as f64 / (self.msgs.len() as f64 * (self.params.n - 1) as f64) - 1.0
+        };
+
+        let avg_ring0 =
+            self.ring0.iter().map(|r| r.len()).sum::<usize>() as f64 / self.params.n.max(1) as f64;
+
+        Report {
+            label: format!(
+                "GOSSIP n={} all-broadcast rtt_aware={} loss={:.1}% seed={} max_tx={}",
+                self.params.n,
+                self.params.rtt_aware,
+                self.params.loss * 100.0,
+                self.params.seed,
+                self.max_tx,
+            ),
+            expected,
+            delivered,
+            missing: 0,
+            hops_p50: pct(&hops, 0.50),
+            hops_p99: pct(&hops, 0.99),
+            hops_max: hops.last().copied().unwrap_or(0),
+            lat_p50_ms: pct(&lat, 0.50) / 1000,
+            lat_p99_ms: pct(&lat, 0.99) / 1000,
+            full_p50_ms: pct(&full, 0.50) / 1000,
+            full_p99_ms: pct(&full, 0.99) / 1000,
+            full_max_ms: full.last().copied().unwrap_or(0) / 1000,
+            // gossip has no tree to converge; report the single RMR in both slots.
+            rmr_first: rmr,
+            rmr_last: rmr,
+            sent_gossip: self.stats.sent_gossip,
+            sent_ihave: 0,
+            sent_graft: 0,
+            sent_prune: 0,
+            longhaul_frac: self.stats.longhaul_gossip as f64 / self.stats.sent_gossip.max(1) as f64,
+            duplicates: self.stats.duplicates,
+            dropped: self.stats.dropped,
+            not_cached: 0,
+            // no eager set in gossip; report the avg ring0 (guaranteed-flood) size.
+            avg_eager: avg_ring0,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -786,6 +1199,111 @@ fn sim_2k_num_eager_sweep() {
         hops_p50.last() <= hops_p50.first(),
         "hops did not improve with fanout: {hops_p50:?}"
     );
+}
+
+/// Baseline: foca gossip broadcast at small scale. Characterizes the redundancy
+/// (RMR) and delivery of the current production path on the same topology.
+#[test]
+fn sim_gossip_small() {
+    let report = GossipSim::new(GossipParams::new(200)).run();
+    println!("{report}");
+    // epidemic gossip reaches ~everyone, though the broadcast layer alone
+    // (no anti-entropy sync) can leave a tiny straggler tail.
+    assert!(
+        report.delivery_pct() > 99.0,
+        "gossip delivery {:.2}% unexpectedly low",
+        report.delivery_pct()
+    );
+    // each relaying node sprays a large fraction of the cluster: RMR is high.
+    assert!(
+        report.rmr_first > 1.0,
+        "gossip RMR {:.2} unexpectedly low",
+        report.rmr_first
+    );
+}
+
+/// Head-to-head: the current foca gossip broadcast vs plumtree at 2k, on the
+/// same topology, printed as one comparison table. This is the "what does
+/// plumtree buy us" test. RMR is the key number (redundant transmissions per
+/// delivery); `sends/msg` = (RMR+1)·(N-1) is the absolute per-change cost.
+/// Run with: cargo test --release -p plum-foca --test sim -- --ignored --nocapture
+#[test]
+#[ignore = "slow; run in release mode"]
+fn sim_gossip_vs_plumtree_2k() {
+    const N: usize = 2000;
+    let gossip = GossipSim::new(GossipParams::new(N)).run();
+    let plum = Sim::new(Params::new(N, 8)).run();
+
+    println!("gossip (current production path):\n{gossip}");
+    println!("plumtree (num_eager=8):\n{plum}");
+
+    let row = |name: &str, g: String, p: String| println!("  {name:<22}{g:>16}{p:>16}");
+    let sends_per_msg = |r: &Report| (r.rmr_first + 1.0) * (N as f64 - 1.0);
+    println!("\n=== gossip vs plumtree (n={N}, full membership) ===");
+    row("metric", "gossip".into(), "plumtree".into());
+    row(
+        "delivery %",
+        format!("{:.3}", gossip.delivery_pct()),
+        format!("{:.3}", plum.delivery_pct()),
+    );
+    row(
+        "hops p50/p99",
+        format!("{}/{}", gossip.hops_p50, gossip.hops_p99),
+        format!("{}/{}", plum.hops_p50, plum.hops_p99),
+    );
+    row(
+        "full-cluster p50 ms",
+        gossip.full_p50_ms.to_string(),
+        plum.full_p50_ms.to_string(),
+    );
+    row(
+        "full-cluster p99 ms",
+        gossip.full_p99_ms.to_string(),
+        plum.full_p99_ms.to_string(),
+    );
+    row(
+        "RMR (redundancy)",
+        format!("{:.1}", gossip.rmr_first),
+        format!("{:.1}", plum.rmr_last),
+    );
+    row(
+        "sends/change",
+        format!("{:.0}", sends_per_msg(&gossip)),
+        format!("{:.0}", sends_per_msg(&plum)),
+    );
+    row(
+        "longhaul gossip %",
+        format!("{:.1}", gossip.longhaul_frac * 100.0),
+        format!("{:.1}", plum.longhaul_frac * 100.0),
+    );
+    println!(
+        "  => plumtree uses ~{:.0}x fewer transmissions per change",
+        sends_per_msg(&gossip) / sends_per_msg(&plum).max(1.0)
+    );
+
+    // The whole point of plumtree: drastically lower redundancy at comparable
+    // convergence. Guard the headline result so a regression is caught.
+    assert!(
+        plum.rmr_last < gossip.rmr_first / 5.0,
+        "plumtree RMR {:.1} not dramatically below gossip RMR {:.1}",
+        plum.rmr_last,
+        gossip.rmr_first
+    );
+}
+
+/// 2k-node gossip baseline, to compare directly against the plumtree numbers
+/// (`sim_2k_num_eager_sweep` / `sim_2k_rtt_awareness`). Every node broadcasts
+/// once, the same workload as the plumtree 2k tests.
+/// Run with: cargo test --release -p plum-foca --test sim -- --ignored --nocapture
+#[test]
+#[ignore = "slow; run in release mode"]
+fn sim_gossip_2k() {
+    let aware = GossipSim::new(GossipParams::new(2000)).run();
+    let mut blind_params = GossipParams::new(2000);
+    blind_params.rtt_aware = false;
+    let blind = GossipSim::new(blind_params).run();
+    println!("rtt-aware (ring0 flood):\n{aware}");
+    println!("topology-blind (pure random gossip):\n{blind}");
 }
 
 /// 2k nodes: topology-aware vs topology-blind eager selection.
