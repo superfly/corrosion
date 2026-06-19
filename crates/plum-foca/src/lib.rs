@@ -72,12 +72,13 @@ pub struct Config {
     /// Optimization threshold in rounds. Controls when a node receiving
     /// a GOSSIP will attempt to GRAFT a shorter-path peer (via IHave)
     pub optimization_threshold: Option<Round>,
-    /// Number of eager peers (fanout).
-    pub num_eager: usize,
-    /// Minimum number of lazy peers.
-    pub min_lazy: usize,
-    /// Maximum number of lazy peers.
-    pub max_lazy: usize,
+    /// Number of eager peers (fanout). `None` derives it from cluster size:
+    /// `round(log10(known_peers + 1) * 3)` (min 3).
+    pub num_eager: Option<usize>,
+    /// Minimum number of lazy peers. `None` defaults to `num_eager * 1.5`.
+    pub min_lazy: Option<usize>,
+    /// Maximum number of lazy peers. `None` defaults to `num_eager * 2`.
+    pub max_lazy: Option<usize>,
     /// Maximum number of times a message can be received before pruning sender.
     /// We trade some duplication for tree stability.
     pub prune_threshold: u32,
@@ -98,14 +99,34 @@ impl Default for Config {
         Self {
             ihave_timeout: Duration::from_secs(1),
             optimization_threshold: Some(3),
-            num_eager: 5,
-            min_lazy: 10,
-            max_lazy: 15,
+            num_eager: None,
+            min_lazy: None,
+            max_lazy: None,
             prune_threshold: 1,
             max_received_entries: 10000,
             max_cached_payloads: 8192,
             prune_throttle: None,
         }
+    }
+}
+
+/// Resolved eager/lazy peer targets used by the protocol.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FanoutTargets {
+    num_eager: usize,
+    min_lazy: usize,
+    max_lazy: usize,
+}
+
+fn resolve_fanout(known_peers: usize, config: &Config) -> FanoutTargets {
+    let num_eager = config.num_eager.unwrap_or_else(|| {
+        let cluster = (known_peers + 1) as f64;
+        ((cluster.log10() * 3.0).round() as usize).max(3)
+    });
+    FanoutTargets {
+        num_eager,
+        min_lazy: config.min_lazy.unwrap_or(num_eager * 3 / 2),
+        max_lazy: config.max_lazy.unwrap_or(num_eager * 2),
     }
 }
 
@@ -333,6 +354,8 @@ pub struct PlumtreeState<
     prune_throttle: PruneThrottle<N>,
     /// set on membership updates so we'd rebalance peers on next tick.
     needs_rebalance: bool,
+    /// cached effective fanout; recomputed on membership changes when derived.
+    fanout: FanoutTargets,
 }
 
 impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStore<I>>
@@ -349,6 +372,7 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
     /// reproducible given the same seed and event order.
     pub fn new_with_store_seeded(local_id: N, config: Config, seen: S, seed: u64) -> Self {
         let cache_size = config.max_cached_payloads;
+        let fanout = resolve_fanout(0, &config);
         Self {
             local_id,
             config,
@@ -364,6 +388,7 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
             rng: SmallRng::seed_from_u64(seed),
             prune_throttle: PruneThrottle::default(),
             needs_rebalance: false,
+            fanout,
         }
     }
 
@@ -393,6 +418,32 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
 
     pub fn config(&self) -> &Config {
         &self.config
+    }
+
+    pub fn num_eager(&self) -> usize {
+        self.fanout.num_eager
+    }
+
+    pub fn min_lazy(&self) -> usize {
+        self.fanout.min_lazy
+    }
+
+    pub fn max_lazy(&self) -> usize {
+        self.fanout.max_lazy
+    }
+
+    /// Recompute cached fanout when `config.num_eager` is unset and cluster
+    /// size produces a new target. Returns `true` if any effective value changed.
+    fn maybe_recompute_fanout(&mut self) -> bool {
+        if self.config.num_eager.is_some() {
+            return false;
+        }
+        let new = resolve_fanout(self.known_peers.len(), &self.config);
+        if new == self.fanout {
+            return false;
+        }
+        self.fanout = new;
+        true
     }
 
     #[doc(hidden)]
@@ -806,6 +857,7 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
                 self.peer_topology.insert(peer, info);
             }
         }
+        self.maybe_recompute_fanout();
         self.rebalance(rt);
     }
 
@@ -818,8 +870,8 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
         self.peer_topology
             .insert(peer.clone(), rtt.unwrap_or_default());
         self.known_peers.insert(peer.clone());
-
-        if self.eager_peers.len() < self.config.num_eager {
+        self.maybe_recompute_fanout();
+        if self.eager_peers.len() < self.num_eager() {
             self.move_to_eager(&peer, rt);
         } else {
             self.insert_into_lazy(peer);
@@ -845,6 +897,7 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
             }
         }
 
+        self.maybe_recompute_fanout();
         if should_rebalance {
             self.rebalance(rt);
             self.needs_rebalance = false;
@@ -855,7 +908,7 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
         let was_eager = self.eager_peers.remove(peer);
         let was_lazy = self.lazy_peers.swap_remove(peer);
         self.known_peers.remove(peer);
-        if was_eager || was_lazy {
+        if was_eager || was_lazy || self.maybe_recompute_fanout() {
             self.needs_rebalance = true;
         }
     }
@@ -874,7 +927,7 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
             return;
         }
         self.set_ring_neighbors();
-        if self.known_peers.len() <= self.config.num_eager {
+        if self.known_peers.len() <= self.num_eager() {
             self.eager_peers.extend(self.known_peers.iter().cloned());
             return;
         }
@@ -893,7 +946,7 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
             self.eager_peers.insert(p);
         }
 
-        let num_eager = self.config.num_eager;
+        let num_eager = self.num_eager();
         // pools exclude ring_locked peers (set_ring_neighbors already ran),
         // so they can never be re-selected by the eager/lazy take() below.
         let (near_pool, mid_pool, far_pool) = self.bucket_pools();
@@ -919,7 +972,7 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
             .extend(far_pool.iter().take(eager_far).cloned());
         // same selection logic for lazy peers since they are the eager candidates.
         // pools already exclude ring_locked, so lazy can never grab a locked peer.
-        let num_lazy = self.config.min_lazy;
+        let num_lazy = self.min_lazy();
         let (lazy_near, lazy_mid, lazy_far) = Self::bucket_targets(
             num_lazy,
             near_pool.len().saturating_sub(eager_near),
@@ -1085,7 +1138,7 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
             return true;
         }
 
-        if self.lazy_peers.len() < self.config.max_lazy {
+        if self.lazy_peers.len() < self.max_lazy() {
             self.lazy_peers.insert(peer);
             return true;
         }
@@ -1192,9 +1245,9 @@ mod tests {
             ihave_timeout: Duration::from_secs(3),
             optimization_threshold: Some(3),
             max_cached_payloads: 128,
-            num_eager: 5,
-            min_lazy: 10,
-            max_lazy: 15,
+            num_eager: Some(5),
+            min_lazy: Some(10),
+            max_lazy: Some(15),
             prune_threshold: 1,
             max_received_entries: 10000,
             prune_throttle: None,
@@ -1313,6 +1366,29 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
+    fn derived_fanout_updates_with_cluster_growth() {
+        let mut cfg = test_config();
+        cfg.num_eager = None;
+        cfg.min_lazy = None;
+        cfg.max_lazy = None;
+        let mut s = PlumtreeState::new_with_store(0u8, cfg, TestSeenStore::default());
+        let mut rt = AccumulatingRuntime::default();
+
+        assert_eq!(s.num_eager(), 3);
+        assert_eq!(s.min_lazy(), 4);
+        assert_eq!(s.max_lazy(), 6);
+
+        // 99 known peers -> cluster size 100 -> log10(100)*3 = 6 eager.
+        let peers: Vec<_> = (1..=99).collect();
+        s.add_peers_bulk(peers, &mut rt);
+        assert_eq!(s.known_peers().len(), 99);
+        assert_eq!(s.num_eager(), 6);
+        assert_eq!(s.min_lazy(), 9);
+        assert_eq!(s.max_lazy(), 12);
+        assert!(s.eager_peers().len() <= s.num_eager());
+    }
+
+    #[test]
     fn test_membership_events() {
         let mut s = state();
         let mut rt = AccumulatingRuntime::default();
@@ -1404,9 +1480,9 @@ mod tests {
     #[test]
     fn peer_up_both_full_ignored() {
         let mut cfg = test_config();
-        cfg.num_eager = 2;
-        cfg.min_lazy = 2;
-        cfg.max_lazy = 2;
+        cfg.num_eager = Some(2);
+        cfg.min_lazy = Some(2);
+        cfg.max_lazy = Some(2);
         let mut s: PlumtreeState<TestMsgId, TestPayload, TestNodeId, TestSeenStore> =
             PlumtreeState::new_with_store(0u8, cfg, TestSeenStore::default());
         let mut rt = AccumulatingRuntime::default();
@@ -1431,9 +1507,9 @@ mod tests {
     #[test]
     fn replenish_eager_after_prune() {
         let mut cfg = test_config();
-        cfg.num_eager = 3;
-        cfg.min_lazy = 5;
-        cfg.max_lazy = 5;
+        cfg.num_eager = Some(3);
+        cfg.min_lazy = Some(5);
+        cfg.max_lazy = Some(5);
         let mut s: PlumtreeState<TestMsgId, TestPayload, TestNodeId, TestSeenStore> =
             PlumtreeState::new_with_store(0u8, cfg, TestSeenStore::default());
         let mut rt = AccumulatingRuntime::default();
@@ -1554,7 +1630,7 @@ mod tests {
     #[test]
     fn handle_gossip_duplicate_sends_prune() {
         let mut cfg = test_config();
-        cfg.num_eager = 3;
+        cfg.num_eager = Some(3);
         let mut s = PlumtreeState::new_with_store(0u8, cfg, TestSeenStore::default());
         let mut rt = AccumulatingRuntime::default();
 
@@ -2153,9 +2229,9 @@ mod tests {
     #[test]
     fn rebalance_uses_weighted_ring_buckets_and_explore_slot() {
         let mut cfg = test_config();
-        cfg.num_eager = 8;
-        cfg.min_lazy = 10;
-        cfg.max_lazy = 10;
+        cfg.num_eager = Some(8);
+        cfg.min_lazy = Some(10);
+        cfg.max_lazy = Some(10);
         let mut s = PlumtreeState::new_with_store(0u8, cfg, TestSeenStore::default());
         let mut rt = AccumulatingRuntime::default();
 
@@ -2213,7 +2289,7 @@ mod tests {
     #[test]
     fn move_to_eager_respects_num_eager() {
         let mut cfg = test_config();
-        cfg.num_eager = 2;
+        cfg.num_eager = Some(2);
         let mut s = PlumtreeState::new_with_store(0u8, cfg, TestSeenStore::default());
         let mut rt = AccumulatingRuntime::default();
 
@@ -2242,10 +2318,10 @@ mod tests {
     #[test]
     fn move_to_lazy_respects_max_lazy() {
         let mut cfg = test_config();
-        cfg.num_eager = 3;
+        cfg.num_eager = Some(3);
         // Need room for both prior lazy (6) and demoted peer (5) so 6 is not evicted from lazy.
-        cfg.min_lazy = 2;
-        cfg.max_lazy = 2;
+        cfg.min_lazy = Some(2);
+        cfg.max_lazy = Some(2);
         let mut s = PlumtreeState::new_with_store(0u8, cfg, TestSeenStore::default());
         let mut rt = AccumulatingRuntime::default();
 

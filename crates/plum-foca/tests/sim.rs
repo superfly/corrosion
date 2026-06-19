@@ -289,9 +289,9 @@ impl Params {
         Config {
             ihave_timeout: Duration::from_millis(200),
             optimization_threshold: Some(5),
-            num_eager: self.num_eager,
-            min_lazy: 15,
-            max_lazy: 30,
+            num_eager: Some(self.num_eager),
+            min_lazy: Some(15),
+            max_lazy: Some(30),
             prune_threshold: 5,
             max_received_entries: (self.n as u32 * self.msgs_per_node) as usize + 1,
             max_cached_payloads: 4096,
@@ -606,7 +606,6 @@ impl Sim {
     }
 
     fn check_invariants(&self) {
-        let max_lazy = self.params.config().max_lazy;
         for state in &self.states {
             let eager = state.eager_peers();
             let lazy = state.lazy_peers();
@@ -621,7 +620,7 @@ impl Sim {
             for p in lazy {
                 assert!(known.contains(p), "lazy peer not known");
             }
-            assert!(lazy.len() <= max_lazy, "lazy set exceeds max_lazy");
+            assert!(lazy.len() <= state.max_lazy(), "lazy set exceeds max_lazy");
             assert!(state.lazy_queue().is_empty(), "lazy queue not drained");
             assert_eq!(known.len(), self.params.n - 1, "full membership lost");
         }
