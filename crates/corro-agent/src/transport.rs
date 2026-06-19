@@ -82,7 +82,7 @@ impl Transport {
         let endpoints_count = if config.client_addr.port() == 0 {
             // zero port means we'll use whatever is available,
             // corrosion can use multiple sockets and reduce the risk of filling kernel buffers
-            8
+            2
         } else {
             // non-zero client addr port means we can only use 1
             1
