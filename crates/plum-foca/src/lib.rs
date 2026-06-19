@@ -331,6 +331,8 @@ pub struct PlumtreeState<
     cache: PayloadCache<I, P>,
     rng: SmallRng,
     prune_throttle: PruneThrottle<N>,
+    /// set on membership updates so we'd rebalance peers on next tick.
+    needs_rebalance: bool,
 }
 
 impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStore<I>>
@@ -361,6 +363,7 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
             cache: PayloadCache::new(cache_size),
             rng: SmallRng::seed_from_u64(seed),
             prune_throttle: PruneThrottle::default(),
+            needs_rebalance: false,
         }
     }
 
@@ -392,6 +395,14 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
         &self.config
     }
 
+    #[doc(hidden)]
+    pub fn force_eager(&mut self, peer: N) {
+        if self.known_peers.contains(&peer) {
+            self.lazy_peers.swap_remove(&peer);
+            self.eager_peers.insert(peer);
+        }
+    }
+
     pub fn local_id(&self) -> &N {
         &self.local_id
     }
@@ -420,7 +431,7 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
                 // pruned this peer within the throttle window — the burst of
                 // in-flight duplicates after a prune would otherwise draw one
                 // PRUNE each. Local state still moves the peer to lazy.
-                // TODO: suppress prunes for recently grafted peers? this would help 
+                // TODO: suppress prunes for recently grafted peers? this would help
                 // with tree stability
                 let suppressed = match self.config.prune_throttle {
                     Some(ttl) => {
@@ -750,8 +761,6 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
     ///
     /// The caller should invoke this on a regular interval.
     pub fn tick(&mut self, rt: &mut impl Runtime<I, P, N>) {
-        self.prune_throttle.sweep(rt.now());
-
         let digests = self.drain_lazy_queue();
         if self.lazy_peers.is_empty() || digests.is_none() {
             return;
@@ -808,37 +817,46 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
 
         self.peer_topology
             .insert(peer.clone(), rtt.unwrap_or_default());
-        self.known_peers.insert(peer);
-        self.rebalance(rt);
+        self.known_peers.insert(peer.clone());
+
+        if self.eager_peers.len() < self.config.num_eager {
+            self.move_to_eager(&peer, rt);
+        } else {
+            self.insert_into_lazy(peer);
+        }
+        self.needs_rebalance = true;
     }
 
-    /// Refresh RTT ring info for known peers (e.g. after members recalculates rings).
+    /// Run the deferred rebalance if one is due — either a membership
+    /// change flagged it (`needs_rebalance`), or an overlay peer crossed a
+    /// bucket boundary (Near/Mid/Far).
     pub fn update_peer_topology(
         &mut self,
         updates: impl IntoIterator<Item = (N, RttInfo)>,
         rt: &mut impl Runtime<I, P, N>,
     ) {
-        let mut changed = false;
+        let mut should_rebalance = self.needs_rebalance;
         for (peer, info) in updates {
             let existing = self.peer_topology.get(&peer);
-            if existing.is_none() || existing.unwrap().ring != info.ring {
+            if existing.is_none() || RingBucket::of(*existing.unwrap()) !=  RingBucket::of(info) {
                 self.peer_topology.insert(peer.clone(), info);
                 self.known_peers.insert(peer);
-                changed = true;
+                should_rebalance = true;
             }
         }
 
-        if changed {
+        if should_rebalance {
             self.rebalance(rt);
+            self.needs_rebalance = false;
         }
     }
 
-    pub fn peer_down(&mut self, peer: &N, rt: &mut impl Runtime<I, P, N>) {
+    pub fn peer_down(&mut self, peer: &N, _rt: &mut impl Runtime<I, P, N>) {
         let was_eager = self.eager_peers.remove(peer);
         let was_lazy = self.lazy_peers.swap_remove(peer);
         self.known_peers.remove(peer);
         if was_eager || was_lazy {
-            self.rebalance(rt);
+            self.needs_rebalance = true;
         }
     }
 
@@ -848,8 +866,6 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
     ///
     /// Ring neighbors are always eager. Remaining eager slots are split across
     /// near, mid, and far RTT bucket. Locked peers count toward the bucket targets.
-    ///
-    /// TODO: leave special slots with for unknown rtt peers
     fn rebalance(&mut self, _rt: &mut impl Runtime<I, P, N>) {
         self.eager_peers.clear();
         self.lazy_peers.clear();
@@ -927,28 +943,6 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
         );
     }
 
-    fn bucket_targets(
-        num_eager: usize,
-        near_cap: usize,
-        mid_cap: usize,
-        far_cap: usize,
-    ) -> (usize, usize, usize) {
-        let near = (num_eager * 50).div_ceil(100).min(near_cap);
-        let mid = (num_eager.saturating_sub(near) * 60)
-            .div_ceil(100)
-            .min(mid_cap);
-        let far = num_eager.saturating_sub(near + mid).min(far_cap);
-
-        // update near and mid, if we still have some room
-        let near = near_cap.min(num_eager.saturating_sub(mid + far));
-        let mid = mid_cap.min(num_eager.saturating_sub(near + far));
-        (near, mid, far)
-    }
-
-    fn peer_bucket(&self, p: &N) -> RingBucket {
-        RingBucket::of(self.peer_topology.get(p).copied().unwrap_or_default())
-    }
-
     fn bucket_pools(&mut self) -> (Vec<N>, Vec<N>, Vec<N>) {
         let mut near = Vec::new();
         let mut mid = Vec::new();
@@ -970,6 +964,28 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
         mid.shuffle(&mut self.rng);
         far.shuffle(&mut self.rng);
         (near, mid, far)
+    }
+
+    fn bucket_targets(
+        num_eager: usize,
+        near_cap: usize,
+        mid_cap: usize,
+        far_cap: usize,
+    ) -> (usize, usize, usize) {
+        let near = (num_eager * 50).div_ceil(100).min(near_cap);
+        let mid = (num_eager.saturating_sub(near) * 60)
+            .div_ceil(100)
+            .min(mid_cap);
+        let far = num_eager.saturating_sub(near + mid).min(far_cap);
+
+        // update near and mid, if we still have some room
+        let near = near_cap.min(num_eager.saturating_sub(mid + far));
+        let mid = mid_cap.min(num_eager.saturating_sub(near + far));
+        (near, mid, far)
+    }
+
+    fn peer_bucket(&self, p: &N) -> RingBucket {
+        RingBucket::of(self.peer_topology.get(p).copied().unwrap_or_default())
     }
 
     fn enqueue_ihave(&mut self, id: I, round: Round) {
@@ -1034,7 +1050,7 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
         }
 
         if self.lazy_peers().contains(peer) {
-            return
+            return;
         }
 
         let was_eager = self.eager_peers.remove(peer);
@@ -1112,9 +1128,11 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
         evicted
     }
 
-    pub fn cache_evict_if_needed(&mut self) {
+    pub fn cache_evict_if_needed(&mut self, rt: &mut impl Runtime<I, P, N>) {
         self.seen.evict_if_needed();
         self.cache.evict_if_needed();
+        self.prune_throttle.sweep(rt.now());
+   
     }
 }
 
@@ -1320,6 +1338,9 @@ mod tests {
         assert_eq!(s.eager_peers().clone(), prev_eager);
         assert_eq!(s.lazy_peers().clone(), prev_lazy);
 
+        // peer_up only flags a rebalance; flush it so ring neighbors are picked.
+        s.update_peer_topology(std::iter::empty::<(TestNodeId, RttInfo)>(), &mut rt);
+
         // test that ring-locked peers are eager
         // since id is zero, ring locked peers are 1 and 6
         assert!(s.ring_locked_peers().contains(&1));
@@ -1330,15 +1351,17 @@ mod tests {
         assert!(!s.lazy_peers().contains(&1));
         assert!(!s.lazy_peers().contains(&6));
 
-        // new peer that takes locked position gets ring-locked
+        // new peer that takes a locked position gets ring-locked after rebalance
         s.peer_up(7, None, &mut rt);
+        s.update_peer_topology(std::iter::empty::<(TestNodeId, RttInfo)>(), &mut rt);
         assert!(s.ring_locked_peers().contains(&7));
         assert!(s.eager_peers().contains(&7));
         assert!(!s.lazy_peers().contains(&7));
         assert_eq!(s.known_peers().len(), 7);
 
-        // removal of ring-locked peer should rebalance and select new ring-locked peers
+        // removal of a ring-locked peer flags a rebalance; flush selects new ones
         s.peer_down(&7, &mut rt);
+        s.update_peer_topology(std::iter::empty::<(TestNodeId, RttInfo)>(), &mut rt);
         assert!(!s.ring_locked_peers().contains(&7));
         assert!(!s.eager_peers().contains(&7));
         assert!(!s.lazy_peers().contains(&7));

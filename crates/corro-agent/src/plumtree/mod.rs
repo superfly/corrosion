@@ -298,7 +298,7 @@ pub async fn spawn_plumtree_loop<T: TransportExt + Clone + Send + 'static>(
     let config = plum_foca::Config {
         ihave_timeout: Duration::from_millis(200),
         optimization_threshold: Some(5),
-        max_cached_payloads: 4096,
+        max_cached_payloads: 5000,
         // todo: have plumtree decide on these values
         num_eager: 8,
         min_lazy: 15,
@@ -357,9 +357,15 @@ pub async fn plumtree_loop<T: TransportExt + Clone + Send + 'static>(
 
     let mut rt = CorrosionPlumtreeRuntime::new(tx_changes, timer_spawner, tx_msgs);
 
-    let bootstrap_peers = plumtree_bootstrap_peers(&agent).await;
-    info!("added {} peers to plumtree", bootstrap_peers.len());
-    state.add_peers_bulk_with_rtt(bootstrap_peers, &mut rt);
+    match plumtree_peers_from_db(&agent).await {
+        Ok(peers) => {
+            info!("added {} peers to plumtree", peers.len());
+            state.add_peers_bulk_with_rtt(peers, &mut rt);
+        }
+        Err(e) => {
+            error!("unable to load plumtree peers from db: {e}")
+        }
+    };
 
     enum Branch {
         Input(PlumtreeInput),
@@ -457,7 +463,7 @@ pub async fn plumtree_loop<T: TransportExt + Clone + Send + 'static>(
             Branch::MaintenanceTick => {
                 trace!("plumtree: updating peer topology");
                 state.update_peer_topology(plumtree_topology_map(&agent), &mut rt);
-                state.cache_evict_if_needed();
+                state.cache_evict_if_needed(&mut rt);
 
                 gauge!("corro.plumtree.eager_peers").set(state.eager_peers().len() as f64);
                 gauge!("corro.plumtree.lazy_peers").set(state.lazy_peers().len() as f64);
@@ -753,25 +759,12 @@ fn plumtree_topology_map(agent: &Agent) -> HashMap<ActorId, RttInfo> {
         .collect()
 }
 
-async fn plumtree_bootstrap_peers(agent: &Agent) -> Vec<(ActorId, RttInfo)> {
-    let local_id = agent.actor_id();
-    let rtts = plumtree_topology_from_db(agent).await.unwrap_or_default();
-
-    agent
-        .members()
-        .read()
-        .states
-        .keys()
-        .into_iter()
-        .filter(|id| **id != local_id)
-        .map(|id| (*id, rtts.get(id).copied().unwrap_or_default()))
-        .collect()
-}
-
-async fn plumtree_topology_from_db(agent: &Agent) -> eyre::Result<HashMap<ActorId, RttInfo>> {
+async fn plumtree_peers_from_db(agent: &Agent) -> eyre::Result<Vec<(ActorId, RttInfo)>> {
     let conn = agent.pool().read().await?;
-    let mut stmt =
-        conn.prepare("SELECT actor_id, rtt_min FROM __corro_members WHERE rtt_min IS NOT NULL")?;
+    let mut stmt = conn.prepare(
+        "SELECT actor_id, rtt_min FROM __corro_members WHERE rtt_min IS NOT NULL
+            AND JSON_EXTRACT(foca_state, '$.state') = 'Alive'",
+    )?;
     let rows = stmt
         .query_map([], |row| {
             let rtt_ms: i64 = row.get(1)?;
@@ -782,7 +775,7 @@ async fn plumtree_topology_from_db(agent: &Agent) -> eyre::Result<HashMap<ActorI
             let actor_id: ActorId = row.get(0)?;
             Ok((actor_id, rtt_info))
         })?
-        .collect::<rusqlite::Result<HashMap<ActorId, RttInfo>>>()?;
+        .collect::<rusqlite::Result<Vec<(ActorId, RttInfo)>>>()?;
 
     Ok(rows)
 }

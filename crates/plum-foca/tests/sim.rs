@@ -14,7 +14,7 @@
 //! ```
 
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::fmt;
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
@@ -261,6 +261,9 @@ struct Params {
     loss: f64,
     /// PRUNE throttle window; `None` = prune every over-threshold duplicate.
     prune_throttle: Option<Duration>,
+    /// Extra eager peers force-added per node after bootstrap, modelling an
+    /// over-full eager set (e.g. admission without trimming). 0 = none.
+    eager_inflate: usize,
     seed: u64,
 }
 
@@ -275,6 +278,7 @@ impl Params {
             rtt_aware: true,
             loss: 0.0,
             prune_throttle: None,
+            eager_inflate: 0,
             seed: 42,
         }
     }
@@ -347,6 +351,8 @@ struct Sim {
     gossip_round: Option<Round>,
     msgs: HashMap<MId, MsgStat>,
     stats: Stats,
+    /// avg eager-set size right after bootstrap+inflation, before the run.
+    start_avg_eager: f64,
 }
 
 impl Sim {
@@ -424,7 +430,32 @@ impl Sim {
             msgs: HashMap::new(),
             stats: Stats::default(),
             params,
+            start_avg_eager: 0.0,
         };
+
+        // Optionally over-fill each node's eager set (model admission without
+        // trimming); prune should converge it back over the run.
+        if sim.params.eager_inflate > 0 {
+            for i in 0..n {
+                let mut added = 0;
+                let mut attempts = 0;
+                while added < sim.params.eager_inflate && attempts < sim.params.eager_inflate * 50 {
+                    attempts += 1;
+                    let p = sim.rng.random_range(0..n as NId);
+                    if p as usize == i || sim.states[i].eager_peers().contains(&p) {
+                        continue;
+                    }
+                    sim.states[i].force_eager(p);
+                    added += 1;
+                }
+            }
+        }
+        sim.start_avg_eager = sim
+            .states
+            .iter()
+            .map(|s| s.eager_peers().len())
+            .sum::<usize>() as f64
+            / n as f64;
 
         // Every node broadcasts, staggered over the window.
         let window_us = sim.params.broadcast_window.as_micros() as u64;
@@ -498,7 +529,7 @@ impl Sim {
                 Event::Tick { node } => {
                     self.tick_pending[node as usize] = false;
                     let state = &mut self.states[node as usize];
-                    state.cache_evict_if_needed();
+                    state.cache_evict_if_needed(&mut self.outbox);
                     state.tick(&mut self.outbox);
                     self.drain(node);
                 }
@@ -667,6 +698,7 @@ impl Sim {
             dropped: self.stats.dropped,
             not_cached: self.stats.not_cached,
             avg_eager,
+            start_avg_eager: self.start_avg_eager,
         }
     }
 }
@@ -704,6 +736,7 @@ struct Report {
     dropped: u64,
     not_cached: u64,
     avg_eager: f64,
+    start_avg_eager: f64,
 }
 
 impl Report {
@@ -750,7 +783,129 @@ impl fmt::Display for Report {
             self.dropped,
             self.longhaul_frac * 100.0,
         )?;
-        writeln!(f, "  topology   avg_eager={:.1}", self.avg_eager)
+        writeln!(
+            f,
+            "  topology   avg_eager start={:.1} end={:.1}",
+            self.start_avg_eager, self.avg_eager
+        )
+    }
+}
+
+impl Sim {
+    /// One fresh node joins a steady cluster. Bootstraps nodes `0..n-1` as the
+    /// existing cluster (the joiner excluded), snapshots their overlays, then
+    /// the joiner bootstraps and every existing node learns it via `peer_up`.
+    /// Measures the joiner's inbound degree (how many existing nodes took it
+    /// into eager/lazy) and the *collateral churn* — overlay edges among the
+    /// existing peers, not involving the joiner, that changed as a side effect.
+    fn measure_join(mut self) -> JoinReport {
+        let n = self.params.n;
+        let joiner = n - 1;
+        let config = self.params.config();
+        let seed = self.params.seed;
+        let region_of = std::mem::take(&mut self.region_of);
+        let rtt_ms = std::mem::take(&mut self.rtt_ms);
+        let info = |a: usize, b: usize| -> RttInfo {
+            let rtt = rtt_ms[region_of[a] as usize][region_of[b] as usize];
+            RttInfo {
+                ring: ring_from_rtt_ms(rtt),
+                rtt_ms: rtt,
+            }
+        };
+
+        let mut states: Vec<PlumtreeState<MId, SimPayload, NId, SimSeenStore>> = (0..n)
+            .map(|i| {
+                PlumtreeState::new_with_store_seeded(
+                    i as NId,
+                    config.clone(),
+                    SimSeenStore::new(config.max_received_entries),
+                    seed.wrapping_add(i as u64),
+                )
+            })
+            .collect();
+        let mut outbox = Outbox::default();
+
+        // existing cluster: full membership among 0..n-1, joiner excluded.
+        for e in 0..joiner {
+            let peers: Vec<(NId, RttInfo)> = (0..joiner)
+                .filter(|&j| j != e)
+                .map(|j| (j as NId, info(e, j)))
+                .collect();
+            states[e].add_peers_bulk_with_rtt(peers, &mut outbox);
+        }
+
+        let before_eager: Vec<HashSet<NId>> = (0..joiner)
+            .map(|e| states[e].eager_peers().clone())
+            .collect();
+        let before_lazy: Vec<HashSet<NId>> = (0..joiner)
+            .map(|e| states[e].lazy_peers().iter().copied().collect())
+            .collect();
+
+        // joiner bootstraps with the existing cluster...
+        let jpeers: Vec<(NId, RttInfo)> =
+            (0..joiner).map(|j| (j as NId, info(joiner, j))).collect();
+        states[joiner].add_peers_bulk_with_rtt(jpeers, &mut outbox);
+        // ...and every existing node learns the joiner.
+        for e in 0..joiner {
+            states[e].peer_up(joiner as NId, Some(info(e, joiner)), &mut outbox);
+        }
+
+        let j = joiner as NId;
+        let (mut eager_in, mut lazy_in, mut known_only, mut collateral) =
+            (0usize, 0usize, 0usize, 0u64);
+        for e in 0..joiner {
+            let ea: HashSet<NId> = states[e].eager_peers().iter().copied().collect();
+            let la: HashSet<NId> = states[e].lazy_peers().iter().copied().collect();
+            if ea.contains(&j) {
+                eager_in += 1;
+            } else if la.contains(&j) {
+                lazy_in += 1;
+            } else {
+                known_only += 1;
+            }
+            // collateral = changes to edges that don't involve the joiner.
+            let ea_noj: HashSet<NId> = ea.iter().copied().filter(|&p| p != j).collect();
+            let la_noj: HashSet<NId> = la.iter().copied().filter(|&p| p != j).collect();
+            collateral += ea_noj.symmetric_difference(&before_eager[e]).count() as u64;
+            collateral += la_noj.symmetric_difference(&before_lazy[e]).count() as u64;
+        }
+
+        JoinReport {
+            n,
+            joiner_eager_in: eager_in,
+            joiner_lazy_in: lazy_in,
+            joiner_known_only: known_only,
+            collateral_churn: collateral,
+        }
+    }
+}
+
+struct JoinReport {
+    n: usize,
+    joiner_eager_in: usize,
+    joiner_lazy_in: usize,
+    joiner_known_only: usize,
+    collateral_churn: u64,
+}
+
+impl fmt::Display for JoinReport {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let existing = self.n - 1;
+        writeln!(
+            f,
+            "--- JOIN n={} (one fresh node joins a steady cluster)",
+            self.n
+        )?;
+        writeln!(
+            f,
+            "  joiner inbound: eager={} lazy={} known-only={} (of {} existing nodes)",
+            self.joiner_eager_in, self.joiner_lazy_in, self.joiner_known_only, existing
+        )?;
+        writeln!(
+            f,
+            "  collateral {} overlay edges among existing peers (not the joiner) changed by the join",
+            self.collateral_churn
+        )
     }
 }
 
@@ -1148,6 +1303,7 @@ impl GossipSim {
             not_cached: 0,
             // no eager set in gossip; report the avg ring0 (guaranteed-flood) size.
             avg_eager: avg_ring0,
+            start_avg_eager: avg_ring0,
         }
     }
 }
@@ -1397,7 +1553,10 @@ fn sim_2k_prune_throttle() {
     println!("prune-throttle 1s:\n{throttled}");
 
     // delivery must be unharmed
-    assert_eq!(throttled.delivered, throttled.expected, "throttle broke delivery");
+    assert_eq!(
+        throttled.delivered, throttled.expected,
+        "throttle broke delivery"
+    );
     assert_eq!(throttled.missing, 0);
     // prune traffic should fall substantially
     assert!(

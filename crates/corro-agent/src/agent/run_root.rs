@@ -109,7 +109,7 @@ async fn run(
     handlers::spawn_swim_announcer(&agent, gossip_addr, tripwire.clone());
 
     // Load existing cluster members into the SWIM runtime
-    util::initialise_foca(&agent, member_states).await;
+    util::initialise_foca(&agent, member_states.clone()).await;
 
     // Load schema from paths
     if let Err(e) = execute_schema_from_paths(&agent).await {
