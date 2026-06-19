@@ -890,7 +890,7 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
         let mut should_rebalance = self.needs_rebalance;
         for (peer, info) in updates {
             let existing = self.peer_topology.get(&peer);
-            if existing.is_none() || RingBucket::of(*existing.unwrap()) !=  RingBucket::of(info) {
+            if existing.is_none() || RingBucket::of(*existing.unwrap()) != RingBucket::of(info) {
                 self.peer_topology.insert(peer.clone(), info);
                 self.known_peers.insert(peer);
                 should_rebalance = true;
@@ -1185,7 +1185,6 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
         self.seen.evict_if_needed();
         self.cache.evict_if_needed();
         self.prune_throttle.sweep(rt.now());
-   
     }
 }
 

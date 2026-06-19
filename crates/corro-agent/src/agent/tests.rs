@@ -42,6 +42,7 @@ use corro_types::{
     agent::Agent,
     api::{ColumnName, TableName},
     change::row_to_change,
+    config::BroadcastMethod,
     pubsub::pack_columns,
 };
 
@@ -126,15 +127,18 @@ async fn http_api_requested_endpoint_name_header_enforced() -> eyre::Result<()> 
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-
-async fn insert_rows_and_gossip() -> eyre::Result<()> {
+async fn insert_rows_and_broadcast(method: BroadcastMethod) -> eyre::Result<()> {
     _ = tracing_subscriber::fmt::try_init();
     let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
-    let ta1 = launch_test_agent(|conf| conf.build(), tripwire.clone()).await?;
+    let ta1 = launch_test_agent(
+        |conf| conf.broadcast_method(method).build(),
+        tripwire.clone(),
+    )
+    .await?;
     let ta2 = launch_test_agent(
         |conf| {
-            conf.bootstrap(vec![ta1.agent.gossip_addr().to_string()])
+            conf.broadcast_method(method)
+                .bootstrap(vec![ta1.agent.gossip_addr().to_string()])
                 .build()
         },
         tripwire.clone(),
@@ -330,19 +334,40 @@ async fn insert_rows_and_gossip() -> eyre::Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn insert_rows_and_gossip() -> eyre::Result<()> {
+    insert_rows_and_broadcast(BroadcastMethod::Gossip).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn insert_rows_and_plumtree() -> eyre::Result<()> {
+    insert_rows_and_broadcast(BroadcastMethod::Plumtree).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn chill_test() -> eyre::Result<()> {
-    configurable_stress_test(2, 1, 4).await
+    configurable_stress_test(2, 1, 4, BroadcastMethod::Gossip).await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn stress_test() -> eyre::Result<()> {
-    configurable_stress_test(30, 10, 200).await
+    configurable_stress_test(30, 10, 200, BroadcastMethod::Gossip).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn stress_plumtree_test() -> eyre::Result<()> {
+    configurable_stress_test(30, 10, 200, BroadcastMethod::Plumtree).await
 }
 
 #[ignore]
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn stresser_test() -> eyre::Result<()> {
-    configurable_stress_test(45, 15, 1500).await
+    configurable_stress_test(45, 15, 1500, BroadcastMethod::Gossip).await
+}
+
+#[ignore]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn stresser_plumtree_test() -> eyre::Result<()> {
+    configurable_stress_test(45, 15, 1500, BroadcastMethod::Plumtree).await
 }
 
 /// Default parameters:
@@ -357,6 +382,7 @@ pub async fn configurable_stress_test(
     num_nodes: usize,
     connectivity: usize,
     input_count: usize,
+    method: BroadcastMethod,
 ) -> eyre::Result<()> {
     _ = tracing_subscriber::fmt::try_init();
     let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
@@ -381,6 +407,7 @@ pub async fn configurable_stress_test(
                         launch_test_agent(
                             |conf| {
                                 conf.gossip_addr(gossip_addr)
+                                    .broadcast_method(method)
                                     .bootstrap(
                                         bootstrap
                                             .iter()
