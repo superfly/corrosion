@@ -1,5 +1,4 @@
 use std::{
-    cmp,
     collections::{HashMap, VecDeque},
     net::SocketAddr,
     num::NonZeroU32,
@@ -40,6 +39,7 @@ use crate::{
 struct SeenEntry {
     seqs: Option<RangeInclusiveSet<CrsqlSeq>>,
     last_seq: Option<CrsqlSeq>,
+    #[allow(unused)]
     round: plum_foca::Round,
     duplicate_count: u32,
 }
@@ -71,7 +71,16 @@ impl SeenStore<ChangeId> for ChangeSeenStore {
         self.contains_local(id) || self.contains_booked(id)
     }
 
+    fn size(&self) -> usize {
+        self.entries.len()
+    }
+
     fn observe(&mut self, id: ChangeId, round: plum_foca::Round) -> Option<u32> {
+        if self.contains_booked(&id) {
+            // we already received this change through a sync or dropped it during a prune
+            counter!("corro.plumtree.change.synced").increment(1);
+            return Some(0);
+        }
         let actor_id = id.actor_id;
         match &id.changeset_id {
             ChangesetId::Full {
@@ -92,7 +101,6 @@ impl SeenStore<ChangeId> for ChangeSeenStore {
                 }
                 indexmap::map::Entry::Occupied(mut e) => {
                     let entry = e.get_mut();
-                    entry.round = cmp::max(entry.round, round);
 
                     if entry.seqs.is_none() {
                         entry.duplicate_count += 1;
@@ -267,6 +275,9 @@ impl plum_foca::Runtime<ChangeId, ChangeV1, ActorId> for CorrosionPlumtreeRuntim
             plum_foca::Notification::PeerDroppedFromEager(_) => {
                 counter!("corro.plumtree.peer_dropped_from_eager").increment(1);
             }
+            plum_foca::Notification::PeerEvictedFromLazy(_) => {
+                counter!("corro.plumtree.peer_evicted").increment(1);
+            }
             plum_foca::Notification::DuplicateMessage(_) => {
                 counter!("corro.plumtree.duplicate_message").increment(1);
             }
@@ -297,16 +308,14 @@ pub async fn spawn_plumtree_loop<T: TransportExt + Clone + Send + 'static>(
 ) {
     let config = plum_foca::Config {
         ihave_timeout: Duration::from_millis(200),
-        optimization_threshold: Some(5),
+        optimization_threshold: Some(7),
         max_cached_payloads: 5000,
         num_eager: None,
         min_lazy: None,
         max_lazy: None,
         prune_threshold: 5,
         max_received_entries: 10000,
-        // Suppress repeat PRUNEs to a peer within this window: at 2k the sim
-        // (plum-foca sim_2k_prune_throttle) cut PRUNE traffic ~83% with delivery
-        // and full-cluster latency unchanged.
+        // Suppress repeat PRUNEs to a peer within this window
         prune_throttle: Some(Duration::from_secs(1)),
     };
 
@@ -470,6 +479,9 @@ pub async fn plumtree_loop<T: TransportExt + Clone + Send + 'static>(
                     .set(state.ring_locked_peers().len() as f64);
                 gauge!("corro.plumtree.known_peers").set(state.known_peers().len() as f64);
                 gauge!("corro.plumtree.lazy_queue").set(state.lazy_queue().len() as f64);
+
+                gauge!("corro.plumtree.payload_cache_size").set(state.payload_cache_size() as f64);
+                gauge!("corro.plumtree.seen_cache_size").set(state.seen_cache_size() as f64);
             }
         }
     }
@@ -559,8 +571,7 @@ async fn send_messages_loop<T: TransportExt + Clone + Send + 'static>(
             }
             Branch::Msg((prio, peers, msg)) => {
                 debug!("plumtree: msg: {msg:?}, peers: {peers:?}");
-                let p1_gossip =
-                    matches!(prio, PlumPrio::P1) && matches!(&msg, PlumtreeMsgV1::Gossip(_));
+                let p1_gossip = matches!(&msg, PlumtreeMsgV1::Gossip(_));
                 let payload = match encode_plumtree_wire(
                     cluster_id,
                     &mut codec,
