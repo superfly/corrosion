@@ -96,6 +96,10 @@ impl SeenStore<MId> for SimSeenStore {
         self.entries.insert(id, 1);
         None
     }
+
+    fn size(&self) -> usize {
+        self.entries.len()
+    }
 }
 
 struct Region {
@@ -157,11 +161,21 @@ fn ring_from_rtt_ms(rtt_ms: u64) -> Option<u8> {
 }
 
 #[derive(Default)]
+struct NotificationStats {
+    duplicates: u64,
+    missing: u64,
+    not_cached: u64,
+    promotions: u64,
+    demotions: u64,
+    prune_suppressed: u64,
+}
+
+#[derive(Default)]
 struct Outbox {
     sent: Vec<(NId, PlumtreeMsg<MId, SimPayload, NId>)>,
     scheduled: Vec<(Timer<MId, NId>, Duration)>,
     delivered: Vec<SimPayload>,
-    notifications: Vec<Notification<MId, NId>>,
+    notification_stats: NotificationStats,
     /// current virtual time in µs, kept in sync with `Sim::now`
     now_us: u64,
 }
@@ -190,8 +204,16 @@ impl Runtime<MId, SimPayload, NId> for Outbox {
         self.scheduled.push((timer, after));
     }
 
-    fn notify(&mut self, notification: Notification<MId, NId>) {
-        self.notifications.push(notification);
+    fn notify(&mut self, notification: Notification<'_, MId, NId>) {
+        match notification {
+            Notification::DuplicateMessage(_) => self.notification_stats.duplicates += 1,
+            Notification::MessageMissing(count) => self.notification_stats.missing += count as u64,
+            Notification::PayloadNotCached(_) => self.notification_stats.not_cached += 1,
+            Notification::PeerMovedToEager(_) => self.notification_stats.promotions += 1,
+            Notification::PeerDroppedFromEager(_) => self.notification_stats.demotions += 1,
+            Notification::PeerMovedToLazy(_) | Notification::PeerEvictedFromLazy(_) => {}
+            Notification::PruneSuppressed(_) => self.notification_stats.prune_suppressed += 1,
+        }
     }
 
     fn now(&self) -> Instant {
@@ -554,18 +576,13 @@ impl Sim {
             self.stats.hops.push(round + 1);
         }
 
-        for notification in std::mem::take(&mut self.outbox.notifications) {
-            match notification {
-                Notification::DuplicateMessage(_) => self.stats.duplicates += 1,
-                Notification::MessageMissing(count) => self.stats.missing += count as u64,
-                Notification::PayloadNotCached(_) => self.stats.not_cached += 1,
-                Notification::PeerMovedToEager(_) => self.stats.promotions += 1,
-                Notification::PeerDroppedFromEager(_) => self.stats.demotions += 1,
-                // lazy-set insert; the real eager→lazy demotion is counted above
-                Notification::PeerMovedToLazy(_) => {}
-                Notification::PruneSuppressed(_) => self.stats.prune_suppressed += 1,
-            }
-        }
+        let notification_stats = std::mem::take(&mut self.outbox.notification_stats);
+        self.stats.duplicates += notification_stats.duplicates;
+        self.stats.missing += notification_stats.missing;
+        self.stats.not_cached += notification_stats.not_cached;
+        self.stats.promotions += notification_stats.promotions;
+        self.stats.demotions += notification_stats.demotions;
+        self.stats.prune_suppressed += notification_stats.prune_suppressed;
 
         for (timer, after) in std::mem::take(&mut self.outbox.scheduled) {
             let at = self.now + after.as_micros() as u64;

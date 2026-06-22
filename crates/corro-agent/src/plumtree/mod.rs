@@ -263,7 +263,7 @@ impl plum_foca::Runtime<ChangeId, ChangeV1, ActorId> for CorrosionPlumtreeRuntim
         self.timer_spawner.spawn((after, timer));
     }
 
-    fn notify(&mut self, notification: plum_foca::Notification<ChangeId, ActorId>) {
+    fn notify(&mut self, notification: plum_foca::Notification<'_, ChangeId, ActorId>) {
         trace!("plumtree notification: {notification:?}");
         match notification {
             plum_foca::Notification::PeerMovedToEager(_) => {
