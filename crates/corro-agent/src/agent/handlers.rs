@@ -24,7 +24,7 @@ use corro_types::{
     actor::{Actor, ActorId},
     agent::{Agent, Bookie, SplitPool},
     base::CrsqlSeq,
-    broadcast::{disseminate_change, ChangeSource, ChangeV1, FocaInput, PlumtreeUpdates},
+    broadcast::{ChangeSource, ChangeV1, FocaInput, PlumtreeUpdates},
     channel::CorroReceiver,
     config::BroadcastMethod,
     members::MemberAddedResult,
@@ -1149,7 +1149,7 @@ pub async fn handle_changes(
         // Rebroadcast changes received from broadcast (gossip method).
         if matches!(src, ChangeSource::Broadcast) && !change.is_empty() {
             assert_sometimes!(true, "Corrosion rebroadcasts changes");
-            disseminate_change(&agent, change.clone());
+            agent.broadcaster().rebroadcast(&change);
         }
 
         // Handle the new change - queue it and potentially spawn a batch

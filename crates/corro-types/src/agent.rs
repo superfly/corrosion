@@ -34,8 +34,8 @@ use crate::{
     actor::{Actor, ActorId, ClusterId, MemberId},
     base::{CrsqlDbVersion, CrsqlDbVersionRange, CrsqlSeq},
     broadcast::{
-        BroadcastInput, ChangeSource, ChangeV1, FocaInput, PlumtreeInput, PlumtreeUpdates,
-        Timestamp,
+        BroadcastInput, BroadcastV1, ChangeSource, ChangeV1, FocaInput, PlumtreeInput,
+        PlumtreeUpdates, Timestamp,
     },
     channel::{bounded, CorroSender},
     config::{BroadcastMethod, Config},
@@ -112,6 +112,7 @@ pub struct AgentInner {
     tx_foca: CorroSender<FocaInput>,
     tx_plumtree: CorroSender<PlumtreeInput>,
     tx_plumtree_updates: CorroSender<PlumtreeUpdates>,
+    broadcaster: Broadcaster,
     write_sema: Arc<Semaphore>,
     schema: RwLock<Schema>,
     cluster_id: ArcSwap<ClusterId>,
@@ -129,6 +130,10 @@ pub struct Limits {
 
 impl Agent {
     pub fn new(config: AgentConfig) -> Self {
+        let broadcaster = match config.config.load().gossip.broadcast_method {
+            BroadcastMethod::Gossip => Broadcaster::Gossip(config.tx_bcast.clone()),
+            BroadcastMethod::Plumtree => Broadcaster::Plumtree(config.tx_plumtree.clone()),
+        };
         Self(Arc::new(AgentInner {
             actor_id: config.actor_id,
             pool: config.pool,
@@ -148,6 +153,7 @@ impl Agent {
             tx_foca: config.tx_foca,
             tx_plumtree: config.tx_plumtree,
             tx_plumtree_updates: config.tx_plumtree_updates,
+            broadcaster,
             write_sema: config.write_sema,
             schema: config.schema,
             cluster_id: ArcSwap::from_pointee(config.cluster_id),
@@ -272,6 +278,12 @@ impl Agent {
         self.config().gossip.broadcast_method
     }
 
+    /// Route changes to the active dissemination method, resolved once from
+    /// [`BroadcastMethod`] at construction.
+    pub fn broadcaster(&self) -> &Broadcaster {
+        &self.0.broadcaster
+    }
+
     pub fn set_config(&self, new_conf: Config) {
         self.0.config.store(Arc::new(new_conf))
     }
@@ -323,6 +335,53 @@ impl Agent {
             .map_err(|e| format!("could not convert ActorId to uhlc ID: {e}"))?;
         self.clock()
             .update_with_timestamp(&uhlc::Timestamp::new(ts.0, id))
+    }
+}
+
+/// Routes changes based on configured broadcast method.
+pub enum Broadcaster {
+    Gossip(CorroSender<BroadcastInput>),
+    Plumtree(CorroSender<PlumtreeInput>),
+}
+
+impl Broadcaster {
+    pub fn broadcast_local(&self, change: ChangeV1) {
+        match self {
+            Broadcaster::Gossip(tx) => {
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = tx
+                        .send(BroadcastInput::AddBroadcast(BroadcastV1::Change(change)))
+                        .await
+                    {
+                        debug!("could not queue change for gossip broadcast: {e}");
+                    }
+                });
+            }
+            Broadcaster::Plumtree(tx) => {
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = tx.send(PlumtreeInput::Broadcast(change)).await {
+                        error!("could not send change for plumtree broadcast: {e}");
+                    }
+                });
+            }
+        }
+    }
+
+    pub fn rebroadcast(&self, change: &ChangeV1) {
+        match self {
+            Broadcaster::Gossip(tx) => {
+                let input = BroadcastInput::Rebroadcast(BroadcastV1::Change(change.clone()));
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = tx.send(input).await {
+                        debug!("could not queue change for gossip rebroadcast: {e}");
+                    }
+                });
+            }
+            Broadcaster::Plumtree(_) => {}
+        }
     }
 }
 

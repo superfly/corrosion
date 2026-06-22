@@ -60,8 +60,6 @@ impl Payload for SimPayload {
     }
 }
 
-/// Bounded seen-store, equivalent in behavior to the in-memory part of
-/// corro-agent's `ChangeSeenStore`: tracks how many times each id was seen.
 struct SimSeenStore {
     entries: IndexMap<MId, u32>,
     cap: usize,
@@ -803,124 +801,6 @@ impl fmt::Display for Report {
             f,
             "  topology   avg_eager start={:.1} end={:.1}",
             self.start_avg_eager, self.avg_eager
-        )
-    }
-}
-
-impl Sim {
-    /// One fresh node joins a steady cluster. Bootstraps nodes `0..n-1` as the
-    /// existing cluster (the joiner excluded), snapshots their overlays, then
-    /// the joiner bootstraps and every existing node learns it via `peer_up`.
-    /// Measures the joiner's inbound degree (how many existing nodes took it
-    /// into eager/lazy) and the *collateral churn* — overlay edges among the
-    /// existing peers, not involving the joiner, that changed as a side effect.
-    fn measure_join(mut self) -> JoinReport {
-        let n = self.params.n;
-        let joiner = n - 1;
-        let config = self.params.config();
-        let seed = self.params.seed;
-        let region_of = std::mem::take(&mut self.region_of);
-        let rtt_ms = std::mem::take(&mut self.rtt_ms);
-        let info = |a: usize, b: usize| -> RttInfo {
-            let rtt = rtt_ms[region_of[a] as usize][region_of[b] as usize];
-            RttInfo {
-                ring: ring_from_rtt_ms(rtt),
-                rtt_ms: rtt,
-            }
-        };
-
-        let mut states: Vec<PlumtreeState<MId, SimPayload, NId, SimSeenStore>> = (0..n)
-            .map(|i| {
-                PlumtreeState::new_with_store_seeded(
-                    i as NId,
-                    config.clone(),
-                    SimSeenStore::new(config.max_received_entries),
-                    seed.wrapping_add(i as u64),
-                )
-            })
-            .collect();
-        let mut outbox = Outbox::default();
-
-        // existing cluster: full membership among 0..n-1, joiner excluded.
-        for e in 0..joiner {
-            let peers: Vec<(NId, RttInfo)> = (0..joiner)
-                .filter(|&j| j != e)
-                .map(|j| (j as NId, info(e, j)))
-                .collect();
-            states[e].add_peers_bulk_with_rtt(peers, &mut outbox);
-        }
-
-        let before_eager: Vec<HashSet<NId>> = (0..joiner)
-            .map(|e| states[e].eager_peers().clone())
-            .collect();
-        let before_lazy: Vec<HashSet<NId>> = (0..joiner)
-            .map(|e| states[e].lazy_peers().iter().copied().collect())
-            .collect();
-
-        // joiner bootstraps with the existing cluster...
-        let jpeers: Vec<(NId, RttInfo)> =
-            (0..joiner).map(|j| (j as NId, info(joiner, j))).collect();
-        states[joiner].add_peers_bulk_with_rtt(jpeers, &mut outbox);
-        // ...and every existing node learns the joiner.
-        for e in 0..joiner {
-            states[e].peer_up(joiner as NId, Some(info(e, joiner)), &mut outbox);
-        }
-
-        let j = joiner as NId;
-        let (mut eager_in, mut lazy_in, mut known_only, mut collateral) =
-            (0usize, 0usize, 0usize, 0u64);
-        for e in 0..joiner {
-            let ea: HashSet<NId> = states[e].eager_peers().iter().copied().collect();
-            let la: HashSet<NId> = states[e].lazy_peers().iter().copied().collect();
-            if ea.contains(&j) {
-                eager_in += 1;
-            } else if la.contains(&j) {
-                lazy_in += 1;
-            } else {
-                known_only += 1;
-            }
-            // collateral = changes to edges that don't involve the joiner.
-            let ea_noj: HashSet<NId> = ea.iter().copied().filter(|&p| p != j).collect();
-            let la_noj: HashSet<NId> = la.iter().copied().filter(|&p| p != j).collect();
-            collateral += ea_noj.symmetric_difference(&before_eager[e]).count() as u64;
-            collateral += la_noj.symmetric_difference(&before_lazy[e]).count() as u64;
-        }
-
-        JoinReport {
-            n,
-            joiner_eager_in: eager_in,
-            joiner_lazy_in: lazy_in,
-            joiner_known_only: known_only,
-            collateral_churn: collateral,
-        }
-    }
-}
-
-struct JoinReport {
-    n: usize,
-    joiner_eager_in: usize,
-    joiner_lazy_in: usize,
-    joiner_known_only: usize,
-    collateral_churn: u64,
-}
-
-impl fmt::Display for JoinReport {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let existing = self.n - 1;
-        writeln!(
-            f,
-            "--- JOIN n={} (one fresh node joins a steady cluster)",
-            self.n
-        )?;
-        writeln!(
-            f,
-            "  joiner inbound: eager={} lazy={} known-only={} (of {} existing nodes)",
-            self.joiner_eager_in, self.joiner_lazy_in, self.joiner_known_only, existing
-        )?;
-        writeln!(
-            f,
-            "  collateral {} overlay edges among existing peers (not the joiner) changed by the join",
-            self.collateral_churn
         )
     }
 }

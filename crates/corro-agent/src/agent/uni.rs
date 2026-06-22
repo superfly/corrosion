@@ -1,8 +1,13 @@
 use corro_types::{
     agent::Agent,
-    broadcast::{BroadcastV1, ChangeSource, PlumtreeInput, PlumtreeMsg, UniPayload, UniPayloadV1},
+    broadcast::{
+        BroadcastV1, ChangeSource, ChangeV1, PlumtreeInput, PlumtreeMsg, PlumtreeMsgV1, UniPayload,
+        UniPayloadV1,
+    },
+    config::BroadcastMethod,
 };
 use metrics::counter;
+use plum_foca::GossipMsg;
 use speedy::Readable;
 use tokio_stream::StreamExt;
 use tokio_util::codec::{FramedRead, LengthDelimitedCodec};
@@ -13,6 +18,7 @@ use tripwire::Tripwire;
 /// spawns another task for each incoming stream to handle.
 pub fn spawn_unipayload_handler(tripwire: &Tripwire, conn: &quinn::Connection, agent: Agent) {
     let cluster_id = agent.cluster_id();
+    let broadcast_method = agent.broadcast_method();
     let tx_changes = agent.tx_changes().clone();
     let tx_plumtree = agent.tx_plumtree().clone();
 
@@ -45,6 +51,7 @@ pub fn spawn_unipayload_handler(tripwire: &Tripwire, conn: &quinn::Connection, a
                 tokio::spawn({
                     let tx_changes = tx_changes.clone();
                     let tx_plumtree = tx_plumtree.clone();
+                    let broadcast_method = broadcast_method;
                     async move {
                         let mut framed = FramedRead::new(
                             rx,
@@ -53,7 +60,7 @@ pub fn spawn_unipayload_handler(tripwire: &Tripwire, conn: &quinn::Connection, a
                                 .new_codec(),
                         );
 
-                        let mut changes = vec![];
+                        let mut changes: Vec<ChangeV1> = vec![];
                         loop {
                             match StreamExt::next(&mut framed).await {
                                 Some(Ok(b)) => {
@@ -74,7 +81,7 @@ pub fn spawn_unipayload_handler(tripwire: &Tripwire, conn: &quinn::Connection, a
                                                     if cluster_id != payload_cluster_id {
                                                         continue;
                                                     }
-                                                    changes.push((change, ChangeSource::Broadcast));
+                                                    changes.push(change);
                                                 }
                                                 UniPayload::V1 {
                                                     data:
@@ -113,10 +120,33 @@ pub fn spawn_unipayload_handler(tripwire: &Tripwire, conn: &quinn::Connection, a
                             }
                         }
 
-                        for change in changes.into_iter().rev() {
-                            if let Err(e) = tx_changes.send(change).await {
-                                error!("could not send change for processing: {e}");
-                                return;
+                        match broadcast_method {
+                            BroadcastMethod::Plumtree => {
+                                for change in changes.into_iter().rev() {
+                                    let wire = PlumtreeMsgV1::Gossip(GossipMsg {
+                                        round: 1,
+                                        sender: change.actor_id,
+                                        payload: change,
+                                    });
+                                    if let Err(e) =
+                                        tx_plumtree.send(PlumtreeInput::Wire(wire)).await
+                                    {
+                                        error!(
+                                            "could not route legacy gossip change to plumtree: {e}"
+                                        );
+                                        return;
+                                    }
+                                }
+                            }
+                            BroadcastMethod::Gossip => {
+                                for change in changes.into_iter().rev() {
+                                    if let Err(e) =
+                                        tx_changes.send((change, ChangeSource::Broadcast)).await
+                                    {
+                                        error!("could not send change for processing: {e}");
+                                        return;
+                                    }
+                                }
                             }
                         }
                     }
