@@ -26,7 +26,8 @@ use tripwire::Tripwire;
 use uuid::Uuid;
 
 pub trait Manager<H> {
-    fn trait_type(&self) -> String;
+    fn trait_type(&self) -> &'static str;
+    fn fallible(&self) -> bool;
     fn get(&self, id: &Uuid) -> Option<H>;
     fn remove(&self, id: &Uuid) -> Option<H>;
     fn get_handles(&self) -> BTreeMap<Uuid, H>;
@@ -61,8 +62,12 @@ impl std::fmt::Debug for HandleMetrics {
 pub struct UpdatesManager(Arc<RwLock<InnerUpdatesManager>>);
 
 impl Manager<UpdateHandle> for UpdatesManager {
-    fn trait_type(&self) -> String {
-        "updates".to_string()
+    fn trait_type(&self) -> &'static str {
+        "updates"
+    }
+
+    fn fallible(&self) -> bool {
+        true
     }
 
     fn get(&self, id: &Uuid) -> Option<UpdateHandle> {
@@ -461,15 +466,19 @@ where
             error!(sub_id = %id, "could not send change candidates to {trait_type} handler: {e}");
             match e {
                 mpsc::error::TrySendError::Full(item) => {
-                    warn!("channel is full, falling back to async send");
-
-                    let changes_tx = handle.changes_tx();
-                    let id = *id;
-                    tokio::spawn(async move {
-                        if let Err(e) = changes_tx.send(item).await {
-                            error!(sub_id = %id, "could not send match_change candidates to handler: {e}");
-                        }
-                    });
+                    if manager.fallible() {
+                        warn!("channel is full, falling back to async send");
+                        let changes_tx = handle.changes_tx();
+                        let id = *id;
+                        tokio::spawn(async move {
+                            if let Err(e) = changes_tx.send(item).await {
+                                error!(sub_id = %id, "could not send match_change candidates to handler: {e}");
+                            }
+                        });
+                    } else {
+                        counter!("corro.matcher.changes.dropped", "type" => trait_type)
+                            .increment(1);
+                    }
                 }
                 mpsc::error::TrySendError::Closed(_) => {
                     if let Some(handle) = manager.remove(id) {
