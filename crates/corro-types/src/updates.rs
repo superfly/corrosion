@@ -466,7 +466,7 @@ where
             error!(sub_id = %id, "could not send change candidates to {trait_type} handler: {e}");
             match e {
                 mpsc::error::TrySendError::Full(item) => {
-                    if manager.fallible() {
+                    if !manager.fallible() {
                         warn!("channel is full, falling back to async send");
                         let changes_tx = handle.changes_tx();
                         let id = *id;
