@@ -1193,7 +1193,7 @@ mod tests {
         let (tx_bcast, rx_bcast) = bounded(100, "bcast");
         let (tx_rtt, _) = mpsc::channel(100);
 
-        let config = Arc::new(RwLock::new(make_foca_config(1.try_into().unwrap())));
+        let config = Arc::new(RwLock::new(make_foca_config(1.try_into().unwrap(), None)));
         let transport = Transport::new(&ta1_agent.config().gossip, tx_rtt).await?;
 
         let server_config = quinn_plaintext::server_config();

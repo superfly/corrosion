@@ -49,7 +49,7 @@ pub enum UniPayload {
 #[derive(Debug, Clone, Readable, Writable)]
 pub enum UniPayloadV1 {
     Broadcast(BroadcastV1),
-    PlumTree(PlumtreeMsg),
+    Plumtree(PlumtreeWire),
 }
 
 // ---------------------------------------------------------------------------
@@ -83,7 +83,7 @@ pub enum ChangesetId {
 pub type PlumtreeMsgV1 = plum_foca::PlumtreeMsg<ChangeId, ChangeV1, ActorId>;
 
 #[derive(Debug, Clone, Readable, Writable)]
-pub enum PlumtreeMsg {
+pub enum PlumtreeWire {
     V1 { data: PlumtreeMsgV1 },
 }
 

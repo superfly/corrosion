@@ -12,8 +12,8 @@ use corro_types::{
     agent::{Agent, Bookie},
     base::{CrsqlDbVersion, CrsqlSeq},
     broadcast::{
-        ChangeId, ChangeSource, ChangeV1, ChangesetId, PlumtreeInput, PlumtreeMsg, PlumtreeMsgV1,
-        PlumtreeUpdates, UniPayload, UniPayloadV1,
+        ChangeId, ChangeSource, ChangeV1, ChangesetId, PlumtreeInput, PlumtreeMsgV1,
+        PlumtreeUpdates, PlumtreeWire, UniPayload, UniPayloadV1,
     },
     channel::{bounded, CorroReceiver, CorroSender},
 };
@@ -640,7 +640,7 @@ fn encode_plumtree_wire(
 ) -> Result<Bytes, ()> {
     ser_buf.clear();
     if let Err(e) = (UniPayload::V1 {
-        data: UniPayloadV1::PlumTree(PlumtreeMsg::V1 { data: msg }),
+        data: UniPayloadV1::Plumtree(PlumtreeWire::V1 { data: msg }),
         cluster_id,
     })
     .write_to_stream(ser_buf.writer())

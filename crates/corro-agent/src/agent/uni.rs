@@ -1,8 +1,8 @@
 use corro_types::{
     agent::Agent,
     broadcast::{
-        BroadcastV1, ChangeSource, ChangeV1, PlumtreeInput, PlumtreeMsg, PlumtreeMsgV1, UniPayload,
-        UniPayloadV1,
+        BroadcastV1, ChangeSource, ChangeV1, PlumtreeInput, PlumtreeMsgV1, PlumtreeWire,
+        UniPayload, UniPayloadV1,
     },
     config::BroadcastMethod,
 };
@@ -85,7 +85,7 @@ pub fn spawn_unipayload_handler(tripwire: &Tripwire, conn: &quinn::Connection, a
                                                 }
                                                 UniPayload::V1 {
                                                     data:
-                                                        UniPayloadV1::PlumTree(PlumtreeMsg::V1 {
+                                                        UniPayloadV1::Plumtree(PlumtreeWire::V1 {
                                                             data: wire_msg,
                                                         }),
                                                     cluster_id: payload_cluster_id,
@@ -94,16 +94,26 @@ pub fn spawn_unipayload_handler(tripwire: &Tripwire, conn: &quinn::Connection, a
                                                         continue;
                                                     }
                                                     let tx = tx_plumtree.clone();
-                                                    tokio::spawn(async move {
-                                                        if let Err(e) = tx
-                                                            .send(PlumtreeInput::Wire(wire_msg))
-                                                            .await
-                                                        {
-                                                            error!(
-                                                                "could not route PlumTree msg: {e}"
+
+                                                    match broadcast_method {
+                                                        // route gossips if we are using broadcast method
+                                                        BroadcastMethod::Gossip => match wire_msg {
+                                                            PlumtreeMsgV1::Gossip(msg) => {
+                                                                changes.push(msg.payload);
+                                                            }
+                                                            _ => {}
+                                                        },
+                                                        BroadcastMethod::Plumtree => {
+                                                            if let Err(e) = tx
+                                                                .send(PlumtreeInput::Wire(wire_msg))
+                                                                .await
+                                                            {
+                                                                error!(
+                                                                "could not route Plumtree msg: {e}"
                                                             );
+                                                            }
                                                         }
-                                                    });
+                                                    }
                                                 }
                                             }
                                         }
