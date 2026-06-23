@@ -74,15 +74,22 @@ use tripwire::{PreemptibleFutureExt, Tripwire};
 
 const REQUESTED_ENDPOINT_NAME_HEADER: &str = "x-corrosion-requested-endpoint-name";
 
-pub async fn initialise_foca(agent: &Agent, states: Vec<(SocketAddr, Member<Actor>)>) {
+pub async fn initialise_foca(agent: &Agent, states: Vec<(SocketAddr, Member<Actor>, Option<u64>)>) {
     if !states.is_empty() {
         let mut foca_states = BTreeMap::<SocketAddr, Member<Actor>>::new();
 
         {
             // block to drop the members write lock
             let mut members = agent.members().write();
-            for (address, foca_state) in states {
-                members.by_addr.insert(address, foca_state.id().id());
+            for (address, foca_state, rtt_min) in states {
+                if matches!(foca_state.state(), foca::State::Alive) {
+                    let actor = foca_state.id();
+                    members.add_member(&actor);
+                    if let Some(rtt_ms) = rtt_min {
+                        members.add_rtt(address, Duration::from_millis(rtt_ms));
+                    }
+                }
+
                 if matches!(foca_state.state(), foca::State::Suspect) {
                     continue;
                 }
@@ -139,28 +146,29 @@ pub async fn initialise_foca(agent: &Agent, states: Vec<(SocketAddr, Member<Acto
     }
 }
 
-/// Load the existing known member state and addresses
-pub async fn load_member_states(agent: &Agent) -> Vec<(SocketAddr, Member<Actor>)> {
+/// Load the existing known member state, addresses, and persisted RTT samples.
+pub async fn load_member_states(agent: &Agent) -> Vec<(SocketAddr, Member<Actor>, Option<u64>)> {
     match agent.pool().read().await {
         Ok(conn) => block_in_place(|| {
-            match conn.prepare("SELECT address,foca_state FROM __corro_members") {
+            match conn.prepare("SELECT address, foca_state, rtt_min FROM __corro_members") {
                 Ok(mut prepped) => {
                     match prepped
                     .query_map([], |row| Ok((
                             row.get::<_, String>(0)?.parse().map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?,
-                            row.get::<_, String>(1)?
+                            row.get::<_, String>(1)?,
+                            row.get::<_, Option<i64>>(2)?,
                         ))
                     )
-                    .and_then(|rows| rows.collect::<rusqlite::Result<Vec<(SocketAddr, String)>>>())
+                    .and_then(|rows| rows.collect::<rusqlite::Result<Vec<(SocketAddr, String, Option<i64>)>>>())
                 {
                     Ok(members) => {
-                        members.into_iter().filter_map(|(address, state)| match serde_json::from_str::<foca::Member<Actor>>(state.as_str()) {
-                            Ok(fs) => Some((address, fs)),
+                        members.into_iter().filter_map(|(address, state, rtt_min)| match serde_json::from_str::<foca::Member<Actor>>(state.as_str()) {
+                            Ok(fs) => Some((address, fs, rtt_min.map(|rtt| rtt as u64))),
                             Err(e) => {
                                 error!("could not deserialize foca member state: {e} (json: {state})");
                                 None
                             }
-                        }).collect::<Vec<(SocketAddr, Member<Actor>)>>()
+                        }).collect::<Vec<(SocketAddr, Member<Actor>, Option<u64>)>>()
                     }
                     Err(e) => {
                         error!("could not query for foca member states: {e}");

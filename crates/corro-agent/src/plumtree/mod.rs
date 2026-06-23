@@ -16,7 +16,6 @@ use corro_types::{
         PlumtreeUpdates, UniPayload, UniPayloadV1,
     },
     channel::{bounded, CorroReceiver, CorroSender},
-    members::ring_from_rtt_ms,
 };
 use governor::{Quota, RateLimiter};
 use indexmap::IndexMap;
@@ -365,15 +364,9 @@ pub async fn plumtree_loop<T: TransportExt + Clone + Send + 'static>(
 
     let mut rt = CorrosionPlumtreeRuntime::new(tx_changes, timer_spawner, tx_msgs);
 
-    match plumtree_peers_from_db(&agent).await {
-        Ok(peers) => {
-            info!("added {} peers to plumtree", peers.len());
-            state.add_peers_bulk_with_rtt(peers, &mut rt);
-        }
-        Err(e) => {
-            error!("unable to load plumtree peers from db: {e}")
-        }
-    };
+    let peers: Vec<_> = plumtree_topology_map(&agent).into_iter().collect();
+    info!("added {} peers to plumtree from members", peers.len());
+    state.add_peers_bulk_with_rtt(peers, &mut rt);
 
     enum Branch {
         Input(PlumtreeInput),
@@ -769,27 +762,6 @@ fn plumtree_topology_map(agent: &Agent) -> HashMap<ActorId, RttInfo> {
         .collect()
 }
 
-async fn plumtree_peers_from_db(agent: &Agent) -> eyre::Result<Vec<(ActorId, RttInfo)>> {
-    let conn = agent.pool().read().await?;
-    let mut stmt = conn.prepare(
-        "SELECT actor_id, rtt_min FROM __corro_members WHERE rtt_min IS NOT NULL
-            AND JSON_EXTRACT(foca_state, '$.state') = 'Alive'",
-    )?;
-    let rows = stmt
-        .query_map([], |row| {
-            let rtt_ms: i64 = row.get(1)?;
-            let rtt_info = RttInfo {
-                ring: ring_from_rtt_ms(rtt_ms as u64),
-                rtt_ms: rtt_ms as u64,
-            };
-            let actor_id: ActorId = row.get(0)?;
-            Ok((actor_id, rtt_info))
-        })?
-        .collect::<rusqlite::Result<Vec<(ActorId, RttInfo)>>>()?;
-
-    Ok(rows)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -811,7 +783,7 @@ mod tests {
     use rand::seq::IndexedRandom;
     use rangemap::RangeInclusiveSet;
     use speedy::Readable;
-    use tokio::task::JoinSet;
+    use tokio::{task::JoinSet, time::Duration};
     use tokio_stream::StreamExt;
     use tokio_util::codec::{FramedRead, LengthDelimitedCodec};
     use tokio_util::sync::CancellationToken;
@@ -930,6 +902,10 @@ mod tests {
                 .await;
             });
 
+            // one sec sleep so plumtree applies membershiip update
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            println!("spawned plumtree loop");
+
             #[derive(Default)]
             struct PlumStats {
                 gossip: u64,
@@ -1020,7 +996,7 @@ mod tests {
         println!("done spawning processing threads");
         let mut rng = StdRng::from_os_rng();
         let chunk_size = 10u64;
-        let chunk_pause = Duration::from_millis(500);
+        let chunk_pause = Duration::from_millis(200);
         let mut all_changes = Vec::new();
         for chunk_start in (0..num_changes).step_by(chunk_size as usize) {
             let chunk_end = (chunk_start + chunk_size).min(num_changes);

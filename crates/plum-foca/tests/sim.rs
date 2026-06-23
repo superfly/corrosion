@@ -14,7 +14,7 @@
 //! ```
 
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{BinaryHeap, HashMap};
 use std::fmt;
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
@@ -309,9 +309,9 @@ impl Params {
         Config {
             ihave_timeout: Duration::from_millis(200),
             optimization_threshold: Some(5),
-            num_eager: Some(self.num_eager),
-            min_lazy: Some(15),
-            max_lazy: Some(30),
+            num_eager: None,
+            min_lazy: None,
+            max_lazy: None,
             prune_threshold: 5,
             max_received_entries: (self.n as u32 * self.msgs_per_node) as usize + 1,
             max_cached_payloads: 4096,

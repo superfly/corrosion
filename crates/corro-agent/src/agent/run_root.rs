@@ -87,7 +87,11 @@ async fn run(
     let (notifications_tx, notifications_rx) =
         bounded(pconf.notifications_channel_len, "notifications");
 
-    let member_states = util::load_member_states(&agent).await;
+    let loaded_member_states = util::load_member_states(&agent).await;
+    let member_states: Vec<_> = loaded_member_states
+        .iter()
+        .map(|(address, member, _)| (*address, member.clone()))
+        .collect();
 
     //// Start the main SWIM runtime loop
     runtime_loop(
@@ -100,7 +104,7 @@ async fn run(
         to_send_tx,
         notifications_tx,
         tripwire.clone(),
-        member_states.clone(),
+        member_states,
     );
 
     //// Update member connection RTTs
@@ -109,7 +113,7 @@ async fn run(
     handlers::spawn_swim_announcer(&agent, gossip_addr, tripwire.clone());
 
     // Load existing cluster members into the SWIM runtime
-    util::initialise_foca(&agent, member_states.clone()).await;
+    util::initialise_foca(&agent, loaded_member_states).await;
 
     // Load schema from paths
     if let Err(e) = execute_schema_from_paths(&agent).await {

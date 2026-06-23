@@ -997,7 +997,7 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
             lazy = self.lazy_peers.len(),
             ring_locked = self.ring_locked.len(),
             known = self.known_peers.len(),
-            "rebalance complete "
+            "rebalance complete (eager: {:?}, lazy: {:?})", self.eager_peers, self.lazy_peers
         );
     }
 
