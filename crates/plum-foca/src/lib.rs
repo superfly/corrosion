@@ -31,19 +31,10 @@ pub enum PlumPrio {
     P1,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct RttInfo {
     pub ring: Option<u8>,
-    pub rtt_ms: u64,
-}
-
-impl Default for RttInfo {
-    fn default() -> Self {
-        Self {
-            ring: None,
-            rtt_ms: u64::MAX,
-        }
-    }
+    // pub rtt_ms: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1995,13 +1986,7 @@ mod tests {
                     5 => Some(2),
                     _ => Some(5),
                 };
-                (
-                    peer,
-                    RttInfo {
-                        ring,
-                        rtt_ms: u64::from(peer),
-                    },
-                )
+                (peer, RttInfo { ring })
             })
             .collect();
         s.add_peers_bulk_with_rtt(peers, &mut rt);

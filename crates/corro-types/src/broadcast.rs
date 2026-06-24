@@ -52,15 +52,6 @@ pub enum UniPayloadV1 {
     Plumtree(PlumtreeWire),
 }
 
-// ---------------------------------------------------------------------------
-// Plumtree wire types
-// ---------------------------------------------------------------------------
-
-/// Uniquely identifies a broadcast message in the network.
-/// Uses the start version of the changeset since broadcasts are
-/// almost always single-version (Full / FullV2).
-///
-///
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Readable, Writable)]
 pub struct ChangeId {
     pub actor_id: ActorId,
@@ -139,10 +130,8 @@ pub enum PlumtreeUpdates {
     MemberUp {
         actor_id: ActorId,
         addr: SocketAddr,
-        /// RTT ring bucket from [`crate::members::Members`], if known.
         ring: Option<u8>,
-        /// Rolling average RTT in ms; `u64::MAX` when unknown.
-        rtt_ms: u64,
+        // rtt_ms: u64,
     },
     MemberDown(ActorId),
 }

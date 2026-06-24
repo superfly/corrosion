@@ -359,34 +359,7 @@ pub async fn handle_notifications(
                             }
                         }
 
-                        let plumtree_msg = if matches!(member_added_res, MemberAddedResult::Removed)
-                        {
-                            PlumtreeUpdates::MemberDown(actor.id())
-                        } else {
-                            let MemberAddedResult::NewMember(state) = member_added_res else {
-                                unreachable!("handled above");
-                            };
-                            let rtt_ms = agent
-                                .members()
-                                .read()
-                                .avg_rtt_ms(&actor.id())
-                                .unwrap_or(u64::MAX);
-                            PlumtreeUpdates::MemberUp {
-                                actor_id: actor.id(),
-                                addr: state.addr,
-                                ring: state.ring,
-                                rtt_ms,
-                            }
-                        };
-
-                        if agent.broadcast_method() == BroadcastMethod::Plumtree {
-                            let tx_plumtree_up = agent.tx_plumtree_updates().clone();
-                            tokio::spawn(async move {
-                                if let Err(e) = tx_plumtree_up.send(plumtree_msg).await {
-                                    error!("could not forward MemberUp to plumtree: {e}");
-                                }
-                            });
-                        }
+                        send_plumtree_member_update(&agent, &actor, member_added_res).await;
                     }
                     MemberAddedResult::Updated(_) => {
                         debug!("Member Updated {actor:?}");
@@ -429,58 +402,25 @@ pub async fn handle_notifications(
                         }
                     }
 
-                    if agent.broadcast_method() == BroadcastMethod::Plumtree {
-                        let tx_plumtree_op = agent.tx_plumtree_updates().clone();
-                        tokio::spawn(async move {
-                            if let Err(e) = tx_plumtree_op
-                                .send(PlumtreeUpdates::MemberDown(actor.id()))
-                                .await
-                            {
-                                error!("could not forward MemberDown to plumtree: {e}");
-                            }
-                        });
-                    }
+                    send_plumtree_member_update(&agent, &actor, MemberAddedResult::Removed).await;
                 }
                 counter!("corro.swim.notification", "type" => "memberdown").increment(1);
             }
             OwnedNotification::Rename(a, b) => {
-                let mut lock = agent.members().write();
-                let del_res = lock.remove_member(&a);
-                let mut msgs = vec![];
+                let (del_res, add_res) = {
+                    let mut lock = agent.members().write();
+                    let del_res = lock.remove_member(&a);
+                    let add_res = lock.add_member(&b);
+                    info!(
+                        "Member Rename {a:?} to {b:?} (del_res: {del_res:?}, add_res: {add_res:?})"
+                    );
+                    (del_res, add_res)
+                };
+
                 if del_res {
-                    msgs.push(PlumtreeUpdates::MemberDown(a.id()));
+                    send_plumtree_member_update(&agent, &a, MemberAddedResult::Removed).await;
                 }
-                let add_res = lock.add_member(&b);
-                match add_res {
-                    MemberAddedResult::Removed => {
-                        msgs.push(PlumtreeUpdates::MemberDown(b.id()));
-                    }
-                    MemberAddedResult::NewMember(ref state)
-                    | MemberAddedResult::Updated(ref state) => {
-                        let rtt_ms = lock.avg_rtt_ms(&b.id()).unwrap_or(u64::MAX);
-                        msgs.push(PlumtreeUpdates::MemberUp {
-                            actor_id: b.id(),
-                            addr: state.addr,
-                            ring: state.ring,
-                            rtt_ms,
-                        });
-                    }
-                    MemberAddedResult::Ignored => {}
-                }
-
-                drop(lock);
-                if agent.broadcast_method() == BroadcastMethod::Plumtree {
-                    let tx_plumtree_up = agent.tx_plumtree_updates().clone();
-                    tokio::spawn(async move {
-                        for msg in msgs {
-                            if let Err(e) = tx_plumtree_up.send(msg).await {
-                                error!("could not forward Plumtree message: {e}");
-                            }
-                        }
-                    });
-                }
-
-                info!("Member Rename {a:?} to {b:?} (del_res: {del_res:?}, add_res: {add_res:?})");
+                send_plumtree_member_update(&agent, &b, add_res).await;
             }
             OwnedNotification::Active => {
                 info!("Current node is considered ACTIVE");
@@ -499,6 +439,33 @@ pub async fn handle_notifications(
                 info!("Rejoined the cluster with id: {id:?}");
                 counter!("corro.swim.notification", "type" => "rejoin").increment(1);
             }
+        }
+    }
+}
+
+async fn send_plumtree_member_update(agent: &Agent, actor: &Actor, result: MemberAddedResult) {
+    if agent.broadcast_method() != BroadcastMethod::Plumtree {
+        return;
+    }
+
+    let update = {
+        match result {
+            MemberAddedResult::Removed => Some(PlumtreeUpdates::MemberDown(actor.id())),
+            MemberAddedResult::NewMember(state) | MemberAddedResult::Updated(state) => {
+                Some(PlumtreeUpdates::MemberUp {
+                    actor_id: actor.id(),
+                    addr: state.addr,
+                    ring: state.ring,
+                    // rtt_ms: members.avg_rtt_ms(&actor.id()).unwrap_or(u64::MAX),
+                })
+            }
+            MemberAddedResult::Ignored => None,
+        }
+    };
+
+    if let Some(update) = update {
+        if let Err(e) = agent.tx_plumtree_updates().send(update).await {
+            error!("could not forward plumtree update: {e}");
         }
     }
 }

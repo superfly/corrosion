@@ -423,7 +423,6 @@ impl Sim {
                     let info = if params.rtt_aware {
                         RttInfo {
                             ring: ring_from_rtt_ms(rtt),
-                            rtt_ms: rtt,
                         }
                     } else {
                         RttInfo::default()

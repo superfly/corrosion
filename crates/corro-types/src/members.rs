@@ -48,16 +48,6 @@ impl MemberState {
 
 const RING_BUCKETS: [Range<u64>; 6] = [0..6, 6..15, 15..50, 50..100, 100..200, 200..300];
 
-/// Map an RTT sample (ms) to the same ring bucket index used by [`Members::recalculate_rings`].
-pub fn ring_from_rtt_ms(rtt_ms: u64) -> Option<u8> {
-    for (ring, range) in RING_BUCKETS.iter().enumerate() {
-        if range.contains(&rtt_ms) {
-            return Some(ring as u8);
-        }
-    }
-    None
-}
-
 #[derive(Debug, Default, Clone)]
 pub struct Rtt {
     pub buf: CircularBuffer<20, u64>,

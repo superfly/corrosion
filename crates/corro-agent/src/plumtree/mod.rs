@@ -444,10 +444,9 @@ pub async fn plumtree_loop<T: TransportExt + Clone + Send + 'static>(
                     actor_id,
                     addr: _,
                     ring,
-                    rtt_ms,
                 } => {
-                    debug!("plumtree: receieved member up: {actor_id}, ring: {ring:?}, rtt_ms: {rtt_ms}");
-                    state.peer_up(actor_id, Some(RttInfo { ring, rtt_ms }), &mut rt);
+                    debug!("plumtree: receieved member up: {actor_id}, ring: {ring:?}");
+                    state.peer_up(actor_id, Some(RttInfo { ring }), &mut rt);
                 }
                 PlumtreeUpdates::MemberDown(actor_id) => {
                     debug!("plumtree: receieved member down: {actor_id}");
@@ -749,16 +748,7 @@ fn plumtree_topology_map(agent: &Agent) -> HashMap<ActorId, RttInfo> {
     members
         .states
         .iter()
-        .map(|(id, st)| {
-            let rtt_ms = members.avg_rtt_ms(id).unwrap_or(u64::MAX);
-            (
-                *id,
-                RttInfo {
-                    ring: st.ring,
-                    rtt_ms,
-                },
-            )
-        })
+        .map(|(id, st)| (*id, RttInfo { ring: st.ring }))
         .collect()
 }
 
@@ -930,11 +920,11 @@ mod tests {
                             );
                             while let Some(Ok(frame)) = framed.next().await {
                                 if let Ok(UniPayload::V1 {
-                                    data: UniPayloadV1::PlumTree(msg),
+                                    data: UniPayloadV1::Plumtree(msg),
                                     ..
                                 }) = UniPayload::read_from_buffer(&frame)
                                 {
-                                    let PlumtreeMsg::V1 { data } = msg;
+                                    let PlumtreeWire::V1 { data } = msg;
 
                                     let msg_type: &'static str = (&data).into();
                                     match msg_type {
