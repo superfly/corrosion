@@ -96,7 +96,7 @@ impl SeenStore<ChangeId> for ChangeSeenStore {
                         duplicate_count: 0,
                     });
 
-                    return None;
+                    None
                 }
                 indexmap::map::Entry::Occupied(mut e) => {
                     let entry = e.get_mut();
@@ -125,13 +125,12 @@ impl SeenStore<ChangeId> for ChangeSeenStore {
                     }
 
                     stored.insert(incoming);
-                    return None;
+                    None
                 }
             },
             // Empty changesets are actually not used rn
             ChangesetId::Empty { versions } => {
                 let min_seen = versions
-                    .clone()
                     .map(|version| {
                         if let Some(entry) = self.entries.get_mut(&(actor_id, version)) {
                             entry.last_seq = None;
@@ -149,19 +148,19 @@ impl SeenStore<ChangeId> for ChangeSeenStore {
                             },
                         );
 
-                        return 0;
+                        0
                     })
                     .min()
                     .unwrap_or(0);
 
                 // there's at least one version are seeing for the first time
                 if min_seen == 0 {
-                    return None;
+                    None
                 } else {
-                    return Some(min_seen);
+                    Some(min_seen)
                 }
             }
-        };
+        }
     }
 }
 
@@ -498,7 +497,7 @@ async fn send_messages_loop<T: TransportExt + Clone + Send + 'static>(
 ) {
     const MAX_INFLIGHT: usize = 500;
     const P1_GOSSIP_BATCH_INTERVAL: Duration = Duration::from_millis(20);
-    const P1_GOSSIP_BATCH_CUTOFF: usize = 1 * 1024 * 1024;
+    const P1_GOSSIP_BATCH_CUTOFF: usize = 1024 * 1024;
 
     let cluster_id = agent.cluster_id();
     let max_queue_len = agent.config().perf.processing_queue_len;
@@ -525,12 +524,13 @@ async fn send_messages_loop<T: TransportExt + Clone + Send + 'static>(
     }))
     .with_middleware();
 
-    loop {
-        enum Branch {
-            Msg((PlumPrio, Vec<ActorId>, PlumtreeMsgV1)),
-            GossipBatchDeadline,
-        }
+    #[allow(clippy::large_enum_variant)]
+    enum Branch {
+        Msg((PlumPrio, Vec<ActorId>, PlumtreeMsgV1)),
+        GossipBatchDeadline,
+    }
 
+    loop {
         let branch = tokio::select! {
             biased;
             _ = &mut tripwire => {
@@ -665,6 +665,7 @@ fn resolve_peer_addrs(agent: &Agent, peers: &[ActorId]) -> Vec<SocketAddr> {
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn drain_plumtree_queue<T: TransportExt + Clone + Send + 'static>(
     agent: &Agent,
     transport: &T,
@@ -944,7 +945,7 @@ mod tests {
                         }
                     }
                 }
-                return stats;
+                stats
             });
 
             // let agent_clone: Agent = agent.clone();
@@ -979,7 +980,7 @@ mod tests {
                     }
                 }
 
-                return (actor_id, duplicate, seen_map);
+                (actor_id, duplicate, seen_map)
             });
         }
 
@@ -1048,7 +1049,7 @@ mod tests {
                 seen_map
                     .iter()
                     .map(|v| v.end().0 - v.start().0 + 1)
-                    .sum::<u64>() as u64
+                    .sum::<u64>()
             })
             .sum();
         let extra_recvs: u64 = total_map

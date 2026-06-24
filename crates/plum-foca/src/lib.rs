@@ -1440,12 +1440,11 @@ mod tests {
         assert!(s.eager_peers().contains(&1));
 
         // prunes should move non-ring-locked peers to lazy
-        let rand_eager = s
+        let rand_eager = *s
             .eager_peers()
             .iter()
             .find(|p| !s.ring_locked_peers().contains(p))
-            .unwrap()
-            .clone();
+            .unwrap();
         s.handle_prune(
             PruneMsg {
                 sender: rand_eager,

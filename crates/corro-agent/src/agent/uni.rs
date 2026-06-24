@@ -97,12 +97,13 @@ pub fn spawn_unipayload_handler(tripwire: &Tripwire, conn: &quinn::Connection, a
 
                                                     match broadcast_method {
                                                         // route gossips if we are using broadcast method
-                                                        BroadcastMethod::Gossip => match wire_msg {
-                                                            PlumtreeMsgV1::Gossip(msg) => {
+                                                        BroadcastMethod::Gossip => {
+                                                            if let PlumtreeMsgV1::Gossip(msg) =
+                                                                wire_msg
+                                                            {
                                                                 changes.push(msg.payload);
                                                             }
-                                                            _ => {}
-                                                        },
+                                                        }
                                                         BroadcastMethod::Plumtree => {
                                                             if let Err(e) = tx
                                                                 .send(PlumtreeInput::Wire(wire_msg))
