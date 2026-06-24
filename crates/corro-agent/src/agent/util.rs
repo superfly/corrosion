@@ -84,7 +84,7 @@ pub async fn initialise_foca(agent: &Agent, states: Vec<(SocketAddr, Member<Acto
             for (address, foca_state, rtt_min) in states {
                 if matches!(foca_state.state(), foca::State::Alive) {
                     let actor = foca_state.id();
-                    members.add_member(&actor);
+                    members.add_member(actor);
                     if let Some(rtt_ms) = rtt_min {
                         members.add_rtt(address, Duration::from_millis(rtt_ms));
                     }

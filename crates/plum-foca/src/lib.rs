@@ -535,32 +535,32 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
             self.ensure_in_lazy(&sender, rt);
         }
 
-        if let Some(entry) = self.missing.remove(&id) {
-            if let Some(optimization_threshold) = self.config.optimization_threshold {
-                if entry.round + optimization_threshold < round && entry.ihave_sender != sender {
-                    let sender = &entry.ihave_sender;
-                    debug!(
-                        ?self_actor_id,
-                        "sending graft to {sender:?} (optimization from id {id:?} with round {round})"
-                    );
-                    rt.send(
-                        *sender,
-                        PlumtreeMsg::Graft(GraftMsg {
-                            sender: self.local_id,
-                            send: false,
-                            requests: vec![GraftRequest {
-                                id: id.clone(),
-                                round: entry.round,
-                            }],
-                        }),
-                        PlumPrio::P0,
-                    );
-                    self.move_to_eager(&entry.ihave_sender, rt);
+        if let Some(entry) = self.missing.remove(&id)
+            && let Some(optimization_threshold) = self.config.optimization_threshold
+            && entry.round + optimization_threshold < round
+            && entry.ihave_sender != sender
+        {
+            let sender = &entry.ihave_sender;
+            debug!(
+                ?self_actor_id,
+                "sending graft to {sender:?} (optimization from id {id:?} with round {round})"
+            );
+            rt.send(
+                *sender,
+                PlumtreeMsg::Graft(GraftMsg {
+                    sender: self.local_id,
+                    send: false,
+                    requests: vec![GraftRequest {
+                        id: id.clone(),
+                        round: entry.round,
+                    }],
+                }),
+                PlumPrio::P0,
+            );
+            self.move_to_eager(&entry.ihave_sender, rt);
 
-                    // paper has a prune here but we might prune a good path for different sender,
-                    // possibly need more info to determine if we should prune.
-                }
-            }
+            // paper has a prune here but we might prune a good path for different sender,
+            // possibly need more info to determine if we should prune.
         }
 
         self.enqueue_ihave(id, round);
@@ -789,7 +789,6 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
                 for id in ids {
                     self.missing.remove(&id);
                 }
-                return;
             }
         }
     }

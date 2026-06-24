@@ -144,7 +144,7 @@ impl SeenStore<ChangeId> for ChangeSeenStore {
                             SeenEntry {
                                 seqs: None,
                                 last_seq: None,
-                                round: round,
+                                round,
                                 duplicate_count: 0,
                             },
                         );
