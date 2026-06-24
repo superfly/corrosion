@@ -40,14 +40,10 @@ use corro_types::{
     agent::Agent,
     broadcast::{BroadcastInput, DispatchRuntime, FocaCmd, FocaInput, UniPayload, UniPayloadV1},
     channel::{bounded, CorroReceiver, CorroSender},
-    config::BroadcastMethod,
     sqlite::unnest_param,
 };
 
-use crate::{
-    agent::util::log_at_pow_10,
-    transport::{Transport, TransportExt},
-};
+use crate::{agent::util::log_at_pow_10, transport::TransportExt};
 
 #[derive(Clone)]
 pub struct TimerSpawner<T: Send + 'static> {
@@ -126,14 +122,12 @@ fn handle_timer(
 pub fn runtime_loop(
     actor: Actor,
     agent: Agent,
-    transport: Transport,
     mut rx_foca: CorroReceiver<FocaInput>,
-    rx_bcast: CorroReceiver<BroadcastInput>,
     to_send_tx: CorroSender<(Actor, Bytes)>,
     notifications_tx: CorroSender<OwnedNotification<Actor>>,
     tripwire: Tripwire,
     member_states: Vec<(SocketAddr, Member<Actor>)>,
-) {
+) -> Arc<RwLock<foca::Config>> {
     debug!("starting runtime loop for actor: {actor:?}");
     let rng = StdRng::from_os_rng();
 
@@ -395,16 +389,7 @@ pub fn runtime_loop(
         }
     });
 
-    if agent.broadcast_method() == BroadcastMethod::Gossip {
-        spawn_counted(handle_broadcasts(
-            agent,
-            rx_bcast,
-            transport,
-            config,
-            tripwire,
-            Default::default(),
-        ));
-    }
+    config
 }
 
 pub(crate) type TransmitRateLimiter = RateLimiter<
@@ -429,7 +414,7 @@ impl Default for BroadcastOpts {
     }
 }
 
-async fn handle_broadcasts(
+pub(crate) async fn handle_broadcasts(
     agent: Agent,
     mut rx_bcast: CorroReceiver<BroadcastInput>,
     transport: impl TransportExt + Clone + Send + 'static,
@@ -1121,6 +1106,7 @@ pub(crate) fn try_transmit_uni(
 mod tests {
     use super::*;
     use crate::agent::{setup, spawn_unipayload_handler};
+    use crate::transport::Transport;
     use corro_tests::test_config;
     use corro_types::{
         base::{dbsr, CrsqlDbVersion, CrsqlSeq},

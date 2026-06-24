@@ -10,7 +10,7 @@ use crate::{
         reaper::spawn_reaper,
         setup, util, AgentOptions,
     },
-    broadcast::runtime_loop,
+    broadcast::{handle_broadcasts, runtime_loop, BroadcastOpts},
     plumtree::spawn_plumtree_loop,
     transport::Transport,
 };
@@ -94,13 +94,11 @@ async fn run(
         .collect();
 
     //// Start the main SWIM runtime loop
-    runtime_loop(
+    let foca_config = runtime_loop(
         // here the agent already has the current cluster_id, we don't need to pass one
         agent.actor(None, agent.config().gossip.member_id),
         agent.clone(),
-        transport.clone(),
         rx_foca,
-        rx_bcast,
         to_send_tx,
         notifications_tx,
         tripwire.clone(),
@@ -114,6 +112,28 @@ async fn run(
 
     // Load existing cluster members into the SWIM runtime
     util::initialise_foca(&agent, loaded_member_states).await;
+
+    match agent.broadcast_method() {
+        BroadcastMethod::Gossip => spawn_counted(handle_broadcasts(
+            agent.clone(),
+            rx_bcast,
+            transport.clone(),
+            foca_config,
+            tripwire.clone(),
+            BroadcastOpts::default(),
+        )),
+        BroadcastMethod::Plumtree => spawn_counted(
+            spawn_plumtree_loop(
+                agent.clone(),
+                transport.clone(),
+                rx_plumtree,
+                rx_plumtree_updates,
+                agent.tx_changes().clone(),
+                tripwire.clone(),
+            )
+            .inspect(|_| info!("plumtree loop is done")),
+        ),
+    };
 
     // Load schema from paths
     if let Err(e) = execute_schema_from_paths(&agent).await {
@@ -211,20 +231,6 @@ async fn run(
     }
 
     info!("Starting peer API on udp/{gossip_addr} (QUIC)");
-
-    if agent.broadcast_method() == BroadcastMethod::Plumtree {
-        spawn_counted(
-            spawn_plumtree_loop(
-                agent.clone(),
-                transport.clone(),
-                rx_plumtree,
-                rx_plumtree_updates,
-                agent.tx_changes().clone(),
-                tripwire.clone(),
-            )
-            .inspect(|_| info!("plumtree loop is done")),
-        );
-    }
 
     //// Start an incoming (corrosion) connection handler.  This
     //// future tree spawns additional message type sub-handlers
