@@ -1675,7 +1675,7 @@ mod tests {
     use corro_types::{
         api::{ColumnName, TableName},
         broadcast::ChangesetPerTable,
-        config::{Config, BroadcastConfig, TlsClientConfig, TlsConfig, DEFAULT_GOSSIP_CLIENT_ADDR},
+        config::{BroadcastConfig, Config, TlsClientConfig, TlsConfig, DEFAULT_GOSSIP_CLIENT_ADDR},
         pubsub::pack_columns,
         tls::{generate_ca, generate_client_cert, generate_server_cert},
     };
