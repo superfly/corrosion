@@ -227,7 +227,6 @@ pub fn default_plumtree_prune_threshold() -> u32 {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
 pub struct PlumtreeConfig {
     #[serde(default = "default_plumtree_prune_threshold")]
     pub prune_threshold: u32,
@@ -725,7 +724,7 @@ mod tests {
             "bind_addr": "127.0.0.1:4001",
             "broadcast": {
                 "plumtree": {
-                    "prune-threshold": 7
+                    "prune_threshold": 7
                 }
             }
         }))
