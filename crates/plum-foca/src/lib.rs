@@ -148,6 +148,7 @@ pub enum Notification<'a, I: MessageId, N: NodeId> {
     PayloadNotCached(&'a I),
     MessageMissing(usize),
     PruneSuppressed(&'a N),
+    Rebalance,
 }
 
 pub trait Runtime<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId> {
@@ -911,7 +912,9 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
     /// near, mid, and far RTT bucket. Locked peers count toward the bucket targets.
     ///
     /// todo: maybe re-implement rebalance so we don't clear exisiting eager/lazy peers.
-    fn rebalance(&mut self, _rt: &mut impl Runtime<I, P, N>) {
+    fn rebalance(&mut self, rt: &mut impl Runtime<I, P, N>) {
+        rt.notify(Notification::Rebalance);
+
         self.eager_peers.clear();
         self.lazy_peers.clear();
         self.ring_locked.clear();

@@ -130,7 +130,7 @@ pub struct Limits {
 
 impl Agent {
     pub fn new(config: AgentConfig) -> Self {
-        let broadcaster = match config.config.load().gossip.broadcast_method {
+        let broadcaster = match config.config.load().gossip.broadcast.method() {
             BroadcastMethod::Gossip => Broadcaster::Gossip(config.tx_bcast.clone()),
             BroadcastMethod::Plumtree => Broadcaster::Plumtree(config.tx_plumtree.clone()),
         };
@@ -275,7 +275,7 @@ impl Agent {
     }
 
     pub fn broadcast_method(&self) -> BroadcastMethod {
-        self.config().gossip.broadcast_method
+        self.config().gossip.broadcast_method()
     }
 
     /// Route changes to the active dissemination method, resolved once from

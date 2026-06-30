@@ -1675,7 +1675,7 @@ mod tests {
     use corro_types::{
         api::{ColumnName, TableName},
         broadcast::ChangesetPerTable,
-        config::{Config, TlsClientConfig, TlsConfig, DEFAULT_GOSSIP_CLIENT_ADDR},
+        config::{Config, BroadcastConfig, TlsClientConfig, TlsConfig, DEFAULT_GOSSIP_CLIENT_ADDR},
         pubsub::pack_columns,
         tls::{generate_ca, generate_client_cert, generate_server_cert},
     };
@@ -2421,7 +2421,7 @@ mod tests {
             max_mtu: None,
             disable_gso: false,
             member_id: None,
-            broadcast_method: corro_types::config::BroadcastMethod::Gossip,
+            broadcast: BroadcastConfig::Gossip,
         };
 
         let server = gossip_server_endpoint(&gossip_config).await?;

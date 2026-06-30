@@ -211,6 +211,7 @@ impl Runtime<MId, SimPayload, NId> for Outbox {
             Notification::PeerDroppedFromEager(_) => self.notification_stats.demotions += 1,
             Notification::PeerMovedToLazy(_) | Notification::PeerEvictedFromLazy(_) => {}
             Notification::PruneSuppressed(_) => self.notification_stats.prune_suppressed += 1,
+            Notification::Rebalance => {}
         }
     }
 

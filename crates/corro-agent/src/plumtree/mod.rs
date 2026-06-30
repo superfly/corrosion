@@ -288,6 +288,9 @@ impl plum_foca::Runtime<ChangeId, ChangeV1, ActorId> for CorrosionPlumtreeRuntim
             plum_foca::Notification::PruneSuppressed(_) => {
                 counter!("corro.plumtree.prune_suppressed").increment(1);
             }
+            plum_foca::Notification::Rebalance => {
+                counter!("corro.plumtree.rebalance.total").increment(1);
+            }
         }
     }
 
@@ -311,7 +314,12 @@ pub async fn spawn_plumtree_loop<T: TransportExt + Clone + Send + 'static>(
         num_eager: None,
         min_lazy: None,
         max_lazy: None,
-        prune_threshold: 5,
+        prune_threshold: agent
+            .config()
+            .gossip
+            .plumtree()
+            .expect("plumtree loop requires plumtree broadcast method")
+            .prune_threshold,
         max_received_entries: 10000,
         // Suppress repeat PRUNEs to a peer within this window
         prune_throttle: Some(Duration::from_secs(1)),
