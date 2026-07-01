@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
 use std::hash::Hash;
 use std::time::{Duration, Instant};
-use tracing::{debug, trace, warn};
+use tracing::{debug, info, trace, warn};
 
 pub trait MessageId: Clone + Eq + Hash + Debug + Send + 'static {}
 
@@ -872,7 +872,7 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
         updates: impl IntoIterator<Item = (N, RttInfo)>,
         rt: &mut impl Runtime<I, P, N>,
     ) {
-        let mut should_rebalance = self.needs_rebalance;
+        let mut topology_changed = false;
 
         let prev_count = self.known_peers().len();
         for (peer, info) in updates {
@@ -880,7 +880,7 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
             if existing.is_none() || RingBucket::of(*existing.unwrap()) != RingBucket::of(info) {
                 self.peer_topology.insert(peer, info);
                 self.known_peers.insert(peer);
-                should_rebalance = true;
+                topology_changed = true;
             }
         }
 
@@ -888,7 +888,11 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
             self.maybe_recompute_fanout();
         }
 
-        if should_rebalance {
+        if self.needs_rebalance || topology_changed {
+            info!(
+                "rebalancing peers: topology_changed: {topology_changed}, needs rebalance: {:?}",
+                self.needs_rebalance
+            );
             self.rebalance(rt);
             self.needs_rebalance = false;
         }

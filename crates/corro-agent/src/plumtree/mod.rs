@@ -452,11 +452,11 @@ pub async fn plumtree_loop<T: TransportExt + Clone + Send + 'static>(
                     addr: _,
                     ring,
                 } => {
-                    debug!("plumtree: receieved member up: {actor_id}, ring: {ring:?}");
+                    info!("plumtree: receieved member up: {actor_id}, ring: {ring:?}");
                     state.peer_up(actor_id, Some(RttInfo { ring }), &mut rt);
                 }
                 PlumtreeUpdates::MemberDown(actor_id) => {
-                    debug!("plumtree: receieved member down: {actor_id}");
+                    info!("plumtree: receieved member down: {actor_id}");
                     state.peer_down(&actor_id, &mut rt);
                 }
             },
