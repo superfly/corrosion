@@ -1,0 +1,1121 @@
+use std::{
+    collections::{HashMap, VecDeque},
+    net::SocketAddr,
+    num::NonZeroU32,
+    ops::RangeInclusive,
+    time::{Duration, Instant},
+};
+
+use bytes::{BufMut, Bytes, BytesMut};
+use corro_types::{
+    actor::{ActorId, ClusterId},
+    agent::{Agent, Bookie},
+    base::{CrsqlDbVersion, CrsqlSeq},
+    broadcast::{
+        ChangeId, ChangeSource, ChangeV1, ChangesetId, PlumtreeInput, PlumtreeMsgV1,
+        PlumtreeUpdates, PlumtreeWire, UniPayload, UniPayloadV1,
+    },
+    channel::{bounded, CorroReceiver, CorroSender},
+};
+use governor::{Quota, RateLimiter};
+use indexmap::IndexMap;
+use metrics::{counter, gauge};
+use plum_foca::{Payload, PlumPrio, PlumtreeState, RttInfo, SeenStore, Timer};
+use rangemap::RangeInclusiveSet;
+use speedy::Writable;
+use tokio::{sync::mpsc, task::JoinSet, time::interval};
+use tokio_util::codec::{Encoder, LengthDelimitedCodec};
+use tracing::{debug, error, info, trace, warn};
+use tripwire::Tripwire;
+
+use crate::{
+    agent::util::log_at_pow_10,
+    broadcast::{try_transmit_uni, TimerSpawner, TransmitError, TransmitRateLimiter},
+    transport::TransportExt,
+};
+
+#[derive(Debug)]
+struct SeenEntry {
+    seqs: Option<RangeInclusiveSet<CrsqlSeq>>,
+    last_seq: Option<CrsqlSeq>,
+    #[allow(unused)]
+    round: plum_foca::Round,
+    duplicate_count: u32,
+}
+
+struct ChangeSeenStore {
+    entries: IndexMap<(ActorId, CrsqlDbVersion), SeenEntry>,
+    max_entries: usize,
+    bookie: Bookie,
+}
+
+impl ChangeSeenStore {
+    fn new(max_entries: usize, bookie: Bookie) -> Self {
+        Self {
+            entries: IndexMap::new(),
+            max_entries,
+            bookie,
+        }
+    }
+}
+
+impl SeenStore<ChangeId> for ChangeSeenStore {
+    fn evict_if_needed(&mut self) {
+        if self.entries.len() > self.max_entries {
+            self.entries.drain(0..self.entries.len() - self.max_entries);
+        }
+    }
+
+    fn contains(&self, id: &ChangeId) -> bool {
+        self.contains_local(id) || self.contains_booked(id)
+    }
+
+    fn size(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn observe(&mut self, id: ChangeId, round: plum_foca::Round) -> Option<u32> {
+        if self.contains_booked(&id) {
+            // we already received this change through a sync or dropped it during a prune
+            counter!("corro.plumtree.change.synced").increment(1);
+            return Some(0);
+        }
+        let actor_id = id.actor_id;
+        match &id.changeset_id {
+            ChangesetId::Full {
+                version,
+                seqs,
+                last_seq,
+            } => match self.entries.entry((actor_id, *version)) {
+                indexmap::map::Entry::Vacant(e) => {
+                    let incoming = RangeInclusiveSet::from_iter([RangeInclusive::from(*seqs)]);
+                    e.insert(SeenEntry {
+                        seqs: Some(incoming),
+                        last_seq: Some(*last_seq),
+                        round,
+                        duplicate_count: 0,
+                    });
+
+                    None
+                }
+                indexmap::map::Entry::Occupied(mut e) => {
+                    let entry = e.get_mut();
+
+                    if entry.seqs.is_none() {
+                        entry.duplicate_count += 1;
+                        return Some(entry.duplicate_count);
+                    }
+
+                    let incoming = RangeInclusive::from(*seqs);
+                    let stored = entry.seqs.as_mut().unwrap();
+
+                    if stored.gaps(&incoming).next().is_none() {
+                        // we already seen this seqs, increase duplicate count if change is complete
+                        let full = CrsqlSeq(0)..=*last_seq;
+                        let is_complete = stored.gaps(&full).next().is_none();
+
+                        // if we seen this partial change, but we are still incomplete, return zero duplicates.
+                        // We don't want partials to cause a prune while we are in the middle of receiving the change.
+                        if !is_complete {
+                            return Some(0);
+                        }
+
+                        entry.duplicate_count += 1;
+                        return Some(entry.duplicate_count);
+                    }
+
+                    stored.insert(incoming);
+                    None
+                }
+            },
+            // Empty changesets are actually not used rn
+            ChangesetId::Empty { versions } => {
+                let min_seen = versions
+                    .map(|version| {
+                        if let Some(entry) = self.entries.get_mut(&(actor_id, version)) {
+                            entry.last_seq = None;
+                            entry.duplicate_count += 1;
+                            return entry.duplicate_count;
+                        }
+
+                        self.entries.insert(
+                            (actor_id, version),
+                            SeenEntry {
+                                seqs: None,
+                                last_seq: None,
+                                round,
+                                duplicate_count: 0,
+                            },
+                        );
+
+                        0
+                    })
+                    .min()
+                    .unwrap_or(0);
+
+                // there's at least one version are seeing for the first time
+                if min_seen == 0 {
+                    None
+                } else {
+                    Some(min_seen)
+                }
+            }
+        }
+    }
+}
+
+impl ChangeSeenStore {
+    fn contains_booked(&self, id: &ChangeId) -> bool {
+        let actor_id = id.actor_id;
+        if let Some(bookie) = self.bookie.get(&actor_id) {
+            match &id.changeset_id {
+                ChangesetId::Full { version, seqs, .. } => {
+                    bookie.read().contains(*version, Some(*seqs))
+                }
+                ChangesetId::Empty { versions, .. } => versions
+                    .clone()
+                    .all(|version| bookie.read().contains(version, None)),
+            }
+        } else {
+            false
+        }
+    }
+
+    fn contains_local(&self, id: &ChangeId) -> bool {
+        let actor_id = id.actor_id;
+        match &id.changeset_id {
+            ChangesetId::Full { version, seqs, .. } => {
+                let entry = self.entries.get(&(actor_id, *version));
+                let Some(entry) = entry else {
+                    return false;
+                };
+                entry
+                    .seqs
+                    .as_ref()
+                    .map(|old_seqs| {
+                        let incoming = RangeInclusive::from(*seqs);
+                        old_seqs.gaps(&incoming).count() == 0
+                    })
+                    .unwrap_or(false)
+            }
+            ChangesetId::Empty { versions, .. } => versions.clone().all(|version| {
+                self.entries
+                    .get(&(actor_id, version))
+                    .map(|e| e.seqs.is_none())
+                    .unwrap_or(false)
+            }),
+        }
+    }
+}
+
+/// Implements `plum_foca::Runtime` for Corrosion, bridging the generic protocol
+/// to Corrosion's transport, change processing, and timer infrastructure.
+struct CorrosionPlumtreeRuntime {
+    tx_changes: CorroSender<(ChangeV1, ChangeSource)>,
+    timer_spawner: TimerSpawner<plum_foca::Timer<ChangeId, ActorId>>,
+    tx_msgs: CorroSender<(PlumPrio, Vec<ActorId>, PlumtreeMsgV1)>,
+}
+
+impl CorrosionPlumtreeRuntime {
+    fn new(
+        tx_changes: CorroSender<(ChangeV1, ChangeSource)>,
+        timer_spawner: TimerSpawner<plum_foca::Timer<ChangeId, ActorId>>,
+        tx_msgs: CorroSender<(PlumPrio, Vec<ActorId>, PlumtreeMsgV1)>,
+    ) -> Self {
+        Self {
+            tx_changes,
+            timer_spawner,
+            tx_msgs,
+        }
+    }
+}
+
+impl plum_foca::Runtime<ChangeId, ChangeV1, ActorId> for CorrosionPlumtreeRuntime {
+    fn send_all(
+        &mut self,
+        peers: Vec<ActorId>,
+        msg: plum_foca::PlumtreeMsg<ChangeId, ChangeV1, ActorId>,
+        priority: PlumPrio,
+    ) {
+        if let Err(e) = self.tx_msgs.try_send((priority, peers, msg)) {
+            error!("plumtree: could not send message: {e}");
+        }
+    }
+
+    fn send(&mut self, to: ActorId, msg: PlumtreeMsgV1, prio: PlumPrio) {
+        if let Err(e) = self.tx_msgs.try_send((prio, vec![to], msg)) {
+            error!("plumtree: could not send message: {e}");
+        }
+    }
+
+    fn deliver(&mut self, payload: ChangeV1) {
+        let tx = self.tx_changes.clone();
+        tokio::spawn(async move {
+            if let Err(e) = tx.send((payload, ChangeSource::Broadcast)).await {
+                error!("plumtree: could not deliver change: {e}");
+            }
+        });
+    }
+
+    fn schedule(&mut self, timer: plum_foca::Timer<ChangeId, ActorId>, after: Duration) {
+        self.timer_spawner.spawn((after, timer));
+    }
+
+    fn notify(&mut self, notification: plum_foca::Notification<'_, ChangeId, ActorId>) {
+        trace!("plumtree notification: {notification:?}");
+        match notification {
+            plum_foca::Notification::PeerMovedToEager(_) => {
+                counter!("corro.plumtree.peer_to_eager").increment(1);
+            }
+            plum_foca::Notification::PeerMovedToLazy(_) => {
+                counter!("corro.plumtree.peer_to_lazy").increment(1);
+            }
+            plum_foca::Notification::PeerDroppedFromEager(_) => {
+                counter!("corro.plumtree.peer_dropped_from_eager").increment(1);
+            }
+            plum_foca::Notification::PeerEvictedFromLazy(_) => {
+                counter!("corro.plumtree.peer_evicted").increment(1);
+            }
+            plum_foca::Notification::DuplicateMessage(_) => {
+                counter!("corro.plumtree.duplicate_message").increment(1);
+            }
+            plum_foca::Notification::PayloadNotCached(_) => {
+                counter!("corro.plumtree.payload_not_cached").increment(1);
+            }
+            plum_foca::Notification::MessageMissing(count) => {
+                counter!("corro.plumtree.message_missing").increment(count as u64);
+            }
+            plum_foca::Notification::PruneSuppressed(_) => {
+                counter!("corro.plumtree.prune_suppressed").increment(1);
+            }
+            plum_foca::Notification::Rebalance => {
+                counter!("corro.plumtree.rebalance.total").increment(1);
+            }
+        }
+    }
+
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+}
+
+pub async fn spawn_plumtree_loop<T: TransportExt + Clone + Send + 'static>(
+    agent: Agent,
+    transport: T,
+    rx_plumtree: CorroReceiver<PlumtreeInput>,
+    rx_plumtree_updates: CorroReceiver<PlumtreeUpdates>,
+    tx_changes: CorroSender<(ChangeV1, ChangeSource)>,
+    tripwire: Tripwire,
+) {
+    let config = plum_foca::Config {
+        ihave_timeout: Duration::from_millis(200),
+        optimization_threshold: Some(7),
+        max_cached_payloads: 5000,
+        num_eager: None,
+        min_lazy: None,
+        max_lazy: None,
+        prune_threshold: agent
+            .config()
+            .gossip
+            .plumtree()
+            .expect("plumtree loop requires plumtree broadcast method")
+            .prune_threshold,
+        max_received_entries: 10000,
+        // Suppress repeat PRUNEs to a peer within this window
+        prune_throttle: Some(Duration::from_secs(1)),
+    };
+
+    plumtree_loop(
+        agent,
+        transport,
+        rx_plumtree,
+        rx_plumtree_updates,
+        tx_changes,
+        config,
+        tripwire,
+    )
+    .await;
+}
+
+pub async fn plumtree_loop<T: TransportExt + Clone + Send + 'static>(
+    agent: Agent,
+    transport: T,
+    mut rx_plumtree: CorroReceiver<PlumtreeInput>,
+    mut rx_plumtree_updates: CorroReceiver<PlumtreeUpdates>,
+    tx_changes: CorroSender<(ChangeV1, ChangeSource)>,
+    config: plum_foca::Config,
+    mut tripwire: Tripwire,
+) {
+    let seen = ChangeSeenStore::new(config.max_received_entries, agent.bookie().clone());
+    let mut state: PlumtreeState<ChangeId, ChangeV1, ActorId, ChangeSeenStore> =
+        PlumtreeState::new_with_store(agent.actor_id(), config, seen);
+
+    let (plumtree_timer_tx, mut plumtree_timer_rx) = mpsc::channel(10);
+    let timer_spawner = TimerSpawner::new(plumtree_timer_tx);
+
+    let (tx_msgs, rx_msgs) = bounded(agent.config().perf.bcast_channel_len, "plumtree_msgs");
+
+    let send_agent = agent.clone();
+    let send_transport = transport.clone();
+    let send_tripwire = tripwire.clone();
+    tokio::spawn(send_messages_loop(
+        send_agent,
+        send_transport,
+        rx_msgs,
+        send_tripwire,
+    ));
+
+    // send out ihave digests to lazy peers
+    let mut ihave_tick_interval = interval(Duration::from_millis(200));
+    let mut maintenance_interval = interval(Duration::from_secs(60));
+
+    let mut rt = CorrosionPlumtreeRuntime::new(tx_changes, timer_spawner, tx_msgs);
+
+    let peers: Vec<_> = plumtree_topology_map(&agent).into_iter().collect();
+    info!("added {} peers to plumtree from members", peers.len());
+    state.add_peers_bulk_with_rtt(peers, &mut rt);
+
+    enum Branch {
+        Input(PlumtreeInput),
+        Updates(PlumtreeUpdates),
+        HandleTimer(Timer<ChangeId, ActorId>),
+        IHaveTick,
+        MaintenanceTick,
+    }
+
+    loop {
+        let branch = tokio::select! {
+            biased;
+            _ = &mut tripwire => {
+                info!("plumtree_loop: tripwire fired, shutting down");
+                break;
+            },
+            updates = rx_plumtree_updates.recv() => match updates {
+                Some(updates) => Branch::Updates(updates),
+                None => {
+                    warn!("plumtree_loop: updates channel closed");
+                    break;
+                }
+            },
+            input = rx_plumtree.recv() => match input {
+                Some(input) => Branch::Input(input),
+                None => {
+                    warn!("plumtree_loop: input channel closed");
+                    break;
+                }
+            },
+            Some((timer, _seq)) = plumtree_timer_rx.recv() => {
+                Branch::HandleTimer(timer)
+            }
+            _ = ihave_tick_interval.tick() => {
+                Branch::IHaveTick
+            }
+            _ = maintenance_interval.tick() => {
+                Branch::MaintenanceTick
+            }
+        };
+
+        match branch {
+            Branch::Input(input) => match input {
+                PlumtreeInput::Wire(msg) => {
+                    let msg_type: &'static str = (&msg).into();
+                    trace!("plumtree: received {msg_type} message");
+                    counter!("corro.plumtree.messages", "msg_type" => msg_type).increment(1);
+                    match msg {
+                        PlumtreeMsgV1::Gossip(g) => {
+                            trace!("handling plumtree gossip");
+                            state.handle_gossip(g, &mut rt);
+                        }
+                        PlumtreeMsgV1::IHave(ih) => {
+                            trace!("handling plumtree ihave");
+                            state.handle_ihave(ih, &mut rt);
+                        }
+                        PlumtreeMsgV1::Graft(g) => {
+                            trace!("handling plumtree graft");
+                            state.handle_graft(g, &mut rt);
+                        }
+                        PlumtreeMsgV1::Prune(p) => {
+                            trace!("handling plumtree prune");
+                            state.handle_prune(p, &mut rt);
+                        }
+                    }
+                }
+                PlumtreeInput::Broadcast(change) => {
+                    let id = change.message_id();
+                    trace!("plumtree: broadcasting change: {id:?}");
+                    state.broadcast(id, change, &mut rt);
+                }
+            },
+            Branch::Updates(updates) => match updates {
+                PlumtreeUpdates::MemberUp {
+                    actor_id,
+                    addr: _,
+                    ring,
+                } => {
+                    info!("plumtree: receieved member up: {actor_id}, ring: {ring:?}");
+                    state.peer_up(actor_id, Some(RttInfo { ring }), &mut rt);
+                }
+                PlumtreeUpdates::MemberDown(actor_id) => {
+                    info!("plumtree: receieved member down: {actor_id}");
+                    state.peer_down(&actor_id, &mut rt);
+                }
+            },
+            Branch::HandleTimer(timer) => {
+                state.timer_fired(timer, &mut rt);
+            }
+            Branch::IHaveTick => {
+                trace!("plumtree: sending out ihave digests");
+                state.tick(&mut rt);
+            }
+            Branch::MaintenanceTick => {
+                trace!("plumtree: updating peer topology");
+                state.update_peer_topology(plumtree_topology_map(&agent), &mut rt);
+                state.cache_evict_if_needed(&mut rt);
+
+                gauge!("corro.plumtree.eager_peers").set(state.eager_peers().len() as f64);
+                gauge!("corro.plumtree.lazy_peers").set(state.lazy_peers().len() as f64);
+                gauge!("corro.plumtree.ring_locked_peers")
+                    .set(state.ring_locked_peers().len() as f64);
+                gauge!("corro.plumtree.known_peers").set(state.known_peers().len() as f64);
+                gauge!("corro.plumtree.lazy_queue").set(state.lazy_queue().len() as f64);
+
+                gauge!("corro.plumtree.payload_cache_size").set(state.payload_cache_size() as f64);
+                gauge!("corro.plumtree.seen_cache_size").set(state.seen_cache_size() as f64);
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct PendingPlumtreeSend {
+    peers: Vec<ActorId>,
+    payload: Bytes,
+}
+
+struct P1GossipBatch {
+    peers: Vec<ActorId>,
+    buf: BytesMut,
+}
+
+async fn send_messages_loop<T: TransportExt + Clone + Send + 'static>(
+    agent: Agent,
+    transport: T,
+    mut rx_msgs: CorroReceiver<(PlumPrio, Vec<ActorId>, PlumtreeMsgV1)>,
+    mut tripwire: Tripwire,
+) {
+    const MAX_INFLIGHT: usize = 500;
+    const P1_GOSSIP_BATCH_INTERVAL: Duration = Duration::from_millis(20);
+    const P1_GOSSIP_BATCH_CUTOFF: usize = 1024 * 1024;
+
+    let cluster_id = agent.cluster_id();
+    let max_queue_len = agent.config().perf.processing_queue_len;
+
+    let mut codec = LengthDelimitedCodec::builder()
+        .max_frame_length(10 * 1_024 * 1_024)
+        .new_codec();
+    let mut ser_buf = BytesMut::new();
+    let mut frame_buf = BytesMut::new();
+
+    let mut p0_queue: VecDeque<PendingPlumtreeSend> = VecDeque::new();
+    let mut p1_queue: VecDeque<PendingPlumtreeSend> = VecDeque::new();
+    let mut p1_gossip_batch = P1GossipBatch {
+        peers: Vec::new(),
+        buf: BytesMut::new(),
+    };
+    let mut gossip_batch_interval = interval(P1_GOSSIP_BATCH_INTERVAL);
+    let mut join_set = JoinSet::new();
+    let mut limited_log_count = 0;
+    let mut drop_log_count = 0;
+
+    let bytes_per_sec: TransmitRateLimiter = RateLimiter::direct(Quota::per_second(unsafe {
+        NonZeroU32::new_unchecked(10 * 1024 * 1024)
+    }))
+    .with_middleware();
+
+    #[allow(clippy::large_enum_variant)]
+    enum Branch {
+        Msg((PlumPrio, Vec<ActorId>, PlumtreeMsgV1)),
+        GossipBatchDeadline,
+    }
+
+    loop {
+        let branch = tokio::select! {
+            biased;
+            _ = &mut tripwire => {
+                info!("plumtree send messages loop: tripwire fired, shutting down");
+                break;
+            },
+            _ = join_set.join_next(), if !join_set.is_empty() => {
+                continue;
+            },
+            msg = rx_msgs.recv() => match msg {
+                Some(msg) => Branch::Msg(msg),
+                None => {
+                    warn!("plumtree send loop: message channel closed");
+                    break;
+                }
+            },
+            _ = gossip_batch_interval.tick() => Branch::GossipBatchDeadline,
+        };
+
+        let mut rate_limited = false;
+
+        match branch {
+            Branch::GossipBatchDeadline => {
+                if !p1_gossip_batch.buf.is_empty() {
+                    p1_queue.push_back(PendingPlumtreeSend {
+                        peers: std::mem::take(&mut p1_gossip_batch.peers),
+                        payload: p1_gossip_batch.buf.split().freeze(),
+                    });
+                }
+            }
+            Branch::Msg((prio, peers, msg)) => {
+                debug!("plumtree: msg: {msg:?}, peers: {peers:?}");
+                let p1_gossip = matches!(&msg, PlumtreeMsgV1::Gossip(_));
+                let payload = match encode_plumtree_wire(
+                    cluster_id,
+                    &mut codec,
+                    &mut ser_buf,
+                    &mut frame_buf,
+                    msg,
+                ) {
+                    Ok(payload) => payload,
+                    Err(()) => continue,
+                };
+
+                if p1_gossip {
+                    // gossip is sent to latest eager peers
+                    p1_gossip_batch.peers = peers;
+                    p1_gossip_batch.buf.extend_from_slice(&payload);
+                    if p1_gossip_batch.buf.len() >= P1_GOSSIP_BATCH_CUTOFF {
+                        p1_queue.push_back(PendingPlumtreeSend {
+                            peers: std::mem::take(&mut p1_gossip_batch.peers),
+                            payload: p1_gossip_batch.buf.split().freeze(),
+                        });
+                    }
+                } else {
+                    let pending = PendingPlumtreeSend { peers, payload };
+                    match prio {
+                        PlumPrio::P0 => p0_queue.push_back(pending),
+                        PlumPrio::P1 => p1_queue.push_back(pending),
+                    }
+                }
+            }
+        }
+
+        drain_plumtree_queue(
+            &agent,
+            &transport,
+            &bytes_per_sec,
+            &mut join_set,
+            &mut p0_queue,
+            MAX_INFLIGHT,
+            &mut rate_limited,
+            &mut limited_log_count,
+        );
+        if !rate_limited {
+            drain_plumtree_queue(
+                &agent,
+                &transport,
+                &bytes_per_sec,
+                &mut join_set,
+                &mut p1_queue,
+                MAX_INFLIGHT,
+                &mut rate_limited,
+                &mut limited_log_count,
+            );
+        }
+
+        if drop_oldest_plumtree_send(&mut p0_queue, &mut p1_queue, max_queue_len).is_some() {
+            log_at_pow_10(
+                "dropped old plumtree message from send queue",
+                &mut drop_log_count,
+            );
+            counter!("corro.plumtree.send.dropped").increment(1);
+        }
+    }
+
+    info!("plumtree send loop is done");
+}
+
+fn encode_plumtree_wire(
+    cluster_id: ClusterId,
+    codec: &mut LengthDelimitedCodec,
+    ser_buf: &mut BytesMut,
+    frame_buf: &mut BytesMut,
+    msg: PlumtreeMsgV1,
+) -> Result<Bytes, ()> {
+    ser_buf.clear();
+    if let Err(e) = (UniPayload::V1 {
+        data: UniPayloadV1::Plumtree(PlumtreeWire::V1 { data: msg }),
+        cluster_id,
+    })
+    .write_to_stream(ser_buf.writer())
+    {
+        error!("plumtree: failed to serialize wire msg: {e}");
+        return Err(());
+    }
+
+    frame_buf.clear();
+    if let Err(e) = codec.encode(ser_buf.split().freeze(), frame_buf) {
+        error!("plumtree: failed to frame wire msg: {e}");
+        return Err(());
+    }
+
+    Ok(frame_buf.split().freeze())
+}
+
+fn resolve_peer_addrs(agent: &Agent, peers: &[ActorId]) -> Vec<SocketAddr> {
+    let members = agent.members().read();
+    peers
+        .iter()
+        .filter_map(|id| members.states.get(id).map(|st| st.addr))
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn drain_plumtree_queue<T: TransportExt + Clone + Send + 'static>(
+    agent: &Agent,
+    transport: &T,
+    bytes_per_sec: &TransmitRateLimiter,
+    join_set: &mut JoinSet<()>,
+    queue: &mut VecDeque<PendingPlumtreeSend>,
+    max_inflight: usize,
+    rate_limited: &mut bool,
+    limited_log_count: &mut u64,
+) {
+    while !queue.is_empty() && join_set.len() < max_inflight {
+        let pending = queue.pop_front().unwrap();
+        let addrs = resolve_peer_addrs(agent, &pending.peers);
+        if addrs.is_empty() {
+            warn!(
+                peers = ?pending.peers,
+                "plumtree: no addresses for peers, dropping message"
+            );
+            continue;
+        }
+
+        debug!("plumtree: sending plumtree msg to {addrs:?}");
+        let mut spawn_count = 0;
+        let addr_count = addrs.len();
+        for addr in addrs {
+            if join_set.len() >= max_inflight {
+                break;
+            }
+
+            match try_transmit_uni(
+                bytes_per_sec,
+                pending.payload.clone(),
+                transport.clone(),
+                addr,
+            ) {
+                Err(e) => match e {
+                    TransmitError::TooBig(_) | TransmitError::InsufficientCapacity(_) => {
+                        error!("plumtree: could not spawn transmission: {e}");
+                    }
+                    TransmitError::QuotaExceeded(_) => {
+                        *rate_limited = true;
+                        counter!("corro.plumtree.send.rate_limited").increment(1);
+                        log_at_pow_10("plumtree broadcasts rate limited", limited_log_count);
+                        break;
+                    }
+                },
+                Ok(fut) => {
+                    join_set.spawn(async move {
+                        fut.await;
+                        counter!("corro.plumtree.send.total").increment(1);
+                    });
+                    spawn_count += 1;
+                }
+            }
+        }
+
+        if *rate_limited && spawn_count == 0 && addr_count > 0 {
+            queue.push_front(pending);
+            break;
+        }
+
+        counter!("corro.plumtree.send.spawn").increment(spawn_count);
+    }
+}
+
+fn drop_oldest_plumtree_send(
+    p0_queue: &mut VecDeque<PendingPlumtreeSend>,
+    p1_queue: &mut VecDeque<PendingPlumtreeSend>,
+    max: usize,
+) -> Option<PendingPlumtreeSend> {
+    if p0_queue.len() + p1_queue.len() <= max {
+        return None;
+    }
+    // drop from low-priority queue first
+    p1_queue.pop_back().or_else(|| p0_queue.pop_back())
+}
+
+/// Ring + RTT snapshot from in-memory [`Members`].
+fn plumtree_topology_map(agent: &Agent) -> HashMap<ActorId, RttInfo> {
+    let members = agent.members().read();
+    members
+        .states
+        .iter()
+        .map(|(id, st)| (*id, RttInfo { ring: st.ring }))
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent::setup;
+    use crate::transport::{TransportError, TransportExt};
+    use async_trait::async_trait;
+    use bytes::Bytes;
+    use corro_tests::test_config;
+    use corro_types::{
+        actor::Actor,
+        base::{dbsr, CrsqlDbVersion, CrsqlSeq},
+        broadcast::{ChangeV1, Changeset},
+        members::Members,
+    };
+    use parking_lot::RwLock;
+
+    use std::{collections::HashMap, net::SocketAddr, sync::Arc};
+    // use plum_foca::PlumtreeMsg;
+    use rand::seq::IndexedRandom;
+    use rangemap::RangeInclusiveSet;
+    use speedy::Readable;
+    use tokio::{task::JoinSet, time::Duration};
+    use tokio_stream::StreamExt;
+    use tokio_util::codec::{FramedRead, LengthDelimitedCodec};
+    use tokio_util::sync::CancellationToken;
+
+    use rand::{rngs::StdRng, SeedableRng};
+
+    #[derive(Clone, Debug)]
+    pub struct TestTransport {
+        nodes: Arc<RwLock<HashMap<SocketAddr, mpsc::Sender<Bytes>>>>,
+    }
+
+    impl TestTransport {
+        pub fn new() -> Self {
+            Self {
+                nodes: Arc::new(RwLock::new(HashMap::new())),
+            }
+        }
+
+        pub async fn add_node(&self, addr: SocketAddr) -> mpsc::Receiver<Bytes> {
+            let (tx, rx) = mpsc::channel(50000);
+            self.nodes.write().insert(addr, tx);
+            rx
+        }
+    }
+
+    #[async_trait]
+    impl TransportExt for TestTransport {
+        async fn send_datagram(&self, addr: SocketAddr, data: Bytes) -> Result<(), TransportError> {
+            let tx = self.nodes.write().get(&addr).unwrap().clone();
+            tokio::spawn(async move {
+                let _ = tx.send(data).await;
+            });
+            Ok(())
+        }
+
+        async fn send_uni(&self, addr: SocketAddr, data: Bytes) -> Result<(), TransportError> {
+            let tx = self.nodes.write().get(&addr).unwrap().clone();
+            tokio::spawn(async move {
+                let _ = tx.send(data).await;
+            });
+            Ok(())
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn test_plumtree_broadcast_spread() -> eyre::Result<()> {
+        let _ = tracing_subscriber::fmt::try_init();
+        let (tripwire, _, _) = Tripwire::new_simple();
+        let num_nodes = 10;
+        let num_changes = 200;
+        let transport = TestTransport::new();
+        let config = Arc::new(RwLock::new(foca::Config::new_wan(
+            num_nodes.try_into().unwrap(),
+        )));
+
+        println!("config: {:?}", config.read().max_transmissions);
+        let mut processed_join_set = JoinSet::new();
+        let mut plumtree_join_set = JoinSet::new();
+
+        let mut tas: Vec<_> = Vec::new();
+        let mut send_tas: Vec<_> = Vec::new();
+        let mut members = Members::default();
+        for _ in 0..num_nodes {
+            let (_, test_conf) = test_config(|conf| conf.build())?;
+            let (agent, opts) = setup(test_conf.clone(), tripwire.clone()).await?;
+            members.add_member(&Actor::new(
+                agent.actor_id(),
+                agent.gossip_addr(),
+                agent.clock().new_timestamp().into(),
+                agent.cluster_id(),
+                None,
+            ));
+            send_tas.push((agent.actor_id(), agent.tx_plumtree().clone()));
+            tas.push((agent, opts));
+        }
+
+        let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
+        // let mut tx_bcasts: Vec<_> = Vec::new();
+        let cancel_token = CancellationToken::new();
+
+        for (agent, mut opts) in tas.into_iter() {
+            let agent_clone = agent.clone();
+            agent_clone.members().write().states = members.states.clone();
+            agent_clone.members().write().by_addr = members.by_addr.clone();
+            agent_clone.members().write().rtts = members.rtts.clone();
+
+            let cancel = cancel_token.clone();
+
+            let mut transport_rx: mpsc::Receiver<Bytes> =
+                transport.add_node(agent_clone.gossip_addr()).await;
+
+            let tx_plumtree = agent_clone.tx_plumtree().clone();
+            let transport_clone = transport.clone();
+            let tripwire_clone = tripwire.clone();
+            tokio::spawn(async move {
+                let config = plum_foca::Config {
+                    ihave_timeout: Duration::from_millis(500),
+                    optimization_threshold: Some(5),
+                    max_cached_payloads: 4096,
+                    num_eager: Some(3),
+                    min_lazy: Some(5),
+                    max_lazy: Some(5),
+                    prune_threshold: 3,
+                    max_received_entries: 10000,
+                    prune_throttle: None,
+                };
+                plumtree_loop(
+                    agent_clone.clone(),
+                    transport_clone,
+                    opts.rx_plumtree,
+                    opts.rx_plumtree_updates,
+                    agent_clone.tx_changes().clone(),
+                    config,
+                    tripwire_clone,
+                )
+                .await;
+            });
+
+            // one sec sleep so plumtree applies membershiip update
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            println!("spawned plumtree loop");
+
+            #[derive(Default)]
+            struct PlumStats {
+                gossip: u64,
+                ihave: u64,
+                graft: u64,
+                prune: u64,
+            }
+
+            let cancel_clone = cancel.clone();
+            plumtree_join_set.spawn(async move {
+                let mut stats = PlumStats::default();
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = cancel_clone.cancelled() => break,
+                        Some(b) = transport_rx.recv() => {
+                            let mut framed = FramedRead::new(
+                                b.as_ref(),
+                                LengthDelimitedCodec::builder()
+                                    .max_frame_length(100 * 1_024 * 1_024)
+                                    .new_codec(),
+                            );
+                            while let Some(Ok(frame)) = framed.next().await {
+                                if let Ok(UniPayload::V1 {
+                                    data: UniPayloadV1::Plumtree(msg),
+                                    ..
+                                }) = UniPayload::read_from_buffer(&frame)
+                                {
+                                    let PlumtreeWire::V1 { data } = msg;
+
+                                    let msg_type: &'static str = (&data).into();
+                                    match msg_type {
+                                        "gossip" => stats.gossip += 1,
+                                        "i_have" => stats.ihave += 1,
+                                        "graft" => stats.graft += 1,
+                                        "prune" => stats.prune += 1,
+                                        _ => warn!("unexpected message type: {msg_type}"),
+                                    }
+                                    tx_plumtree
+                                        .send(PlumtreeInput::Wire(data))
+                                        .await
+                                        .ok();
+                                }
+                            }
+
+                        }
+                    }
+                }
+                stats
+            });
+
+            // let agent_clone: Agent = agent.clone();
+            processed_join_set.spawn(async move {
+                let actor_id = agent.actor_id();
+                let mut seen_map: RangeInclusiveSet<CrsqlDbVersion> = RangeInclusiveSet::new();
+                let mut duplicate = 0;
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => break,
+                        Some(changes) = opts.rx_changes.recv() => {
+                            match changes {
+                                (
+                                    ChangeV1 {
+                                        actor_id: _,
+                                        changeset,
+                                    },
+                                    ChangeSource::Broadcast,
+                                ) => {
+                                    if seen_map.contains(&changeset.versions().start()) {
+                                        duplicate += 1;
+                                        continue;
+                                    }
+                                    seen_map.insert(changeset.versions().start()..=changeset.versions().end());
+                                }
+                                _ => {
+                                    warn!("unexpected change source: {:?}", changes);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                (actor_id, duplicate, seen_map)
+            });
+        }
+
+        println!("done spawning processing threads");
+        let mut rng = StdRng::from_os_rng();
+        let chunk_size = 10u64;
+        let chunk_pause = Duration::from_millis(200);
+        let mut all_changes = Vec::new();
+        for chunk_start in (0..num_changes).step_by(chunk_size as usize) {
+            let chunk_end = (chunk_start + chunk_size).min(num_changes);
+            for i in chunk_start..chunk_end {
+                let (actor_id, tx_plumtree) = send_tas.choose(&mut rng).unwrap();
+                let change = ChangeV1 {
+                    actor_id: *actor_id,
+                    changeset: Changeset::Full {
+                        version: CrsqlDbVersion(i),
+                        changes: vec![],
+                        seqs: dbsr!(0, 0),
+                        last_seq: CrsqlSeq(0),
+                        ts: Default::default(),
+                    },
+                };
+                all_changes.push(change.clone());
+                tx_plumtree
+                    .send(PlumtreeInput::Broadcast(change))
+                    .await
+                    .unwrap();
+            }
+
+            tokio::time::sleep(chunk_pause).await;
+        }
+
+        println!("done sending changes");
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        cancel_token.cancel();
+        println!("done cancelling");
+        drop(send_tas);
+
+        println!("sending cancel signal");
+        tripwire_tx.send(()).await.unwrap();
+        tripwire_worker.await;
+        // spawn::wait_for_all_pending_handles().await;
+
+        let results = processed_join_set.join_all().await;
+        let plumtree_results = plumtree_join_set.join_all().await;
+
+        let mut total_map = results
+            .into_iter()
+            .map(|(actor_id, duplicate, seen_map)| (actor_id, (duplicate, seen_map)))
+            .collect::<HashMap<_, _>>();
+
+        let plumstats_map = plumtree_results.into_iter().collect::<Vec<_>>();
+
+        for change in all_changes {
+            let (_, seen_map) = total_map
+                .entry(change.actor_id)
+                .or_insert((0, RangeInclusiveSet::new()));
+            seen_map
+                .insert(change.changeset.versions().start()..=change.changeset.versions().end());
+        }
+
+        let total_expected = num_nodes as u64 * num_changes;
+        let total_seen: u64 = total_map
+            .values()
+            .map(|(_, seen_map)| {
+                seen_map
+                    .iter()
+                    .map(|v| v.end().0 - v.start().0 + 1)
+                    .sum::<u64>()
+            })
+            .sum();
+        let extra_recvs: u64 = total_map
+            .values()
+            .map(|(duplicate, _)| *duplicate as u64)
+            .sum();
+
+        let (total_gossip, total_ihave, total_graft, total_prune) = plumstats_map.iter().fold(
+            (0, 0, 0, 0),
+            |(acc_gossip, acc_ihave, acc_graft, acc_prune), stats| {
+                (
+                    acc_gossip + stats.gossip,
+                    acc_ihave + stats.ihave,
+                    acc_graft + stats.graft,
+                    acc_prune + stats.prune,
+                )
+            },
+        );
+        let total_control = total_ihave + total_graft + total_prune;
+
+        println!();
+        println!("--- Plumtree spread results (async) ---");
+        println!("nodes: {num_nodes}, changes: {num_changes}");
+        println!();
+
+        for (actor_id, (duplicate, seen_map)) in total_map {
+            println!("actor_id: {actor_id}, duplicate: {duplicate}, seen: {seen_map:?}");
+        }
+
+        println!("delivery: {total_seen} / {total_expected}");
+        println!(
+            "delivery %: {:.2}",
+            total_seen as f64 / total_expected as f64 * 100.0
+        );
+        println!("duplicate deliveries: {extra_recvs}");
+        println!(
+            "duplicate %: {:.4}",
+            extra_recvs as f64 / total_expected as f64 * 100.0
+        );
+        println!();
+        println!("gossip messages:  {total_gossip}");
+        println!(
+            "gossip duplicates: {:.1}",
+            total_gossip as f64 / total_expected as f64
+        );
+        println!("ihave messages:   {total_ihave}");
+        println!("graft messages:   {total_graft}");
+        println!("prune messages:   {total_prune}");
+        println!("total control:    {total_control}");
+        println!(
+            "control per change: {:.1}",
+            total_control as f64 / num_changes as f64
+        );
+
+        assert!(
+            total_seen as f64 / total_expected as f64 > 0.99,
+            "delivery rate too low: {total_seen}/{total_expected}"
+        );
+        Ok(())
+    }
+}

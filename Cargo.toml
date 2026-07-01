@@ -1,7 +1,7 @@
 [workspace]
 members = [ ".antithesis/client/rust-load-generator",
 	"crates/*",
-	"integration-tests"
+	"integration-tests",
 ]
 resolver = "2"
 

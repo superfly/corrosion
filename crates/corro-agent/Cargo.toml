@@ -10,6 +10,7 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
+async-trait = { workspace = true }
 antithesis_sdk = { workspace = true }
 arc-swap = { workspace = true }
 axum = { workspace = true }
@@ -37,6 +38,7 @@ metrics = { workspace = true }
 opentelemetry = { workspace = true }
 parking_lot = { workspace = true }
 pin-project-lite.workspace = true
+plum-foca = { path = "../plum-foca" }
 quinn = { workspace = true }
 quinn-proto = { workspace = true }
 quinn-plaintext = { workspace = true }

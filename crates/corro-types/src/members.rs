@@ -61,11 +61,11 @@ pub struct Members {
     pub rtts: BTreeMap<SocketAddr, Rtt>,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug)]
 pub enum MemberAddedResult {
-    NewMember,
+    NewMember(MemberState),
     Removed,
-    Updated,
+    Updated(MemberState),
     Ignored,
 }
 
@@ -85,6 +85,19 @@ impl Members {
         if let Some(state) = self.states.get_mut(actor_id) {
             state.last_sync_ts = Some(ts);
         }
+    }
+
+    /// Rolling average RTT in milliseconds for this member (same weighting as
+    /// [`Self::recalculate_rings`]), or `None` if there are no samples yet.
+    pub fn avg_rtt_ms(&self, actor_id: &ActorId) -> Option<u64> {
+        let addr = self.states.get(actor_id)?.addr;
+        let rtt = self.rtts.get(&addr)?;
+        if rtt.buf.is_empty() {
+            return None;
+        }
+        let sum =
+            rtt.buf.as_slices().0.iter().sum::<u64>() + rtt.buf.as_slices().1.iter().sum::<u64>();
+        Some(sum / rtt.buf.len() as u64)
     }
 
     // A result of `true` means that the effective list of
@@ -108,8 +121,8 @@ impl Members {
             };
         }
 
+        let is_new = !self.states.contains_key(&actor_id);
         let member = self.states.entry(actor_id).or_insert_with(|| {
-            ret = MemberAddedResult::NewMember;
             MemberState::new(
                 actor.addr(),
                 actor.ts(),
@@ -117,6 +130,10 @@ impl Members {
                 actor.member_id(),
             )
         });
+
+        if is_new {
+            ret = MemberAddedResult::NewMember(member.clone());
+        }
 
         trace!("member: {member:?}");
 
@@ -137,12 +154,12 @@ impl Members {
             member.ts = actor.ts();
             member.cluster_id = actor.cluster_id();
             member.member_id = actor.member_id();
-            ret = MemberAddedResult::Updated;
+            ret = MemberAddedResult::Updated(member.clone());
         }
 
         // If we just inserted, add the actor to the by_addr set and
         // recalculate the RTT rings.
-        if ret == MemberAddedResult::NewMember {
+        if matches!(ret, MemberAddedResult::NewMember(_)) {
             self.by_addr.insert(actor.addr(), actor.id());
             self.recalculate_rings(actor.addr());
         }

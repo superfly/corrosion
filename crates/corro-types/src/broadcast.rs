@@ -1,6 +1,6 @@
 use std::{
-    cmp, collections::HashMap, fmt, io, num::NonZeroU32, num::ParseIntError, ops::Deref,
-    time::Duration,
+    cmp, collections::HashMap, fmt, io, net::SocketAddr, num::NonZeroU32, num::ParseIntError,
+    ops::Deref, time::Duration,
 };
 
 use antithesis_sdk::assert_sometimes;
@@ -10,6 +10,7 @@ use corro_base_types::{CrsqlDbVersionRange, CrsqlSeqRange};
 use foca::{Identity, Member, Notification, Runtime, Timer};
 use indexmap::{map::Entry, IndexMap};
 use metrics::counter;
+use plum_foca::Payload;
 use rusqlite::{
     types::{FromSql, FromSqlError},
     ToSql,
@@ -48,6 +49,33 @@ pub enum UniPayload {
 #[derive(Debug, Clone, Readable, Writable)]
 pub enum UniPayloadV1 {
     Broadcast(BroadcastV1),
+    Plumtree(PlumtreeWire),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Readable, Writable)]
+pub struct ChangeId {
+    pub actor_id: ActorId,
+    pub changeset_id: ChangesetId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Readable, Writable)]
+pub enum ChangesetId {
+    Full {
+        version: CrsqlDbVersion,
+        seqs: CrsqlSeqRange,
+        last_seq: CrsqlSeq,
+    },
+    Empty {
+        versions: CrsqlDbVersionRange,
+    },
+}
+
+/// Concrete Plumtree message type used on the wire.
+pub type PlumtreeMsgV1 = plum_foca::PlumtreeMsg<ChangeId, ChangeV1, ActorId>;
+
+#[derive(Debug, Clone, Readable, Writable)]
+pub enum PlumtreeWire {
+    V1 { data: PlumtreeMsgV1 },
 }
 
 #[derive(Debug, Clone, Readable, Writable)]
@@ -89,6 +117,25 @@ pub enum AuthzV1 {
     Token(String),
 }
 
+#[derive(Debug)]
+pub enum PlumtreeInput {
+    /// A wire message received from a remote peer (deserialized from uni-stream).
+    Wire(PlumtreeMsgV1),
+    /// Application wants to originate a new broadcast.
+    Broadcast(ChangeV1),
+}
+
+#[derive(Debug)]
+pub enum PlumtreeUpdates {
+    MemberUp {
+        actor_id: ActorId,
+        addr: SocketAddr,
+        ring: Option<u8>,
+        // rtt_ms: u64,
+    },
+    MemberDown(ActorId),
+}
+
 #[derive(Clone, Debug, Readable, Writable)]
 pub enum BroadcastV1 {
     Change(ChangeV1),
@@ -121,6 +168,22 @@ impl Deref for ChangeV1 {
 
     fn deref(&self) -> &Self::Target {
         &self.changeset
+    }
+}
+
+impl Payload for ChangeV1 {
+    type MessageId = ChangeId;
+    type NodeId = ActorId;
+
+    fn message_id(&self) -> ChangeId {
+        ChangeId {
+            actor_id: self.actor_id,
+            changeset_id: self.changeset.id(),
+        }
+    }
+
+    fn origin(&self) -> Self::NodeId {
+        self.actor_id
     }
 }
 
@@ -432,6 +495,37 @@ impl Changeset {
             Changeset::Empty { .. } | Changeset::EmptySet { .. } => Box::new(std::iter::empty()),
         }
     }
+
+    pub fn id(&self) -> ChangesetId {
+        match self {
+            Changeset::Full {
+                version,
+                seqs,
+                last_seq,
+                ..
+            } => ChangesetId::Full {
+                version: *version,
+                seqs: *seqs,
+                last_seq: *last_seq,
+            },
+            Changeset::FullV2 {
+                version,
+                seqs,
+                last_seq,
+                ..
+            } => ChangesetId::Full {
+                version: *version,
+                seqs: *seqs,
+                last_seq: *last_seq,
+            },
+            Changeset::Empty { versions, .. } => ChangesetId::Empty {
+                versions: *versions,
+            },
+            Changeset::EmptySet { .. } => {
+                todo!()
+            }
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -703,20 +797,10 @@ pub async fn broadcast_changes(
                     match_changes(agent.subs_manager(), &changeset, db_version);
                     match_changes(agent.updates_manager(), &changeset, db_version);
 
-                    let tx_bcast = agent.tx_bcast().clone();
                     assert_sometimes!(true, "Corrosion broadcasts changes");
-                    tokio::spawn(async move {
-                        if let Err(e) = tx_bcast
-                            .send(BroadcastInput::AddBroadcast(BroadcastV1::Change(
-                                ChangeV1 {
-                                    actor_id,
-                                    changeset,
-                                },
-                            )))
-                            .await
-                        {
-                            error!("could not send change message for broadcast: {e}");
-                        }
+                    agent.broadcaster().broadcast_local(ChangeV1 {
+                        actor_id,
+                        changeset,
                     });
                 }
                 Err(e) => {

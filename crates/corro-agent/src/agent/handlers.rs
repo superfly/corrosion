@@ -24,8 +24,9 @@ use corro_types::{
     actor::{Actor, ActorId},
     agent::{Agent, Bookie, SplitPool},
     base::CrsqlSeq,
-    broadcast::{BroadcastInput, BroadcastV1, ChangeSource, ChangeV1, FocaInput},
+    broadcast::{ChangeSource, ChangeV1, FocaInput, PlumtreeUpdates},
     channel::CorroReceiver,
+    config::BroadcastMethod,
     members::MemberAddedResult,
     sqlite::log_slow_inflight_queries,
     sync::generate_sync,
@@ -133,12 +134,7 @@ pub fn spawn_incoming_connection_handlers(
 
         // Spawn handler tasks for this connection
         spawn_foca_handler(&agent, &tripwire, &conn);
-        uni::spawn_unipayload_handler(
-            &tripwire,
-            &conn,
-            agent.cluster_id(),
-            agent.tx_changes().clone(),
-        );
+        uni::spawn_unipayload_handler(&tripwire, &conn, agent.clone());
         bi::spawn_bipayload_handler(&agent, &bookie, &tripwire, &conn);
     });
 }
@@ -338,7 +334,7 @@ pub async fn handle_notifications(
                 info!("Member Up {actor:?} (result: {member_added_res:?})");
 
                 match member_added_res {
-                    MemberAddedResult::NewMember | MemberAddedResult::Removed => {
+                    MemberAddedResult::NewMember(_) | MemberAddedResult::Removed => {
                         if matches!(member_added_res, MemberAddedResult::Removed) {
                             debug!("Member Removed {actor:?} due to member id mismatch");
                             counter!(
@@ -362,10 +358,13 @@ pub async fn handle_notifications(
                                 error!("could not send new foca cluster size: {e}");
                             }
                         }
+
+                        send_plumtree_member_update(&agent, &actor, member_added_res).await;
                     }
-                    MemberAddedResult::Updated => {
+                    MemberAddedResult::Updated(_) => {
                         debug!("Member Updated {actor:?}");
                         // anything else to do here?
+                        // TODO: do we want to send rtt updates to plumtree
                     }
                     MemberAddedResult::Ignored => {
                         // TODO: it's unclear if this is needed or
@@ -402,14 +401,26 @@ pub async fn handle_notifications(
                             error!("could not send new foca cluster size: {e}");
                         }
                     }
+
+                    send_plumtree_member_update(&agent, &actor, MemberAddedResult::Removed).await;
                 }
                 counter!("corro.swim.notification", "type" => "memberdown").increment(1);
             }
             OwnedNotification::Rename(a, b) => {
-                let mut lock = agent.members().write();
-                let del_res = lock.remove_member(&a);
-                let add_res = lock.add_member(&b);
-                info!("Member Rename {a:?} to {b:?} (del_res: {del_res:?}, add_res: {add_res:?})");
+                let (del_res, add_res) = {
+                    let mut lock = agent.members().write();
+                    let del_res = lock.remove_member(&a);
+                    let add_res = lock.add_member(&b);
+                    info!(
+                        "Member Rename {a:?} to {b:?} (del_res: {del_res:?}, add_res: {add_res:?})"
+                    );
+                    (del_res, add_res)
+                };
+
+                if del_res {
+                    send_plumtree_member_update(&agent, &a, MemberAddedResult::Removed).await;
+                }
+                send_plumtree_member_update(&agent, &b, add_res).await;
             }
             OwnedNotification::Active => {
                 info!("Current node is considered ACTIVE");
@@ -428,6 +439,33 @@ pub async fn handle_notifications(
                 info!("Rejoined the cluster with id: {id:?}");
                 counter!("corro.swim.notification", "type" => "rejoin").increment(1);
             }
+        }
+    }
+}
+
+async fn send_plumtree_member_update(agent: &Agent, actor: &Actor, result: MemberAddedResult) {
+    if agent.broadcast_method() != BroadcastMethod::Plumtree {
+        return;
+    }
+
+    let update = {
+        match result {
+            MemberAddedResult::Removed => Some(PlumtreeUpdates::MemberDown(actor.id())),
+            MemberAddedResult::NewMember(state) | MemberAddedResult::Updated(state) => {
+                Some(PlumtreeUpdates::MemberUp {
+                    actor_id: actor.id(),
+                    addr: state.addr,
+                    ring: state.ring,
+                    // rtt_ms: members.avg_rtt_ms(&actor.id()).unwrap_or(u64::MAX),
+                })
+            }
+            MemberAddedResult::Ignored => None,
+        }
+    };
+
+    if let Some(update) = update {
+        if let Err(e) = agent.tx_plumtree_updates().send(update).await {
+            error!("could not forward plumtree update: {e}");
         }
     }
 }
@@ -1074,18 +1112,11 @@ pub async fn handle_changes(
             matches!(src, ChangeSource::Sync),
             "Corrosion receives changes through sync"
         );
-        // Rebroadcast changes received from broadcast
+
+        // Rebroadcast changes received from broadcast (gossip method).
         if matches!(src, ChangeSource::Broadcast) && !change.is_empty() {
             assert_sometimes!(true, "Corrosion rebroadcasts changes");
-            if let Err(_e) =
-                agent
-                    .tx_bcast()
-                    .try_send(BroadcastInput::Rebroadcast(BroadcastV1::Change(
-                        change.clone(),
-                    )))
-            {
-                debug!("broadcasts are full or done!");
-            }
+            agent.broadcaster().rebroadcast(&change);
         }
 
         // Handle the new change - queue it and potentially spawn a batch

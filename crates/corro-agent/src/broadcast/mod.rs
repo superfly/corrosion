@@ -43,16 +43,16 @@ use corro_types::{
     sqlite::unnest_param,
 };
 
-use crate::{agent::util::log_at_pow_10, transport::Transport};
+use crate::{agent::util::log_at_pow_10, transport::TransportExt};
 
 #[derive(Clone)]
-struct TimerSpawner {
-    send: mpsc::UnboundedSender<(Duration, Timer<Actor>)>,
+pub struct TimerSpawner<T: Send + 'static> {
+    send: mpsc::UnboundedSender<(Duration, T)>,
 }
 
-impl TimerSpawner {
-    pub fn new(timer_tx: mpsc::Sender<(Timer<Actor>, Instant)>) -> Self {
-        let (send, mut recv) = mpsc::unbounded_channel();
+impl<T: Send + 'static> TimerSpawner<T> {
+    pub fn new(timer_tx: mpsc::Sender<(T, Instant)>) -> Self {
+        let (send, mut recv) = mpsc::unbounded_channel::<(Duration, T)>();
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -86,7 +86,7 @@ impl TimerSpawner {
         Self { send }
     }
 
-    pub fn spawn(&self, task: (Duration, Timer<Actor>)) {
+    pub fn spawn(&self, task: (Duration, T)) {
         self.send
             .send(task)
             .expect("Thread with LocalSet has shut down.");
@@ -122,14 +122,12 @@ fn handle_timer(
 pub fn runtime_loop(
     actor: Actor,
     agent: Agent,
-    transport: Transport,
     mut rx_foca: CorroReceiver<FocaInput>,
-    rx_bcast: CorroReceiver<BroadcastInput>,
     to_send_tx: CorroSender<(Actor, Bytes)>,
     notifications_tx: CorroSender<OwnedNotification<Actor>>,
     tripwire: Tripwire,
     member_states: Vec<(SocketAddr, Member<Actor>)>,
-) {
+) -> Arc<RwLock<foca::Config>> {
     debug!("starting runtime loop for actor: {actor:?}");
     let rng = StdRng::from_os_rng();
 
@@ -391,17 +389,10 @@ pub fn runtime_loop(
         }
     });
 
-    spawn_counted(handle_broadcasts(
-        agent,
-        rx_bcast,
-        transport,
-        config,
-        tripwire,
-        Default::default(),
-    ));
+    config
 }
 
-type BroadcastRateLimiter = RateLimiter<
+pub(crate) type TransmitRateLimiter = RateLimiter<
     governor::state::NotKeyed,
     governor::state::InMemoryState,
     governor::clock::QuantaClock,
@@ -423,10 +414,10 @@ impl Default for BroadcastOpts {
     }
 }
 
-async fn handle_broadcasts(
+pub(crate) async fn handle_broadcasts(
     agent: Agent,
     mut rx_bcast: CorroReceiver<BroadcastInput>,
-    transport: Transport,
+    transport: impl TransportExt + Clone + Send + 'static,
     config: Arc<RwLock<foca::Config>>,
     mut tripwire: Tripwire,
     opts: BroadcastOpts,
@@ -473,7 +464,7 @@ async fn handle_broadcasts(
 
     let mut limited_log_count = 0;
 
-    let bytes_per_sec: BroadcastRateLimiter = RateLimiter::direct(Quota::per_second(unsafe {
+    let bytes_per_sec: TransmitRateLimiter = RateLimiter::direct(Quota::per_second(unsafe {
         NonZeroU32::new_unchecked(10 * 1024 * 1024)
     }))
     .with_middleware();
@@ -623,12 +614,7 @@ async fn handle_broadcasts(
                 ring0_count += 1;
                 ring0.insert(addr);
 
-                match try_transmit_broadcast(
-                    &bytes_per_sec,
-                    payload.clone(),
-                    transport.clone(),
-                    addr,
-                ) {
+                match try_transmit_uni(&bytes_per_sec, payload.clone(), transport.clone(), addr) {
                     Err(e) => {
                         log_at_pow_10(
                             "could not spawn broadcast transmission: {e}",
@@ -732,7 +718,7 @@ async fn handle_broadcasts(
                 let mut spawn_count = 0;
                 trace!("broadcasting to: {:?}", broadcast_to);
                 for addr in broadcast_to {
-                    match try_transmit_broadcast(
+                    match try_transmit_uni(
                         &bytes_per_sec,
                         pending.payload.clone(),
                         transport.clone(),
@@ -1063,7 +1049,7 @@ impl PendingBroadcast {
 }
 
 #[derive(Debug, thiserror::Error)]
-enum TransmitError {
+pub(crate) enum TransmitError {
     #[error("payload > u32::MAX: {0}")]
     TooBig(usize),
     #[error(transparent)]
@@ -1073,10 +1059,10 @@ enum TransmitError {
 }
 
 #[tracing::instrument(skip(payload, transport), fields(buf_size = payload.len()), level = "debug")]
-fn try_transmit_broadcast(
-    bytes_per_sec: &BroadcastRateLimiter,
+pub(crate) fn try_transmit_uni(
+    bytes_per_sec: &TransmitRateLimiter,
     payload: Bytes,
-    transport: Transport,
+    transport: impl TransportExt + Send + 'static,
     addr: SocketAddr,
 ) -> Result<Pin<Box<dyn Future<Output = ()> + Send>>, TransmitError> {
     trace!("singly broadcasting to {addr}");
@@ -1119,12 +1105,15 @@ fn try_transmit_broadcast(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::spawn_unipayload_handler;
-    use corro_tests::launch_test_agent;
+    use crate::agent::{setup, spawn_unipayload_handler};
+    use crate::transport::Transport;
+    use corro_tests::test_config;
     use corro_types::{
         base::{dbsr, CrsqlDbVersion, CrsqlSeq},
         broadcast::{BroadcastV1, ChangeV1, Changeset},
     };
+    // use plum_foca::PlumtreeMsg;
+    use std::collections::HashSet;
     use uuid::Uuid;
 
     #[test]
@@ -1183,13 +1172,15 @@ mod tests {
             .with_max_level(tracing::Level::DEBUG)
             .try_init();
         let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
-        let ta1 = launch_test_agent(|conf| conf.build(), tripwire.clone()).await?;
+        let (_tmpdir, conf) = test_config(|c| c.build())?;
+        let (ta1_agent, opts) = setup(conf, tripwire.clone()).await?;
+        let mut rx_changes = opts.rx_changes;
 
         let (tx_bcast, rx_bcast) = bounded(100, "bcast");
         let (tx_rtt, _) = mpsc::channel(100);
 
         let config = Arc::new(RwLock::new(make_foca_config(1.try_into().unwrap(), None)));
-        let transport = Transport::new(&ta1.config.gossip, tx_rtt).await?;
+        let transport = Transport::new(&ta1_agent.config().gossip, tx_rtt).await?;
 
         let server_config = quinn_plaintext::server_config();
         let endpoint = quinn::Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap())?;
@@ -1200,13 +1191,13 @@ mod tests {
             ActorId(Uuid::new_v4()),
             ta2_gossip_addr,
             Default::default(),
-            ta1.agent.cluster_id(),
+            ta1_agent.cluster_id(),
             None,
         );
-        ta1.agent.members().write().add_member(&ta2_actor);
+        ta1_agent.members().write().add_member(&ta2_actor);
 
         let bcast = BroadcastV1::Change(ChangeV1 {
-            actor_id: ta1.agent.actor_id(),
+            actor_id: ta1_agent.actor_id(),
             changeset: Changeset::Full {
                 version: CrsqlDbVersion(0),
                 changes: vec![],
@@ -1218,13 +1209,13 @@ mod tests {
         let mut ser_buf = BytesMut::new();
         UniPayload::V1 {
             data: UniPayloadV1::Broadcast(bcast),
-            cluster_id: ta1.agent.cluster_id(),
+            cluster_id: ta1_agent.cluster_id(),
         }
         .write_to_stream((&mut ser_buf).writer())?;
         let estimated_size = ser_buf.len();
 
         tokio::spawn(handle_broadcasts(
-            ta1.agent.clone(),
+            ta1_agent.clone(),
             rx_bcast,
             transport,
             config,
@@ -1235,7 +1226,7 @@ mod tests {
             },
         ));
 
-        let actor_id = ta1.agent.actor_id();
+        let actor_id = ta1_agent.actor_id();
         for i in 0..5 {
             tx_bcast
                 .send(BroadcastInput::Rebroadcast(BroadcastV1::Change(ChangeV1 {
@@ -1255,8 +1246,7 @@ mod tests {
             info!("accepting connection");
             let conn = conn.await.unwrap();
 
-            let (tx_changes, mut rx_changes) = bounded(100, "changes");
-            spawn_unipayload_handler(&tripwire, &conn, ta1.agent.cluster_id(), tx_changes);
+            spawn_unipayload_handler(&tripwire, &conn, ta1_agent.clone());
 
             // we should receive five items starting from the biggest version
             for i in (0..5).rev() {

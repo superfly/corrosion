@@ -211,6 +211,71 @@ pub enum AuthzConfig {
     BearerToken(String),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BroadcastMethod {
+    Gossip,
+    Plumtree,
+}
+
+fn default_broadcast_config() -> BroadcastConfig {
+    BroadcastConfig::Gossip
+}
+
+pub fn default_plumtree_prune_threshold() -> u32 {
+    5
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlumtreeConfig {
+    #[serde(default = "default_plumtree_prune_threshold")]
+    pub prune_threshold: u32,
+}
+
+impl Default for PlumtreeConfig {
+    fn default() -> Self {
+        Self {
+            prune_threshold: default_plumtree_prune_threshold(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BroadcastConfig {
+    Gossip,
+    Plumtree(PlumtreeConfig),
+}
+
+impl Default for BroadcastConfig {
+    fn default() -> Self {
+        Self::Gossip
+    }
+}
+
+impl BroadcastConfig {
+    pub fn method(&self) -> BroadcastMethod {
+        match self {
+            Self::Gossip => BroadcastMethod::Gossip,
+            Self::Plumtree(_) => BroadcastMethod::Plumtree,
+        }
+    }
+
+    pub fn plumtree(&self) -> Option<&PlumtreeConfig> {
+        match self {
+            Self::Plumtree(cfg) => Some(cfg),
+            Self::Gossip => None,
+        }
+    }
+
+    pub fn from_method(method: BroadcastMethod) -> Self {
+        match method {
+            BroadcastMethod::Gossip => Self::Gossip,
+            BroadcastMethod::Plumtree => Self::Plumtree(PlumtreeConfig::default()),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GossipConfig {
     #[serde(alias = "addr")]
@@ -232,6 +297,18 @@ pub struct GossipConfig {
     pub disable_gso: bool,
     #[serde(default)]
     pub member_id: Option<MemberId>,
+    #[serde(default = "default_broadcast_config")]
+    pub broadcast: BroadcastConfig,
+}
+
+impl GossipConfig {
+    pub fn broadcast_method(&self) -> BroadcastMethod {
+        self.broadcast.method()
+    }
+
+    pub fn plumtree(&self) -> Option<&PlumtreeConfig> {
+        self.broadcast.plumtree()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -418,6 +495,7 @@ pub struct ConfigBuilder {
     member_id: Option<MemberId>,
     max_mtu: Option<u16>,
     disable_gso: bool,
+    broadcast: Option<BroadcastConfig>,
 }
 
 impl ConfigBuilder {
@@ -497,6 +575,21 @@ impl ConfigBuilder {
         self
     }
 
+    pub fn broadcast_method(mut self, method: BroadcastMethod) -> Self {
+        self.broadcast = Some(BroadcastConfig::from_method(method));
+        self
+    }
+
+    pub fn broadcast(mut self, broadcast: BroadcastConfig) -> Self {
+        self.broadcast = Some(broadcast);
+        self
+    }
+
+    pub fn plumtree(mut self, plumtree: PlumtreeConfig) -> Self {
+        self.broadcast = Some(BroadcastConfig::Plumtree(plumtree));
+        self
+    }
+
     /// Disable Generic Segmentation Offload (GSO) for the QUIC gossip transport.
     pub fn disable_gso(mut self, disable: bool) -> Self {
         self.disable_gso = disable;
@@ -543,6 +636,7 @@ impl ConfigBuilder {
                 max_mtu: self.max_mtu,
                 disable_gso: self.disable_gso,
                 member_id: self.member_id,
+                broadcast: self.broadcast.unwrap_or_else(default_broadcast_config),
             },
             perf: self.perf.unwrap_or_default(),
             admin: AdminConfig {
@@ -608,4 +702,34 @@ pub struct TableReapConfig {
     /// that match the filter e.g "id LIKE 'throwaway-%'"
     #[serde(default)]
     pub match_filter: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn broadcast_config_defaults_to_gossip() {
+        let cfg: GossipConfig = serde_json::from_value(serde_json::json!({
+            "bind_addr": "127.0.0.1:4001",
+        }))
+        .unwrap();
+        assert_eq!(cfg.broadcast.method(), BroadcastMethod::Gossip);
+        assert!(cfg.plumtree().is_none());
+    }
+
+    #[test]
+    fn broadcast_config_plumtree() {
+        let cfg: GossipConfig = serde_json::from_value(serde_json::json!({
+            "bind_addr": "127.0.0.1:4001",
+            "broadcast": {
+                "plumtree": {
+                    "prune_threshold": 7
+                }
+            }
+        }))
+        .unwrap();
+        assert_eq!(cfg.broadcast.method(), BroadcastMethod::Plumtree);
+        assert_eq!(cfg.plumtree().unwrap().prune_threshold, 7);
+    }
 }

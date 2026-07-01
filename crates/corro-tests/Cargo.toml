@@ -7,6 +7,8 @@ homepage.workspace = true
 repository.workspace = true
 
 [dependencies]
+async-trait = { workspace = true }
+bytes = { workspace = true }
 corro-agent = { path = "../corro-agent" }
 corro-client = { path = "../corro-client" }
 corro-types = { path = "../corro-types" }

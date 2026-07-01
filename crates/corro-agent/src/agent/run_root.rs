@@ -10,7 +10,8 @@ use crate::{
         reaper::spawn_reaper,
         setup, util, AgentOptions,
     },
-    broadcast::runtime_loop,
+    broadcast::{handle_broadcasts, runtime_loop, BroadcastOpts},
+    plumtree::spawn_plumtree_loop,
     transport::Transport,
 };
 
@@ -18,7 +19,7 @@ use corro_types::{
     agent::{Agent, Bookie},
     base::CrsqlSeq,
     channel::bounded,
-    config::{Config, PerfConfig},
+    config::{BroadcastMethod, Config, PerfConfig},
 };
 
 use futures::FutureExt;
@@ -58,6 +59,8 @@ async fn run(
         rx_clear_buf,
         rx_changes,
         rx_foca,
+        rx_plumtree,
+        rx_plumtree_updates,
         subs_manager,
         subs_bcast_cache,
         updates_bcast_cache,
@@ -84,20 +87,22 @@ async fn run(
     let (notifications_tx, notifications_rx) =
         bounded(pconf.notifications_channel_len, "notifications");
 
-    let member_states = util::load_member_states(&agent).await;
+    let loaded_member_states = util::load_member_states(&agent).await;
+    let member_states: Vec<_> = loaded_member_states
+        .iter()
+        .map(|(address, member, _)| (*address, member.clone()))
+        .collect();
 
     //// Start the main SWIM runtime loop
-    runtime_loop(
+    let foca_config = runtime_loop(
         // here the agent already has the current cluster_id, we don't need to pass one
         agent.actor(None, agent.config().gossip.member_id),
         agent.clone(),
-        transport.clone(),
         rx_foca,
-        rx_bcast,
         to_send_tx,
         notifications_tx,
         tripwire.clone(),
-        member_states.clone(),
+        member_states,
     );
 
     //// Update member connection RTTs
@@ -106,7 +111,29 @@ async fn run(
     handlers::spawn_swim_announcer(&agent, gossip_addr, tripwire.clone());
 
     // Load existing cluster members into the SWIM runtime
-    util::initialise_foca(&agent, member_states).await;
+    util::initialise_foca(&agent, loaded_member_states).await;
+
+    match agent.broadcast_method() {
+        BroadcastMethod::Gossip => spawn_counted(handle_broadcasts(
+            agent.clone(),
+            rx_bcast,
+            transport.clone(),
+            foca_config,
+            tripwire.clone(),
+            BroadcastOpts::default(),
+        )),
+        BroadcastMethod::Plumtree => spawn_counted(
+            spawn_plumtree_loop(
+                agent.clone(),
+                transport.clone(),
+                rx_plumtree,
+                rx_plumtree_updates,
+                agent.tx_changes().clone(),
+                tripwire.clone(),
+            )
+            .inspect(|_| info!("plumtree loop is done")),
+        ),
+    };
 
     // Load schema from paths
     if let Err(e) = execute_schema_from_paths(&agent).await {
