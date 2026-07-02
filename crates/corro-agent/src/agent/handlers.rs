@@ -998,6 +998,9 @@ pub async fn handle_changes(
             let v = change.versions().start();
             if let Some(seen_seqs) = seen.get(&(change.actor_id, v)) {
                 if seqs.all(|seq| seen_seqs.contains(&seq)) {
+                    if matches!(src, ChangeSource::Broadcast) {
+                        counter!("corro.broadcast.duplicate.count", "from" => "cache").increment(1);
+                    }
                     continue;
                 }
             }
