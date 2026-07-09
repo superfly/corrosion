@@ -81,6 +81,7 @@ pub fn spawn_bipayload_handler(
                                                     BiPayloadV1::SyncStart {
                                                         actor_id,
                                                         trace_ctx,
+                                                        supports_compression,
                                                     } => {
                                                         trace!(
                                                             "framed read buffer len: {}",
@@ -89,8 +90,14 @@ pub fn spawn_bipayload_handler(
 
                                                         // println!("got sync state: {state:?}");
                                                         if let Err(e) = serve_sync(
-                                                            &agent, &bookie, actor_id, trace_ctx,
-                                                            cluster_id, framed, tx,
+                                                            &agent,
+                                                            &bookie,
+                                                            actor_id,
+                                                            trace_ctx,
+                                                            supports_compression,
+                                                            cluster_id,
+                                                            framed,
+                                                            tx,
                                                         )
                                                         .await
                                                         {

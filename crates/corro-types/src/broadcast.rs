@@ -65,6 +65,9 @@ pub enum BiPayloadV1 {
         actor_id: ActorId,
         #[speedy(default_on_eof)]
         trace_ctx: SyncTraceContextV1,
+        // whether this node can decode SyncMessageV1::CompressedChangeset
+        #[speedy(default_on_eof)]
+        supports_compression: bool,
     },
 }
 
@@ -89,9 +92,111 @@ pub enum AuthzV1 {
     Token(String),
 }
 
+/// zstd compression level used for wire compression of changesets.
+/// todo: make level configurable
+const ZSTD_LEVEL: i32 = 3;
+
+#[derive(Debug, thiserror::Error)]
+pub enum CompressError {
+    #[error(transparent)]
+    Speedy(#[from] speedy::Error),
+    #[error(transparent)]
+    Io(#[from] io::Error),
+}
+
+pub fn compress_change(change: &ChangeV1) -> Result<Vec<u8>, CompressError> {
+    let encoded = change.write_to_vec()?;
+    Ok(zstd::stream::encode_all(encoded.as_slice(), ZSTD_LEVEL)?)
+}
+
+pub fn decompress_change(data: &[u8]) -> Result<ChangeV1, CompressError> {
+    let decompressed = zstd::stream::decode_all(data)?;
+    Ok(ChangeV1::read_from_buffer(&decompressed)?)
+}
+
+/// Result of attempting to compress a change for the wire.
+pub enum WireCompression {
+    /// Payload shrank; send the compressed bytes.
+    Compressed(Vec<u8>),
+    /// Compression didn't help; send the original change.
+    Uncompressed,
+}
+
+/// Try to compress a `ChangeV1` for the wire. Records compression metrics under
+/// `traffic` (`"broadcast"` or `"sync"`).
+pub fn try_compress_change_for_wire(
+    change: &ChangeV1,
+    traffic: &'static str,
+) -> Result<WireCompression, CompressError> {
+    let raw_len = change.write_to_vec()?.len();
+
+    counter!("corro.compression.attempts.total", "traffic" => traffic).increment(1);
+    counter!("corro.compression.bytes.raw.total", "traffic" => traffic).increment(raw_len as u64);
+
+    match compress_change(change)? {
+        compressed if compressed.len() < raw_len => {
+            let saved_bytes = raw_len - compressed.len();
+            counter!("corro.compression.used.total", "traffic" => traffic).increment(1);
+            counter!("corro.compression.bytes.saved", "traffic" => traffic)
+                .increment(saved_bytes as u64);
+            Ok(WireCompression::Compressed(compressed))
+        }
+        _ => {
+            counter!("corro.compression.useless", "traffic" => traffic).increment(raw_len as u64);
+            Ok(WireCompression::Uncompressed)
+        }
+    }
+}
+
 #[derive(Clone, Debug, Readable, Writable)]
 pub enum BroadcastV1 {
     Change(ChangeV1),
+    // zstd-compressed, speedy-encoded ChangeV1
+    CompressedChange(Vec<u8>),
+}
+
+impl BroadcastV1 {
+    pub fn is_compressed(&self) -> bool {
+        matches!(self, BroadcastV1::CompressedChange(_))
+    }
+
+    /// Try to compress the inner `ChangeV1` for the wire. Falls back to the
+    /// original, uncompressed variant if compression fails or doesn't
+    /// actually shrink the payload.
+    pub fn compress_for_wire(self) -> Self {
+        let BroadcastV1::Change(change) = self else {
+            return self;
+        };
+
+        match try_compress_change_for_wire(&change, "broadcast") {
+            Ok(WireCompression::Compressed(compressed)) => {
+                BroadcastV1::CompressedChange(compressed)
+            }
+            Ok(WireCompression::Uncompressed) => BroadcastV1::Change(change),
+            Err(e) => {
+                counter!("corro.compression.errors.total", "traffic" => "broadcast").increment(1);
+                debug!("could not compress broadcast change, sending uncompressed: {e}");
+                BroadcastV1::Change(change)
+            }
+        }
+    }
+
+    /// Decode the inner `ChangeV1`, borrowing `self` so the original wire
+    /// form (compressed or not) can still be reused verbatim -- e.g. to
+    /// rebroadcast it to other peers without re-deciding/re-compressing.
+    pub fn into_change(&self) -> Result<ChangeV1, BroadcastDecodeError> {
+        match self {
+            BroadcastV1::Change(change) => Ok(change.clone()),
+            BroadcastV1::CompressedChange(data) => match decompress_change(data) {
+                Ok(change) => Ok(change),
+                Err(e) => {
+                    counter!("corro.decompression.errors.total", "traffic" => "broadcast")
+                        .increment(1);
+                    Err(e.into())
+                }
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Readable, Writable)]
@@ -580,6 +685,8 @@ pub enum BroadcastDecodeError {
     Io(#[from] io::Error),
     #[error("insufficient length received to decode message: {0}")]
     InsufficientLength(usize),
+    #[error(transparent)]
+    Compress(#[from] CompressError),
 }
 
 #[derive(Debug)]
@@ -729,4 +836,65 @@ pub async fn broadcast_changes(
     })?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use uuid::Uuid;
+
+    fn change_with_rows(n: usize) -> ChangeV1 {
+        let actor_id = ActorId(Uuid::new_v4());
+        let changes = (0..n)
+            .map(|i| Change {
+                table: "test_table".into(),
+                pk: format!("pk-{i}").into_bytes(),
+                cid: "some_column".into(),
+                val: SqliteValue::Text("a fairly repetitive value".into()),
+                col_version: 1,
+                db_version: CrsqlDbVersion(1),
+                seq: CrsqlSeq(i as u64),
+                site_id: actor_id.to_bytes(),
+                cl: 1,
+            })
+            .collect::<Vec<_>>();
+
+        ChangeV1 {
+            actor_id,
+            changeset: Changeset::Full {
+                version: CrsqlDbVersion(1),
+                changes,
+                seqs: CrsqlSeqRange::new(CrsqlSeq(0), CrsqlSeq(n.max(1) as u64 - 1)),
+                last_seq: CrsqlSeq(n.max(1) as u64 - 1),
+                ts: Timestamp::zero(),
+            },
+        }
+    }
+
+    #[test]
+    fn test_compress_change_compresses_and_roundtrips() {
+        let change = change_with_rows(200);
+        let raw_len = change.write_to_vec().unwrap().len();
+        let bcast = BroadcastV1::Change(change.clone()).compress_for_wire();
+
+        let BroadcastV1::CompressedChange(compressed) = bcast else {
+            panic!("expected a large, repetitive change to compress");
+        };
+        let compressed_len = compressed.len();
+
+        assert!(
+            compressed_len < raw_len,
+            "compressed size ({compressed_len}) should be smaller than raw ({raw_len})"
+        );
+
+        let ratio = (1.0 - compressed_len as f64 / raw_len as f64) * 100.0;
+        eprintln!(
+            "broadcast change compression: raw={raw_len}B compressed={compressed_len}B ratio={ratio:.1}%"
+        );
+
+        let decoded = BroadcastV1::CompressedChange(compressed)
+            .into_change()
+            .unwrap();
+        assert_eq!(decoded, change);
+    }
 }

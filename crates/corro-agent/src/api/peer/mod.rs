@@ -1044,7 +1044,7 @@ pub async fn parallel_sync(
                         &mut codec,
                         &mut encode_buf,
                         &mut send_buf,
-                        BiPayload::V1 {data: BiPayloadV1::SyncStart {actor_id: agent.actor_id(), trace_ctx}, cluster_id: agent.cluster_id()},
+                        BiPayload::V1 {data: BiPayloadV1::SyncStart {actor_id: agent.actor_id(), trace_ctx, supports_compression: agent.config().gossip.compression}, cluster_id: agent.cluster_id()},
                         &mut tx,
                     ).instrument(info_span!("write_sync_start"))
                     .await?;
@@ -1363,7 +1363,7 @@ pub async fn parallel_sync(
                             }
 
                             tx_changes
-                                .send((change, ChangeSource::Sync))
+                                .send((change, ChangeSource::Sync, None))
                                 .await
                                 .map_err(|_| SyncRecvError::ChangesChannelClosed)?;
                         }
@@ -1382,6 +1382,10 @@ pub async fn parallel_sync(
                         SyncMessage::V1(SyncMessageV1::Rejection(rejection)) => {
                             return Err(rejection.into())
                         }
+                        SyncMessage::V1(SyncMessageV1::CompressedChangeset(_)) => {
+                            warn!(%actor_id, "received sync compressed change unexpectedly, ignoring");
+                            continue
+                        },
                     },
                 }
             }
@@ -1418,10 +1422,14 @@ pub async fn serve_sync(
     bookie: &Bookie,
     their_actor_id: ActorId,
     trace_ctx: SyncTraceContextV1,
+    wants_compression: bool,
     cluster_id: ClusterId,
     mut read: FramedRead<RecvStream, LengthDelimitedCodec>,
     mut write: SendStream,
 ) -> Result<usize, SyncError> {
+    // only compress if the peer can decode it AND we're locally configured to
+    let supports_compression = wants_compression && agent.config().gossip.compression;
+
     let context =
         opentelemetry::global::get_text_map_propagator(|propagator| propagator.extract(&trace_ctx));
     tracing::Span::current().set_parent(context);
@@ -1566,6 +1574,19 @@ pub async fn serve_sync(
                             if let SyncMessage::V1(SyncMessageV1::Changeset(change)) = &msg {
                                 count += change.len();
                             }
+                            let msg = if supports_compression {
+                                match tokio::task::spawn_blocking(move || msg.compress_changeset())
+                                    .await
+                                {
+                                    Ok(msg) => msg,
+                                    Err(e) => {
+                                        error!("compress_changeset task panicked: {e}");
+                                        continue;
+                                    }
+                                }
+                            } else {
+                                msg
+                            };
                             encode_sync_msg(&mut codec, &mut encode_buf, &mut send_buf, msg)?;
 
                             if send_buf.len() >= 16 * 1024 {
@@ -1644,6 +1665,10 @@ pub async fn serve_sync(
                         SyncMessage::V1(SyncMessageV1::Rejection(rejection)) => {
                             return Err(rejection.into())
                         }
+                        SyncMessage::V1(SyncMessageV1::CompressedChangeset(_)) => {
+                            warn!(actor_id = %their_actor_id, "received sync compressed change unexpectedly, ignoring");
+                            continue
+                        },
                     },
                 }
             }
@@ -2421,6 +2446,7 @@ mod tests {
             max_mtu: None,
             disable_gso: false,
             member_id: None,
+            compression: true,
         };
 
         let server = gossip_server_endpoint(&gossip_config).await?;

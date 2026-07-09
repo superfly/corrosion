@@ -542,8 +542,21 @@ async fn handle_broadcasts(
                 };
                 trace!("adding broadcast: {bcast:?}, local? {is_local}");
 
+                // compress payload if needed
+                let bcast = if agent.config().gossip.compression && !bcast.is_compressed() {
+                    match tokio::task::spawn_blocking(move || bcast.compress_for_wire()).await {
+                        Ok(bcast) => bcast,
+                        Err(e) => {
+                            error!("compress_for_wire task panicked: {e}");
+                            continue;
+                        }
+                    }
+                } else {
+                    bcast
+                };
+
                 if let Err(e) = (UniPayload::V1 {
-                    data: UniPayloadV1::Broadcast(bcast.clone()),
+                    data: UniPayloadV1::Broadcast(bcast),
                     cluster_id: agent.cluster_id(),
                 })
                 .write_to_stream((&mut ser_buf).writer())

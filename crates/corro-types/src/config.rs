@@ -232,6 +232,12 @@ pub struct GossipConfig {
     pub disable_gso: bool,
     #[serde(default)]
     pub member_id: Option<MemberId>,
+    /// Whether to zstd-compress broadcast and sync changeset payloads.
+    /// Safe to flip cluster-wide at any time: uncompressed and compressed
+    /// nodes interoperate (broadcast drops what it can't decode and heals
+    /// via sync; sync negotiates per-peer via a capability flag).
+    #[serde(default)]
+    pub compression: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -418,6 +424,7 @@ pub struct ConfigBuilder {
     member_id: Option<MemberId>,
     max_mtu: Option<u16>,
     disable_gso: bool,
+    compression: Option<bool>,
 }
 
 impl ConfigBuilder {
@@ -503,6 +510,12 @@ impl ConfigBuilder {
         self
     }
 
+    /// Enable or disable zstd compression of broadcast and sync changeset payloads.
+    pub fn compression(mut self, enabled: bool) -> Self {
+        self.compression = Some(enabled);
+        self
+    }
+
     pub fn build(self) -> Result<Config, ConfigBuilderError> {
         let db_path = self.db_path.ok_or(ConfigBuilderError::DbPathRequired)?;
 
@@ -543,6 +556,7 @@ impl ConfigBuilder {
                 max_mtu: self.max_mtu,
                 disable_gso: self.disable_gso,
                 member_id: self.member_id,
+                compression: self.compression.unwrap_or_default(),
             },
             perf: self.perf.unwrap_or_default(),
             admin: AdminConfig {

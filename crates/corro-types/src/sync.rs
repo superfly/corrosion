@@ -1,18 +1,22 @@
 use std::{cmp, collections::HashMap, io, ops::RangeInclusive};
 
 use bytes::BytesMut;
+use metrics::counter;
 use opentelemetry::propagation::{Extractor, Injector};
 use rangemap::RangeInclusiveSet;
 use serde::{Deserialize, Serialize};
 use speedy::{Readable, Writable};
 use tokio_util::codec::{Decoder, LengthDelimitedCodec};
-use tracing::warn;
+use tracing::{debug, warn};
 
 use crate::{
     actor::ActorId,
     agent::Bookie,
     base::{CrsqlDbVersion, CrsqlDbVersionRange, CrsqlSeq, CrsqlSeqRange},
-    broadcast::{ChangeV1, Timestamp},
+    broadcast::{
+        decompress_change, try_compress_change_for_wire, ChangeV1, CompressError, Timestamp,
+        WireCompression,
+    },
 };
 
 #[derive(Debug, Clone, PartialEq, Readable, Writable)]
@@ -27,6 +31,9 @@ pub enum SyncMessageV1 {
     Clock(Timestamp),
     Rejection(SyncRejectionV1),
     Request(SyncRequestV1),
+    // zstd-compressed, speedy-encoded ChangeV1 -- only ever sent to peers that
+    // advertised support for it via BiPayloadV1::SyncStart::supports_compression
+    CompressedChangeset(Vec<u8>),
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Readable, Writable)]
@@ -338,6 +345,8 @@ pub enum SyncMessageDecodeError {
     Corrupted(u32, u32),
     #[error(transparent)]
     Io(#[from] io::Error),
+    #[error(transparent)]
+    Compress(#[from] CompressError),
 }
 
 impl SyncMessage {
@@ -353,7 +362,42 @@ impl SyncMessage {
     }
 
     pub fn from_buf(buf: &mut BytesMut) -> Result<Self, SyncMessageDecodeError> {
-        Ok(Self::from_slice(buf)?)
+        let msg = Self::from_slice(buf)?;
+        Ok(match msg {
+            SyncMessage::V1(SyncMessageV1::CompressedChangeset(data)) => {
+                match decompress_change(&data) {
+                    Ok(change) => SyncMessage::V1(SyncMessageV1::Changeset(change)),
+                    Err(e) => {
+                        counter!("corro.decompression.errors.total", "traffic" => "sync")
+                            .increment(1);
+                        return Err(e.into());
+                    }
+                }
+            }
+            other => other,
+        })
+    }
+
+    /// Try to compress a `Changeset` message for the wire. Falls back to the
+    /// original, uncompressed message if compression fails or doesn't
+    /// actually shrink the payload. Should only be sent to peers that have
+    /// advertised support for decoding `CompressedChangeset`.
+    pub fn compress_changeset(self) -> Self {
+        let SyncMessage::V1(SyncMessageV1::Changeset(change)) = self else {
+            return self;
+        };
+
+        match try_compress_change_for_wire(&change, "sync") {
+            Ok(WireCompression::Compressed(compressed)) => {
+                SyncMessage::V1(SyncMessageV1::CompressedChangeset(compressed))
+            }
+            Ok(WireCompression::Uncompressed) => SyncMessage::V1(SyncMessageV1::Changeset(change)),
+            Err(e) => {
+                counter!("corro.compression.errors.total", "traffic" => "sync").increment(1);
+                debug!("could not compress sync changeset, sending uncompressed: {e}");
+                SyncMessage::V1(SyncMessageV1::Changeset(change))
+            }
+        }
     }
 
     pub fn decode(
@@ -472,5 +516,80 @@ mod tests {
             )]
             .into()
         );
+    }
+
+    fn change_with_rows(n: usize) -> ChangeV1 {
+        use crate::{actor::ActorId, base::CrsqlDbVersion, change::Change};
+        use corro_api_types::SqliteValue;
+
+        let actor_id = ActorId(Uuid::new_v4());
+        let changes = (0..n)
+            .map(|i| Change {
+                table: "test_table".into(),
+                pk: format!("pk-{i}").into_bytes(),
+                cid: "some_column".into(),
+                val: SqliteValue::Text("a fairly repetitive value".into()),
+                col_version: 1,
+                db_version: CrsqlDbVersion(1),
+                seq: CrsqlSeq(i as u64),
+                site_id: actor_id.to_bytes(),
+                cl: 1,
+            })
+            .collect::<Vec<_>>();
+
+        ChangeV1 {
+            actor_id,
+            changeset: crate::broadcast::Changeset::Full {
+                version: CrsqlDbVersion(1),
+                changes,
+                seqs: CrsqlSeqRange::new(CrsqlSeq(0), CrsqlSeq(n.max(1) as u64 - 1)),
+                last_seq: CrsqlSeq(n.max(1) as u64 - 1),
+                ts: Timestamp::zero(),
+            },
+        }
+    }
+
+    #[test]
+    fn test_compress_changeset_roundtrips_through_wire() {
+        let change = change_with_rows(200);
+        let msg = SyncMessage::V1(SyncMessageV1::Changeset(change.clone())).compress_changeset();
+
+        assert!(
+            matches!(msg, SyncMessage::V1(SyncMessageV1::CompressedChangeset(_))),
+            "expected a large, repetitive changeset to compress"
+        );
+
+        let mut buf = BytesMut::from(msg.write_to_vec().unwrap().as_slice());
+        let decoded = SyncMessage::from_buf(&mut buf).unwrap();
+
+        assert_eq!(decoded, SyncMessage::V1(SyncMessageV1::Changeset(change)));
+    }
+
+    fn incompressible_change() -> ChangeV1 {
+        use crate::{actor::ActorId, base::CrsqlDbVersion, change::Change};
+        use corro_api_types::SqliteValue;
+
+        let actor_id = ActorId(Uuid::new_v4());
+        let random_bytes: [u8; 64] = rand::random();
+        ChangeV1 {
+            actor_id,
+            changeset: crate::broadcast::Changeset::Full {
+                version: CrsqlDbVersion(1),
+                changes: vec![Change {
+                    table: "t".into(),
+                    pk: vec![1],
+                    cid: "c".into(),
+                    val: SqliteValue::Blob(random_bytes.to_vec().into()),
+                    col_version: 1,
+                    db_version: CrsqlDbVersion(1),
+                    seq: CrsqlSeq(0),
+                    site_id: actor_id.to_bytes(),
+                    cl: 1,
+                }],
+                seqs: CrsqlSeqRange::new(CrsqlSeq(0), CrsqlSeq(0)),
+                last_seq: CrsqlSeq(0),
+                ts: Timestamp::zero(),
+            },
+        }
     }
 }
