@@ -1417,6 +1417,7 @@ pub async fn parallel_sync(
 }
 
 #[tracing::instrument(skip(agent, bookie, their_actor_id, read, write), fields(actor_id = %their_actor_id), err)]
+#[allow(clippy::too_many_arguments)]
 pub async fn serve_sync(
     agent: &Agent,
     bookie: &Bookie,

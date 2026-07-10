@@ -78,7 +78,7 @@ pub fn spawn_unipayload_handler(
                                                             changes.push((
                                                                 change,
                                                                 ChangeSource::Broadcast,
-                                                                compressed.then(|| bcast),
+                                                                compressed.then_some(bcast),
                                                             ));
                                                         }
                                                         Err(e) => {

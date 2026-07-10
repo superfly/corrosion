@@ -564,32 +564,4 @@ mod tests {
 
         assert_eq!(decoded, SyncMessage::V1(SyncMessageV1::Changeset(change)));
     }
-
-    fn incompressible_change() -> ChangeV1 {
-        use crate::{actor::ActorId, base::CrsqlDbVersion, change::Change};
-        use corro_api_types::SqliteValue;
-
-        let actor_id = ActorId(Uuid::new_v4());
-        let random_bytes: [u8; 64] = rand::random();
-        ChangeV1 {
-            actor_id,
-            changeset: crate::broadcast::Changeset::Full {
-                version: CrsqlDbVersion(1),
-                changes: vec![Change {
-                    table: "t".into(),
-                    pk: vec![1],
-                    cid: "c".into(),
-                    val: SqliteValue::Blob(random_bytes.to_vec().into()),
-                    col_version: 1,
-                    db_version: CrsqlDbVersion(1),
-                    seq: CrsqlSeq(0),
-                    site_id: actor_id.to_bytes(),
-                    cl: 1,
-                }],
-                seqs: CrsqlSeqRange::new(CrsqlSeq(0), CrsqlSeq(0)),
-                last_seq: CrsqlSeq(0),
-                ts: Timestamp::zero(),
-            },
-        }
-    }
 }
