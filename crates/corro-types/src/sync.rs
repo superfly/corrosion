@@ -32,7 +32,7 @@ pub enum SyncMessageV1 {
     Rejection(SyncRejectionV1),
     Request(SyncRequestV1),
     // zstd-compressed, speedy-encoded ChangeV1 -- only ever sent to peers that
-    // advertised support for it via BiPayloadV1::SyncStart::supports_compression
+    // advertised support for it via BiPayload::V1::supports_compression
     CompressedChangeset(Vec<u8>),
 }
 

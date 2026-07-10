@@ -56,6 +56,9 @@ pub enum BiPayload {
         data: BiPayloadV1,
         #[speedy(default_on_eof)]
         cluster_id: ClusterId,
+        /// Whether the sender can decode compressed sync/broadcast changesets.
+        #[speedy(default_on_eof)]
+        supports_compression: bool,
     },
 }
 
@@ -65,9 +68,6 @@ pub enum BiPayloadV1 {
         actor_id: ActorId,
         #[speedy(default_on_eof)]
         trace_ctx: SyncTraceContextV1,
-        // whether this node can decode SyncMessageV1::CompressedChangeset
-        #[speedy(default_on_eof)]
-        supports_compression: bool,
     },
 }
 

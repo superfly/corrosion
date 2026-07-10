@@ -1044,7 +1044,14 @@ pub async fn parallel_sync(
                         &mut codec,
                         &mut encode_buf,
                         &mut send_buf,
-                        BiPayload::V1 {data: BiPayloadV1::SyncStart {actor_id: agent.actor_id(), trace_ctx, supports_compression: agent.config().gossip.compression}, cluster_id: agent.cluster_id()},
+                        BiPayload::V1 {
+                            data: BiPayloadV1::SyncStart {
+                                actor_id: agent.actor_id(),
+                                trace_ctx,
+                            },
+                            cluster_id: agent.cluster_id(),
+                            supports_compression: agent.config().gossip.compression,
+                        },
                         &mut tx,
                     ).instrument(info_span!("write_sync_start"))
                     .await?;
@@ -1443,9 +1450,14 @@ pub async fn serve_sync(
     let mut send_buf = BytesMut::new();
     let mut encode_buf = BytesMut::new();
 
-
     if cluster_id != agent.cluster_id() {
-        error!("got a different cluster_id ({:?}): {} vs {}",their_actor_id, cluster_id, agent.cluster_id());
+        error!(
+            "got a different cluster_id ({:?}): {} vs {} - {}",
+            their_actor_id,
+            cluster_id,
+            agent.cluster_id(),
+            wants_compression
+        );
         encode_write_sync_msg(
             &mut codec,
             &mut encode_buf,
