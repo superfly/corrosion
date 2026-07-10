@@ -303,6 +303,7 @@ impl Agent {
             .map_err(|e| format!("could not convert ActorId to uhlc ID: {e}"))?;
         self.clock()
             .update_with_timestamp(&uhlc::Timestamp::new(ts.0, id))
+            .map_err(|e| e.to_string())
     }
 }
 
