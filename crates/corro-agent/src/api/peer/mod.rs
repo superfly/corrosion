@@ -1443,7 +1443,9 @@ pub async fn serve_sync(
     let mut send_buf = BytesMut::new();
     let mut encode_buf = BytesMut::new();
 
+
     if cluster_id != agent.cluster_id() {
+        error!("got a different cluster_id ({:?}): {} vs {}",their_actor_id, cluster_id, agent.cluster_id());
         encode_write_sync_msg(
             &mut codec,
             &mut encode_buf,
