@@ -92,10 +92,6 @@ pub enum AuthzV1 {
     Token(String),
 }
 
-/// zstd compression level used for wire compression of changesets.
-/// todo: make level configurable
-const ZSTD_LEVEL: i32 = 3;
-
 #[derive(Debug, thiserror::Error)]
 pub enum CompressError {
     #[error(transparent)]
@@ -104,9 +100,9 @@ pub enum CompressError {
     Io(#[from] io::Error),
 }
 
-pub fn compress_change(change: &ChangeV1) -> Result<Vec<u8>, CompressError> {
+pub fn compress_change(change: &ChangeV1, level: i32) -> Result<Vec<u8>, CompressError> {
     let encoded = change.write_to_vec()?;
-    Ok(zstd::stream::encode_all(encoded.as_slice(), ZSTD_LEVEL)?)
+    Ok(zstd::stream::encode_all(encoded.as_slice(), level)?)
 }
 
 pub fn decompress_change(data: &[u8]) -> Result<ChangeV1, CompressError> {
@@ -127,13 +123,14 @@ pub enum WireCompression {
 pub fn try_compress_change_for_wire(
     change: &ChangeV1,
     traffic: &'static str,
+    level: i32,
 ) -> Result<WireCompression, CompressError> {
     let raw_len = change.write_to_vec()?.len();
 
     counter!("corro.compression.attempts.total", "traffic" => traffic).increment(1);
     counter!("corro.compression.bytes.raw.total", "traffic" => traffic).increment(raw_len as u64);
 
-    match compress_change(change)? {
+    match compress_change(change, level)? {
         compressed if compressed.len() < raw_len => {
             let saved_bytes = raw_len - compressed.len();
             counter!("corro.compression.used.total", "traffic" => traffic).increment(1);
@@ -163,12 +160,12 @@ impl BroadcastV1 {
     /// Try to compress the inner `ChangeV1` for the wire. Falls back to the
     /// original, uncompressed variant if compression fails or doesn't
     /// actually shrink the payload.
-    pub fn compress_for_wire(self) -> Self {
+    pub fn compress_for_wire(self, level: i32) -> Self {
         let BroadcastV1::Change(change) = self else {
             return self;
         };
 
-        match try_compress_change_for_wire(&change, "broadcast") {
+        match try_compress_change_for_wire(&change, "broadcast", level) {
             Ok(WireCompression::Compressed(compressed)) => {
                 BroadcastV1::CompressedChange(compressed)
             }
@@ -875,7 +872,7 @@ mod tests {
     fn test_compress_change_compresses_and_roundtrips() {
         let change = change_with_rows(200);
         let raw_len = change.write_to_vec().unwrap().len();
-        let bcast = BroadcastV1::Change(change.clone()).compress_for_wire();
+        let bcast = BroadcastV1::Change(change.clone()).compress_for_wire(3);
 
         let BroadcastV1::CompressedChange(compressed) = bcast else {
             panic!("expected a large, repetitive change to compress");

@@ -382,12 +382,12 @@ impl SyncMessage {
     /// original, uncompressed message if compression fails or doesn't
     /// actually shrink the payload. Should only be sent to peers that have
     /// advertised support for decoding `CompressedChangeset`.
-    pub fn compress_changeset(self) -> Self {
+    pub fn compress_changeset(self, level: i32) -> Self {
         let SyncMessage::V1(SyncMessageV1::Changeset(change)) = self else {
             return self;
         };
 
-        match try_compress_change_for_wire(&change, "sync") {
+        match try_compress_change_for_wire(&change, "sync", level) {
             Ok(WireCompression::Compressed(compressed)) => {
                 SyncMessage::V1(SyncMessageV1::CompressedChangeset(compressed))
             }
@@ -552,7 +552,7 @@ mod tests {
     #[test]
     fn test_compress_changeset_roundtrips_through_wire() {
         let change = change_with_rows(200);
-        let msg = SyncMessage::V1(SyncMessageV1::Changeset(change.clone())).compress_changeset();
+        let msg = SyncMessage::V1(SyncMessageV1::Changeset(change.clone())).compress_changeset(3);
 
         assert!(
             matches!(msg, SyncMessage::V1(SyncMessageV1::CompressedChangeset(_))),

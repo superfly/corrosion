@@ -544,7 +544,9 @@ async fn handle_broadcasts(
 
                 // compress payload if needed
                 let bcast = if agent.config().gossip.compression && !bcast.is_compressed() {
-                    match tokio::task::spawn_blocking(move || bcast.compress_for_wire()).await {
+                    let level = agent.config().gossip.compression_level;
+                    match tokio::task::spawn_blocking(move || bcast.compress_for_wire(level)).await
+                    {
                         Ok(bcast) => bcast,
                         Err(e) => {
                             error!("compress_for_wire task panicked: {e}");

@@ -1429,6 +1429,7 @@ pub async fn serve_sync(
 ) -> Result<usize, SyncError> {
     // only compress if the peer can decode it AND we're locally configured to
     let supports_compression = wants_compression && agent.config().gossip.compression;
+    let compression_level = agent.config().gossip.compression_level;
 
     let context =
         opentelemetry::global::get_text_map_propagator(|propagator| propagator.extract(&trace_ctx));
@@ -1575,8 +1576,10 @@ pub async fn serve_sync(
                                 count += change.len();
                             }
                             let msg = if supports_compression {
-                                match tokio::task::spawn_blocking(move || msg.compress_changeset())
-                                    .await
+                                match tokio::task::spawn_blocking(move || {
+                                    msg.compress_changeset(compression_level)
+                                })
+                                .await
                                 {
                                     Ok(msg) => msg,
                                     Err(e) => {
@@ -2446,7 +2449,8 @@ mod tests {
             max_mtu: None,
             disable_gso: false,
             member_id: None,
-            compression: true,
+            compression: false,
+            compression_level: 3,
         };
 
         let server = gossip_server_endpoint(&gossip_config).await?;
