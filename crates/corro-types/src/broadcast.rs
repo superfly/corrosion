@@ -440,8 +440,7 @@ pub enum TimestampParseError {
     Parse(ParseIntError),
 }
 
-#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize, Eq, PartialOrd, Ord)]
-#[serde(transparent)]
+#[derive(Debug, Default, Clone, Copy, Eq, PartialOrd, Ord)]
 pub struct Timestamp(pub NTP64);
 
 impl Timestamp {
@@ -460,6 +459,24 @@ impl Timestamp {
 
     pub fn is_zero(&self) -> bool {
         self.0 .0 == 0
+    }
+}
+
+impl Serialize for Timestamp {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_u64(self.0 .0)
+    }
+}
+
+impl<'de> Deserialize<'de> for Timestamp {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Ok(Self(NTP64(u64::deserialize(deserializer)?)))
     }
 }
 
