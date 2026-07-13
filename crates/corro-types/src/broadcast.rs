@@ -1,6 +1,10 @@
 use std::{
-    cmp, collections::HashMap, fmt, io, num::NonZeroU32, num::ParseIntError, ops::Deref,
-    time::Duration,
+    cmp,
+    collections::HashMap,
+    fmt, io,
+    num::{NonZeroU32, ParseIntError},
+    ops::Deref,
+    time::{Duration, Instant},
 };
 
 use antithesis_sdk::assert_sometimes;
@@ -9,7 +13,7 @@ use corro_api_types::{ColumnName, SqliteValue, TableName};
 use corro_base_types::{CrsqlDbVersionRange, CrsqlSeqRange};
 use foca::{Identity, Member, Notification, Runtime, Timer};
 use indexmap::{map::Entry, IndexMap};
-use metrics::counter;
+use metrics::{counter, histogram};
 use rusqlite::{
     types::{FromSql, FromSqlError},
     ToSql,
@@ -127,12 +131,15 @@ pub fn try_compress_change_for_wire(
 ) -> Result<WireCompression, CompressError> {
     let raw_len = change.write_to_vec()?.len();
 
+    let start = Instant::now();
     counter!("corro.compression.attempts.total", "traffic" => traffic).increment(1);
     counter!("corro.compression.bytes.raw.total", "traffic" => traffic).increment(raw_len as u64);
 
     match compress_change(change, level)? {
         compressed if compressed.len() < raw_len => {
             let saved_bytes = raw_len - compressed.len();
+
+            histogram!("corro.compression.time.seconds").record(start.elapsed());
             counter!("corro.compression.used.total", "traffic" => traffic).increment(1);
             counter!("corro.compression.bytes.saved", "traffic" => traffic)
                 .increment(saved_bytes as u64);
