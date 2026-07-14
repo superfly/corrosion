@@ -917,7 +917,7 @@ impl HandleChangesState {
 pub async fn handle_changes(
     agent: Agent,
     bookie: Bookie,
-    mut rx_changes: CorroReceiver<(ChangeV1, ChangeSource)>,
+    mut rx_changes: CorroReceiver<(ChangeV1, ChangeSource, Option<BroadcastV1>)>,
     mut tripwire: Tripwire,
 ) {
     let max_queue_len: usize = agent.config().perf.processing_queue_len;
@@ -946,7 +946,7 @@ pub async fn handle_changes(
     let mut seen: IndexMap<_, RangeInclusiveSet<CrsqlSeq>> = IndexMap::new();
 
     loop {
-        let (change, src) = tokio::select! {
+        let (change, src, original_bcast) = tokio::select! {
             biased;
 
             // Processing task finished
@@ -957,7 +957,7 @@ pub async fn handle_changes(
 
             // New changes arrive
             maybe_change_src = rx_changes.recv() => match maybe_change_src {
-                Some((change, src)) => (change, src),
+                Some((change, src, original_bcast)) => (change, src, original_bcast),
                 None => break,
             },
 
@@ -1080,12 +1080,11 @@ pub async fn handle_changes(
         // Rebroadcast changes received from broadcast
         if matches!(src, ChangeSource::Broadcast) && !change.is_empty() {
             assert_sometimes!(true, "Corrosion rebroadcasts changes");
-            if let Err(_e) =
-                agent
-                    .tx_bcast()
-                    .try_send(BroadcastInput::Rebroadcast(BroadcastV1::Change(
-                        change.clone(),
-                    )))
+            // reuse received compressed broadcast if available
+            let bcast = original_bcast.unwrap_or_else(|| BroadcastV1::Change(change.clone()));
+            if let Err(_e) = agent
+                .tx_bcast()
+                .try_send(BroadcastInput::Rebroadcast(bcast))
             {
                 debug!("broadcasts are full or done!");
             }
@@ -1307,6 +1306,7 @@ mod tests {
                         },
                     },
                     ChangeSource::Sync,
+                    None,
                 );
 
                 agent.tx_changes().send(change).await?;

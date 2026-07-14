@@ -33,7 +33,7 @@ use tripwire::Tripwire;
 use crate::{
     actor::{Actor, ActorId, ClusterId, MemberId},
     base::{CrsqlDbVersion, CrsqlDbVersionRange, CrsqlSeq},
-    broadcast::{BroadcastInput, ChangeSource, ChangeV1, FocaInput, Timestamp},
+    broadcast::{BroadcastInput, BroadcastV1, ChangeSource, ChangeV1, FocaInput, Timestamp},
     channel::{bounded, CorroSender},
     config::Config,
     metrics_tracker::MetricsTracker,
@@ -69,7 +69,7 @@ pub struct AgentConfig {
     pub tx_bcast: CorroSender<BroadcastInput>,
     pub tx_apply: CorroSender<(ActorId, CrsqlDbVersion)>,
     pub tx_clear_buf: CorroSender<(ActorId, CrsqlDbVersionRange)>,
-    pub tx_changes: CorroSender<(ChangeV1, ChangeSource)>,
+    pub tx_changes: CorroSender<(ChangeV1, ChangeSource, Option<BroadcastV1>)>,
     pub tx_foca: CorroSender<FocaInput>,
 
     pub write_sema: Arc<Semaphore>,
@@ -104,7 +104,7 @@ pub struct AgentInner {
     tx_bcast: CorroSender<BroadcastInput>,
     tx_apply: CorroSender<(ActorId, CrsqlDbVersion)>,
     tx_clear_buf: CorroSender<(ActorId, CrsqlDbVersionRange)>,
-    tx_changes: CorroSender<(ChangeV1, ChangeSource)>,
+    tx_changes: CorroSender<(ChangeV1, ChangeSource, Option<BroadcastV1>)>,
     tx_foca: CorroSender<FocaInput>,
     write_sema: Arc<Semaphore>,
     schema: RwLock<Schema>,
@@ -200,7 +200,7 @@ impl Agent {
         &self.0.tx_apply
     }
 
-    pub fn tx_changes(&self) -> &CorroSender<(ChangeV1, ChangeSource)> {
+    pub fn tx_changes(&self) -> &CorroSender<(ChangeV1, ChangeSource, Option<BroadcastV1>)> {
         &self.0.tx_changes
     }
 

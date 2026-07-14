@@ -232,6 +232,16 @@ pub struct GossipConfig {
     pub disable_gso: bool,
     #[serde(default)]
     pub member_id: Option<MemberId>,
+    /// Whether to zstd-compress broadcast and sync changeset payloads.
+    /// Safe to flip cluster-wide at any time: uncompressed and compressed
+    /// nodes interoperate (broadcast drops what it can't decode and heals
+    /// via sync; sync negotiates per-peer via a capability flag).
+    #[serde(default)]
+    pub compression: bool,
+    /// zstd compression level for wire payloads (1–22). Ignored when
+    /// `compression` is false.
+    #[serde(default = "default_compression_level")]
+    pub compression_level: i32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -321,6 +331,10 @@ fn default_gossip_client_addr() -> SocketAddr {
     DEFAULT_GOSSIP_CLIENT_ADDR
 }
 
+fn default_compression_level() -> i32 {
+    3
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TlsConfig {
     /// Certificate file
@@ -370,6 +384,8 @@ pub enum ConfigError {
     Config(#[from] config::ConfigError),
     #[error("gossip.max_mtu value {value} is below the QUIC minimum of 1200 (RFC 9000)")]
     InvalidMaxMtu { value: u16 },
+    #[error("gossip.compression_level value {value} is outside the supported zstd range 1..=22")]
+    InvalidCompressionLevel { value: i32 },
 }
 
 impl Config {
@@ -393,6 +409,11 @@ impl Config {
             if mtu < 1200 {
                 return Err(ConfigError::InvalidMaxMtu { value: mtu });
             }
+        }
+        if !(1..=22).contains(&self.gossip.compression_level) {
+            return Err(ConfigError::InvalidCompressionLevel {
+                value: self.gossip.compression_level,
+            });
         }
         Ok(())
     }
@@ -418,6 +439,8 @@ pub struct ConfigBuilder {
     member_id: Option<MemberId>,
     max_mtu: Option<u16>,
     disable_gso: bool,
+    compression: Option<bool>,
+    compression_level: Option<i32>,
 }
 
 impl ConfigBuilder {
@@ -503,6 +526,18 @@ impl ConfigBuilder {
         self
     }
 
+    /// Enable or disable zstd compression of broadcast and sync changeset payloads.
+    pub fn compression(mut self, enabled: bool) -> Self {
+        self.compression = Some(enabled);
+        self
+    }
+
+    /// Set the zstd compression level (1–22) for wire payloads.
+    pub fn compression_level(mut self, level: i32) -> Self {
+        self.compression_level = Some(level);
+        self
+    }
+
     pub fn build(self) -> Result<Config, ConfigBuilderError> {
         let db_path = self.db_path.ok_or(ConfigBuilderError::DbPathRequired)?;
 
@@ -543,6 +578,10 @@ impl ConfigBuilder {
                 max_mtu: self.max_mtu,
                 disable_gso: self.disable_gso,
                 member_id: self.member_id,
+                compression: self.compression.unwrap_or_default(),
+                compression_level: self
+                    .compression_level
+                    .unwrap_or_else(default_compression_level),
             },
             perf: self.perf.unwrap_or_default(),
             admin: AdminConfig {

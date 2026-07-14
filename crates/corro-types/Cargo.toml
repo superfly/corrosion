@@ -62,6 +62,7 @@ uuid = { workspace = true }
 strum = { workspace = true }
 antithesis_sdk = { workspace = true }
 lazy_static = { workspace = true }
+zstd = { workspace = true }
 
 [dev-dependencies]
 corro-tests = { path = "../corro-tests" }
