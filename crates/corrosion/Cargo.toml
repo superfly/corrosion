@@ -40,6 +40,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 shellwords = { version = "1" }
 spawn = { path = "../spawn" }
+speedy = { workspace = true }
 sqlite3-restore = { path = "../sqlite3-restore" }
 tempfile = { workspace = true }
 thiserror = { workspace = true }

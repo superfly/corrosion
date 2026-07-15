@@ -232,16 +232,46 @@ pub struct GossipConfig {
     pub disable_gso: bool,
     #[serde(default)]
     pub member_id: Option<MemberId>,
+    #[serde(default)]
+    pub compression: Option<CompressionConfig>,
+}
+
+impl GossipConfig {
+    pub fn compression_config(&self) -> CompressionConfig {
+        self.compression.clone().unwrap_or_default()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompressionConfig {
     /// Whether to zstd-compress broadcast and sync changeset payloads.
     /// Safe to flip cluster-wide at any time: uncompressed and compressed
-    /// nodes interoperate (broadcast drops what it can't decode and heals
-    /// via sync; sync negotiates per-peer via a capability flag).
+    /// nodes interoperate
     #[serde(default)]
-    pub compression: bool,
+    pub enabled: bool,
     /// zstd compression level for wire payloads (1–22). Ignored when
-    /// `compression` is false.
+    /// `enabled` is false.
     #[serde(default = "default_compression_level")]
-    pub compression_level: i32,
+    pub level: i32,
+    /// Path to a trained zstd dictionary (e.g. produced by `corrosion db
+    /// train-dict`), used to compress outgoing broadcasts. Its containing
+    /// directory is also scanned at startup for other trained dictionaries
+    /// (e.g. previous versions of it), which are loaded and indexed by
+    /// their embedded zstd dictionary id purely for decoding -- so
+    /// broadcasts from peers that haven't rotated to the current dictionary
+    /// yet can still be decoded.
+    #[serde(default)]
+    pub dict_path: Option<Utf8PathBuf>,
+}
+
+impl Default for CompressionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            level: default_compression_level(),
+            dict_path: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -410,9 +440,10 @@ impl Config {
                 return Err(ConfigError::InvalidMaxMtu { value: mtu });
             }
         }
-        if !(1..=22).contains(&self.gossip.compression_level) {
+        let compression_level = self.gossip.compression_config().level;
+        if !(1..=22).contains(&compression_level) {
             return Err(ConfigError::InvalidCompressionLevel {
-                value: self.gossip.compression_level,
+                value: compression_level,
             });
         }
         Ok(())
@@ -578,10 +609,13 @@ impl ConfigBuilder {
                 max_mtu: self.max_mtu,
                 disable_gso: self.disable_gso,
                 member_id: self.member_id,
-                compression: self.compression.unwrap_or_default(),
-                compression_level: self
-                    .compression_level
-                    .unwrap_or_else(default_compression_level),
+                compression: Some(CompressionConfig {
+                    enabled: self.compression.unwrap_or_default(),
+                    level: self
+                        .compression_level
+                        .unwrap_or_else(default_compression_level),
+                    dict_path: None,
+                }),
             },
             perf: self.perf.unwrap_or_default(),
             admin: AdminConfig {

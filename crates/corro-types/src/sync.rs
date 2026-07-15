@@ -13,10 +13,8 @@ use crate::{
     actor::ActorId,
     agent::Bookie,
     base::{CrsqlDbVersion, CrsqlDbVersionRange, CrsqlSeq, CrsqlSeqRange},
-    broadcast::{
-        decompress_change, try_compress_change_for_wire, ChangeV1, CompressError, Timestamp,
-        WireCompression,
-    },
+    broadcast::{ChangeV1, Timestamp},
+    compress::{decompress_change, try_compress_change_for_wire, CompressError, WireCompression},
 };
 
 #[derive(Debug, Clone, PartialEq, Readable, Writable)]
@@ -364,16 +362,9 @@ impl SyncMessage {
     pub fn from_buf(buf: &mut BytesMut) -> Result<Self, SyncMessageDecodeError> {
         let msg = Self::from_slice(buf)?;
         Ok(match msg {
-            SyncMessage::V1(SyncMessageV1::CompressedChangeset(data)) => {
-                match decompress_change(&data) {
-                    Ok(change) => SyncMessage::V1(SyncMessageV1::Changeset(change)),
-                    Err(e) => {
-                        counter!("corro.decompression.errors.total", "traffic" => "sync")
-                            .increment(1);
-                        return Err(e.into());
-                    }
-                }
-            }
+            SyncMessage::V1(SyncMessageV1::CompressedChangeset(data)) => SyncMessage::V1(
+                SyncMessageV1::Changeset(decompress_change(&data, "sync", None)?),
+            ),
             other => other,
         })
     }
@@ -387,7 +378,7 @@ impl SyncMessage {
             return self;
         };
 
-        match try_compress_change_for_wire(&change, "sync", level) {
+        match try_compress_change_for_wire(&change, "sync", level, None) {
             Ok(WireCompression::Compressed(compressed)) => {
                 SyncMessage::V1(SyncMessageV1::CompressedChangeset(compressed))
             }

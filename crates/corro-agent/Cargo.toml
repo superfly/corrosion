@@ -70,6 +70,7 @@ uuid = { workspace = true }
 corro-pg = { path = "../corro-pg" }
 indexmap = { workspace = true }
 governor.workspace = true
+zstd = { workspace = true }
 
 [dev-dependencies]
 corro-tests = { path = "../corro-tests" }
