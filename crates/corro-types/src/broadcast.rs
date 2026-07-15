@@ -113,7 +113,7 @@ pub fn decompress_change(data: &[u8]) -> Result<ChangeV1, CompressError> {
     let start = Instant::now();
     let decompressed = zstd::stream::decode_all(data)?;
     histogram!("corro.decompression.time.seconds").record(start.elapsed());
-    if (decompressed.len() > data.len()) {
+    if decompressed.len() > data.len() {
         counter!("corro.decompression.bytes.extra")
             .increment((decompressed.len() - data.len()) as u64);
     }
