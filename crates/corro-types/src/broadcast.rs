@@ -871,7 +871,7 @@ mod tests {
     #[test]
     fn test_compress_change_with_dict_roundtrips() {
         let change = change_with_rows(50);
-        let dicts = ZstdDicts::new(&trained_dict_bytes(), 3, vec![]);
+        let dicts = ZstdDicts::new(Some(&trained_dict_bytes()), 3, vec![]);
 
         let bcast = BroadcastV1::Change(change.clone()).compress_for_wire(3, Some(&dicts));
         let BroadcastV1::CompressedChange(compressed) = bcast else {
@@ -897,8 +897,8 @@ mod tests {
             zstd::dict::from_samples(&samples, 16 * 1024).unwrap()
         };
 
-        let encoder_dicts = ZstdDicts::new(&old_dict_bytes, 3, vec![]);
-        let decoder_dicts = ZstdDicts::new(&new_dict_bytes, 3, vec![old_dict_bytes]);
+        let encoder_dicts = ZstdDicts::new(Some(&old_dict_bytes), 3, vec![]);
+        let decoder_dicts = ZstdDicts::new(Some(&new_dict_bytes), 3, vec![old_dict_bytes]);
 
         let change = change_with_rows(50);
         let bcast = BroadcastV1::Change(change.clone()).compress_for_wire(3, Some(&encoder_dicts));
@@ -915,7 +915,7 @@ mod tests {
     #[test]
     fn test_decode_fails_for_unknown_dict_id() {
         let old_dict_bytes = trained_dict_bytes();
-        let encoder_dicts = ZstdDicts::new(&old_dict_bytes, 3, vec![]);
+        let encoder_dicts = ZstdDicts::new(Some(&old_dict_bytes), 3, vec![]);
         // decoder doesn't know about `old_dict_bytes` at all
         let new_dict_bytes = {
             let samples: Vec<Vec<u8>> = (200..400)
@@ -923,7 +923,7 @@ mod tests {
                 .collect();
             zstd::dict::from_samples(&samples, 16 * 1024).unwrap()
         };
-        let decoder_dicts = ZstdDicts::new(&new_dict_bytes, 3, vec![]);
+        let decoder_dicts = ZstdDicts::new(Some(&new_dict_bytes), 3, vec![]);
 
         let change = change_with_rows(50);
         let bcast = BroadcastV1::Change(change.clone()).compress_for_wire(3, Some(&encoder_dicts));
