@@ -182,6 +182,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
         Some(path) => {
             let bytes = std::fs::read(path)
                 .map_err(|e| eyre::eyre!("could not read compression dict at {path}: {e}"))?;
+            info!("using compression dictionary at {path} for encoding");
 
             // also pick up any other trained dictionaries in the same directory
             let mut extra_dicts = Vec::new();
@@ -204,7 +205,10 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
                     };
 
                     match load_dictionary(&mut file) {
-                        Ok(Some(b)) => extra_dicts.push(b),
+                        Ok(Some(b)) => {
+                            info!("loading compression dictionary at {entry_path:?} for decoding");
+                            extra_dicts.push(b);
+                        }
                         _ => {
                             warn!("could not read candidate compression dict {entry_path:?}");
                         }
