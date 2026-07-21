@@ -253,15 +253,17 @@ pub struct CompressionConfig {
     /// `enabled` is false.
     #[serde(default = "default_compression_level")]
     pub level: i32,
-    /// Path to a trained zstd dictionary (e.g. produced by `corrosion db
-    /// train-dict`), used to compress outgoing broadcasts. Its containing
-    /// directory is also scanned at startup for other trained dictionaries
-    /// (e.g. previous versions of it), which are loaded and indexed by
-    /// their embedded zstd dictionary id purely for decoding -- so
-    /// broadcasts from peers that haven't rotated to the current dictionary
-    /// yet can still be decoded.
+    /// Directory of trained zstd dictionaries. Every valid dictionary file in this directory
+    /// is loaded at startup and indexed by its embedded zstd dictionary id for
+    /// decoding, so broadcasts from peers still on an older (or newer)
+    /// encoding dictionary can be understood during a gradual rollout.
     #[serde(default)]
-    pub dict_path: Option<Utf8PathBuf>,
+    pub dict_dir: Option<Utf8PathBuf>,
+    /// Filename within `dict_dir` used to compress outgoing broadcasts.
+    /// Omit to compress without a dictionary while still decoding
+    /// dictionary-compressed peers.
+    #[serde(default)]
+    pub dict_file: Option<String>,
 }
 
 impl Default for CompressionConfig {
@@ -269,7 +271,8 @@ impl Default for CompressionConfig {
         Self {
             enabled: false,
             level: default_compression_level(),
-            dict_path: None,
+            dict_dir: None,
+            dict_file: None,
         }
     }
 }
@@ -416,6 +419,8 @@ pub enum ConfigError {
     InvalidMaxMtu { value: u16 },
     #[error("gossip.compression_level value {value} is outside the supported zstd range 1..=22")]
     InvalidCompressionLevel { value: i32 },
+    #[error("gossip.compression.dict_file requires gossip.compression.dict_dir to be set")]
+    DictFileWithoutDictDir,
 }
 
 impl Config {
@@ -440,11 +445,14 @@ impl Config {
                 return Err(ConfigError::InvalidMaxMtu { value: mtu });
             }
         }
-        let compression_level = self.gossip.compression_config().level;
-        if !(1..=22).contains(&compression_level) {
+        let compression = self.gossip.compression_config();
+        if !(1..=22).contains(&compression.level) {
             return Err(ConfigError::InvalidCompressionLevel {
-                value: compression_level,
+                value: compression.level,
             });
+        }
+        if compression.dict_file.is_some() && compression.dict_dir.is_none() {
+            return Err(ConfigError::DictFileWithoutDictDir);
         }
         Ok(())
     }
@@ -614,7 +622,8 @@ impl ConfigBuilder {
                     level: self
                         .compression_level
                         .unwrap_or_else(default_compression_level),
-                    dict_path: None,
+                    dict_dir: None,
+                    dict_file: None,
                 }),
             },
             perf: self.perf.unwrap_or_default(),

@@ -178,48 +178,68 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
     let metrics_tracker = MetricsTracker::new(Duration::from_secs(120), 5)?;
 
     let compression_config = conf.gossip.compression_config();
-    let change_dict = match &compression_config.dict_path {
-        Some(path) => {
-            let bytes = std::fs::read(path)
-                .map_err(|e| eyre::eyre!("could not read compression dict at {path}: {e}"))?;
-            info!("using compression dictionary at {path} for encoding");
+    let change_dict = match &compression_config.dict_dir {
+        Some(dir) => {
+            let encode_name = compression_config.dict_file.as_deref();
+            let mut encoder_bytes: Option<Vec<u8>> = None;
+            let mut decoder_dicts = Vec::new();
 
-            // also pick up any other trained dictionaries in the same directory
-            let mut extra_dicts = Vec::new();
-            if let Some(dir) = path.parent().filter(|dir| !dir.as_str().is_empty()) {
-                let entries = std::fs::read_dir(dir)
-                    .map_err(|e| eyre::eyre!("could not read compression dict dir {dir}: {e}"))?;
-                for entry in entries {
-                    let entry = entry?;
-                    if !entry.file_type()?.is_file() || entry.path() == path.as_std_path() {
+            let entries = std::fs::read_dir(dir)
+                .map_err(|e| eyre::eyre!("could not read compression dict dir {dir}: {e}"))?;
+            for entry in entries {
+                let entry = entry?;
+                if !entry.file_type()?.is_file() {
+                    continue;
+                }
+                let entry_path = entry.path();
+                let file_name = entry.file_name();
+                let file_name = file_name.to_string_lossy();
+
+                let mut file = match std::fs::File::open(&entry_path) {
+                    Ok(file) => file,
+                    Err(e) => {
+                        warn!("could not open candidate compression dict {entry_path:?}: {e}");
                         continue;
                     }
-                    let entry_path = entry.path();
+                };
 
-                    let mut file = match std::fs::File::open(&entry_path) {
-                        Ok(file) => file,
-                        Err(e) => {
-                            warn!("could not open candidate compression dict {entry_path:?}: {e}");
-                            continue;
+                match load_dictionary(&mut file) {
+                    Ok(Some(b)) => {
+                        if encode_name == Some(file_name.as_ref()) {
+                            info!(
+                                path = %entry_path.display(),
+                                dict_id = ?zstd::zstd_safe::get_dict_id_from_dict(&b),
+                                "using compression dictionary for encoding and decoding"
+                            );
+                            encoder_bytes = Some(b.clone());
+                        } else {
+                            info!(
+                                path = %entry_path.display(),
+                                dict_id = ?zstd::zstd_safe::get_dict_id_from_dict(&b),
+                                "using compression dictionary for decoding"
+                            );
                         }
-                    };
-
-                    match load_dictionary(&mut file) {
-                        Ok(Some(b)) => {
-                            info!("loading compression dictionary at {entry_path:?} for decoding");
-                            extra_dicts.push(b);
-                        }
-                        _ => {
-                            warn!("could not read candidate compression dict {entry_path:?}");
-                        }
+                        decoder_dicts.push(b);
+                    }
+                    _ => {
+                        warn!("could not read candidate compression dict {entry_path:?}");
                     }
                 }
             }
 
+            if let Some(name) = encode_name {
+                if encoder_bytes.is_none() {
+                    eyre::bail!(
+                        "gossip.compression.dict_file `{name}` not found in {dir} \
+                         or is not a valid zstd dictionary"
+                    );
+                }
+            }
+
             Some(Arc::new(ZstdDicts::new(
-                &bytes,
+                encoder_bytes.as_deref(),
                 compression_config.level,
-                extra_dicts,
+                decoder_dicts,
             )))
         }
         None => None,

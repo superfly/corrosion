@@ -2470,7 +2470,8 @@ mod tests {
             compression: Some(CompressionConfig {
                 enabled: false,
                 level: 3,
-                dict_path: None,
+                dict_dir: None,
+                dict_file: None,
             }),
         };
 

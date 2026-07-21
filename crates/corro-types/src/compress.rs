@@ -38,38 +38,36 @@ pub fn looks_like_zstd_dict(prefix: &[u8]) -> bool {
 }
 
 /// Trained zstd dictionaries for broadcast compression. `encoder` is the
-/// single, explicitly configured dictionary used to compress outgoing
-/// broadcasts. `decoders` indexes every known dictionary (the encoder one,
-/// plus any extra ones loaded from a scanned directory) by its embedded
-/// zstd dictionary ID, so we can keep decoding broadcasts from peers still
-/// on an older (or newer) dictionary.
+/// optional dictionary used to compress outgoing broadcasts.
 pub struct ZstdDicts {
-    encoder: zstd::dict::EncoderDictionary<'static>,
+    encoder: Option<zstd::dict::EncoderDictionary<'static>>,
     decoders: HashMap<NonZeroU32, zstd::dict::DecoderDictionary<'static>>,
 }
 
 impl ZstdDicts {
-    /// `encoder_bytes` is used both to compress outgoing broadcasts and to
-    /// decode frames that reference its ID. `extra_decoder_bytes` are
-    /// additional dictionaries usable only for decoding.
-    pub fn new(encoder_bytes: &[u8], level: i32, extra_decoder_bytes: Vec<Vec<u8>>) -> Self {
+    /// `encoder_bytes`, when present, is used to compress outgoing broadcasts
+    /// and is also registered for decoding. `decoder_bytes` are additional
+    /// dictionaries usable only for decoding.
+    pub fn new(
+        encoder_bytes: Option<&[u8]>,
+        level: i32,
+        decoder_bytes: impl IntoIterator<Item = Vec<u8>>,
+    ) -> Self {
         let mut decoders = HashMap::new();
 
-        match zstd::zstd_safe::get_dict_id_from_dict(encoder_bytes) {
-            Some(id) => {
-                decoders.insert(id, zstd::dict::DecoderDictionary::copy(encoder_bytes));
+        let encoder = encoder_bytes.map(|bytes| {
+            match zstd::zstd_safe::get_dict_id_from_dict(bytes) {
+                Some(id) => {
+                    decoders.insert(id, zstd::dict::DecoderDictionary::copy(bytes));
+                }
+                None => {
+                    warn!("configured compression dict has no embedded dictionary id");
+                }
             }
-            None => {
-                warn!(
-                    "configured compression dict has no embedded dictionary id \
-                     (was it trained with `zstd --train`?); broadcasts \
-                     compressed with it can't be decoded by dictionary-aware \
-                     nodes, including this one"
-                );
-            }
-        }
+            zstd::dict::EncoderDictionary::copy(bytes, level)
+        });
 
-        for bytes in extra_decoder_bytes {
+        for bytes in decoder_bytes {
             match zstd::zstd_safe::get_dict_id_from_dict(&bytes) {
                 Some(id) => {
                     decoders
@@ -82,21 +80,18 @@ impl ZstdDicts {
             }
         }
 
-        Self {
-            encoder: zstd::dict::EncoderDictionary::copy(encoder_bytes, level),
-            decoders,
-        }
+        Self { encoder, decoders }
     }
 }
 
 fn encode_all_with_dict(data: &[u8], level: i32, dicts: Option<&ZstdDicts>) -> io::Result<Vec<u8>> {
-    match dicts {
-        Some(dicts) => {
+    match dicts.and_then(|d| d.encoder.as_ref()) {
+        Some(encoder) => {
             let mut buf = Vec::new();
-            let mut encoder =
-                zstd::stream::write::Encoder::with_prepared_dictionary(&mut buf, &dicts.encoder)?;
-            encoder.write_all(data)?;
-            encoder.finish()?;
+            let mut stream =
+                zstd::stream::write::Encoder::with_prepared_dictionary(&mut buf, encoder)?;
+            stream.write_all(data)?;
+            stream.finish()?;
             Ok(buf)
         }
         None => zstd::stream::encode_all(data, level),
@@ -294,7 +289,7 @@ mod tests {
     #[test]
     fn test_compress_change_with_dict_roundtrips() {
         let change = change_with_rows(50);
-        let dicts = ZstdDicts::new(&trained_dict_bytes(), 3, vec![]);
+        let dicts = ZstdDicts::new(Some(&trained_dict_bytes()), 3, vec![]);
 
         let bcast = BroadcastV1::Change(change.clone()).compress_for_wire(3, Some(&dicts));
         let BroadcastV1::CompressedChange(compressed) = bcast else {
@@ -320,8 +315,8 @@ mod tests {
             zstd::dict::from_samples(&samples, 16 * 1024).unwrap()
         };
 
-        let encoder_dicts = ZstdDicts::new(&old_dict_bytes, 3, vec![]);
-        let decoder_dicts = ZstdDicts::new(&new_dict_bytes, 3, vec![old_dict_bytes]);
+        let encoder_dicts = ZstdDicts::new(Some(&old_dict_bytes), 3, vec![]);
+        let decoder_dicts = ZstdDicts::new(Some(&new_dict_bytes), 3, vec![old_dict_bytes]);
 
         let change = change_with_rows(50);
         let bcast = BroadcastV1::Change(change.clone()).compress_for_wire(3, Some(&encoder_dicts));
@@ -338,7 +333,7 @@ mod tests {
     #[test]
     fn test_decode_fails_for_unknown_dict_id() {
         let old_dict_bytes = trained_dict_bytes();
-        let encoder_dicts = ZstdDicts::new(&old_dict_bytes, 3, vec![]);
+        let encoder_dicts = ZstdDicts::new(Some(&old_dict_bytes), 3, vec![]);
         // decoder doesn't know about `old_dict_bytes` at all
         let new_dict_bytes = {
             let samples: Vec<Vec<u8>> = (200..400)
@@ -346,7 +341,7 @@ mod tests {
                 .collect();
             zstd::dict::from_samples(&samples, 16 * 1024).unwrap()
         };
-        let decoder_dicts = ZstdDicts::new(&new_dict_bytes, 3, vec![]);
+        let decoder_dicts = ZstdDicts::new(Some(&new_dict_bytes), 3, vec![]);
 
         let change = change_with_rows(50);
         let bcast = BroadcastV1::Change(change.clone()).compress_for_wire(3, Some(&encoder_dicts));
