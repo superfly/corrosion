@@ -957,6 +957,7 @@ dependencies = [
  "tripwire",
  "uhlc",
  "uuid",
+ "zstd",
 ]
 
 [[package]]
@@ -1227,6 +1228,7 @@ dependencies = [
  "shell-words",
  "shellwords",
  "spawn",
+ "speedy",
  "sqlite3-restore",
  "tempfile",
  "thiserror 1.0.69",

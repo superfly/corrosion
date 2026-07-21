@@ -35,6 +35,7 @@ use crate::{
     base::{CrsqlDbVersion, CrsqlDbVersionRange, CrsqlSeq},
     broadcast::{BroadcastInput, BroadcastV1, ChangeSource, ChangeV1, FocaInput, Timestamp},
     channel::{bounded, CorroSender},
+    compress::ZstdDicts,
     config::Config,
     metrics_tracker::MetricsTracker,
     pubsub::SubsManager,
@@ -72,6 +73,9 @@ pub struct AgentConfig {
     pub tx_changes: CorroSender<(ChangeV1, ChangeSource, Option<BroadcastV1>)>,
     pub tx_foca: CorroSender<FocaInput>,
 
+    /// Trained zstd dictionary for broadcast compression, if configured.
+    pub change_dict: Option<Arc<ZstdDicts>>,
+
     pub write_sema: Arc<Semaphore>,
 
     pub schema: RwLock<Schema>,
@@ -106,6 +110,7 @@ pub struct AgentInner {
     tx_clear_buf: CorroSender<(ActorId, CrsqlDbVersionRange)>,
     tx_changes: CorroSender<(ChangeV1, ChangeSource, Option<BroadcastV1>)>,
     tx_foca: CorroSender<FocaInput>,
+    change_dict: Option<Arc<ZstdDicts>>,
     write_sema: Arc<Semaphore>,
     schema: RwLock<Schema>,
     cluster_id: ArcSwap<ClusterId>,
@@ -140,6 +145,7 @@ impl Agent {
             tx_clear_buf: config.tx_clear_buf,
             tx_changes: config.tx_changes,
             tx_foca: config.tx_foca,
+            change_dict: config.change_dict,
             write_sema: config.write_sema,
             schema: config.schema,
             cluster_id: ArcSwap::from_pointee(config.cluster_id),
@@ -210,6 +216,10 @@ impl Agent {
 
     pub fn tx_foca(&self) -> &CorroSender<FocaInput> {
         &self.0.tx_foca
+    }
+
+    pub fn change_dict(&self) -> Option<Arc<ZstdDicts>> {
+        self.0.change_dict.clone()
     }
 
     pub fn write_sema(&self) -> &Arc<Semaphore> {

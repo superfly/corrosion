@@ -138,6 +138,7 @@ pub fn spawn_incoming_connection_handlers(
             &conn,
             agent.cluster_id(),
             agent.tx_changes().clone(),
+            agent.change_dict(),
         );
         bi::spawn_bipayload_handler(&agent, &bookie, &tripwire, &conn);
     });

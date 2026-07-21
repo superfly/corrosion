@@ -1,7 +1,10 @@
+use std::sync::Arc;
+
 use corro_types::{
     actor::ClusterId,
     broadcast::{BroadcastV1, ChangeSource, ChangeV1, UniPayload, UniPayloadV1},
     channel::CorroSender,
+    compress::ZstdDicts,
 };
 use metrics::counter;
 use speedy::Readable;
@@ -17,6 +20,7 @@ pub fn spawn_unipayload_handler(
     conn: &quinn::Connection,
     cluster_id: ClusterId,
     tx_changes: CorroSender<(ChangeV1, ChangeSource, Option<BroadcastV1>)>,
+    change_dict: Option<Arc<ZstdDicts>>,
 ) {
     tokio::spawn({
         let conn = conn.clone();
@@ -46,6 +50,7 @@ pub fn spawn_unipayload_handler(
 
                 tokio::spawn({
                     let tx_changes = tx_changes.clone();
+                    let change_dict = change_dict.clone();
                     async move {
                         let mut framed = FramedRead::new(
                             rx,
@@ -73,7 +78,8 @@ pub fn spawn_unipayload_handler(
                                                         continue;
                                                     }
                                                     let compressed = bcast.is_compressed();
-                                                    match bcast.into_change() {
+                                                    match bcast.into_change(change_dict.as_deref())
+                                                    {
                                                         Ok(change) => {
                                                             changes.push((
                                                                 change,

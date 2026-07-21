@@ -1050,7 +1050,7 @@ pub async fn parallel_sync(
                                 trace_ctx,
                             },
                             cluster_id: agent.cluster_id(),
-                            supports_compression: agent.config().gossip.compression,
+                            supports_compression: agent.config().gossip.compression_config().enabled,
                         },
                         &mut tx,
                     ).instrument(info_span!("write_sync_start"))
@@ -1436,8 +1436,9 @@ pub async fn serve_sync(
     mut write: SendStream,
 ) -> Result<usize, SyncError> {
     // only compress if the peer can decode it AND we're locally configured to
-    let supports_compression = wants_compression && agent.config().gossip.compression;
-    let compression_level = agent.config().gossip.compression_level;
+    let compression_config = agent.config().gossip.compression_config();
+    let supports_compression = wants_compression && compression_config.enabled;
+    let compression_level = compression_config.level;
 
     let context =
         opentelemetry::global::get_text_map_propagator(|propagator| propagator.extract(&trace_ctx));
@@ -1718,7 +1719,9 @@ mod tests {
     use corro_types::{
         api::{ColumnName, TableName},
         broadcast::ChangesetPerTable,
-        config::{Config, TlsClientConfig, TlsConfig, DEFAULT_GOSSIP_CLIENT_ADDR},
+        config::{
+            CompressionConfig, Config, TlsClientConfig, TlsConfig, DEFAULT_GOSSIP_CLIENT_ADDR,
+        },
         pubsub::pack_columns,
         tls::{generate_ca, generate_client_cert, generate_server_cert},
     };
@@ -2464,8 +2467,11 @@ mod tests {
             max_mtu: None,
             disable_gso: false,
             member_id: None,
-            compression: false,
-            compression_level: 3,
+            compression: Some(CompressionConfig {
+                enabled: false,
+                level: 3,
+                dict_path: None,
+            }),
         };
 
         let server = gossip_server_endpoint(&gossip_config).await?;
