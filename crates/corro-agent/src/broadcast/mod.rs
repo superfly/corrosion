@@ -1281,7 +1281,7 @@ mod tests {
                 &conn,
                 ta1.agent.cluster_id(),
                 tx_changes,
-                ta1.agent.change_dict(),
+                ta1.agent.change_dict_slot(),
             );
 
             // we should receive five items starting from the biggest version

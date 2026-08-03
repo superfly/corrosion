@@ -27,7 +27,7 @@ use uuid::Uuid;
 // Public exports
 pub use error::{SyncClientError, SyncRecvError};
 pub use run_root::start_with_config;
-pub use setup::{setup, AgentOptions};
+pub use setup::{reload_change_dicts, setup, AgentOptions};
 pub use uni::spawn_unipayload_handler;
 pub use util::process_multiple_changes;
 

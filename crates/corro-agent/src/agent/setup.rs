@@ -42,7 +42,7 @@ use corro_types::{
     broadcast::{BroadcastInput, BroadcastV1, ChangeSource, ChangeV1, FocaInput},
     channel::{bounded, CorroReceiver},
     compress::ZstdDicts,
-    config::Config,
+    config::{CompressionConfig, Config},
     members::Members,
     metrics_tracker::MetricsTracker,
     pubsub::{Matcher, SubsManager},
@@ -177,73 +177,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
 
     let metrics_tracker = MetricsTracker::new(Duration::from_secs(120), 5)?;
 
-    let compression_config = conf.gossip.compression_config();
-    let change_dict = match &compression_config.dict_dir {
-        Some(dir) => {
-            let encode_name = compression_config.dict_file.as_deref();
-            let mut encoder_bytes: Option<Vec<u8>> = None;
-            let mut decoder_dicts = Vec::new();
-
-            let entries = std::fs::read_dir(dir)
-                .map_err(|e| eyre::eyre!("could not read compression dict dir {dir}: {e}"))?;
-            for entry in entries {
-                let entry = entry?;
-                if !entry.file_type()?.is_file() {
-                    continue;
-                }
-                let entry_path = entry.path();
-                let file_name = entry.file_name();
-                let file_name = file_name.to_string_lossy();
-
-                let mut file = match std::fs::File::open(&entry_path) {
-                    Ok(file) => file,
-                    Err(e) => {
-                        warn!("could not open candidate compression dict {entry_path:?}: {e}");
-                        continue;
-                    }
-                };
-
-                match load_dictionary(&mut file) {
-                    Ok(Some(b)) => {
-                        if encode_name == Some(file_name.as_ref()) {
-                            info!(
-                                path = %entry_path.display(),
-                                dict_id = ?zstd::zstd_safe::get_dict_id_from_dict(&b),
-                                "using compression dictionary for encoding and decoding"
-                            );
-                            encoder_bytes = Some(b.clone());
-                        } else {
-                            info!(
-                                path = %entry_path.display(),
-                                dict_id = ?zstd::zstd_safe::get_dict_id_from_dict(&b),
-                                "using compression dictionary for decoding"
-                            );
-                        }
-                        decoder_dicts.push(b);
-                    }
-                    _ => {
-                        warn!("could not read candidate compression dict {entry_path:?}");
-                    }
-                }
-            }
-
-            if let Some(name) = encode_name {
-                if encoder_bytes.is_none() {
-                    eyre::bail!(
-                        "gossip.compression.dict_file `{name}` not found in {dir} \
-                         or is not a valid zstd dictionary"
-                    );
-                }
-            }
-
-            Some(Arc::new(ZstdDicts::new(
-                encoder_bytes.as_deref(),
-                compression_config.level,
-                decoder_dicts,
-            )))
-        }
-        None => None,
-    };
+    let change_dict = load_change_dicts(&conf.gossip.compression_config())?;
 
     let opts = AgentOptions {
         gossip_server_endpoint,
@@ -290,6 +224,88 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
     });
 
     Ok((agent, opts))
+}
+
+/// Load trained zstd dictionaries from `gossip.compression.dict_dir`.
+///
+/// Every valid dictionary file in the directory is registered for decoding.
+/// When `dict_file` is set, that file is also used as the encoder dictionary.
+pub fn load_change_dicts(
+    compression_config: &CompressionConfig,
+) -> eyre::Result<Option<Arc<ZstdDicts>>> {
+    let Some(dir) = &compression_config.dict_dir else {
+        return Ok(None);
+    };
+
+    let encode_name = compression_config.dict_file.as_deref();
+    let mut encoder_bytes: Option<Vec<u8>> = None;
+    let mut decoder_dicts = Vec::new();
+
+    let entries = std::fs::read_dir(dir)
+        .map_err(|e| eyre::eyre!("could not read compression dict dir {dir}: {e}"))?;
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let entry_path = entry.path();
+        let file_name = entry.file_name();
+        let file_name = file_name.to_string_lossy();
+
+        let mut file = match std::fs::File::open(&entry_path) {
+            Ok(file) => file,
+            Err(e) => {
+                warn!("could not open candidate compression dict {entry_path:?}: {e}");
+                continue;
+            }
+        };
+
+        match load_dictionary(&mut file) {
+            Ok(Some(b)) => {
+                if encode_name == Some(file_name.as_ref()) {
+                    info!(
+                        path = %entry_path.display(),
+                        dict_id = ?zstd::zstd_safe::get_dict_id_from_dict(&b),
+                        "using compression dictionary for encoding and decoding"
+                    );
+                    encoder_bytes = Some(b.clone());
+                } else {
+                    info!(
+                        path = %entry_path.display(),
+                        dict_id = ?zstd::zstd_safe::get_dict_id_from_dict(&b),
+                        "using compression dictionary for decoding"
+                    );
+                }
+                decoder_dicts.push(b);
+            }
+            _ => {
+                warn!("could not read candidate compression dict {entry_path:?}");
+            }
+        }
+    }
+
+    if let Some(name) = encode_name {
+        if encoder_bytes.is_none() {
+            eyre::bail!(
+                "gossip.compression.dict_file `{name}` not found in {dir} \
+                 or is not a valid zstd dictionary"
+            );
+        }
+    }
+
+    Ok(Some(Arc::new(ZstdDicts::new(
+        encoder_bytes.as_deref(),
+        compression_config.level,
+        decoder_dicts,
+    ))))
+}
+
+/// Rescan `gossip.compression.dict_dir` and swap the agent's dictionaries.
+pub fn reload_change_dicts(agent: &Agent) -> eyre::Result<usize> {
+    let dicts = load_change_dicts(&agent.config().gossip.compression_config())?;
+    let decoder_count = dicts.as_ref().map(|d| d.decoder_count()).unwrap_or(0);
+    agent.set_change_dict(dicts);
+    Ok(decoder_count)
 }
 
 /// Initialise subscription state and tasks
