@@ -38,6 +38,7 @@
     - [exec](cli/exec.md)
     - [query](cli/query.md)
     - [reload](cli/reload.md)
+    - [reload-dicts](cli/reload-dicts.md)
     - [restore](cli/restore.md)
     - [subs](cli/subs.md)
     - [sync](cli/sync.md)

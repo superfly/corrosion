@@ -13,6 +13,7 @@ See the pages for each subcommand:
 - [`corrosion exec`](exec.md)
 - [`corrosion query`](query.md)
 - [`corrosion reload`](reload.md)
+- [`corrosion reload-dicts`](reload-dicts.md)
 - [`corrosion restore`](restore.md)
 - [`corrosion subs`](subs.md)
 - [`corrosion sync`](sync.md)

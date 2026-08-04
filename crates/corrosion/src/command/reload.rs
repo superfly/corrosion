@@ -15,6 +15,16 @@ pub async fn run<P: AsRef<Path>>(admin_path: P) -> eyre::Result<()> {
     Ok(())
 }
 
+pub async fn run_dicts<P: AsRef<Path>>(admin_path: P) -> eyre::Result<()> {
+    let mut conn = AdminConn::connect(admin_path).await?;
+    if let Err(e) = conn.send_command(Command::ReloadDicts).await {
+        error!("Failed to reload compression dictionaries: {e}");
+        return Err(eyre!("Failed to reload compression dictionaries: {e}"));
+    }
+    info!("Successfully reloaded zstd compression dictionaries from configured dict_dir!");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

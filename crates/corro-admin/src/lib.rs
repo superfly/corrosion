@@ -5,7 +5,7 @@ use std::{
 };
 
 use camino::Utf8PathBuf;
-use corro_agent::agent::util::execute_schema_from_paths;
+use corro_agent::agent::{reload_change_dicts, util::execute_schema_from_paths};
 use corro_types::{
     actor::{ActorId, ClusterId},
     agent::{Agent, BookedVersions, Bookie, WriteConn},
@@ -112,6 +112,7 @@ pub enum Command {
     Subs(SubsCommand),
     Log(LogCommand),
     Reload,
+    ReloadDicts,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -225,6 +226,29 @@ async fn handle_conn(
                     }
                     info_log(&mut stream, "schema reload finished").await;
                     send_success(&mut stream).await;
+                }
+                Command::ReloadDicts => {
+                    info_log(
+                        &mut stream,
+                        "reloading zstd compression dictionaries from configured dict_dir...",
+                    )
+                    .await;
+                    match reload_change_dicts(&agent) {
+                        Ok(decoder_count) => {
+                            info_log(
+                                &mut stream,
+                                format!(
+                                    "compression dictionary reload finished ({decoder_count} decoder dicts)"
+                                ),
+                            )
+                            .await;
+                            send_success(&mut stream).await;
+                        }
+                        Err(e) => {
+                            send_error(&mut stream, e).await;
+                            continue;
+                        }
+                    }
                 }
                 Command::Sync(SyncCommand::Generate) => {
                     info_log(&mut stream, "generating sync...").await;

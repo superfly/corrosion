@@ -254,9 +254,10 @@ pub struct CompressionConfig {
     #[serde(default = "default_compression_level")]
     pub level: i32,
     /// Directory of trained zstd dictionaries. Every valid dictionary file in this directory
-    /// is loaded at startup and indexed by its embedded zstd dictionary id for
-    /// decoding, so broadcasts from peers still on an older (or newer)
-    /// encoding dictionary can be understood during a gradual rollout.
+    /// is loaded at startup (and on `corrosion reload-dicts`) and indexed by its
+    /// embedded zstd dictionary id for decoding, so broadcasts from peers still
+    /// on an older (or newer) encoding dictionary can be understood during a
+    /// gradual rollout.
     #[serde(default)]
     pub dict_dir: Option<Utf8PathBuf>,
     /// Filename within `dict_dir` used to compress outgoing broadcasts.

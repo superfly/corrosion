@@ -82,6 +82,10 @@ impl ZstdDicts {
 
         Self { encoder, decoders }
     }
+
+    pub fn decoder_count(&self) -> usize {
+        self.decoders.len()
+    }
 }
 
 fn encode_all_with_dict(data: &[u8], level: i32, dicts: Option<&ZstdDicts>) -> io::Result<Vec<u8>> {

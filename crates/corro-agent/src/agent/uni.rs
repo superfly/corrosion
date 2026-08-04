@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use arc_swap::ArcSwapOption;
 use corro_types::{
     actor::ClusterId,
     broadcast::{BroadcastV1, ChangeSource, ChangeV1, UniPayload, UniPayloadV1},
@@ -20,7 +21,7 @@ pub fn spawn_unipayload_handler(
     conn: &quinn::Connection,
     cluster_id: ClusterId,
     tx_changes: CorroSender<(ChangeV1, ChangeSource, Option<BroadcastV1>)>,
-    change_dict: Option<Arc<ZstdDicts>>,
+    change_dict: Arc<ArcSwapOption<ZstdDicts>>,
 ) {
     tokio::spawn({
         let conn = conn.clone();
@@ -48,9 +49,10 @@ pub fn spawn_unipayload_handler(
                     conn.remote_address()
                 );
 
+                let change_dict = change_dict.load_full();
+
                 tokio::spawn({
                     let tx_changes = tx_changes.clone();
-                    let change_dict = change_dict.clone();
                     async move {
                         let mut framed = FramedRead::new(
                             rx,

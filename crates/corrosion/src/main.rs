@@ -486,6 +486,7 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
             }
         }
         Command::Reload => command::reload::run(cli.admin_path()).await?,
+        Command::ReloadDicts => command::reload::run_dicts(cli.admin_path()).await?,
         Command::Sync(SyncCommand::Generate) => {
             let mut conn = AdminConn::connect(cli.admin_path()).await?;
             conn.send_command(corro_admin::Command::Sync(
@@ -804,6 +805,10 @@ enum Command {
 
     /// Reload Corrosion schema
     Reload,
+
+    /// Rescan gossip.compression.dict_dir and reload zstd dictionaries
+    /// without restarting the agent
+    ReloadDicts,
 
     /// Sync-related commands
     #[command(subcommand)]

@@ -9,7 +9,7 @@ use std::{
 };
 
 use antithesis_sdk::assert_unreachable;
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use camino::Utf8PathBuf;
 use metrics::{gauge, histogram};
 use parking_lot::RwLock;
@@ -110,7 +110,7 @@ pub struct AgentInner {
     tx_clear_buf: CorroSender<(ActorId, CrsqlDbVersionRange)>,
     tx_changes: CorroSender<(ChangeV1, ChangeSource, Option<BroadcastV1>)>,
     tx_foca: CorroSender<FocaInput>,
-    change_dict: Option<Arc<ZstdDicts>>,
+    change_dict: Arc<ArcSwapOption<ZstdDicts>>,
     write_sema: Arc<Semaphore>,
     schema: RwLock<Schema>,
     cluster_id: ArcSwap<ClusterId>,
@@ -145,7 +145,7 @@ impl Agent {
             tx_clear_buf: config.tx_clear_buf,
             tx_changes: config.tx_changes,
             tx_foca: config.tx_foca,
-            change_dict: config.change_dict,
+            change_dict: Arc::new(ArcSwapOption::from(config.change_dict)),
             write_sema: config.write_sema,
             schema: config.schema,
             cluster_id: ArcSwap::from_pointee(config.cluster_id),
@@ -219,7 +219,15 @@ impl Agent {
     }
 
     pub fn change_dict(&self) -> Option<Arc<ZstdDicts>> {
+        self.0.change_dict.load_full()
+    }
+
+    pub fn change_dict_slot(&self) -> Arc<ArcSwapOption<ZstdDicts>> {
         self.0.change_dict.clone()
+    }
+
+    pub fn set_change_dict(&self, dicts: Option<Arc<ZstdDicts>>) {
+        self.0.change_dict.store(dicts);
     }
 
     pub fn write_sema(&self) -> &Arc<Semaphore> {
