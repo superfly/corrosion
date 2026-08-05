@@ -6,6 +6,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use async_trait::async_trait;
 use bytes::Bytes;
 use corro_types::config::GossipConfig;
 use metrics::{counter, gauge, histogram};
@@ -21,6 +22,12 @@ use tokio::{
 use tracing::{debug, debug_span, info, trace, warn, Instrument};
 
 use crate::api::peer::gossip_client_endpoint;
+
+#[async_trait]
+pub trait TransportExt {
+    async fn send_datagram(&self, addr: SocketAddr, data: Bytes) -> Result<(), TransportError>;
+    async fn send_uni(&self, addr: SocketAddr, data: Bytes) -> Result<(), TransportError>;
+}
 
 #[derive(Debug, Clone)]
 pub struct Transport(Arc<TransportInner>);
@@ -563,5 +570,81 @@ fn test_conn(conn: &Connection) -> bool {
             warn!("cached connection was closed abnormally, reconnecting: {e}");
             false
         }
+    }
+}
+
+#[async_trait]
+impl TransportExt for Transport {
+    #[tracing::instrument(skip(self, data), fields(buf_size = data.len()), level = "debug", err)]
+    async fn send_datagram(&self, addr: SocketAddr, data: Bytes) -> Result<(), TransportError> {
+        let conn = self.connect(addr, TrafficClass::Foca).await?;
+        debug!("connected to {addr}");
+
+        match conn.send_datagram(data.clone()) {
+            Ok(send) => {
+                debug!("sent datagram to {addr}");
+                return Ok(send);
+            }
+            Err(SendDatagramError::ConnectionLost(e)) => {
+                debug!("retryable error attempting to send datagram: {e}");
+            }
+            Err(e) => {
+                counter!("corro.transport.send_datagram.errors", "addr" => addr.to_string(), "error" => e.to_string()).increment(1);
+                if matches!(e, SendDatagramError::TooLarge) {
+                    warn!(%addr, "attempted to send a larger-than-PMTU datagram. len: {}, pmtu: {:?}", data.len(), conn.max_datagram_size());
+                }
+                return Err(e.into());
+            }
+        }
+
+        let conn = self.connect(addr, TrafficClass::Foca).await?;
+        debug!("re-connected to {addr}");
+        Ok(conn.send_datagram(data)?)
+    }
+
+    #[tracing::instrument(skip(self, data), fields(buf_size = data.len()), level = "debug", err)]
+    async fn send_uni(&self, addr: SocketAddr, data: Bytes) -> Result<(), TransportError> {
+        let len = data.len();
+        let conn = self.connect(addr, TrafficClass::Broadcast).await?;
+
+        let mut stream = match conn
+            .open_uni()
+            .instrument(debug_span!("quic_open_uni"))
+            .await
+        {
+            Ok(stream) => stream,
+            Err(e @ ConnectionError::VersionMismatch) => {
+                return Err(e.into());
+            }
+            Err(e) => {
+                debug!("retryable error attempting to open unidirectional stream: {e}");
+                let conn = self.connect(addr, TrafficClass::Broadcast).await?;
+                conn.open_uni()
+                    .instrument(debug_span!("quic_open_uni"))
+                    .await?
+            }
+        };
+
+        stream
+            .write_chunk(data)
+            .instrument(debug_span!("quic_write_chunk"))
+            .await?;
+
+        stream
+            .finish()
+            .expect("unreachable, the stream does not leave this method");
+
+        stream
+            .stopped()
+            .instrument(debug_span!("quic_stopped"))
+            .await?;
+
+        counter!(
+            "corro.transport.tx.bytes.v2.total",
+            "traffic" => TrafficClass::Broadcast.as_str()
+        )
+        .increment(len as u64);
+
+        Ok(())
     }
 }

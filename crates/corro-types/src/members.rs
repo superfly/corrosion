@@ -48,9 +48,82 @@ impl MemberState {
 
 const RING_BUCKETS: [Range<u64>; 6] = [0..6, 6..15, 15..50, 50..100, 100..200, 200..300];
 
+/// Number of recent RTT samples retained per member and used to compute the
+/// median RTT for ring assignment.
+const RTT_WINDOW: usize = 20;
+
+/// Hysteresis dead-band as a percentage of the shared boundary value, applied
+/// only to moves between *adjacent* ring buckets. Prevents ring flapping when
+/// the average RTT sits right on a bucket boundary. Non-adjacent jumps are not
+/// affected and switch immediately.
+const RING_HYSTERESIS_PCT: u64 = 20;
+
+/// Index of the `RING_BUCKETS` range containing `avg`. Values at or above the
+/// last bucket (>= 300ms) are clamped into the top bucket so a ring is always
+/// assigned.
+fn bucket_for(avg: u64) -> u8 {
+    RING_BUCKETS
+        .iter()
+        .position(|r| r.contains(&avg))
+        .unwrap_or(RING_BUCKETS.len() - 1) as u8
+}
+
+/// Compute the ring for `avg`, applying hysteresis only when new ring bucket
+/// is adjacent to prevent small rtt jumps from moving rings.
+fn ring_with_hysteresis(current: Option<u8>, avg: u64) -> u8 {
+    let target = bucket_for(avg);
+    let Some(current) = current else {
+        return target;
+    };
+    if target == current || target.abs_diff(current) != 1 {
+        return target;
+    }
+    if target > current {
+        // Moving up: exceed the end-of-current boundary by the margin.
+        let boundary = RING_BUCKETS[current as usize].end;
+        let margin = boundary * RING_HYSTERESIS_PCT / 100;
+        if avg >= boundary + margin {
+            target
+        } else {
+            current
+        }
+    } else {
+        // Moving down: drop below the start-of-current boundary by the margin.
+        let boundary = RING_BUCKETS[current as usize].start;
+        let margin = boundary * RING_HYSTERESIS_PCT / 100;
+        if avg + margin <= boundary {
+            target
+        } else {
+            current
+        }
+    }
+}
+
+fn median_rtt(rtt: &Rtt) -> Option<u64> {
+    let len = rtt.buf.len();
+    if len == 0 {
+        return None;
+    }
+
+    let mut scratch = [0u64; RTT_WINDOW];
+    let (head, tail) = rtt.buf.as_slices();
+    scratch[..head.len()].copy_from_slice(head);
+    scratch[head.len()..len].copy_from_slice(tail);
+
+    let values = &mut scratch[..len];
+    values.sort_unstable();
+
+    let mid = len / 2;
+    Some(if len % 2 == 0 {
+        (values[mid - 1] + values[mid]) / 2
+    } else {
+        values[mid]
+    })
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct Rtt {
-    pub buf: CircularBuffer<20, u64>,
+    pub buf: CircularBuffer<RTT_WINDOW, u64>,
 }
 
 #[derive(Default)]
@@ -61,11 +134,11 @@ pub struct Members {
     pub rtts: BTreeMap<SocketAddr, Rtt>,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug)]
 pub enum MemberAddedResult {
-    NewMember,
+    NewMember(MemberState),
     Removed,
-    Updated,
+    Updated(MemberState),
     Ignored,
 }
 
@@ -85,6 +158,13 @@ impl Members {
         if let Some(state) = self.states.get_mut(actor_id) {
             state.last_sync_ts = Some(ts);
         }
+    }
+
+    /// Median RTT in milliseconds for this member (same statistic as
+    /// [`Self::recalculate_rings`]), or `None` if there are no samples yet.
+    pub fn avg_rtt_ms(&self, actor_id: &ActorId) -> Option<u64> {
+        let addr = self.states.get(actor_id)?.addr;
+        median_rtt(self.rtts.get(&addr)?)
     }
 
     // A result of `true` means that the effective list of
@@ -108,8 +188,8 @@ impl Members {
             };
         }
 
+        let is_new = !self.states.contains_key(&actor_id);
         let member = self.states.entry(actor_id).or_insert_with(|| {
-            ret = MemberAddedResult::NewMember;
             MemberState::new(
                 actor.addr(),
                 actor.ts(),
@@ -117,6 +197,10 @@ impl Members {
                 actor.member_id(),
             )
         });
+
+        if is_new {
+            ret = MemberAddedResult::NewMember(member.clone());
+        }
 
         trace!("member: {member:?}");
 
@@ -137,12 +221,12 @@ impl Members {
             member.ts = actor.ts();
             member.cluster_id = actor.cluster_id();
             member.member_id = actor.member_id();
-            ret = MemberAddedResult::Updated;
+            ret = MemberAddedResult::Updated(member.clone());
         }
 
         // If we just inserted, add the actor to the by_addr set and
         // recalculate the RTT rings.
-        if ret == MemberAddedResult::NewMember {
+        if matches!(ret, MemberAddedResult::NewMember(_)) {
             self.by_addr.insert(actor.addr(), actor.id());
             self.recalculate_rings(actor.addr());
         }
@@ -178,31 +262,27 @@ impl Members {
         self.recalculate_rings(addr)
     }
 
-    /// For a given member, calculate the average RTT and update
-    /// `self.ring` with the index of the corresponding bucket in
-    /// `RING_BUCKETS`.
+    /// For a given member, calculate the median RTT and update `self.ring` with
+    /// the index of the corresponding bucket in `RING_BUCKETS`, applying
+    /// hysteresis on moves between adjacent buckets (see [`ring_with_hysteresis`])
+    /// to avoid flapping when the RTT sits near a bucket boundary.
     fn recalculate_rings(&mut self, addr: SocketAddr) {
         if let Some(actor_id) = self.by_addr.get(&addr) {
-            if let Some(avg) = self.rtts.get(&addr).and_then(|rtt| {
-                // If the ring buffer isn't empty
-                (!rtt.buf.is_empty()).then(|| {
-                    // We can only access the ring buffer via two
-                    // slices, so we sum both of them together
-                    (rtt.buf.as_slices().0.iter().sum::<u64>()
-                     + rtt.buf.as_slices().1.iter().sum::<u64>())
-                        // Then average over the full size of the ring
-                        // buffer for the average of recent RTTs
-                        / rtt.buf.len() as u64
-                })
-            }) {
-                if let Some(state) = self.states.get_mut(actor_id) {
-                    // We check which range-bucket the RTT is
-                    // contained in, then update the stored index
-                    for (ring, n) in RING_BUCKETS.iter().enumerate() {
-                        if n.contains(&avg) {
-                            state.ring = Some(ring as u8);
-                            break;
+            if let Some(rtt) = self.rtts.get(&addr) {
+                let median = median_rtt(rtt);
+
+                if let Some(median) = median {
+                    if let Some(state) = self.states.get_mut(actor_id) {
+                        let new_ring = ring_with_hysteresis(state.ring, median);
+                        if state.ring != Some(new_ring) {
+                            info!(
+                                "actor: {actor_id}, rtt: {:?}{:?}, old ring: {:?}, new ring: {new_ring}, median: {median}",
+                                rtt.buf.as_slices().0,
+                                rtt.buf.as_slices().1,
+                                state.ring,
+                            );
                         }
+                        state.ring = Some(new_ring);
                     }
                 }
             }
