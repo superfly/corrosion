@@ -1,13 +1,13 @@
 use corro_types::{
     agent::Agent,
     broadcast::{
-        BroadcastV1, ChangeSource, ChangeV1, PlumtreeInput, PlumtreeMsgV1, PlumtreeWire,
-        UniPayload, UniPayloadV1,
+        BroadcastV1, ChangeSource, ChangeV1, PlumtreeInput, PlumtreeMsgV1, PlumtreePayload,
+        PlumtreeWire, UniPayload, UniPayloadV1,
     },
     config::BroadcastMethod,
 };
 use metrics::counter;
-use plum_foca::GossipMsg;
+use plum_foca::{GossipMsg, Payload};
 use speedy::Readable;
 use tokio_stream::StreamExt;
 use tokio_util::codec::{FramedRead, LengthDelimitedCodec};
@@ -50,6 +50,7 @@ pub fn spawn_unipayload_handler(tripwire: &Tripwire, conn: &quinn::Connection, a
                 );
 
                 let change_dict = change_dict.load_full();
+                let remote_addr = conn.remote_address();
 
                 tokio::spawn({
                     let tx_changes = tx_changes.clone();
@@ -119,11 +120,29 @@ pub fn spawn_unipayload_handler(tripwire: &Tripwire, conn: &quinn::Connection, a
                                                                 wire_msg
                                                             {
                                                                 warn!("broadcast algorithm set to gossip but node receieved plumtree message");
-                                                                changes.push((
-                                                                    msg.payload,
-                                                                    ChangeSource::Broadcast,
-                                                                    None,
-                                                                ));
+                                                                let compressed = msg
+                                                                    .payload
+                                                                    .bcast
+                                                                    .is_compressed();
+                                                                match msg.payload.bcast.into_change(
+                                                                    change_dict.as_deref(),
+                                                                ) {
+                                                                    Ok(change) => {
+                                                                        changes.push((
+                                                                            change,
+                                                                            ChangeSource::Broadcast,
+                                                                            compressed.then_some(
+                                                                                msg.payload.bcast,
+                                                                            ),
+                                                                        ));
+                                                                    }
+                                                                    Err(e) => {
+                                                                        error!(
+                                                                            "could not decode plumtree broadcast change: {e}"
+                                                                        );
+                                                                        continue;
+                                                                    }
+                                                                }
                                                             }
                                                         }
                                                         BroadcastMethod::Plumtree => {
@@ -155,12 +174,22 @@ pub fn spawn_unipayload_handler(tripwire: &Tripwire, conn: &quinn::Connection, a
 
                         match broadcast_method {
                             BroadcastMethod::Plumtree => {
-                                warn!("broadcast algorithm set to plumtree but node receieved gossip message.");
-                                for (change, _, _) in changes.into_iter().rev() {
+                                if let Some((change, _, _)) = changes.first() {
+                                    warn!(
+                                        %remote_addr,
+                                        id = ?change.message_id(),
+                                        count = changes.len(),
+                                        "broadcast algorithm set to plumtree but node received gossip message"
+                                    );
+                                }
+                                for (change, _, original_bcast) in changes.into_iter().rev() {
+                                    let id = change.message_id();
+                                    let bcast = original_bcast
+                                        .unwrap_or_else(|| BroadcastV1::Change(change));
                                     let wire = PlumtreeMsgV1::Gossip(GossipMsg {
                                         round: 1,
-                                        sender: change.actor_id,
-                                        payload: change,
+                                        sender: id.actor_id,
+                                        payload: PlumtreePayload { id, bcast },
                                     });
                                     if let Err(e) =
                                         tx_plumtree.send(PlumtreeInput::Wire(wire)).await

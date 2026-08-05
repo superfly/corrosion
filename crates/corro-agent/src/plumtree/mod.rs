@@ -6,6 +6,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+use std::sync::Arc;
+
+use arc_swap::ArcSwapOption;
 use bytes::{BufMut, Bytes, BytesMut};
 use corro_types::{
     actor::{ActorId, ClusterId},
@@ -13,13 +16,14 @@ use corro_types::{
     base::{CrsqlDbVersion, CrsqlSeq},
     broadcast::{
         BroadcastV1, ChangeId, ChangeSource, ChangeV1, ChangesetId, PlumtreeInput, PlumtreeMsgV1,
-        PlumtreeStats, PlumtreeUpdates, PlumtreeWire, UniPayload, UniPayloadV1,
+        PlumtreePayload, PlumtreeStats, PlumtreeUpdates, PlumtreeWire, UniPayload, UniPayloadV1,
     },
     channel::{bounded, CorroReceiver, CorroSender},
+    compress::ZstdDicts,
 };
 use governor::{Quota, RateLimiter};
 use indexmap::IndexMap;
-use metrics::{counter, gauge};
+use metrics::{counter, gauge, histogram};
 use plum_foca::{Payload, PlumPrio, PlumtreeState, RttInfo, SeenStore, Timer};
 use rangemap::RangeInclusiveSet;
 use speedy::Writable;
@@ -212,6 +216,7 @@ impl ChangeSeenStore {
 /// to Corrosion's transport, change processing, and timer infrastructure.
 struct CorrosionPlumtreeRuntime {
     tx_changes: CorroSender<(ChangeV1, ChangeSource, Option<BroadcastV1>)>,
+    change_dict: Arc<ArcSwapOption<ZstdDicts>>,
     timer_spawner: TimerSpawner<plum_foca::Timer<ChangeId, ActorId>>,
     tx_msgs: CorroSender<(PlumPrio, Vec<ActorId>, PlumtreeMsgV1)>,
 }
@@ -219,22 +224,24 @@ struct CorrosionPlumtreeRuntime {
 impl CorrosionPlumtreeRuntime {
     fn new(
         tx_changes: CorroSender<(ChangeV1, ChangeSource, Option<BroadcastV1>)>,
+        change_dict: Arc<ArcSwapOption<ZstdDicts>>,
         timer_spawner: TimerSpawner<plum_foca::Timer<ChangeId, ActorId>>,
         tx_msgs: CorroSender<(PlumPrio, Vec<ActorId>, PlumtreeMsgV1)>,
     ) -> Self {
         Self {
             tx_changes,
+            change_dict,
             timer_spawner,
             tx_msgs,
         }
     }
 }
 
-impl plum_foca::Runtime<ChangeId, ChangeV1, ActorId> for CorrosionPlumtreeRuntime {
+impl plum_foca::Runtime<ChangeId, PlumtreePayload, ActorId> for CorrosionPlumtreeRuntime {
     fn send_all(
         &mut self,
         peers: Vec<ActorId>,
-        msg: plum_foca::PlumtreeMsg<ChangeId, ChangeV1, ActorId>,
+        msg: plum_foca::PlumtreeMsg<ChangeId, PlumtreePayload, ActorId>,
         priority: PlumPrio,
     ) {
         if let Err(e) = self.tx_msgs.try_send((priority, peers, msg)) {
@@ -248,12 +255,22 @@ impl plum_foca::Runtime<ChangeId, ChangeV1, ActorId> for CorrosionPlumtreeRuntim
         }
     }
 
-    fn deliver(&mut self, payload: ChangeV1) {
+    fn deliver(&mut self, payload: PlumtreePayload) {
+        let dicts = self.change_dict.load_full();
+        let compressed = payload.bcast.is_compressed();
+        let change = match payload.bcast.into_change(dicts.as_deref()) {
+            Ok(change) => change,
+            Err(e) => {
+                error!("plumtree: could not decode delivered broadcast: {e}");
+                return;
+            }
+        };
+        let original_bcast = compressed.then_some(payload.bcast);
         let tx = self.tx_changes.clone();
         tokio::spawn(async move {
             match tokio::time::timeout(
                 Duration::from_secs(1),
-                tx.send((payload, ChangeSource::Broadcast, None)),
+                tx.send((change, ChangeSource::Broadcast, original_bcast)),
             )
             .await
             {
@@ -356,7 +373,7 @@ pub async fn plumtree_loop<T: TransportExt + Clone + Send + 'static>(
     mut tripwire: Tripwire,
 ) {
     let seen = ChangeSeenStore::new(config.max_received_entries, agent.bookie().clone());
-    let mut state: PlumtreeState<ChangeId, ChangeV1, ActorId, ChangeSeenStore> =
+    let mut state: PlumtreeState<ChangeId, PlumtreePayload, ActorId, ChangeSeenStore> =
         PlumtreeState::new_with_store(agent.actor_id(), config, seen);
 
     let (plumtree_timer_tx, mut plumtree_timer_rx) = mpsc::channel(10);
@@ -372,7 +389,8 @@ pub async fn plumtree_loop<T: TransportExt + Clone + Send + 'static>(
     let mut ihave_tick_interval = interval(Duration::from_millis(150));
     let mut maintenance_interval = interval(Duration::from_secs(60));
 
-    let mut rt = CorrosionPlumtreeRuntime::new(tx_changes, timer_spawner, tx_msgs);
+    let mut rt =
+        CorrosionPlumtreeRuntime::new(tx_changes, agent.change_dict_slot(), timer_spawner, tx_msgs);
 
     let peers: Vec<_> = plumtree_topology_map(&agent).into_iter().collect();
     info!("added {} peers to plumtree from members", peers.len());
@@ -428,6 +446,7 @@ pub async fn plumtree_loop<T: TransportExt + Clone + Send + 'static>(
                     match msg {
                         PlumtreeMsgV1::Gossip(g) => {
                             trace!("handling plumtree gossip");
+                            histogram!("corro.plumtree.gossip.round").record(g.round as f64);
                             state.handle_gossip(g, &mut rt);
                         }
                         PlumtreeMsgV1::IHave(ih) => {
@@ -449,8 +468,29 @@ pub async fn plumtree_loop<T: TransportExt + Clone + Send + 'static>(
                 }
                 PlumtreeInput::Broadcast(change) => {
                     let id = change.message_id();
+                    // compress payload if needed (same as gossip broadcast path)
+                    let compression_config = agent.config().gossip.compression_config();
+                    let bcast = BroadcastV1::Change(change);
+                    let bcast = if compression_config.enabled {
+                        let level = compression_config.level;
+                        let dict = agent.change_dict();
+                        match tokio::task::spawn_blocking(move || {
+                            bcast.compress_for_wire(level, dict.as_deref())
+                        })
+                        .await
+                        {
+                            Ok(bcast) => bcast,
+                            Err(e) => {
+                                error!("plumtree: compress_for_wire task panicked: {e}");
+                                continue;
+                            }
+                        }
+                    } else {
+                        bcast
+                    };
+
                     trace!("plumtree: broadcasting change: {id:?}");
-                    state.broadcast(id, change, &mut rt);
+                    state.broadcast(id.clone(), PlumtreePayload { id, bcast }, &mut rt);
                 }
                 PlumtreeInput::QueryStats(reply) => {
                     let stats = PlumtreeStats {
@@ -800,7 +840,7 @@ mod tests {
     use corro_types::{
         actor::Actor,
         base::{dbsr, CrsqlDbVersion, CrsqlSeq},
-        broadcast::{ChangeV1, Changeset},
+        broadcast::{BroadcastV1, ChangeV1, Changeset},
         members::Members,
     };
     use parking_lot::RwLock;

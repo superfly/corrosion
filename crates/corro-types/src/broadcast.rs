@@ -78,8 +78,29 @@ pub enum ChangesetId {
     },
 }
 
+/// Plumtree gossip payload. Carries a stable message id for the protocol and
+/// the original wire form (possibly compressed)
+#[derive(Debug, Clone, Readable, Writable)]
+pub struct PlumtreePayload {
+    pub id: ChangeId,
+    pub bcast: BroadcastV1,
+}
+
+impl Payload for PlumtreePayload {
+    type MessageId = ChangeId;
+    type NodeId = ActorId;
+
+    fn message_id(&self) -> ChangeId {
+        self.id.clone()
+    }
+
+    fn origin(&self) -> Self::NodeId {
+        self.id.actor_id
+    }
+}
+
 /// Concrete Plumtree message type used on the wire.
-pub type PlumtreeMsgV1 = plum_foca::PlumtreeMsg<ChangeId, ChangeV1, ActorId>;
+pub type PlumtreeMsgV1 = plum_foca::PlumtreeMsg<ChangeId, PlumtreePayload, ActorId>;
 
 #[derive(Debug, Clone, Readable, Writable)]
 pub enum PlumtreeWire {

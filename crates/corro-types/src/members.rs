@@ -275,10 +275,8 @@ impl Members {
                     if let Some(state) = self.states.get_mut(actor_id) {
                         let new_ring = ring_with_hysteresis(state.ring, median);
                         if state.ring != Some(new_ring) {
-                            info!(
-                                "actor: {actor_id}, rtt: {:?}{:?}, old ring: {:?}, new ring: {new_ring}, median: {median}",
-                                rtt.buf.as_slices().0,
-                                rtt.buf.as_slices().1,
+                            debug!(
+                                "actor: {actor_id}, old ring: {:?}, new ring: {new_ring}, median: {median}",
                                 state.ring,
                             );
                         }
