@@ -99,6 +99,13 @@ impl Payload for PlumtreePayload {
     }
 }
 
+impl plum_foca::MessageId for ChangeId {
+    type NodeId = ActorId;
+    fn origin(&self) -> ActorId {
+        self.actor_id
+    }
+}
+
 /// Concrete Plumtree message type used on the wire.
 pub type PlumtreeMsgV1 = plum_foca::PlumtreeMsg<ChangeId, PlumtreePayload, ActorId>;
 

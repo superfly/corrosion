@@ -456,7 +456,7 @@ async fn send_plumtree_member_update(agent: &Agent, actor: &Actor, result: Membe
                     actor_id: actor.id(),
                     addr: state.addr,
                     ring: state.ring,
-                    // rtt_ms: members.avg_rtt_ms(&actor.id()).unwrap_or(u64::MAX),
+                    // rtt_ms: members.min_rtt_ms(&actor.id()).unwrap_or(u64::MAX),
                 })
             }
             MemberAddedResult::Ignored => None,

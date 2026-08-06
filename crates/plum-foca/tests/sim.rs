@@ -33,7 +33,9 @@ use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng};
 
 type NId = u32;
-type MId = u64;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct MId(u64);
 
 #[derive(Debug, Clone)]
 struct SimPayload {
@@ -43,14 +45,21 @@ struct SimPayload {
 
 impl SimPayload {
     fn id(&self) -> MId {
-        ((self.origin as u64) << 32) | self.seq as u64
+        MId(((self.origin as u64) << 32) | self.seq as u64)
     }
 }
 
 /// Decode the origin node encoded in a `SimPayload::id()`/gossip `mid`
 /// (both sims use the same `(origin << 32) | seq` encoding).
 fn origin_of(mid: MId) -> NId {
-    (mid >> 32) as NId
+    (mid.0 >> 32) as NId
+}
+
+impl plum_foca::MessageId for MId {
+    type NodeId = NId;
+    fn origin(&self) -> NId {
+        origin_of(*self)
+    }
 }
 
 impl Payload for SimPayload {
@@ -1047,8 +1056,8 @@ fn pct<T: Copy + Default>(sorted: &[T], p: f64) -> T {
 ///     never down at all. A real signal, expected to be 0 in a healthy run
 ///     (modulo gossip's own inherent small residual non-convergence, which
 ///     is unrelated to any failure and pre-exists this metric).
-/// Short-circuits to `(0, 0)` when nothing was ever recorded, so non-failure
-/// runs (including 2k-scale ones) pay nothing for this.
+///     Short-circuits to `(0, 0)` when nothing was ever recorded, so non-failure
+///     runs (including 2k-scale ones) pay nothing for this.
 fn failure_miss_stats(
     n: usize,
     msgs: &HashMap<MId, MsgStat>,
@@ -1532,7 +1541,7 @@ impl GossipSim {
 
         for chunk in origins.chunks(CHUNK) {
             for &node in chunk {
-                let mid = (node as u64) << 32;
+                let mid = MId((node as u64) << 32);
                 let at = self.now;
                 self.push(at, GEvent::Originate { node, mid });
             }
@@ -1557,7 +1566,7 @@ impl GossipSim {
         let n = self.params.n as NId;
         let window_us = self.params.broadcast_window.as_micros() as u64;
         for node in 0..n {
-            let mid = (node as u64) << 32;
+            let mid = MId((node as u64) << 32);
             let at = self.rng.random_range(0..window_us.max(1));
             self.push(at, GEvent::Originate { node, mid });
         }

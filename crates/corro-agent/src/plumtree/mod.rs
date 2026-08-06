@@ -29,7 +29,7 @@ use rangemap::RangeInclusiveSet;
 use speedy::Writable;
 use tokio::{sync::mpsc, task::JoinSet, time::interval};
 use tokio_util::codec::{Encoder, LengthDelimitedCodec};
-use tracing::{debug, error, info, trace, warn};
+use tracing::{error, info, trace, warn};
 use tripwire::Tripwire;
 
 use crate::{
@@ -66,6 +66,7 @@ impl ChangeSeenStore {
 impl SeenStore<ChangeId> for ChangeSeenStore {
     fn evict_if_needed(&mut self) {
         if self.entries.len() > self.max_entries {
+            counter!("corro.plumtree.cache.drained").increment(1);
             self.entries.drain(0..self.entries.len() - self.max_entries);
         }
     }
@@ -79,13 +80,11 @@ impl SeenStore<ChangeId> for ChangeSeenStore {
     }
 
     fn observe(&mut self, id: ChangeId, round: plum_foca::Round) -> Option<u32> {
-        if self.contains_booked(&id) {
-            // we already received this change through a sync or dropped it during a prune
-            counter!("corro.plumtree.change.synced").increment(1);
-            return Some(0);
-        }
+        // Already applied via sync/apply or entry was dropped
+        let already_booked = !self.has_cache_entry(&id) && self.contains_booked(&id);
+
         let actor_id = id.actor_id;
-        match &id.changeset_id {
+        let result = match &id.changeset_id {
             ChangesetId::Full {
                 version,
                 seqs,
@@ -164,6 +163,14 @@ impl SeenStore<ChangeId> for ChangeSeenStore {
                     Some(min_seen)
                 }
             }
+        };
+
+        if already_booked {
+            // return zero so it isn't re-delivered
+            counter!("corro.plumtree.change.synced").increment(1);
+            Some(0)
+        } else {
+            result
         }
     }
 }
@@ -171,17 +178,25 @@ impl SeenStore<ChangeId> for ChangeSeenStore {
 impl ChangeSeenStore {
     fn contains_booked(&self, id: &ChangeId) -> bool {
         let actor_id = id.actor_id;
-        if let Some(bookie) = self.bookie.get(&actor_id) {
+        self.bookie.get(&actor_id).is_some_and(|booked| {
+            let bookedr = booked.read();
             match &id.changeset_id {
-                ChangesetId::Full { version, seqs, .. } => {
-                    bookie.read().contains(*version, Some(*seqs))
-                }
+                ChangesetId::Full { version, seqs, .. } => bookedr.contains(*version, Some(*seqs)),
                 ChangesetId::Empty { versions, .. } => versions
                     .clone()
-                    .all(|version| bookie.read().contains(version, None)),
+                    .all(|version| bookedr.contains(version, None)),
             }
-        } else {
-            false
+        })
+    }
+
+    fn has_cache_entry(&self, id: &ChangeId) -> bool {
+        match &id.changeset_id {
+            ChangesetId::Full { version, .. } => {
+                self.entries.contains_key(&(id.actor_id, *version))
+            }
+            ChangesetId::Empty { versions, .. } => versions
+                .clone()
+                .any(|version| self.entries.contains_key(&(id.actor_id, version))),
         }
     }
 
@@ -638,7 +653,7 @@ async fn send_messages_loop<T: TransportExt + Clone + Send + 'static>(
                 }
             }
             Branch::Msg((prio, peers, msg)) => {
-                debug!("plumtree: msg: {msg:?}, peers: {peers:?}");
+                trace!("plumtree: msg: {msg:?}, peers: {peers:?}");
                 let p1_gossip = matches!(&msg, PlumtreeMsgV1::Gossip(_));
                 let payload = match encode_plumtree_wire(
                     cluster_id,
@@ -763,7 +778,7 @@ fn drain_plumtree_queue<T: TransportExt + Clone + Send + 'static>(
             continue;
         }
 
-        debug!("plumtree: sending plumtree msg to {addrs:?}");
+        trace!("plumtree: sending plumtree msg to {addrs:?}");
         let mut spawn_count = 0;
         let addr_count = addrs.len();
         for addr in addrs {
@@ -839,8 +854,8 @@ mod tests {
     use corro_tests::test_config;
     use corro_types::{
         actor::Actor,
-        base::{dbsr, CrsqlDbVersion, CrsqlSeq},
-        broadcast::{BroadcastV1, ChangeV1, Changeset},
+        base::{dbsr, CrsqlDbVersion, CrsqlSeq, CrsqlSeqRange},
+        broadcast::{ChangeV1, Changeset},
         members::Members,
     };
     use parking_lot::RwLock;
@@ -857,6 +872,70 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use rand::{rngs::StdRng, SeedableRng};
+
+    fn full_change_id(
+        actor_id: ActorId,
+        version: u64,
+        seq_start: u64,
+        seq_end: u64,
+        last_seq: u64,
+    ) -> ChangeId {
+        ChangeId {
+            actor_id,
+            changeset_id: ChangesetId::Full {
+                version: CrsqlDbVersion(version),
+                seqs: CrsqlSeqRange::new(CrsqlSeq(seq_start), CrsqlSeq(seq_end)),
+                last_seq: CrsqlSeq(last_seq),
+            },
+        }
+    }
+
+    fn mark_booked(bookie: &Bookie, actor_id: ActorId, version: CrsqlDbVersion) {
+        let booked = bookie.ensure(actor_id);
+        let guard = bookie.write_lock_blocking();
+        let mut tx = guard.write_tx(&booked);
+        tx.compute_and_apply_gaps(RangeInclusiveSet::from_iter([version..=version]));
+        tx.commit();
+    }
+
+    #[test]
+    fn test_seen_store_duplicate_handling() {
+        let actor_id = ActorId(uuid::Uuid::new_v4());
+        let bookie = Bookie::new(Default::default());
+        let mut store = ChangeSeenStore::new(100, bookie.clone());
+        let round: plum_foca::Round = 0;
+
+        // First complete gossip is new.
+        let complete = full_change_id(actor_id, 1, 0, 0, 0);
+        assert_eq!(store.observe(complete.clone(), round), None);
+
+        // Exact duplicates of a complete change increase the dup count.
+        assert_eq!(store.observe(complete.clone(), round), Some(1));
+        assert_eq!(store.observe(complete.clone(), round), Some(2));
+
+        // Incomplete partials: first seq is new, repeating it must not prune (Some(0)).
+        let partial_a = full_change_id(actor_id, 2, 0, 0, 2);
+        assert_eq!(store.observe(partial_a.clone(), round), None);
+        assert_eq!(store.observe(partial_a, round), Some(0));
+
+        // Filling remaining seqs is still new; only a full duplicate increments.
+        let partial_b = full_change_id(actor_id, 2, 1, 2, 2);
+        assert_eq!(store.observe(partial_b, round), None);
+        let complete_v2 = full_change_id(actor_id, 2, 0, 2, 2);
+        assert_eq!(store.observe(complete_v2, round), Some(1));
+
+        // Bookie already has the change but cache is cold: seed cache and
+        // report Some(0) so gossip is not re-delivered.
+        mark_booked(&bookie, actor_id, CrsqlDbVersion(3));
+        let booked_id = full_change_id(actor_id, 3, 0, 0, 0);
+        assert!(!store.has_cache_entry(&booked_id));
+        assert!(store.contains_booked(&booked_id));
+        assert_eq!(store.observe(booked_id.clone(), round), Some(0));
+        assert!(store.has_cache_entry(&booked_id));
+
+        // After seeding, a second gossip for the same change is a real duplicate.
+        assert_eq!(store.observe(booked_id, round), Some(1));
+    }
 
     #[derive(Clone, Debug)]
     pub struct TestTransport {

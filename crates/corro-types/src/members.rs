@@ -49,81 +49,84 @@ impl MemberState {
 const RING_BUCKETS: [Range<u64>; 6] = [0..6, 6..15, 15..50, 50..100, 100..200, 200..300];
 
 /// Number of recent RTT samples retained per member and used to compute the
-/// median RTT for ring assignment.
+/// minimum RTT for ring assignment.
 const RTT_WINDOW: usize = 20;
 
 /// Hysteresis dead-band as a percentage of the shared boundary value, applied
-/// only to moves between *adjacent* ring buckets. Prevents ring flapping when
-/// the average RTT sits right on a bucket boundary. Non-adjacent jumps are not
-/// affected and switch immediately.
-const RING_HYSTERESIS_PCT: u64 = 20;
+/// when stepping to an adjacent ring. Prevents ring flapping when the RTT sits
+/// right on a bucket boundary.
+const RING_HYSTERESIS_PCT: u64 = 25;
 
-/// Index of the `RING_BUCKETS` range containing `avg`. Values at or above the
-/// last bucket (>= 300ms) are clamped into the top bucket so a ring is always
-/// assigned.
-fn bucket_for(avg: u64) -> u8 {
+/// Floor on the hysteresis margin in ms. Percent-only margins are tiny on the
+/// low ring edges (20% of 15ms ≈ 3ms), which is where Near↔Mid flaps in practice.
+const RING_HYSTERESIS_MIN_MS: u64 = 8;
+
+/// Index of the `RING_BUCKETS` range containing `rtt_ms`. Values at or above
+/// the last bucket (>= 300ms) are clamped into the top bucket so a ring is
+/// always assigned.
+fn bucket_for(rtt_ms: u64) -> u8 {
     RING_BUCKETS
         .iter()
-        .position(|r| r.contains(&avg))
+        .position(|r| r.contains(&rtt_ms))
         .unwrap_or(RING_BUCKETS.len() - 1) as u8
 }
 
-/// Compute the ring for `avg`, applying hysteresis only when new ring bucket
-/// is adjacent to prevent small rtt jumps from moving rings.
-fn ring_with_hysteresis(current: Option<u8>, avg: u64) -> u8 {
-    let target = bucket_for(avg);
+fn hysteresis_margin(boundary: u64) -> u64 {
+    let m = (boundary * RING_HYSTERESIS_PCT / 100).max(RING_HYSTERESIS_MIN_MS);
+    // Never exceed the boundary itself — otherwise a ring could become
+    // impossible to leave downward (e.g. start=6 with margin=8).
+    m.min(boundary)
+}
+
+/// Compute the ring for `rtt_ms`, applying hysteresis on adjacent steps.
+///
+/// Multi-bucket jumps move at most one ring per update so a single noisy
+/// sample cannot skip hysteresis (e.g. ring 2 → 0).
+fn ring_with_hysteresis(current: Option<u8>, rtt_ms: u64) -> u8 {
+    let target = bucket_for(rtt_ms);
     let Some(current) = current else {
         return target;
     };
-    if target == current || target.abs_diff(current) != 1 {
+    if target == current {
         return target;
     }
+
+    // Step at most one ring toward the target; hysteresis applies to that step.
     if target > current {
-        // Moving up: exceed the end-of-current boundary by the margin.
         let boundary = RING_BUCKETS[current as usize].end;
-        let margin = boundary * RING_HYSTERESIS_PCT / 100;
-        if avg >= boundary + margin {
-            target
+        let margin = hysteresis_margin(boundary);
+        if rtt_ms >= boundary + margin {
+            current + 1
         } else {
             current
         }
     } else {
-        // Moving down: drop below the start-of-current boundary by the margin.
         let boundary = RING_BUCKETS[current as usize].start;
-        let margin = boundary * RING_HYSTERESIS_PCT / 100;
-        if avg + margin <= boundary {
-            target
+        let margin = hysteresis_margin(boundary);
+        if rtt_ms + margin <= boundary {
+            current - 1
         } else {
             current
         }
     }
-}
-
-fn median_rtt(rtt: &Rtt) -> Option<u64> {
-    let len = rtt.buf.len();
-    if len == 0 {
-        return None;
-    }
-
-    let mut scratch = [0u64; RTT_WINDOW];
-    let (head, tail) = rtt.buf.as_slices();
-    scratch[..head.len()].copy_from_slice(head);
-    scratch[head.len()..len].copy_from_slice(tail);
-
-    let values = &mut scratch[..len];
-    values.sort_unstable();
-
-    let mid = len / 2;
-    Some(if len % 2 == 0 {
-        (values[mid - 1] + values[mid]) / 2
-    } else {
-        values[mid]
-    })
 }
 
 #[derive(Debug, Default, Clone)]
 pub struct Rtt {
     pub buf: CircularBuffer<RTT_WINDOW, u64>,
+}
+
+impl Rtt {
+    /// Smallest sample in the window, in milliseconds.
+    ///
+    /// Samples are reads of quinn's smoothed RTT, not independent
+    /// measurements: one delayed ACK inflates the estimator and it then decays
+    /// back over roughly a full window, so most of the buffer can be tail from
+    /// a single stall. The minimum recovers the propagation floor, which is
+    /// what the rings are meant to describe.
+    pub fn min_ms(&self) -> Option<u64> {
+        self.buf.iter().min().copied()
+    }
 }
 
 #[derive(Default)]
@@ -160,11 +163,11 @@ impl Members {
         }
     }
 
-    /// Median RTT in milliseconds for this member (same statistic as
+    /// Minimum RTT in milliseconds for this member (same statistic as
     /// [`Self::recalculate_rings`]), or `None` if there are no samples yet.
-    pub fn avg_rtt_ms(&self, actor_id: &ActorId) -> Option<u64> {
+    pub fn min_rtt_ms(&self, actor_id: &ActorId) -> Option<u64> {
         let addr = self.states.get(actor_id)?.addr;
-        median_rtt(self.rtts.get(&addr)?)
+        self.rtts.get(&addr)?.min_ms()
     }
 
     // A result of `true` means that the effective list of
@@ -262,22 +265,23 @@ impl Members {
         self.recalculate_rings(addr)
     }
 
-    /// For a given member, calculate the median RTT and update `self.ring` with
-    /// the index of the corresponding bucket in `RING_BUCKETS`, applying
+    /// For a given member, calculate the minimum RTT and update `self.ring`
+    /// with the index of the corresponding bucket in `RING_BUCKETS`, applying
     /// hysteresis on moves between adjacent buckets (see [`ring_with_hysteresis`])
     /// to avoid flapping when the RTT sits near a bucket boundary.
     fn recalculate_rings(&mut self, addr: SocketAddr) {
         if let Some(actor_id) = self.by_addr.get(&addr) {
             if let Some(rtt) = self.rtts.get(&addr) {
-                let median = median_rtt(rtt);
+                let min = rtt.min_ms();
 
-                if let Some(median) = median {
+                let (b1, b2) = rtt.buf.as_slices();
+                if let Some(min) = min {
                     if let Some(state) = self.states.get_mut(actor_id) {
-                        let new_ring = ring_with_hysteresis(state.ring, median);
+                        let new_ring = ring_with_hysteresis(state.ring, min);
                         if state.ring != Some(new_ring) {
                             debug!(
-                                "actor: {actor_id}, old ring: {:?}, new ring: {new_ring}, median: {median}",
-                                state.ring,
+                                "actor: {actor_id}, old ring: {:?}, new ring: {new_ring}, min: {min}, buf: {:?} {:?}",
+                                state.ring, b1, b2
                             );
                         }
                         state.ring = Some(new_ring);
@@ -294,5 +298,38 @@ impl Members {
             v.ring
                 .and_then(|ring| (v.cluster_id == cluster_id && ring == 0).then_some(v.addr))
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hysteresis_holds_near_mid_boundary() {
+        // Ring 1 is 6..15, ring 2 is 15..50. Margin at 15ms is max(25%*15, 8) = 8.
+        // Stay in ring 1 until avg >= 23; stay in ring 2 until avg <= 7.
+        assert_eq!(ring_with_hysteresis(Some(1), 18), 1);
+        assert_eq!(ring_with_hysteresis(Some(1), 22), 1);
+        assert_eq!(ring_with_hysteresis(Some(1), 23), 2);
+
+        assert_eq!(ring_with_hysteresis(Some(2), 12), 2);
+        assert_eq!(ring_with_hysteresis(Some(2), 8), 2);
+        assert_eq!(ring_with_hysteresis(Some(2), 7), 1);
+    }
+
+    #[test]
+    fn hysteresis_steps_one_ring_at_a_time() {
+        // A sudden drop from mid-ring RTT must not skip straight to ring 0.
+        assert_eq!(ring_with_hysteresis(Some(2), 3), 1);
+        // Leaving ring 1 downward still needs to clear its start bound (avg 0).
+        assert_eq!(ring_with_hysteresis(Some(1), 3), 1);
+        assert_eq!(ring_with_hysteresis(Some(1), 0), 0);
+    }
+
+    #[test]
+    fn first_assignment_has_no_hysteresis() {
+        assert_eq!(ring_with_hysteresis(None, 10), 1);
+        assert_eq!(ring_with_hysteresis(None, 20), 2);
     }
 }

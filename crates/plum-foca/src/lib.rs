@@ -11,10 +11,13 @@ use std::time::{Duration, Instant};
 use thiserror::Error;
 use tracing::{debug, info, trace, warn};
 
-pub trait MessageId: Clone + Eq + Hash + Debug + Send + 'static {}
+pub trait MessageId: Clone + Eq + Hash + Debug + Send + 'static {
+    type NodeId: NodeId;
+    fn origin(&self) -> Self::NodeId;
+}
 
 pub trait Payload: Clone + Debug + Send + 'static {
-    type MessageId: MessageId;
+    type MessageId: MessageId<NodeId = Self::NodeId>;
     type NodeId: NodeId;
     fn message_id(&self) -> Self::MessageId;
     fn origin(&self) -> Self::NodeId;
@@ -22,7 +25,6 @@ pub trait Payload: Clone + Debug + Send + 'static {
 
 pub trait NodeId: Copy + Eq + Hash + Ord + Debug + Send {}
 
-impl<T> MessageId for T where T: Clone + Eq + Hash + Debug + Send + 'static {}
 impl<T> NodeId for T where T: Copy + Eq + Hash + Ord + Debug + Send + 'static {}
 
 pub type Round = u32;
@@ -416,12 +418,12 @@ impl<N: NodeId> PruneThrottle<N> {
     }
 }
 
-const RING_EXTRA_CONFIRMATIONS: u32 = 5;
+const RING_EXTRA_CONFIRMATIONS: u32 = 10;
 
 /// Full Plumtree protocol state for one local node.
 #[derive(Debug)]
 pub struct PlumtreeState<
-    I: MessageId,
+    I: MessageId<NodeId = N>,
     P: Payload<MessageId = I, NodeId = N>,
     N: NodeId,
     S: SeenStore<I>,
@@ -465,7 +467,7 @@ pub struct PlumtreeState<
     fanout: FanoutTargets,
 }
 
-impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStore<I>>
+impl<I: MessageId<NodeId = N>, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStore<I>>
     PlumtreeState<I, P, N, S>
 {
     pub fn new_with_store(local_id: N, config: Config, seen: S) -> Self {
@@ -591,6 +593,10 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
         let id = payload.message_id();
 
         let self_actor_id = self.local_id;
+        if payload.origin() == self.local_id {
+            return;
+        }
+
         if let Some(duplicates) = self.seen.observe(id.clone(), round) {
             if duplicates > self.config.prune_threshold && !self.ring_locked.contains(&sender) {
                 // TODO: suppress prunes for recently grafted peers? this would help
@@ -704,6 +710,10 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
 
         let mut new_ids = Vec::new();
         for digest in digests {
+            // Same as gossip: we originated this message, nothing to pull.
+            if digest.id.origin() == self.local_id {
+                continue;
+            }
             if self.seen.contains(&digest.id) {
                 continue;
             }
@@ -759,9 +769,6 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
 
         let self_actor_id = &self.local_id;
         for req in requests {
-            if !self.seen.contains(&req.id) {
-                continue;
-            }
             if let Some((payload, round)) = self.cache.get(&req.id).cloned() {
                 debug!(
                     ?self_actor_id,
@@ -828,7 +835,6 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
             self.lazy_peers.len()
         );
 
-        self.seen.observe(id.clone(), 0);
         self.cache.insert(id.clone(), payload.clone(), 0);
 
         let peers = self
@@ -879,6 +885,10 @@ impl<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStor
         let mut graft_requests = Vec::new();
 
         for id in ids {
+            if id.origin() == self.local_id {
+                self.missing.remove(&id);
+                continue;
+            }
             if self.seen.contains(&id) {
                 trace!("missing change already received, noop");
                 self.missing.remove(&id);
@@ -1377,8 +1387,19 @@ mod tests {
     use super::*;
     use std::iter;
 
-    #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-    pub(crate) struct TestMsgId(u8);
+    /// Packed as `(origin << 8) | seq`.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub(crate) struct TestMsgId(u16);
+
+    impl TestMsgId {
+        fn new(origin: TestNodeId, seq: u8) -> Self {
+            Self(((origin as u16) << 8) | seq as u16)
+        }
+    }
+
+    fn tid(origin: TestNodeId, seq: u8) -> TestMsgId {
+        TestMsgId::new(origin, seq)
+    }
 
     pub(crate) type TestNodeId = u8;
 
@@ -1389,11 +1410,18 @@ mod tests {
         type MessageId = TestMsgId;
         type NodeId = TestNodeId;
         fn message_id(&self) -> Self::MessageId {
-            TestMsgId(self.0[1])
+            TestMsgId::new(self.0[0], self.0[1])
         }
 
         fn origin(&self) -> Self::NodeId {
             self.0[0]
+        }
+    }
+
+    impl MessageId for TestMsgId {
+        type NodeId = TestNodeId;
+        fn origin(&self) -> TestNodeId {
+            (self.0 >> 8) as u8
         }
     }
 
@@ -1637,7 +1665,7 @@ mod tests {
         s.handle_prune(
             PruneMsg {
                 sender: 1,
-                triggered_by: Some(TestMsgId(0)),
+                triggered_by: Some(tid(1, 0)),
             },
             &mut rt,
         );
@@ -1652,7 +1680,7 @@ mod tests {
         s.handle_prune(
             PruneMsg {
                 sender: rand_eager,
-                triggered_by: Some(TestMsgId(0)),
+                triggered_by: Some(tid(1, 0)),
             },
             &mut rt,
         );
@@ -1722,7 +1750,7 @@ mod tests {
         s.handle_prune(
             PruneMsg {
                 sender: prune_sender,
-                triggered_by: Some(TestMsgId(99)),
+                triggered_by: Some(tid(1, 99)),
             },
             &mut rt,
         );
@@ -1735,7 +1763,7 @@ mod tests {
         s.handle_prune(
             PruneMsg {
                 sender: 1,
-                triggered_by: Some(TestMsgId(99)),
+                triggered_by: Some(tid(1, 99)),
             },
             &mut rt,
         );
@@ -1752,13 +1780,13 @@ mod tests {
         // manually move 3 to lazy
         s.lazy_peers.insert(3);
 
-        s.broadcast(TestMsgId(42), payload(0, 42), &mut rt);
+        s.broadcast(tid(0, 42), payload(0, 42), &mut rt);
 
         // Should have sent GOSSIP to eager peers 1 and 2
         assert_eq!(rt.sent.len(), 2);
         for (to, m) in &rt.sent {
             let g = unwrap_gossip(m);
-            assert_eq!(g.payload.message_id(), TestMsgId(42));
+            assert_eq!(g.payload.message_id(), tid(0, 42));
             assert_eq!(g.round, 0);
             assert_eq!(g.sender, 0); // local_id
             assert!(s.eager_peers.contains(to));
@@ -1766,9 +1794,14 @@ mod tests {
 
         // Lazy queue for peer 3 should have one digest
         assert_eq!(s.lazy_queue.len(), 1);
+        assert!(
+            s.lazy_queue
+                .iter()
+                .any(|d| d.id == tid(0, 42) && d.round == 0)
+        );
 
-        // Message should be marked received
-        assert!(s.has_message(&TestMsgId(42)));
+        // we don't track local messages
+        assert!(!s.has_message(&tid(0, 42)));
 
         // Receive a GOSSIP from peer 4 (not yet in our peer set)
         rt.clear();
@@ -1782,7 +1815,7 @@ mod tests {
         );
         // Delivered once
         assert_eq!(rt.delivered.len(), 1);
-        assert_eq!(rt.delivered[0].message_id(), TestMsgId(10));
+        assert_eq!(rt.delivered[0].message_id(), tid(1, 10));
 
         // Forwarded to eager peers 2, 3 (not sender 1)
         let gossip_targets: Vec<u8> = rt
@@ -1805,7 +1838,7 @@ mod tests {
         assert!(!s.lazy_peers.contains(&1));
         // lazy queue
         assert_eq!(s.lazy_queue.len(), 2);
-        assert!(s.has_message(&TestMsgId(10)));
+        assert!(s.has_message(&tid(1, 10)));
 
         rt.clear();
 
@@ -1819,7 +1852,7 @@ mod tests {
             &mut rt,
         );
         assert_eq!(s.lazy_queue.len(), 3);
-        assert!(s.has_message(&TestMsgId(15)));
+        assert!(s.has_message(&tid(5, 15)));
         assert!(!s.lazy_peers.contains(&5));
 
         // duplicate gossip gets pruned
@@ -1842,10 +1875,59 @@ mod tests {
         assert_eq!(*to, 11);
         let prune = unwrap_prune(m);
         assert_eq!(prune.sender, 0);
-        assert_eq!(prune.triggered_by, Some(TestMsgId(15)));
+        assert_eq!(prune.triggered_by, Some(tid(5, 15)));
 
         assert!(!s.lazy_peers.contains(&11));
         assert!(!s.eager_peers.contains(&11));
+    }
+
+    #[test]
+    fn handle_gossip_ignores_own_origin() {
+        let mut s = state();
+        let mut rt = AccumulatingRuntime::default();
+        s.peer_up(1, None, &mut rt);
+        rt.clear();
+
+        s.handle_gossip(
+            GossipMsg {
+                round: 0,
+                sender: 1,
+                payload: payload(0, 7), // origin == local_id
+            },
+            &mut rt,
+        );
+
+        assert!(rt.delivered.is_empty());
+        assert!(rt.sent.is_empty());
+        assert!(!s.has_message(&tid(0, 7)));
+        assert!(s.lazy_queue.is_empty());
+    }
+
+    #[test]
+    fn handle_ihave_ignores_own_origin() {
+        let mut s = state();
+        let mut rt = AccumulatingRuntime::default();
+
+        s.handle_ihave(
+            IHaveMsg {
+                sender: 5,
+                digests: vec![
+                    IHaveDigest {
+                        id: tid(0, 1), // own origin
+                        round: 0,
+                    },
+                    IHaveDigest {
+                        id: tid(1, 2),
+                        round: 0,
+                    },
+                ],
+            },
+            &mut rt,
+        );
+
+        assert!(!s.missing.contains_key(&tid(0, 1)));
+        assert!(s.missing.contains_key(&tid(1, 2)));
+        assert_eq!(s.missing.len(), 1);
     }
 
     #[test]
@@ -1861,18 +1943,18 @@ mod tests {
                 sender: 5,
                 digests: vec![
                     IHaveDigest {
-                        id: TestMsgId(42),
+                        id: tid(10, 42),
                         round: 1,
                     },
                     IHaveDigest {
-                        id: TestMsgId(45),
+                        id: tid(10, 45),
                         round: 2,
                     },
                 ],
             },
             &mut rt,
         );
-        assert!(s.missing.contains_key(&TestMsgId(42)));
+        assert!(s.missing.contains_key(&tid(10, 42)));
         rt.clear();
 
         // Now the GOSSIP arrives from peer 1 at round 10 (1 + 3 < 10)
@@ -1903,7 +1985,7 @@ mod tests {
         assert!(s.eager_peers.contains(&5));
 
         // Missing entry removed
-        assert!(!s.missing.contains_key(&TestMsgId(42)));
+        assert!(!s.missing.contains_key(&tid(10, 42)));
 
         // check that nothing gets triggered if round is very close
         rt.clear();
@@ -1923,7 +2005,7 @@ mod tests {
             .collect();
 
         assert!(grafts.is_empty());
-        assert!(!s.missing.contains_key(&TestMsgId(45)));
+        assert!(!s.missing.contains_key(&tid(10, 45)));
     }
 
     // -----------------------------------------------------------------------
@@ -1935,21 +2017,21 @@ mod tests {
         let mut s = state();
         let mut rt = AccumulatingRuntime::default();
 
-        s.seen.observe(TestMsgId(3), 0);
+        s.seen.observe(tid(1, 3), 0);
         s.handle_ihave(
             IHaveMsg {
                 sender: 5,
                 digests: vec![
                     IHaveDigest {
-                        id: TestMsgId(1),
+                        id: tid(1, 1),
                         round: 0,
                     },
                     IHaveDigest {
-                        id: TestMsgId(2),
+                        id: tid(1, 2),
                         round: 1,
                     },
                     IHaveDigest {
-                        id: TestMsgId(3),
+                        id: tid(1, 3),
                         round: 1,
                     },
                 ],
@@ -1960,11 +2042,11 @@ mod tests {
         assert_eq!(s.missing.len(), 2);
         assert_eq!(rt.scheduled.len(), 1);
         // already received changes aren't added to missing
-        assert!(!s.missing.contains_key(&TestMsgId(3)));
+        assert!(!s.missing.contains_key(&tid(1, 3)));
         assert_eq!(
             rt.scheduled[0].0,
             Timer::IHaveTimeoutBatch {
-                ids: vec![TestMsgId(1), TestMsgId(2)],
+                ids: vec![tid(1, 1), tid(1, 2)],
                 retries: 0,
                 senders: vec![5],
             }
@@ -1978,12 +2060,12 @@ mod tests {
         let mut rt = AccumulatingRuntime::default();
 
         // First, broadcast so the payload is cached
-        s.broadcast(TestMsgId(1), payload(42, 1), &mut rt);
+        s.broadcast(tid(42, 1), payload(42, 1), &mut rt);
         rt.clear();
 
         // Peer 5 sends GRAFT
         s.known_peers.insert(5);
-        s.handle_graft(graft_msg(5, true, vec![(TestMsgId(1), 0)]), &mut rt);
+        s.handle_graft(graft_msg(5, true, vec![(tid(42, 1), 0)]), &mut rt);
 
         // Peer 5 promoted to eager
         assert!(s.eager_peers.contains(&5));
@@ -1996,11 +2078,11 @@ mod tests {
         assert_eq!(g.payload, payload(42, 1));
 
         rt.clear();
-        s.seen.observe(TestMsgId(99), 0);
-        s.handle_graft(graft_msg(5, true, vec![(TestMsgId(99), 0)]), &mut rt);
+        s.seen.observe(tid(1, 99), 0);
+        s.handle_graft(graft_msg(5, true, vec![(tid(1, 99), 0)]), &mut rt);
 
         // seen but not cached — graft must not send gossip back
-        assert!(s.has_message(&TestMsgId(99)));
+        assert!(s.has_message(&tid(1, 99)));
         assert!(rt.sent.is_empty());
     }
 
@@ -2015,24 +2097,24 @@ mod tests {
                 sender: 5,
                 digests: vec![
                     IHaveDigest {
-                        id: TestMsgId(1),
+                        id: tid(1, 1),
                         round: 0,
                     },
                     IHaveDigest {
-                        id: TestMsgId(2),
+                        id: tid(1, 2),
                         round: 0,
                     },
                 ],
             },
             &mut rt,
         );
-        s.seen.observe(TestMsgId(1), 0);
+        s.seen.observe(tid(1, 1), 0);
         rt.sent.clear();
         rt.scheduled.clear();
 
         s.timer_fired(
             Timer::IHaveTimeoutBatch {
-                ids: vec![TestMsgId(1), TestMsgId(2)],
+                ids: vec![tid(1, 1), tid(1, 2)],
                 retries: 0,
                 senders: vec![5, 6],
             },
@@ -2045,17 +2127,17 @@ mod tests {
             let graft = unwrap_graft(m);
             assert_eq!(*to, 5);
             assert_eq!(graft.requests.len(), 1);
-            assert_eq!(graft.requests[0].id, TestMsgId(2));
+            assert_eq!(graft.requests[0].id, tid(1, 2));
             assert_eq!(graft.requests[0].round, 0);
         }
 
         assert!(s.eager_peers.contains(&5));
-        assert!(!s.missing.contains_key(&TestMsgId(1)));
-        assert!(s.missing.contains_key(&TestMsgId(2)));
+        assert!(!s.missing.contains_key(&tid(1, 1)));
+        assert!(s.missing.contains_key(&tid(1, 2)));
         assert_eq!(rt.scheduled.len(), 1);
         // schedule retry
         let scheduled = Timer::IHaveTimeoutBatch {
-            ids: vec![TestMsgId(2)],
+            ids: vec![tid(1, 2)],
             retries: 1,
             senders: vec![5, 6],
         };
@@ -2069,7 +2151,7 @@ mod tests {
         let graft = unwrap_graft(&rt.sent[0].1);
         assert_eq!(graft.requests.len(), 1);
         assert_eq!(rt.sent[0].0, 6);
-        assert!(!s.missing.contains_key(&TestMsgId(2)));
+        assert!(!s.missing.contains_key(&tid(1, 2)));
         assert_eq!(rt.scheduled.len(), 0);
     }
 
@@ -2080,7 +2162,7 @@ mod tests {
 
         let digests: Vec<_> = (1..=15)
             .map(|n| IHaveDigest {
-                id: TestMsgId(n),
+                id: tid(1, n),
                 round: 0,
             })
             .collect();
@@ -2089,7 +2171,7 @@ mod tests {
         rt.sent.clear();
         rt.scheduled.clear();
 
-        let ids: Vec<_> = (1..=15).map(TestMsgId).collect();
+        let ids: Vec<_> = (1..=15).map(|n| tid(1, n)).collect();
         s.timer_fired(
             Timer::IHaveTimeoutBatch {
                 ids,
@@ -2116,7 +2198,7 @@ mod tests {
             IHaveMsg {
                 sender: 5,
                 digests: vec![IHaveDigest {
-                    id: TestMsgId(1),
+                    id: tid(2, 1),
                     round: 0,
                 }],
             },
@@ -2137,7 +2219,7 @@ mod tests {
         // Timer fires — but missing entry already removed
         s.timer_fired(
             Timer::IHaveTimeoutBatch {
-                ids: vec![TestMsgId(1)],
+                ids: vec![tid(2, 1)],
                 retries: 0,
                 senders: vec![5],
             },
@@ -2154,8 +2236,8 @@ mod tests {
         s.lazy_peers.insert(3);
         s.lazy_peers.insert(4);
 
-        s.enqueue_ihave(TestMsgId(1), 0);
-        s.enqueue_ihave(TestMsgId(2), 1);
+        s.enqueue_ihave(tid(1, 1), 0);
+        s.enqueue_ihave(tid(1, 2), 1);
 
         s.tick(&mut rt);
 
@@ -2252,7 +2334,7 @@ mod tests {
         assert_ne!(dup_sender, lazy_peer);
 
         // Duplicate gossip from non-locked eager → demote;
-        s.seen.observe(TestMsgId(1), 0);
+        s.seen.observe(tid(dup_sender, 1), 0);
         s.handle_gossip(
             GossipMsg {
                 round: 0,
@@ -2296,7 +2378,7 @@ mod tests {
             },
             &mut rt_b,
         );
-        assert!(b.has_message(&TestMsgId(1)));
+        assert!(b.has_message(&tid(1, 1)));
         rt_b.sent.clear();
 
         // B receives duplicate from C → sends PRUNE to C
@@ -2315,13 +2397,13 @@ mod tests {
         assert!(b.lazy_peers.contains(&30));
         rt_b.sent.clear();
 
-        // Now C ticks and sends IHave for TestMsgId(2) to B (lazy peer)
+        // Now C ticks and sends IHave for tid(1, 2) to B (lazy peer)
         // Simulated: B receives the IHave
         b.handle_ihave(
             IHaveMsg {
                 sender: 30,
                 digests: vec![IHaveDigest {
-                    id: TestMsgId(2),
+                    id: tid(1, 2),
                     round: 0,
                 }],
             },
@@ -2331,7 +2413,7 @@ mod tests {
         // Timer fires — B sends GRAFT to C
         b.timer_fired(
             Timer::IHaveTimeoutBatch {
-                ids: vec![TestMsgId(2)],
+                ids: vec![tid(1, 2)],
                 retries: 0,
                 senders: vec![30],
             },
