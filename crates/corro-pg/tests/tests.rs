@@ -40,7 +40,8 @@ async fn setup_pg_test_server(
             CREATE TABLE kitchensink (
                 id BIGINT PRIMARY KEY NOT NULL,
                 other_ts DATETIME,
-                updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+                updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                trusted BOOL
             );
         ",
     )
@@ -259,6 +260,32 @@ async fn test_pg() {
             .await
             .unwrap();
         println!("COUNT ROW: {row:?}");
+
+        // Test bool column round-trip
+        client
+            .execute(
+                "INSERT INTO kitchensink (id, trusted) VALUES ($1, $2)",
+                &[&10i64, &true],
+            )
+            .await
+            .unwrap();
+        client
+            .execute(
+                "INSERT INTO kitchensink (id, trusted) VALUES ($1, $2)",
+                &[&11i64, &false],
+            )
+            .await
+            .unwrap();
+        let rows = client
+            .query(
+                "SELECT trusted FROM kitchensink WHERE id >= 10 ORDER BY id",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].get::<_, Option<bool>>(0), Some(true));
+        assert_eq!(rows[1].get::<_, Option<bool>>(0), Some(false));
     }
 
     tripwire_tx.send(()).await.ok();
@@ -799,6 +826,26 @@ async fn test_unnest_typing() {
             )
             .await;
         }
+        // Test bool types
+        {
+            let should_work = [
+                "bool[]",
+                "BOOL[]",
+                "Bool[]",
+                "boolean[]",
+                "BOOLEAN[]",
+                "bool      []",
+            ];
+            let should_fail = ["bool", "BOOL", "boolean", "BOOLEAN"];
+            run_typing_unnest_case(
+                &client,
+                "bool",
+                &should_work,
+                &should_fail,
+                vec![true, false, true],
+            )
+            .await;
+        }
     }
 
     tripwire_tx.send(()).await.ok();
@@ -1073,6 +1120,31 @@ async fn test_unnest_vtab() {
                 for (i, row) in rows.iter().enumerate() {
                     let val: Vec<u8> = row.get(0);
                     assert_eq!(val, col1[i]);
+                }
+            }
+        }
+
+        // Test single array unnest with bool type
+        {
+            let col1 = vec![true, false, true, false, true];
+            for format in [Format::Text, Format::Binary] {
+                for func in ["unnest", "corro_unnest"] {
+                    let sql_vec = SqlVec {
+                        inner: &col1,
+                        format,
+                    };
+                    let rows = client
+                        .query(
+                            &format!("SELECT CAST(value0 AS bool) FROM {func}(CAST($1 AS bool[]))"),
+                            &[&sql_vec],
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(rows.len(), col1.len());
+                    for (i, row) in rows.iter().enumerate() {
+                        let val: bool = row.get(0);
+                        assert_eq!(val, col1[i]);
+                    }
                 }
             }
         }
