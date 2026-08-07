@@ -5,6 +5,7 @@ use std::{
 };
 
 use camino::Utf8PathBuf;
+use corro_agent::agent::{reload_change_dicts, util::execute_schema_from_paths};
 use corro_types::{
     actor::{ActorId, ClusterId},
     agent::{Agent, BookedVersions, Bookie, WriteConn},
@@ -37,6 +38,8 @@ use uuid::Uuid;
 pub enum AdminError {
     #[error(transparent)]
     Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Report(#[from] eyre::Report),
 }
 
 #[derive(Debug, Clone)]
@@ -108,6 +111,8 @@ pub enum Command {
     Actor(ActorCommand),
     Subs(SubsCommand),
     Log(LogCommand),
+    Reload,
+    ReloadDicts,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -213,6 +218,38 @@ async fn handle_conn(
         match stream.try_next().await {
             Ok(Some(cmd)) => match cmd {
                 Command::Ping => send_success(&mut stream).await,
+                Command::Reload => {
+                    info_log(&mut stream, "reloading schema from configured paths...").await;
+                    if let Err(e) = execute_schema_from_paths(&agent).await {
+                        send_error(&mut stream, e).await;
+                        continue;
+                    }
+                    info_log(&mut stream, "schema reload finished").await;
+                    send_success(&mut stream).await;
+                }
+                Command::ReloadDicts => {
+                    info_log(
+                        &mut stream,
+                        "reloading zstd compression dictionaries from configured dict_dir...",
+                    )
+                    .await;
+                    match reload_change_dicts(&agent) {
+                        Ok(decoder_count) => {
+                            info_log(
+                                &mut stream,
+                                format!(
+                                    "compression dictionary reload finished ({decoder_count} decoder dicts)"
+                                ),
+                            )
+                            .await;
+                            send_success(&mut stream).await;
+                        }
+                        Err(e) => {
+                            send_error(&mut stream, e).await;
+                            continue;
+                        }
+                    }
+                }
                 Command::Sync(SyncCommand::Generate) => {
                     info_log(&mut stream, "generating sync...").await;
                     let sync_state = generate_sync(bookie, agent.actor_id()).await;
@@ -511,6 +548,7 @@ async fn handle_conn(
                                "id": k,
                                "hash": v.hash(),
                                 "sql": v.sql().lines().map(|c| c.trim()).collect::<Vec<_>>().join(" "),
+                                "ms_per_sec_cost": v.ms_per_sec(),
                             })
                         })
                         .collect::<Vec<_>>();
@@ -547,6 +585,7 @@ async fn handle_conn(
                                     "last_change_id": matcher.last_change_id_sent(),
                                     "original_query": matcher.sql().lines().map(|c| c.trim()).collect::<Vec<_>>().join(" "),
                                     "statements": statements,
+                                    "ms_per_sec_cost": matcher.ms_per_sec(),
                                 })),
                             )
                             .await;

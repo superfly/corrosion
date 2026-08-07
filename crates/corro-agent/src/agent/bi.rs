@@ -77,7 +77,11 @@ pub fn spawn_bipayload_handler(
                                     match BiPayload::read_from_buffer(&b) {
                                         Ok(payload) => {
                                             match payload {
-                                                BiPayload::V1 { data, cluster_id } => match data {
+                                                BiPayload::V1 {
+                                                    data,
+                                                    cluster_id,
+                                                    supports_compression,
+                                                } => match data {
                                                     BiPayloadV1::SyncStart {
                                                         actor_id,
                                                         trace_ctx,
@@ -89,8 +93,14 @@ pub fn spawn_bipayload_handler(
 
                                                         // println!("got sync state: {state:?}");
                                                         if let Err(e) = serve_sync(
-                                                            &agent, &bookie, actor_id, trace_ctx,
-                                                            cluster_id, framed, tx,
+                                                            &agent,
+                                                            &bookie,
+                                                            actor_id,
+                                                            trace_ctx,
+                                                            supports_compression,
+                                                            cluster_id,
+                                                            framed,
+                                                            tx,
                                                         )
                                                         .await
                                                         {

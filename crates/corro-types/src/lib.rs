@@ -6,6 +6,7 @@ pub mod bookie;
 pub mod broadcast;
 pub mod change;
 pub mod channel;
+pub mod compress;
 pub mod config;
 pub mod gauge;
 pub mod members;

@@ -542,8 +542,28 @@ async fn handle_broadcasts(
                 };
                 trace!("adding broadcast: {bcast:?}, local? {is_local}");
 
+                // compress payload if needed
+                let compression_config = agent.config().gossip.compression_config();
+                let bcast = if compression_config.enabled && !bcast.is_compressed() {
+                    let level = compression_config.level;
+                    let dict = agent.change_dict();
+                    match tokio::task::spawn_blocking(move || {
+                        bcast.compress_for_wire(level, dict.as_deref())
+                    })
+                    .await
+                    {
+                        Ok(bcast) => bcast,
+                        Err(e) => {
+                            error!("compress_for_wire task panicked: {e}");
+                            continue;
+                        }
+                    }
+                } else {
+                    bcast
+                };
+
                 if let Err(e) = (UniPayload::V1 {
-                    data: UniPayloadV1::Broadcast(bcast.clone()),
+                    data: UniPayloadV1::Broadcast(bcast),
                     cluster_id: agent.cluster_id(),
                 })
                 .write_to_stream((&mut ser_buf).writer())
@@ -1256,7 +1276,13 @@ mod tests {
             let conn = conn.await.unwrap();
 
             let (tx_changes, mut rx_changes) = bounded(100, "changes");
-            spawn_unipayload_handler(&tripwire, &conn, ta1.agent.cluster_id(), tx_changes);
+            spawn_unipayload_handler(
+                &tripwire,
+                &conn,
+                ta1.agent.cluster_id(),
+                tx_changes,
+                ta1.agent.change_dict_slot(),
+            );
 
             // we should receive five items starting from the biggest version
             for i in (0..5).rev() {

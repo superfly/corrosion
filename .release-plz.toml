@@ -1,0 +1,22 @@
+[workspace]
+release = false
+
+[[package]]
+name = "sqlite-pool"
+release = true
+git_release_enable = false
+
+[[package]]
+name = "corro-api-types"
+release = true
+git_release_enable = false
+
+[[package]]
+name = "consul-client"
+release = true
+git_release_enable = false
+
+[[package]]
+name = "corro-client"
+release = true
+git_release_enable = false

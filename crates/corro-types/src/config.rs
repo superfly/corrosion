@@ -38,6 +38,10 @@ const fn default_reaper_interval() -> usize {
     3600
 }
 
+const fn default_reaper_limit() -> usize {
+    500
+}
+
 const fn default_wal_threshold() -> usize {
     // Default of 5GB
     5 * 1024
@@ -228,6 +232,50 @@ pub struct GossipConfig {
     pub disable_gso: bool,
     #[serde(default)]
     pub member_id: Option<MemberId>,
+    #[serde(default)]
+    pub compression: Option<CompressionConfig>,
+}
+
+impl GossipConfig {
+    pub fn compression_config(&self) -> CompressionConfig {
+        self.compression.clone().unwrap_or_default()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompressionConfig {
+    /// Whether to zstd-compress broadcast and sync changeset payloads.
+    /// Safe to flip cluster-wide at any time: uncompressed and compressed
+    /// nodes interoperate
+    #[serde(default)]
+    pub enabled: bool,
+    /// zstd compression level for wire payloads (1–22). Ignored when
+    /// `enabled` is false.
+    #[serde(default = "default_compression_level")]
+    pub level: i32,
+    /// Directory of trained zstd dictionaries. Every valid dictionary file in this directory
+    /// is loaded at startup (and on `corrosion reload-dicts`) and indexed by its
+    /// embedded zstd dictionary id for decoding, so broadcasts from peers still
+    /// on an older (or newer) encoding dictionary can be understood during a
+    /// gradual rollout.
+    #[serde(default)]
+    pub dict_dir: Option<Utf8PathBuf>,
+    /// Filename within `dict_dir` used to compress outgoing broadcasts.
+    /// Omit to compress without a dictionary while still decoding
+    /// dictionary-compressed peers.
+    #[serde(default)]
+    pub dict_file: Option<String>,
+}
+
+impl Default for CompressionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            level: default_compression_level(),
+            dict_dir: None,
+            dict_file: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -317,6 +365,10 @@ fn default_gossip_client_addr() -> SocketAddr {
     DEFAULT_GOSSIP_CLIENT_ADDR
 }
 
+fn default_compression_level() -> i32 {
+    3
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TlsConfig {
     /// Certificate file
@@ -366,6 +418,10 @@ pub enum ConfigError {
     Config(#[from] config::ConfigError),
     #[error("gossip.max_mtu value {value} is below the QUIC minimum of 1200 (RFC 9000)")]
     InvalidMaxMtu { value: u16 },
+    #[error("gossip.compression_level value {value} is outside the supported zstd range 1..=22")]
+    InvalidCompressionLevel { value: i32 },
+    #[error("gossip.compression.dict_file requires gossip.compression.dict_dir to be set")]
+    DictFileWithoutDictDir,
 }
 
 impl Config {
@@ -389,6 +445,15 @@ impl Config {
             if mtu < 1200 {
                 return Err(ConfigError::InvalidMaxMtu { value: mtu });
             }
+        }
+        let compression = self.gossip.compression_config();
+        if !(1..=22).contains(&compression.level) {
+            return Err(ConfigError::InvalidCompressionLevel {
+                value: compression.level,
+            });
+        }
+        if compression.dict_file.is_some() && compression.dict_dir.is_none() {
+            return Err(ConfigError::DictFileWithoutDictDir);
         }
         Ok(())
     }
@@ -414,6 +479,8 @@ pub struct ConfigBuilder {
     member_id: Option<MemberId>,
     max_mtu: Option<u16>,
     disable_gso: bool,
+    compression: Option<bool>,
+    compression_level: Option<i32>,
 }
 
 impl ConfigBuilder {
@@ -499,6 +566,18 @@ impl ConfigBuilder {
         self
     }
 
+    /// Enable or disable zstd compression of broadcast and sync changeset payloads.
+    pub fn compression(mut self, enabled: bool) -> Self {
+        self.compression = Some(enabled);
+        self
+    }
+
+    /// Set the zstd compression level (1–22) for wire payloads.
+    pub fn compression_level(mut self, level: i32) -> Self {
+        self.compression_level = Some(level);
+        self
+    }
+
     pub fn build(self) -> Result<Config, ConfigBuilderError> {
         let db_path = self.db_path.ok_or(ConfigBuilderError::DbPathRequired)?;
 
@@ -539,6 +618,14 @@ impl ConfigBuilder {
                 max_mtu: self.max_mtu,
                 disable_gso: self.disable_gso,
                 member_id: self.member_id,
+                compression: Some(CompressionConfig {
+                    enabled: self.compression.unwrap_or_default(),
+                    level: self
+                        .compression_level
+                        .unwrap_or_else(default_compression_level),
+                    dict_dir: None,
+                    dict_file: None,
+                }),
             },
             perf: self.perf.unwrap_or_default(),
             admin: AdminConfig {
@@ -588,6 +675,12 @@ pub struct ReaperConfig {
     pub tables: HashMap<String, TableReapConfig>,
     #[serde(default = "default_reaper_interval")]
     pub check_interval: usize,
+    /// When false, skip scanning for PK rows with no clock entries.
+    #[serde(default)]
+    pub check_orphaned_pks: bool,
+    /// Max orphaned PK rows to reap per table per tick.
+    #[serde(default = "default_reaper_limit")]
+    pub row_limit: usize,
 }
 
 /// Per-table reaper config.

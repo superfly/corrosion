@@ -12,7 +12,10 @@ use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Instant;
-use tokio::time::{sleep, Duration};
+use tokio::{
+    task::block_in_place,
+    time::{sleep, Duration},
+};
 use tracing::{debug, error, info};
 use tripwire::Tripwire;
 
@@ -41,7 +44,7 @@ impl CorrosionConfig {
         let mut host_port = self.addr.split(':');
         let host_name = host_port.next().unwrap_or("localhost");
 
-        let system_resolver = Resolver::builder_tokio()?.build();
+        let system_resolver = Resolver::builder_tokio()?.build().unwrap();
         match system_resolver.lookup_ip(host_name).await?.iter().next() {
             Some(ip_addr) => {
                 let addr = SocketAddr::from((
@@ -321,6 +324,13 @@ async fn subscribe(cfg: CorrosionConfig, mut tripwire: Tripwire) -> eyre::Result
                         | corro_client::Error::Http(_)
                         | corro_client::Error::InvalidUri(_)
                 ) {
+                    block_in_place(|| {
+                        let db_path = storage.as_ref().unwrap().db_path();
+                        if let Err(e) = std::fs::remove_dir_all(db_path.parent().unwrap()) {
+                            error!("could not delete subscription path due to: {e}");
+                        }
+                    });
+
                     last_change_id = None;
                     storage = None;
                 }

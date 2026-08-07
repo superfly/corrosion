@@ -9,3 +9,5 @@ Configuration sections:
 - [admin](admin.md)
 - [telemetry](telemetry.md)
 - [consul](consul.md)
+- [reaper](reaper.md)
+- [perf](perf.md) (advanced — not required for most users)

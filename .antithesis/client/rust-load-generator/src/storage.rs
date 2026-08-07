@@ -10,6 +10,7 @@ pub struct SubscriptionDb {
     sub_id: Uuid,
     columns: Option<Vec<String>>,
     table_name: String,
+    db_path: std::path::PathBuf,
 }
 
 impl SubscriptionDb {
@@ -19,7 +20,7 @@ impl SubscriptionDb {
         sql: &str,
         table_name: &str,
     ) -> Result<Self> {
-        let conn = Connection::open(db_path)?;
+        let conn = Connection::open(&db_path)?;
 
         // Enable WAL mode for better concurrency
         conn.execute_batch(
@@ -40,7 +41,12 @@ impl SubscriptionDb {
             sub_id,
             columns: None,
             table_name: table_name.to_string(),
+            db_path: db_path.as_ref().to_path_buf(),
         })
+    }
+
+    pub fn db_path(&self) -> &std::path::Path {
+        &self.db_path
     }
 
     pub fn initialize_columns(&mut self, columns: Vec<ColumnName>) -> Result<()> {

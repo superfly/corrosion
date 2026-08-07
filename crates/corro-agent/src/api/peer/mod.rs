@@ -1044,7 +1044,14 @@ pub async fn parallel_sync(
                         &mut codec,
                         &mut encode_buf,
                         &mut send_buf,
-                        BiPayload::V1 {data: BiPayloadV1::SyncStart {actor_id: agent.actor_id(), trace_ctx}, cluster_id: agent.cluster_id()},
+                        BiPayload::V1 {
+                            data: BiPayloadV1::SyncStart {
+                                actor_id: agent.actor_id(),
+                                trace_ctx,
+                            },
+                            cluster_id: agent.cluster_id(),
+                            supports_compression: agent.config().gossip.compression_config().enabled,
+                        },
                         &mut tx,
                     ).instrument(info_span!("write_sync_start"))
                     .await?;
@@ -1363,7 +1370,7 @@ pub async fn parallel_sync(
                             }
 
                             tx_changes
-                                .send((change, ChangeSource::Sync))
+                                .send((change, ChangeSource::Sync, None))
                                 .await
                                 .map_err(|_| SyncRecvError::ChangesChannelClosed)?;
                         }
@@ -1382,6 +1389,10 @@ pub async fn parallel_sync(
                         SyncMessage::V1(SyncMessageV1::Rejection(rejection)) => {
                             return Err(rejection.into())
                         }
+                        SyncMessage::V1(SyncMessageV1::CompressedChangeset(_)) => {
+                            warn!(%actor_id, "received sync compressed change unexpectedly, ignoring");
+                            continue
+                        },
                     },
                 }
             }
@@ -1413,15 +1424,22 @@ pub async fn parallel_sync(
 }
 
 #[tracing::instrument(skip(agent, bookie, their_actor_id, read, write), fields(actor_id = %their_actor_id), err)]
+#[allow(clippy::too_many_arguments)]
 pub async fn serve_sync(
     agent: &Agent,
     bookie: &Bookie,
     their_actor_id: ActorId,
     trace_ctx: SyncTraceContextV1,
+    wants_compression: bool,
     cluster_id: ClusterId,
     mut read: FramedRead<RecvStream, LengthDelimitedCodec>,
     mut write: SendStream,
 ) -> Result<usize, SyncError> {
+    // only compress if the peer can decode it AND we're locally configured to
+    let compression_config = agent.config().gossip.compression_config();
+    let supports_compression = wants_compression && compression_config.enabled;
+    let compression_level = compression_config.level;
+
     let context =
         opentelemetry::global::get_text_map_propagator(|propagator| propagator.extract(&trace_ctx));
     tracing::Span::current().set_parent(context);
@@ -1434,6 +1452,13 @@ pub async fn serve_sync(
     let mut encode_buf = BytesMut::new();
 
     if cluster_id != agent.cluster_id() {
+        error!(
+            "got a different cluster_id ({:?}): {} vs {} - {}",
+            their_actor_id,
+            cluster_id,
+            agent.cluster_id(),
+            wants_compression
+        );
         encode_write_sync_msg(
             &mut codec,
             &mut encode_buf,
@@ -1566,6 +1591,21 @@ pub async fn serve_sync(
                             if let SyncMessage::V1(SyncMessageV1::Changeset(change)) = &msg {
                                 count += change.len();
                             }
+                            let msg = if supports_compression {
+                                match tokio::task::spawn_blocking(move || {
+                                    msg.compress_changeset(compression_level)
+                                })
+                                .await
+                                {
+                                    Ok(msg) => msg,
+                                    Err(e) => {
+                                        error!("compress_changeset task panicked: {e}");
+                                        continue;
+                                    }
+                                }
+                            } else {
+                                msg
+                            };
                             encode_sync_msg(&mut codec, &mut encode_buf, &mut send_buf, msg)?;
 
                             if send_buf.len() >= 16 * 1024 {
@@ -1644,6 +1684,10 @@ pub async fn serve_sync(
                         SyncMessage::V1(SyncMessageV1::Rejection(rejection)) => {
                             return Err(rejection.into())
                         }
+                        SyncMessage::V1(SyncMessageV1::CompressedChangeset(_)) => {
+                            warn!(actor_id = %their_actor_id, "received sync compressed change unexpectedly, ignoring");
+                            continue
+                        },
                     },
                 }
             }
@@ -1666,7 +1710,7 @@ pub async fn serve_sync(
 #[cfg(test)]
 mod tests {
     use crate::api::public::api_v1_transactions;
-    use axum::{Extension, Json};
+    use axum::Extension;
     use camino::Utf8PathBuf;
     use corro_tests::launch_test_agent;
     use corro_tests::TEST_SCHEMA;
@@ -1675,7 +1719,9 @@ mod tests {
     use corro_types::{
         api::{ColumnName, TableName},
         broadcast::ChangesetPerTable,
-        config::{Config, TlsClientConfig, TlsConfig, DEFAULT_GOSSIP_CLIENT_ADDR},
+        config::{
+            CompressionConfig, Config, TlsClientConfig, TlsConfig, DEFAULT_GOSSIP_CLIENT_ADDR,
+        },
         pubsub::pack_columns,
         tls::{generate_ca, generate_client_cert, generate_server_cert},
     };
@@ -1685,8 +1731,8 @@ mod tests {
     use tripwire::Tripwire;
 
     use crate::{
-        agent::{process_multiple_changes, setup},
-        api::public::{api_v1_db_schema, TimeoutParams},
+        agent::{process_multiple_changes, setup, util::execute_schema},
+        api::public::TimeoutParams,
     };
 
     use super::*;
@@ -1764,10 +1810,7 @@ mod tests {
         )
         .await?;
 
-        let (status_code, _res) =
-            api_v1_db_schema(Extension(agent.clone()), Json(vec![TEST_SCHEMA.to_owned()])).await;
-
-        assert_eq!(status_code, StatusCode::OK);
+        execute_schema(&agent, vec![TEST_SCHEMA.to_owned()]).await?;
 
         let actor_id = ActorId(uuid::Uuid::new_v4());
 
@@ -2424,6 +2467,12 @@ mod tests {
             max_mtu: None,
             disable_gso: false,
             member_id: None,
+            compression: Some(CompressionConfig {
+                enabled: false,
+                level: 3,
+                dict_dir: None,
+                dict_file: None,
+            }),
         };
 
         let server = gossip_server_endpoint(&gossip_config).await?;

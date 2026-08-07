@@ -10,6 +10,7 @@ repository.workspace = true
 camino = { workspace = true }
 corro-types = { path = "../corro-types" }
 corro-agent = { path = "../corro-agent" }
+eyre = { workspace = true }
 futures = { workspace = true }
 rusqlite = { workspace = true }
 serde = { workspace = true }

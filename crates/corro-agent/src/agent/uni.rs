@@ -1,7 +1,11 @@
+use std::sync::Arc;
+
+use arc_swap::ArcSwapOption;
 use corro_types::{
     actor::ClusterId,
     broadcast::{BroadcastV1, ChangeSource, ChangeV1, UniPayload, UniPayloadV1},
     channel::CorroSender,
+    compress::ZstdDicts,
 };
 use metrics::counter;
 use speedy::Readable;
@@ -16,7 +20,8 @@ pub fn spawn_unipayload_handler(
     tripwire: &Tripwire,
     conn: &quinn::Connection,
     cluster_id: ClusterId,
-    tx_changes: CorroSender<(ChangeV1, ChangeSource)>,
+    tx_changes: CorroSender<(ChangeV1, ChangeSource, Option<BroadcastV1>)>,
+    change_dict: Arc<ArcSwapOption<ZstdDicts>>,
 ) {
     tokio::spawn({
         let conn = conn.clone();
@@ -44,6 +49,8 @@ pub fn spawn_unipayload_handler(
                     conn.remote_address()
                 );
 
+                let change_dict = change_dict.load_full();
+
                 tokio::spawn({
                     let tx_changes = tx_changes.clone();
                     async move {
@@ -66,16 +73,29 @@ pub fn spawn_unipayload_handler(
 
                                             match payload {
                                                 UniPayload::V1 {
-                                                    data:
-                                                        UniPayloadV1::Broadcast(BroadcastV1::Change(
-                                                            change,
-                                                        )),
+                                                    data: UniPayloadV1::Broadcast(bcast),
                                                     cluster_id: payload_cluster_id,
                                                 } => {
                                                     if cluster_id != payload_cluster_id {
                                                         continue;
                                                     }
-                                                    changes.push((change, ChangeSource::Broadcast));
+                                                    let compressed = bcast.is_compressed();
+                                                    match bcast.into_change(change_dict.as_deref())
+                                                    {
+                                                        Ok(change) => {
+                                                            changes.push((
+                                                                change,
+                                                                ChangeSource::Broadcast,
+                                                                compressed.then_some(bcast),
+                                                            ));
+                                                        }
+                                                        Err(e) => {
+                                                            error!(
+                                                                "could not decode broadcast change: {e}"
+                                                            );
+                                                            continue;
+                                                        }
+                                                    }
                                                 }
                                             }
                                         }

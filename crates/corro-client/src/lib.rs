@@ -1,9 +1,9 @@
 pub mod sub;
 
-use corro_api_types::{ChangeId, ExecResponse, ExecResult, SqliteValue, Statement};
-use hickory_resolver::{
-    name_server::TokioConnectionProvider, ResolveError, ResolveErrorKind, Resolver,
+use corro_api_types::{
+    ChangeId, ExecResponse, ExecResult, SqliteValue, Statement, QUERY_HASH_HEADER, QUERY_ID_HEADER,
 };
+use hickory_resolver::net::NetError as ResolveError;
 use serde::de::DeserializeOwned;
 use std::{
     fmt::Write as _,
@@ -25,6 +25,10 @@ const HTTP2_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const HTTP2_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(10);
 const DNS_RESOLVE_TIMEOUT: Duration = Duration::from_secs(3);
 
+type Resolver = hickory_resolver::Resolver<hickory_resolver::net::runtime::TokioRuntimeProvider>;
+
+/// Single-address Corrosion HTTP API client.
+///
 #[derive(Clone)]
 pub struct CorrosionApiClient {
     api_addr: SocketAddr,
@@ -44,6 +48,37 @@ impl CorrosionApiClient {
         })
     }
 
+    /// Build a client that sets `Authorization: Bearer <auth_token>` on every request when
+    /// `auth_token` is set. Passing `None` is equivalent to [`Self::new`].
+    pub fn with_auth_token(
+        api_addr: SocketAddr,
+        auth_token: Option<String>,
+    ) -> Result<Self, Error> {
+        let mut builder = reqwest::ClientBuilder::new()
+            .http2_prior_knowledge()
+            .connect_timeout(HTTP2_CONNECT_TIMEOUT)
+            .http2_keep_alive_interval(Some(HTTP2_KEEP_ALIVE_INTERVAL))
+            .http2_keep_alive_timeout(HTTP2_KEEP_ALIVE_INTERVAL / 2);
+
+        if let Some(token) = auth_token {
+            let mut value = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
+                .map_err(|_| Error::InvalidAuthToken)?;
+            value.set_sensitive(true);
+            let mut headers = reqwest::header::HeaderMap::new();
+            headers.insert(reqwest::header::AUTHORIZATION, value);
+            builder = builder.default_headers(headers);
+        }
+
+        Ok(Self {
+            api_addr,
+            api_client: builder.build()?,
+        })
+    }
+
+    /// Execute a single query against a Corrosion node, deserializing each row into `T`.
+    /// Optionally accepts a timeout for the request.
+    ///
+    /// Calls the `/v1/queries` endpoint (<https://superfly.github.io/corrosion/api/queries.html>).
     pub async fn query_typed<T: DeserializeOwned + Unpin>(
         &self,
         statement: &Statement,
@@ -93,6 +128,8 @@ impl CorrosionApiClient {
         Ok(QueryStream::new(res.into()))
     }
 
+    /// Same as [`Self::query_typed`], but returns each row as a
+    /// `Vec<SqliteValue>`.
     pub async fn query(
         &self,
         statement: &Statement,
@@ -101,6 +138,11 @@ impl CorrosionApiClient {
         self.query_typed(statement, timeout).await
     }
 
+    /// Create a new subscription and stream query updates, deserializing rows into T.
+    /// * `skip_rows` — when `true`, the initial rows are skipped and only changes are streamed.
+    /// * `from` — when set, resume the subscription past the given `ChangeId` instead of producing a fresh snapshot.
+    ///
+    /// Calls the `/v1/subscriptions` endpoint (<https://superfly.github.io/corrosion/api/subscriptions.html>).
     pub async fn subscribe_typed<T: DeserializeOwned + Unpin>(
         &self,
         statement: &Statement,
@@ -129,15 +171,14 @@ impl CorrosionApiClient {
             return Err(Error::UnexpectedStatusCode(res.status()));
         }
 
-        // TODO: make that header name a const in corro-types
         let id = res
             .headers()
-            .get("corro-query-id")
+            .get(QUERY_ID_HEADER)
             .and_then(|v| v.to_str().ok().and_then(|v| v.parse().ok()))
             .ok_or(Error::ExpectedQueryId)?;
         let hash = res
             .headers()
-            .get("corro-query-hash")
+            .get(QUERY_HASH_HEADER)
             .and_then(|v| v.to_str().map(ToOwned::to_owned).ok());
 
         Ok(SubscriptionStream::new(
@@ -150,6 +191,8 @@ impl CorrosionApiClient {
         ))
     }
 
+    /// Same as [`Self::subscribe_typed`], but returns each row as a
+    /// `Vec<SqliteValue>`.
     pub async fn subscribe(
         &self,
         statement: &Statement,
@@ -159,6 +202,7 @@ impl CorrosionApiClient {
         self.subscribe_typed(statement, skip_rows, from).await
     }
 
+    /// Reconnect to an existing subscription identified by its `Uuid`.
     pub async fn subscription_typed<T: DeserializeOwned + Unpin>(
         &self,
         id: Uuid,
@@ -187,7 +231,7 @@ impl CorrosionApiClient {
 
         let hash = res
             .headers()
-            .get("corro-query-hash")
+            .get(QUERY_HASH_HEADER)
             .and_then(|v| v.to_str().map(ToOwned::to_owned).ok());
 
         Ok(SubscriptionStream::new(
@@ -200,6 +244,8 @@ impl CorrosionApiClient {
         ))
     }
 
+    /// Same as [`Self::subscription_typed`], but returns each row as a
+    /// `Vec<SqliteValue>`.
     pub async fn subscription(
         &self,
         id: Uuid,
@@ -209,6 +255,9 @@ impl CorrosionApiClient {
         self.subscription_typed(id, skip_rows, from).await
     }
 
+    /// Subscribe to row-level changes on a single table.
+    ///
+    /// Calls the `/v1/updates/{table}` endpoint (<https://superfly.github.io/corrosion/api/updates.html>).
     pub async fn updates_typed<T: DeserializeOwned + Unpin>(
         &self,
         table: &str,
@@ -225,20 +274,24 @@ impl CorrosionApiClient {
             return Err(Error::UnexpectedStatusCode(res.status()));
         }
 
-        // TODO: make that header name a const in corro-types
         let id = res
             .headers()
-            .get("corro-query-id")
+            .get(QUERY_ID_HEADER)
             .and_then(|v| v.to_str().ok().and_then(|v| v.parse().ok()))
             .ok_or(Error::ExpectedQueryId)?;
 
         Ok(UpdatesStream::new(id, res.into()))
     }
 
+    /// Same as [`Self::updates_typed`], but returns each row as a
+    /// `Vec<SqliteValue>`.
     pub async fn updates(&self, table: &str) -> Result<UpdatesStream<Vec<SqliteValue>>, Error> {
         self.updates_typed(table).await
     }
 
+    /// Execute one or more SQL statements in a single transaction.
+    ///
+    /// Calls the `/v1/transactions` endpoint (<https://superfly.github.io/corrosion/api/transactions.html>).
     pub async fn execute(
         &self,
         statements: &[Statement],
@@ -292,43 +345,10 @@ impl CorrosionApiClient {
 
         Ok(serde_json::from_slice(&res.bytes().await?)?)
     }
-
-    pub async fn schema(&self, statements: &[Statement]) -> Result<ExecResponse, Error> {
-        let res = self
-            .api_client
-            .post(format!("http://{}/v1/migrations", self.api_addr))
-            .header(http::header::CONTENT_TYPE, "application/json")
-            .header(http::header::ACCEPT, "application/json")
-            .body(serde_json::to_vec(statements)?)
-            .send()
-            .await?;
-
-        if !res.status().is_success() {
-            return Err(Error::UnexpectedStatusCode(res.status()));
-        }
-
-        Ok(serde_json::from_slice(&res.bytes().await?)?)
-    }
-
-    pub async fn schema_from_paths<P: AsRef<Path>>(
-        &self,
-        schema_paths: &[P],
-    ) -> Result<Option<ExecResponse>, Error> {
-        let statements: Vec<Statement> = corro_utils::read_files_from_paths(schema_paths)
-            .await
-            .map_err(|e| Error::ResponseError(e.to_string()))?
-            .into_iter()
-            .map(Statement::Simple)
-            .collect();
-
-        if statements.is_empty() {
-            return Ok(None);
-        }
-
-        Ok(Some(self.schema(&statements).await?))
-    }
 }
 
+/// Convenience client that combines a [`CorrosionApiClient`] with a local
+/// SQLite connection pool.
 #[derive(Clone)]
 pub struct CorrosionClient {
     api_client: CorrosionApiClient,
@@ -356,6 +376,7 @@ impl CorrosionClient {
         })
     }
 
+    /// Borrow the SQLite connection pool used for direct reads.
     pub fn pool(&self) -> &sqlite_pool::RusqlitePool {
         &self.pool
     }
@@ -369,6 +390,12 @@ impl Deref for CorrosionClient {
     }
 }
 
+/// Client to connect to a pool of Corrosion nodes.
+///
+/// Selects the first address from the list and tries to connect to it.
+/// On I/O errors the client falls back to the next address; once a request succeeds the client
+/// "sticks" to that peer until it has been failing continuously for the
+/// configured `stickiness_timeout`.
 #[derive(Clone)]
 pub struct CorrosionPooledClient {
     inner: Arc<RwLock<PooledClientInner>>,
@@ -390,11 +417,18 @@ struct PooledClientInner {
 }
 
 impl CorrosionPooledClient {
-    pub fn new(
-        addrs: Vec<String>,
-        stickiness_timeout: time::Duration,
-        resolver: Resolver<TokioConnectionProvider>,
-    ) -> Self {
+    /// Build a new pooled client.
+    ///
+    /// * `addrs` — ordered list of agent addresses. Each entry can be either
+    ///   a `host:port` string (resolved through `resolver`) or an already
+    ///   resolved `SocketAddr` formatted as a string. Entries are tried in
+    ///   the supplied order; once a peer has been successful the client
+    ///   prefers it for as long as it stays healthy.
+    /// * `stickiness_timeout` — how long the client keeps retrying a
+    ///   previously successful peer after it starts failing before rotating
+    ///   to the next address.
+    /// * `resolver` — DNS resolver used to translate hostnames to addresses.
+    pub fn new(addrs: Vec<String>, stickiness_timeout: time::Duration, resolver: Resolver) -> Self {
         Self {
             inner: Arc::new(RwLock::new(PooledClientInner {
                 picker: AddrPicker::new(addrs, resolver),
@@ -408,6 +442,9 @@ impl CorrosionPooledClient {
         }
     }
 
+    /// Run a one-shot query against the currently selected peer.
+    ///
+    /// Equivalent to [`CorrosionApiClient::query_typed`]
     pub async fn query_typed<T: DeserializeOwned + Unpin>(
         &self,
         statement: &Statement,
@@ -431,6 +468,8 @@ impl CorrosionPooledClient {
         response
     }
 
+    /// Open a new subscription against the currently selected peer.
+    ///
     pub async fn subscribe_typed<T: DeserializeOwned + Unpin>(
         &self,
         statement: &Statement,
@@ -455,6 +494,8 @@ impl CorrosionPooledClient {
         response
     }
 
+    /// Reconnect to an existing subscription by id against the currently
+    /// selected peer. See [`CorrosionApiClient::subscription_typed`].
     pub async fn subscription_typed<T: DeserializeOwned + Unpin>(
         &self,
         id: Uuid,
@@ -550,7 +591,7 @@ impl CorrosionPooledClient {
 
 struct AddrPicker {
     // Resolver used to resolve the addresses
-    resolver: Resolver<TokioConnectionProvider>,
+    resolver: Resolver,
     // List of addresses/hostname to try in order
     addrs: Vec<String>,
     // Next address/hostname to try
@@ -563,7 +604,7 @@ struct AddrPicker {
 }
 
 impl AddrPicker {
-    fn new(addrs: Vec<String>, resolver: Resolver<TokioConnectionProvider>) -> AddrPicker {
+    fn new(addrs: Vec<String>, resolver: Resolver) -> AddrPicker {
         Self {
             resolver,
             addrs,
@@ -600,7 +641,7 @@ impl AddrPicker {
 
                 timeout(DNS_RESOLVE_TIMEOUT, self.resolver.lookup_ip(host))
                     .await
-                    .map_err(|_| ResolveError::from(ResolveErrorKind::Message("timeout")))??
+                    .map_err(|_| ResolveError::Timeout)??
                     .iter()
                     .map(|addr| (addr, port).into())
                     .collect::<Vec<_>>()
@@ -634,6 +675,7 @@ impl AddrPicker {
     }
 }
 
+/// Errors returned by [`CorrosionApiClient`] and [`CorrosionPooledClient`].
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error(transparent)]
@@ -658,12 +700,15 @@ pub enum Error {
 
     #[error("could not retrieve subscription id from headers")]
     ExpectedQueryId,
+
+    #[error("auth token contains characters that are not valid in an HTTP header value")]
+    InvalidAuthToken,
 }
 
 #[cfg(test)]
 mod tests {
     use crate::{CorrosionPooledClient, Error};
-    use corro_api_types::SqliteValue;
+    use corro_api_types::{SqliteValue, QUERY_ID_HEADER};
     use hickory_resolver::Resolver;
     use hyper::{header::HeaderValue, service::service_fn, Request, Response};
     use std::{
@@ -742,7 +787,7 @@ mod tests {
                                 service_fn(move |_: Request<hyper::body::Incoming>| async move {
                                     let mut res = Response::new(Empty::new());
                                     res.headers_mut().insert(
-                                        "corro-query-id",
+                                        QUERY_ID_HEADER,
                                         HeaderValue::from_str(&id.to_string()).unwrap(),
                                     );
                                     Ok::<_, Infallible>(res)
@@ -797,7 +842,7 @@ mod tests {
         let statement = "".into();
         let (servers, addresses) = gen_servers(1).await;
 
-        let resolver = Resolver::builder_tokio().unwrap().build();
+        let resolver = Resolver::builder_tokio().unwrap().build().unwrap();
         let client = CorrosionPooledClient::new(addresses, Duration::from_nanos(1), resolver);
         let sub = client
             .subscribe_typed::<SqliteValue>(&statement, false, None)
@@ -826,7 +871,7 @@ mod tests {
         let statement = "".into();
         let (servers, addresses) = gen_servers(3).await;
 
-        let resolver = Resolver::builder_tokio().unwrap().build();
+        let resolver = Resolver::builder_tokio().unwrap().build().unwrap();
         let client = CorrosionPooledClient::new(addresses, Duration::from_nanos(1), resolver);
 
         // Refuse connections on the first server
@@ -871,7 +916,7 @@ mod tests {
         let statement = "".into();
         let (servers, addresses) = gen_servers(3).await;
 
-        let resolver = Resolver::builder_tokio().unwrap().build();
+        let resolver = Resolver::builder_tokio().unwrap().build().unwrap();
         let client = CorrosionPooledClient::new(addresses, Duration::from_millis(50), resolver);
 
         // Refuse connections on the first server
@@ -921,7 +966,7 @@ mod tests {
         let mut addresses = pool1_addresses;
         addresses.extend_from_slice(&pool2_addresses);
 
-        let resolver = Resolver::builder_tokio().unwrap().build();
+        let resolver = Resolver::builder_tokio().unwrap().build().unwrap();
         let client = CorrosionPooledClient::new(addresses, Duration::from_nanos(1), resolver);
 
         // Refuse connections on all servers

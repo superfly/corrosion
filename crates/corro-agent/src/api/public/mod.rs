@@ -24,7 +24,6 @@ use corro_types::{
     broadcast::Timestamp,
     change::{insert_local_changes, InsertChangesInfo, SqliteValue},
     persistent_gauge,
-    schema::{apply_schema, parse_sql},
     sqlite::SqlitePoolError,
 };
 use hyper::StatusCode;
@@ -41,7 +40,7 @@ use tokio::{
     },
     task::block_in_place,
 };
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, error, trace, warn};
 
 use corro_types::broadcast::broadcast_changes;
 
@@ -105,10 +104,17 @@ where
         let ret = f(&tx)?;
 
         let insert_info = insert_local_changes(agent, &tx, &mut book_writer)?;
-        tx.commit().map_err(|source| ChangeError::Rusqlite {
-            source,
-            actor_id: Some(actor_id),
-            version: insert_info.as_ref().map(|info| info.db_version),
+        tx.commit().map_err(|source| {
+            let ce = ChangeError::Rusqlite {
+                source,
+                actor_id: Some(actor_id),
+                version: insert_info.as_ref().map(|info| info.db_version),
+            };
+            if let Some(issue) = ce.fatal_db_issue() {
+                error!("fatal DB issue detected: {issue}");
+                agent.mark_unhealthy(issue);
+            }
+            ce
         })?;
 
         let elapsed = start.elapsed();
@@ -520,116 +526,28 @@ pub async fn api_v1_queries(
     }
 }
 
-pub(crate) async fn execute_schema(agent: &Agent, statements: Vec<String>) -> eyre::Result<()> {
-    let new_sql: String = statements.join(";");
-
-    let partial_schema = parse_sql(&new_sql)?;
-
-    info!("getting write connection to update schema");
-    let mut conn = agent.pool().write_priority().await?;
-    info!("got write connection to update schema");
-
-    // hold onto this lock so nothing else makes changes
-    let mut schema_write = agent.schema().write();
-
-    // clone the previous schema and apply
-    let mut new_schema = {
-        let mut schema = schema_write.clone();
-        for (name, def) in partial_schema.tables.iter() {
-            // overwrite table because users are expected to return a full table def
-            schema.tables.insert(name.clone(), def.clone());
-        }
-        schema
-    };
-
-    new_schema.constrain()?;
-
-    // conn.trace(Some(|sql| debug!(sql)));
-
-    let apply_res = block_in_place(|| {
-        let tx = conn.immediate_transaction()?;
-
-        apply_schema(&tx, &schema_write, &mut new_schema)?;
-
-        for tbl_name in partial_schema.tables.keys() {
-            tx.execute("DELETE FROM __corro_schema WHERE tbl_name = ?", [tbl_name])?;
-
-            let n = tx.execute("INSERT INTO __corro_schema SELECT tbl_name, type, name, sql, 'api' AS source FROM sqlite_schema WHERE tbl_name = ? AND type IN ('table', 'index') AND name IS NOT NULL AND sql IS NOT NULL", [tbl_name])?;
-            info!("Updated {n} rows in __corro_schema for table {tbl_name}");
-        }
-
-        tx.commit()?;
-
-        // drain the pool of RO connections because they might not get the new tables in cr-sqlite!
-        agent.pool().drain_read();
-
-        Ok::<_, eyre::Report>(())
-    });
-
-    // conn.trace(None);
-
-    apply_res?;
-
-    *schema_write = new_schema;
-
-    Ok(())
-}
-
-pub async fn api_v1_db_schema(
-    Extension(agent): Extension<Agent>,
-    axum::extract::Json(statements): axum::extract::Json<Vec<String>>,
-) -> (StatusCode, axum::Json<ExecResponse>) {
-    let actor_id = agent.actor_id().to_string();
-    if statements.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            axum::Json(ExecResponse {
-                results: vec![ExecResult::Error {
-                    error: "at least 1 statement is required".into(),
-                }],
-                time: 0.0,
-                version: None,
-                actor_id: Some(actor_id),
-            }),
-        );
-    }
-
-    let start = Instant::now();
-
-    assert_sometimes!(true, "Corrosion applies schema");
-    if let Err(e) = execute_schema(&agent, statements).await {
-        error!("could not merge schemas: {e}");
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            axum::Json(ExecResponse {
-                results: vec![ExecResult::Error {
-                    error: e.to_string(),
-                }],
-                time: 0.0,
-                version: None,
-                actor_id: Some(actor_id),
-            }),
-        );
-    }
-
-    (
-        StatusCode::OK,
-        axum::Json(ExecResponse {
-            results: vec![],
-            time: start.elapsed().as_secs_f64(),
-            version: None,
-            actor_id: Some(actor_id),
-        }),
-    )
-}
-
 pub async fn api_v1_health(
     Extension(agent): Extension<Agent>,
     Query(query): Query<HealthQuery>,
 ) -> (StatusCode, axum::Json<HealthResponse>) {
     match check_health(&agent).await {
         Ok((gaps, members)) => {
-            let p99_lag = agent.metrics_tracker().quantile_lag(0.99).unwrap_or(0.0);
+            let status = query.failure_status.unwrap_or(503);
+            let error_status =
+                StatusCode::from_u16(status).unwrap_or(StatusCode::SERVICE_UNAVAILABLE);
+            let p99_lag = match agent.metrics_tracker().quantile_lag(0.99) {
+                Some(lag) => lag,
+                None => {
+                    error!("no p99 lag information available");
+                    return (
+                        error_status,
+                        axum::Json(HealthResponse::Error(
+                            "no p99 lag information available".into(),
+                        )),
+                    );
+                }
+            };
+
             let queue_size = agent.metrics_tracker().queue_size();
             let status = if query.gaps.is_some_and(|max| gaps > max)
                 || query.max_queue.is_some_and(|max| queue_size > max)
@@ -639,8 +557,7 @@ pub async fn api_v1_health(
                 || (query.p99_lag.is_some_and(|max| p99_lag > max)
                     && query.queue_size.is_none_or(|max| queue_size > max))
             {
-                let status = query.failure_status.unwrap_or(503);
-                StatusCode::from_u16(status).unwrap_or(StatusCode::SERVICE_UNAVAILABLE)
+                error_status
             } else {
                 StatusCode::OK
             };
@@ -761,7 +678,7 @@ mod tests {
 
     use super::*;
 
-    use crate::agent::setup;
+    use crate::{agent::setup, agent::util::execute_schema};
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn test_api_db_execute() -> eyre::Result<()> {
@@ -783,13 +700,7 @@ mod tests {
 
         let rx_bcast = &mut agent_options.rx_bcast;
 
-        let (status_code, _body) = api_v1_db_schema(
-            Extension(agent.clone()),
-            axum::Json(vec![corro_tests::TEST_SCHEMA.into()]),
-        )
-        .await;
-
-        assert_eq!(status_code, StatusCode::OK);
+        execute_schema(&agent, vec![corro_tests::TEST_SCHEMA.to_owned()]).await?;
 
         let (status_code, body) = api_v1_transactions(
             Extension(agent.clone()),
@@ -867,13 +778,7 @@ mod tests {
         )
         .await?;
 
-        let (status_code, _body) = api_v1_db_schema(
-            Extension(agent.clone()),
-            axum::Json(vec![corro_tests::TEST_SCHEMA.into()]),
-        )
-        .await;
-
-        assert_eq!(status_code, StatusCode::OK);
+        execute_schema(&agent, vec![corro_tests::TEST_SCHEMA.to_owned()]).await?;
 
         let (status_code, body) = api_v1_transactions(
             Extension(agent.clone()),
@@ -979,15 +884,14 @@ mod tests {
         )
         .await?;
 
-        let (status_code, _body) = api_v1_db_schema(
-            Extension(agent.clone()),
-            axum::Json(vec![
+        execute_schema(
+            &agent,
+            vec![
+                "CREATE TABLE tests2 (id BIGINT NOT NULL PRIMARY KEY, foo TEXT);".into(),
                 "CREATE TABLE tests (id BIGINT NOT NULL PRIMARY KEY, foo TEXT);".into(),
-            ]),
+            ],
         )
-        .await;
-
-        assert_eq!(status_code, StatusCode::OK);
+        .await?;
 
         // scope the schema reader in here
         {
@@ -1010,16 +914,14 @@ mod tests {
             assert!(!foo_col.primary_key);
         }
 
-        let (status_code, _body) = api_v1_db_schema(
-            Extension(agent.clone()),
-            axum::Json(vec![
+        execute_schema(
+            &agent,
+            vec![
                 "CREATE TABLE tests2 (id BIGINT NOT NULL PRIMARY KEY, foo TEXT);".into(),
                 "CREATE TABLE tests (id BIGINT NOT NULL PRIMARY KEY, foo TEXT);".into(),
-            ]),
+            ],
         )
-        .await;
-
-        assert_eq!(status_code, StatusCode::OK);
+        .await?;
 
         {
             let schema = agent.schema().read();
@@ -1083,13 +985,7 @@ mod tests {
             );
         }
 
-        let (status_code, _body) = api_v1_db_schema(
-            Extension(agent.clone()),
-            axum::Json(vec![create_stmt.into()]),
-        )
-        .await;
-
-        assert_eq!(status_code, StatusCode::OK);
+        execute_schema(&agent, vec![create_stmt.to_owned()]).await?;
 
         {
             let schema = agent.schema().read();

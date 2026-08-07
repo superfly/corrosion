@@ -94,9 +94,13 @@ addr = "" # required, no default value
 
 bootstrap = []
 
-plaintext = false  # optional
-max_mtu = 1200  # optional
-disable_gso = false  # optional
+plaintext = false           # optional
+idle_timeout_secs = 30      # optional
+disable_gso = false         # optional
+
+# max_mtu = 1452            # optional; unset = autodetect, must be >= 1200
+# external_addr = ""        # optional, defaults to gossip.addr
+# client_addr   = "[::]:0"  # optional
 
 member_id = 1 # optional
 

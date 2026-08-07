@@ -22,10 +22,10 @@ use tripwire::Tripwire;
 use uuid::Uuid;
 
 use crate::{
-    agent::process_multiple_changes,
+    agent::{process_multiple_changes, util::execute_schema_from_paths},
     api::{
         peer::parallel_sync,
-        public::{api_v1_db_schema, api_v1_transactions, TimeoutParams},
+        public::{api_v1_transactions, TimeoutParams},
     },
     transport::Transport,
 };
@@ -804,21 +804,6 @@ async fn test_clear_empty_versions() -> eyre::Result<()> {
 
     let (rtt_tx, _rtt_rx) = mpsc::channel(1024);
     let ta2_transport = Transport::new(&ta2.agent.config().gossip, rtt_tx.clone()).await?;
-    // setup the schema, for both nodes
-    let (status_code, _body) = api_v1_db_schema(
-        Extension(ta1.agent.clone()),
-        axum::Json(vec![corro_tests::TEST_SCHEMA.into()]),
-    )
-    .await;
-
-    assert_eq!(status_code, StatusCode::OK);
-
-    let (status_code, _body) = api_v1_db_schema(
-        Extension(ta2.agent.clone()),
-        axum::Json(vec![corro_tests::TEST_SCHEMA.into()]),
-    )
-    .await;
-    assert_eq!(status_code, StatusCode::OK);
 
     // make about 50 transactions to ta1
     insert_rows(ta1.agent.clone(), 1, 50).await;
@@ -891,21 +876,8 @@ async fn process_failed_changes() -> eyre::Result<()> {
     let ta1 = launch_test_agent(|conf| conf.build(), tripwire.clone()).await?;
     let uuid = Uuid::parse_str("00000000-0000-0000-a716-446655440000")?;
     let actor_id = ActorId(uuid);
-    // setup the schema, for both nodes
-    let (status_code, _body) = api_v1_db_schema(
-        Extension(ta1.agent.clone()),
-        axum::Json(vec![corro_tests::TEST_SCHEMA.into()]),
-    )
-    .await;
-    assert_eq!(status_code, StatusCode::OK);
 
     let ta2 = launch_test_agent(|conf| conf.build(), tripwire.clone()).await?;
-    let (status_code, _body) = api_v1_db_schema(
-        Extension(ta2.agent.clone()),
-        axum::Json(vec![corro_tests::TEST_SCHEMA.into()]),
-    )
-    .await;
-    assert_eq!(status_code, StatusCode::OK);
 
     for i in 1..=5_i64 {
         let (status_code, _) = api_v1_transactions(
@@ -1011,22 +983,6 @@ async fn test_process_multiple_changes() -> eyre::Result<()> {
     let ta1 = launch_test_agent(|conf| conf.build(), tripwire.clone()).await?;
     let ta2 = launch_test_agent(|conf| conf.build(), tripwire.clone()).await?;
     let tx_timeout = Duration::from_secs(60);
-
-    // setup the schema, for both nodes
-    let (status_code, _body) = api_v1_db_schema(
-        Extension(ta1.agent.clone()),
-        axum::Json(vec![corro_tests::TEST_SCHEMA.into()]),
-    )
-    .await;
-
-    assert_eq!(status_code, StatusCode::OK);
-
-    let (status_code, _body) = api_v1_db_schema(
-        Extension(ta2.agent.clone()),
-        axum::Json(vec![corro_tests::TEST_SCHEMA.into()]),
-    )
-    .await;
-    assert_eq!(status_code, StatusCode::OK);
 
     // make about 50 transactions to ta1
     insert_rows(ta1.agent.clone(), 1, 50).await;
@@ -1527,4 +1483,57 @@ async fn test_diff_member_id() -> eyre::Result<()> {
     wait_for_all_pending_handles().await;
 
     Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_execute_schema_from_paths() -> eyre::Result<()> {
+    _ = tracing_subscriber::fmt::try_init();
+    let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
+    let ta = launch_test_agent(|conf| conf.build(), tripwire.clone()).await?;
+
+    let schema_dir = ta.tmpdir.path().join("schema");
+    let extra_sql = r#"
+CREATE TABLE IF NOT EXISTS test_reload (
+    id INTEGER NOT NULL PRIMARY KEY,
+    note TEXT NOT NULL DEFAULT ''
+) WITHOUT ROWID;
+
+CREATE TABLE IF NOT EXISTS test_reload2 (
+    id INTEGER NOT NULL PRIMARY KEY
+) WITHOUT ROWID;
+"#;
+    tokio::fs::write(schema_dir.join("extra.sql"), extra_sql.as_bytes()).await?;
+
+    let index_sql = r#"
+    CREATE INDEX IF NOT EXISTS test_reload_note_idx ON test_reload (note);
+    "#;
+    tokio::fs::write(schema_dir.join("index.sql"), index_sql.as_bytes()).await?;
+
+    execute_schema_from_paths(&ta.agent).await?;
+
+    let conn = ta.agent.pool().read().await?;
+    assert!(check_obj_exists(&conn, "table", "test_reload"));
+    assert!(check_obj_exists(&conn, "table", "test_reload2"));
+    assert!(check_obj_exists(&conn, "index", "test_reload_note_idx"));
+
+    {
+        let schema = ta.agent.schema().read();
+        assert!(schema.tables.get("test_reload").is_some());
+        assert!(schema.tables.get("test_reload2").is_some());
+    }
+
+    tripwire_tx.send(()).await.ok();
+    tripwire_worker.await;
+    wait_for_all_pending_handles().await;
+
+    Ok(())
+}
+
+fn check_obj_exists(conn: &rusqlite::Connection, obj_type: &str, obj_name: &str) -> bool {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = ? AND name = ?)",
+        [obj_type, obj_name],
+        |row| row.get(0),
+    )
+    .unwrap()
 }

@@ -6,7 +6,7 @@ use bytes::{BufMut, Bytes, BytesMut};
 use compact_str::ToCompactString;
 use corro_types::{
     agent::Agent,
-    api::NotifyEvent,
+    api::{NotifyEvent, QUERY_ID_HEADER},
     persistent_gauge,
     updates::{Handle, UpdateCreated, UpdateHandle, UpdatesManager},
 };
@@ -70,7 +70,7 @@ pub async fn api_v1_updates(
 
     hyper::Response::builder()
         .status(StatusCode::OK)
-        .header("corro-query-id", update_id.to_string())
+        .header(QUERY_ID_HEADER, update_id.to_string())
         .body(axum::body::Body::new(body))
         .expect("could not generate ok http response for update request")
 }

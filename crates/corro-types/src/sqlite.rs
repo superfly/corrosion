@@ -30,6 +30,9 @@ type InFlightQueries = HashMap<String, Instant>;
 static QUERY_STATS: ThreadLocal<Mutex<QueryStats>> = ThreadLocal::new();
 pub static IN_FLIGHT_QUERIES: ThreadLocal<Mutex<InFlightQueries>> = ThreadLocal::new();
 
+// Aggregate stats for subscription matcher connections (no per-query breakdown)
+static SUBS_QUERY_STATS: ThreadLocal<Mutex<(u64, u128)>> = ThreadLocal::new(); // (count, nanos)
+
 pub async fn query_metrics_loop(mut tripwire: Tripwire) {
     let mut interval = tokio::time::interval(Duration::from_secs(10));
     let mut prev_tick = interval.tick().await;
@@ -39,6 +42,7 @@ pub async fn query_metrics_loop(mut tripwire: Tripwire) {
             let elapsed = t.duration_since(prev_tick);
             prev_tick = t;
             handle_query_metrics(elapsed);
+            handle_subs_query_metrics();
             },
             _ = &mut tripwire => break,
         }
@@ -190,6 +194,51 @@ pub fn trace_heavy_queries(conn: &Connection) -> rusqlite::Result<()> {
         }),
     );
     Ok(())
+}
+
+/// Install tracing on a connection used by subscription matchers.
+/// Writes to a separate SUBS_QUERY_STATS so subs sqlite time is
+/// bucketed into `corro.subs.db.query.ms` / `corro.subs.db.query.count`
+/// instead of the general `corro.db.query.*` metrics.
+pub fn trace_heavy_queries_subs(conn: &Connection) -> rusqlite::Result<()> {
+    conn.trace_v2(
+        TraceEventCodes::SQLITE_TRACE_PROFILE,
+        Some(tracing_callback_subs),
+    );
+    Ok(())
+}
+
+fn tracing_callback_subs(ev: rusqlite::trace::TraceEvent) {
+    if let rusqlite::trace::TraceEvent::Profile(stmt_ref, duration) = ev {
+        let dur = duration.as_nanos();
+        let sql = stmt_ref.sql().to_string();
+
+        let stats_mutex = SUBS_QUERY_STATS.get_or_default();
+        let mut stats = stats_mutex.lock();
+        stats.0 += 1;
+        stats.1 += dur;
+
+        if duration >= SLOW_QUERY_THRESHOLD {
+            drop(stats);
+            warn!("SLOW SUBS query {duration:?} => {sql}");
+        }
+    }
+}
+
+fn handle_subs_query_metrics() {
+    let mut total_count = 0u64;
+    let mut total_nanos = 0u128;
+
+    for stats_mutex in SUBS_QUERY_STATS.iter() {
+        let mut stats = stats_mutex.lock();
+        total_count += stats.0;
+        total_nanos += stats.1;
+        *stats = (0, 0);
+    }
+
+    let total_ms = (total_nanos / 1_000_000) as u64;
+    counter!("corro.subs.db.query.ms").increment(total_ms);
+    counter!("corro.subs.db.query.count").increment(total_count);
 }
 
 const CRSQL_EXT_GENERIC_NAME: &str = "crsqlite";

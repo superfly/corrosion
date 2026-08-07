@@ -8,7 +8,7 @@
 use crate::{
     agent::{handlers, CountedExecutor, TO_CLEAR_COUNT},
     api::public::{
-        api_v1_db_schema, api_v1_health, api_v1_queries, api_v1_table_stats, api_v1_transactions,
+        api_v1_health, api_v1_queries, api_v1_table_stats, api_v1_transactions,
         pubsub::{api_v1_sub_by_id, api_v1_subs},
         update::SharedUpdateBroadcastCache,
     },
@@ -26,6 +26,7 @@ use corro_types::{
     channel::CorroReceiver,
     config::AuthzConfig,
     pubsub::SubsManager,
+    schema::{apply_schema, parse_sql},
     sqlite::unnest_param,
     updates::{match_changes, match_changes_from_db_version},
 };
@@ -262,20 +263,6 @@ pub async fn setup_http_api_handler(
             ),
         )
         .route(
-            "/v1/migrations",
-            post(api_v1_db_schema).route_layer(
-                tower::ServiceBuilder::new()
-                    .layer(HandleErrorLayer::new(|_error: BoxError| async {
-                        Ok::<_, Infallible>((
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            "max concurrency limit reached".to_string(),
-                        ))
-                    }))
-                    .layer(LoadShedLayer::new())
-                    .layer(ConcurrencyLimitLayer::new(4)),
-            ),
-        )
-        .route(
             "/v1/table_stats",
             post(api_v1_table_stats).route_layer(
                 tower::ServiceBuilder::new()
@@ -484,16 +471,18 @@ pub async fn apply_fully_buffered_changes_loop(
     mut tripwire: Tripwire,
 ) {
     info!("Starting apply_fully_buffered_changes loop");
-    // use slightly higher timeout (1.5 x perf timeout) since we could have a lot of buffered changes.
-    let timeout = (agent.config().perf.sql_tx_timeout as u64 * 3) / 2;
-    let tx_timeout: Duration = Duration::from_secs(timeout);
-    let timeout_proximity = tx_timeout.saturating_sub(Duration::from_secs(3));
+    let sql_tx_timeout_secs = Duration::from_secs(agent.config().perf.sql_tx_timeout as u64);
+    // we can burst timeout up to an additional 2 min
+    let max_timeout_increase: u64 = 6;
+    let step_timeout_secs: u64 = 20;
 
-    let mut retry_interval = tokio::time::interval(Duration::from_secs(60));
-    let mut clear_limit_interval = tokio::time::interval(Duration::from_secs(5 * 60));
+    let throttle_min = Duration::from_secs(5 * 60);
+    let throttle_max = Duration::from_secs(60 * 60);
+
+    let mut retry_interval = tokio::time::interval(Duration::from_secs(5 * 60));
 
     // map to throttle retries for failed versions that took too long to apply
-    let mut limit_retries = ThrottleMap::new(Duration::from_secs(5 * 60));
+    let mut limit_retries = ThrottleMap::new(throttle_min, throttle_max);
 
     retry_interval.tick().await;
 
@@ -516,23 +505,25 @@ pub async fn apply_fully_buffered_changes_loop(
                     },
                 }
             },
-
-            _ = clear_limit_interval.tick() => {
-                limit_retries.clear_expired();
-                continue;
-            }
         };
 
-        if limit_retries.is_throttled(&partial_version) {
+        if let Some(blocked_until) = limit_retries.is_throttled(&partial_version) {
+            let next_retry = blocked_until.duration_since(Instant::now()).as_secs();
             warn!(
                 ?partial_version,
-                "previous attempt to apply buffered changes took too long, skipping retry"
+                "previous attempt to apply buffered changes took too long, will retry in {next_retry} seconds"
             );
             continue;
         }
 
         let (actor_id, version) = partial_version;
-        debug!(%actor_id, %version, "picked up background apply of buffered changes");
+        let throttle_count = limit_retries
+            .throttle_count(&(actor_id, version))
+            .min(max_timeout_increase);
+        let tx_timeout =
+            sql_tx_timeout_secs + Duration::from_secs(step_timeout_secs * throttle_count);
+
+        debug!(%actor_id, %version, ?tx_timeout, "picked up background apply of buffered changes");
         let start = Instant::now();
         let res =
             process_fully_buffered_changes(&agent, &bookie, actor_id, version, tx_timeout).await;
@@ -540,18 +531,26 @@ pub async fn apply_fully_buffered_changes_loop(
         match res {
             Ok(false) => {
                 warn!(%actor_id, %version, "did not apply buffered changes");
+                limit_retries.remove(&(actor_id, version));
             }
             Ok(true) => {
                 debug!(%actor_id, %version, "succesfully applied buffered changes");
                 histogram!("corro.agent.changes.processing.time.seconds", "source" => "buffered")
                     .record(elapsed.as_secs_f64());
+                limit_retries.remove(&(actor_id, version));
             }
             Err(e) => {
-                error!(%actor_id, %version, "could not apply fully buffered changes: {e}");
+                let is_interrupt_error = e.is_interrupt_error();
+                error!(%actor_id, %version, "could not apply fully buffered changes with timeout {tx_timeout:?}: {e}");
+                if let Some(issue) = e.fatal_db_issue() {
+                    error!("fatal DB issue detected: {issue}");
+                    agent.mark_unhealthy(issue);
+                }
                 let details = json!({"error": e.to_string()});
                 assert_unreachable!("could not apply fully buffered changes", &details);
-                // processing time came close to timeout, limit retry
-                if elapsed >= timeout_proximity {
+
+                // processing time came close to timeout, limit retry with exponential backoff
+                if is_interrupt_error {
                     limit_retries.throttle((actor_id, version));
                 }
             }
@@ -1039,10 +1038,15 @@ pub async fn process_multiple_changes(
                             }
                             Err(e) => {
                                 error!(%actor_id, versions = ?versions, "error processing single version: {e}");
-                                if e.sqlite_error_code().is_some_and(|code| {
-                                    code != rusqlite::ErrorCode::DiskFull
-                                        && code != rusqlite::ErrorCode::OperationInterrupted
-                                }) {
+                                if let Some(issue) = e
+                                    .sqlite_error_code()
+                                    .and_then(ChangeError::fatal_db_issue_for_code)
+                                {
+                                    error!("fatal DB issue detected: {issue}");
+                                    agent.mark_unhealthy(issue);
+                                } else if e.sqlite_error_code()
+                                    != Some(rusqlite::ErrorCode::OperationInterrupted)
+                                {
                                     let details = json!({"error": e.to_string()});
                                     assert_unreachable!("error committing transaction", &details);
                                 }
@@ -1122,11 +1126,14 @@ pub async fn process_multiple_changes(
         debug!("inserted {count} new changesets");
 
         tx.commit().map_err(|source| {
-            // only sqlite error we expect is SQLITE_FULL if disk is full
-            if source.sqlite_error_code().is_some_and(|code| {
-                code != rusqlite::ErrorCode::DiskFull
-                    && code != rusqlite::ErrorCode::OperationInterrupted
-            }) {
+            if let Some(issue) = source
+                .sqlite_error_code()
+                .and_then(ChangeError::fatal_db_issue_for_code)
+            {
+                error!("fatal DB issue detected: {issue}");
+                agent.mark_unhealthy(issue);
+            } else if source.sqlite_error_code() != Some(rusqlite::ErrorCode::OperationInterrupted)
+            {
                 let details =
                     json!({"elapsed": elapsed.as_secs_f32(), "error": source.to_string()});
                 assert_unreachable!("error committing transaction", &details);
@@ -1413,6 +1420,70 @@ pub fn process_complete_version<T: Deref<Target = rusqlite::Connection> + Commit
     };
 
     Ok::<_, rusqlite::Error>((known_version, new_changeset, changes_per_table))
+}
+
+pub async fn execute_schema_from_paths(agent: &Agent) -> eyre::Result<()> {
+    let statements = corro_utils::read_files_from_paths(&agent.config().db.schema_paths).await?;
+    if statements.is_empty() {
+        return Ok(());
+    }
+
+    execute_schema(agent, statements).await
+}
+
+pub async fn execute_schema(agent: &Agent, statements: Vec<String>) -> eyre::Result<()> {
+    let new_sql: String = statements.join(";");
+
+    let partial_schema = parse_sql(&new_sql)?;
+
+    info!("getting write connection to update schema");
+    let mut conn = agent.pool().write_priority().await?;
+    info!("got write connection to update schema");
+
+    // hold onto this lock so nothing else makes changes
+    let mut schema_write = agent.schema().write();
+
+    // clone the previous schema and apply
+    let mut new_schema = {
+        let mut schema = schema_write.clone();
+        for (name, def) in partial_schema.tables.iter() {
+            // overwrite table because users are expected to return a full table def
+            schema.tables.insert(name.clone(), def.clone());
+        }
+        schema
+    };
+
+    new_schema.constrain()?;
+
+    // conn.trace(Some(|sql| debug!(sql)));
+
+    let apply_res = block_in_place(|| {
+        let tx = conn.immediate_transaction()?;
+
+        apply_schema(&tx, &schema_write, &mut new_schema)?;
+
+        for tbl_name in partial_schema.tables.keys() {
+            tx.execute("DELETE FROM __corro_schema WHERE tbl_name = ?", [tbl_name])?;
+
+            let n = tx.execute("INSERT INTO __corro_schema SELECT tbl_name, type, name, sql, 'api' AS source FROM sqlite_schema WHERE tbl_name = ? AND type IN ('table', 'index') AND name IS NOT NULL AND sql IS NOT NULL", [tbl_name])?;
+            info!("Updated {n} rows in __corro_schema for table {tbl_name}");
+        }
+
+        tx.commit()?;
+
+        // drain the pool of RO connections because they might not get the new tables in cr-sqlite!
+        agent.pool().drain_read();
+
+        Ok::<_, eyre::Report>(())
+    });
+
+    // conn.trace(None);
+
+    apply_res?;
+
+    *schema_write = new_schema;
+
+    Ok(())
 }
 
 pub fn check_buffered_meta_to_clear(

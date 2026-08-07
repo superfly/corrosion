@@ -1,7 +1,7 @@
 use camino::Utf8PathBuf;
 use serde::{Deserialize, Serialize};
 
-/// HashiCorp Consul client configuration
+/// HashiCorp Consul client configuration.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Config {
     /// Vault address

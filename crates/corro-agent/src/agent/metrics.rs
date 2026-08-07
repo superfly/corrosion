@@ -9,7 +9,7 @@ use tracing::error;
 use tripwire::Tripwire;
 
 pub async fn metrics_loop(agent: Agent, transport: Transport, mut tripwire: Tripwire) {
-    let mut metrics_interval = tokio::time::interval(Duration::from_secs(10));
+    let mut metrics_interval = tokio::time::interval(Duration::from_secs(60));
     let on_antithesis = std::env::var("ANTITHESIS_OUTPUT_DIR").is_ok();
 
     loop {

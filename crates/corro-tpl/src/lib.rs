@@ -715,11 +715,6 @@ mod tests {
         let client = ta.api_client();
 
         client
-            .schema(&[Statement::Simple(corro_tests::TEST_SCHEMA.into())])
-            .await
-            .unwrap();
-
-        client
             .execute(
                 &[
                     Statement::WithParams(

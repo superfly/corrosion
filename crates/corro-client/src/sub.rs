@@ -1,3 +1,18 @@
+//! Streaming response types for the Corrosion HTTP API.
+//!
+//! Each long-running endpoint exposes a dedicated [`Stream`] implementation:
+//!
+//! * [`QueryStream`] — one-shot query results
+//!   (`POST /v1/queries`).
+//! * [`SubscriptionStream`] — resumable live subscription
+//!   (`POST /v1/subscriptions`); transparently reconnects with the last
+//!   observed [`ChangeId`] on transient I/O errors.
+//! * [`UpdatesStream`] — table-level update feed (`POST /v1/updates/{table}`).
+//!
+//! All three decode JSON-lines responses through the [`LinesBytesCodec`]
+//! defined here, which is a port of `tokio-util`'s `LinesCodec` adapted to
+//! emit [`bytes::BytesMut`] frames.
+
 use std::{
     error::Error,
     io,
@@ -21,6 +36,9 @@ use tracing::error;
 use uuid::Uuid;
 
 pin_project! {
+    /// Adapter that exposes a [`reqwest::Body`] as a [`Stream`] of
+    /// [`io::Result<Bytes>`], mapping framing errors into [`io::Error`] so
+    /// the underlying [`StreamReader`] can consume them.
     pub struct IoBodyStream {
         #[pin]
         body: reqwest::Body
@@ -59,6 +77,16 @@ type FramedBody = FramedRead<IoBodyStreamReader, LinesBytesCodec>;
 type ResponseFuture =
     Box<dyn Future<Output = Result<reqwest::Response, reqwest::Error>> + Unpin + Send + Sync>;
 
+/// Live subscription stream returned by
+/// [`crate::CorrosionApiClient::subscribe_typed`].
+///
+/// Yields [`TypedQueryEvent<T>`] frames produced by the agent. Once the
+/// initial result set is fully consumed (after the first
+/// [`TypedQueryEvent::EndOfQuery`]) the stream automatically reconnects
+/// when the underlying HTTP body terminates, using the last observed
+/// [`ChangeId`] to resume without gaps. Reconnects use a fixed-size
+/// linear backoff and give up after 10 consecutive failures with
+/// [`SubscriptionError::MaxRetryAttempts`].
 pub struct SubscriptionStream<T> {
     id: Uuid,
     hash: Option<String>,
@@ -73,20 +101,30 @@ pub struct SubscriptionStream<T> {
     _deser: std::marker::PhantomData<T>,
 }
 
+/// Errors yielded by [`SubscriptionStream`].
 #[derive(Debug, thiserror::Error)]
 pub enum SubscriptionError {
+    /// Underlying I/O error on the HTTP body.
     #[error(transparent)]
     Io(#[from] io::Error),
+    /// Generic HTTP error encountered while reconnecting.
     #[error(transparent)]
     Http(#[from] http::Error),
+    /// A frame could not be decoded as a [`TypedQueryEvent`].
     #[error(transparent)]
     Deserialize(#[from] serde_json::Error),
+    /// The agent skipped a [`ChangeId`], indicating the local view is no
+    /// longer consistent with the server.
     #[error("missed a change (expected: {expected}, got: {got}), inconsistent state")]
     MissedChange { expected: ChangeId, got: ChangeId },
+    /// A single JSON line exceeded the codec's maximum length.
     #[error("max line length exceeded")]
     MaxLineLengthExceeded,
+    /// The connection terminated before the initial query produced an
+    /// [`TypedQueryEvent::EndOfQuery`].
     #[error("initial query never finished")]
     UnfinishedQuery,
+    /// Error when maximum number of consecutive reconnect is exceeded.
     #[error("max retry attempts exceeded")]
     MaxRetryAttempts,
 }
@@ -121,14 +159,22 @@ where
         }
     }
 
+    /// Server-assigned subscription identifier.
+    ///
+    /// Persist this id (along with the [`ChangeId`] from
+    /// [`TypedQueryEvent::Change`]) to resume the subscription later via
+    /// [`crate::CorrosionApiClient::subscription_typed`].
     pub fn id(&self) -> Uuid {
         self.id
     }
 
+    /// Hash advertised by the server for this subscription's query.
+    ///
     pub fn hash(&self) -> Option<&str> {
         self.hash.as_deref()
     }
 
+    /// API address the subscription was opened against.
     pub fn api_addr(&self) -> SocketAddr {
         self.api_addr
     }
@@ -309,18 +355,26 @@ where
     }
 }
 
+/// Stream returned by [`crate::CorrosionApiClient::updates_typed`].
+///
+/// Yields a [`TypedNotifyEvent`] for every row inserted, updated or deleted
+/// in the watched table after the update was registered.
 pub struct UpdatesStream<T> {
     id: Uuid,
     stream: FramedBody,
     _deser: std::marker::PhantomData<T>,
 }
 
+/// Errors yielded by [`UpdatesStream`].
 #[derive(Debug, thiserror::Error)]
 pub enum UpdatesError {
+    /// Underlying I/O error on the HTTP body.
     #[error(transparent)]
     Io(#[from] io::Error),
+    /// A frame could not be decoded as a [`TypedNotifyEvent`].
     #[error(transparent)]
     Deserialize(#[from] serde_json::Error),
+    /// A single JSON line exceeded the codec's maximum length.
     #[error("max line length exceeded")]
     MaxLineLengthExceeded,
 }
@@ -329,6 +383,7 @@ impl<T> UpdatesStream<T>
 where
     T: DeserializeOwned + Unpin,
 {
+    /// Build an `UpdatesStream` from a freshly opened HTTP response.
     pub fn new(id: Uuid, body: reqwest::Body) -> Self {
         Self {
             id,
@@ -340,6 +395,7 @@ where
         }
     }
 
+    /// Server-assigned subscription identifier for this stream.
     pub fn id(&self) -> Uuid {
         self.id
     }
@@ -369,17 +425,24 @@ where
     }
 }
 
+/// Stream returned by [`crate::CorrosionApiClient::query_typed`] for a single query.
+///
+/// Yields a [`TypedQueryEvent`] with columns, each row of the result set, and a final [`TypedQueryEvent::EndOfQuery`].
 pub struct QueryStream<T> {
     stream: FramedBody,
     _deser: std::marker::PhantomData<T>,
 }
 
+/// Errors yielded by [`QueryStream`].
 #[derive(Debug, thiserror::Error)]
 pub enum QueryError {
+    /// Underlying I/O error on the HTTP body.
     #[error(transparent)]
     Io(#[from] io::Error),
+    /// A frame could not be decoded as a [`TypedQueryEvent`].
     #[error(transparent)]
     Deserialize(#[from] serde_json::Error),
+    /// A single JSON line exceeded the codec's maximum length.
     #[error("max line length exceeded")]
     MaxLineLengthExceeded,
 }
@@ -388,6 +451,7 @@ impl<T> QueryStream<T>
 where
     T: DeserializeOwned + Unpin,
 {
+    /// Build a `QueryStream` from a freshly opened HTTP response.
     pub fn new(body: reqwest::Body) -> Self {
         Self {
             stream: FramedRead::new(
@@ -422,6 +486,8 @@ where
     }
 }
 
+/// `LinesBytesCodec` used to to split up bytes into lines.
+/// It uses the `\n` character as the line delimiter.
 pub struct LinesBytesCodec {
     // Stored index of the next index to examine for a `\n` character.
     // This is used to optimize searching.
@@ -449,7 +515,6 @@ impl Default for LinesBytesCodec {
     /// of a buffered line. See the documentation for [`new_with_max_length`]
     /// for information on why this could be a potential security risk.
     ///
-    /// [`new_with_max_length`]: crate::codec::LinesBytesCodec::default_with_max_length()
     fn default() -> Self {
         LinesBytesCodec {
             next_index: 0,

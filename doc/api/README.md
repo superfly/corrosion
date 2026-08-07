@@ -9,3 +9,4 @@ Endpoints:
 - [POST /v1/transactions](transactions.md) for writes
 - [POST /v1/queries](queries.md) for reads
 - [POST /v1/subscriptions](subscriptions.md) to receive streaming updates for a desired query
+- [POST /v1/updates/{table}](updates.md) to receive primary-key update/delete events for a particular table

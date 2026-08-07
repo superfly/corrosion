@@ -4,12 +4,12 @@ use std::{
     net::SocketAddr,
     ops::{Deref, DerefMut, RangeInclusive},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, OnceLock},
     time::{Duration, Instant},
 };
 
 use antithesis_sdk::assert_unreachable;
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use camino::Utf8PathBuf;
 use metrics::{gauge, histogram};
 use parking_lot::RwLock;
@@ -33,8 +33,9 @@ use tripwire::Tripwire;
 use crate::{
     actor::{Actor, ActorId, ClusterId, MemberId},
     base::{CrsqlDbVersion, CrsqlDbVersionRange, CrsqlSeq},
-    broadcast::{BroadcastInput, ChangeSource, ChangeV1, FocaInput, Timestamp},
+    broadcast::{BroadcastInput, BroadcastV1, ChangeSource, ChangeV1, FocaInput, Timestamp},
     channel::{bounded, CorroSender},
+    compress::ZstdDicts,
     config::Config,
     metrics_tracker::MetricsTracker,
     pubsub::SubsManager,
@@ -69,8 +70,11 @@ pub struct AgentConfig {
     pub tx_bcast: CorroSender<BroadcastInput>,
     pub tx_apply: CorroSender<(ActorId, CrsqlDbVersion)>,
     pub tx_clear_buf: CorroSender<(ActorId, CrsqlDbVersionRange)>,
-    pub tx_changes: CorroSender<(ChangeV1, ChangeSource)>,
+    pub tx_changes: CorroSender<(ChangeV1, ChangeSource, Option<BroadcastV1>)>,
     pub tx_foca: CorroSender<FocaInput>,
+
+    /// Trained zstd dictionary for broadcast compression, if configured.
+    pub change_dict: Option<Arc<ZstdDicts>>,
 
     pub write_sema: Arc<Semaphore>,
 
@@ -84,6 +88,9 @@ pub struct AgentConfig {
     pub metrics_tracker: MetricsTracker,
 
     pub tripwire: Tripwire,
+
+    pub fatal_issue: Arc<OnceLock<String>>,
+    pub shutdown_token: CancellationToken,
 }
 
 pub struct AgentInner {
@@ -101,14 +108,17 @@ pub struct AgentInner {
     tx_bcast: CorroSender<BroadcastInput>,
     tx_apply: CorroSender<(ActorId, CrsqlDbVersion)>,
     tx_clear_buf: CorroSender<(ActorId, CrsqlDbVersionRange)>,
-    tx_changes: CorroSender<(ChangeV1, ChangeSource)>,
+    tx_changes: CorroSender<(ChangeV1, ChangeSource, Option<BroadcastV1>)>,
     tx_foca: CorroSender<FocaInput>,
+    change_dict: Arc<ArcSwapOption<ZstdDicts>>,
     write_sema: Arc<Semaphore>,
     schema: RwLock<Schema>,
     cluster_id: ArcSwap<ClusterId>,
     limits: Limits,
     subs_manager: SubsManager,
     updates_manager: UpdatesManager,
+    fatal_issue: Arc<OnceLock<String>>,
+    shutdown_token: CancellationToken,
 }
 
 #[derive(Debug, Clone)]
@@ -135,6 +145,7 @@ impl Agent {
             tx_clear_buf: config.tx_clear_buf,
             tx_changes: config.tx_changes,
             tx_foca: config.tx_foca,
+            change_dict: Arc::new(ArcSwapOption::from(config.change_dict)),
             write_sema: config.write_sema,
             schema: config.schema,
             cluster_id: ArcSwap::from_pointee(config.cluster_id),
@@ -143,6 +154,8 @@ impl Agent {
             },
             subs_manager: config.subs_manager,
             updates_manager: config.updates_manager,
+            fatal_issue: config.fatal_issue,
+            shutdown_token: config.shutdown_token,
         }))
     }
 
@@ -193,7 +206,7 @@ impl Agent {
         &self.0.tx_apply
     }
 
-    pub fn tx_changes(&self) -> &CorroSender<(ChangeV1, ChangeSource)> {
+    pub fn tx_changes(&self) -> &CorroSender<(ChangeV1, ChangeSource, Option<BroadcastV1>)> {
         &self.0.tx_changes
     }
 
@@ -203,6 +216,18 @@ impl Agent {
 
     pub fn tx_foca(&self) -> &CorroSender<FocaInput> {
         &self.0.tx_foca
+    }
+
+    pub fn change_dict(&self) -> Option<Arc<ZstdDicts>> {
+        self.0.change_dict.load_full()
+    }
+
+    pub fn change_dict_slot(&self) -> Arc<ArcSwapOption<ZstdDicts>> {
+        self.0.change_dict.clone()
+    }
+
+    pub fn set_change_dict(&self, dicts: Option<Arc<ZstdDicts>>) {
+        self.0.change_dict.store(dicts);
     }
 
     pub fn write_sema(&self) -> &Arc<Semaphore> {
@@ -261,6 +286,19 @@ impl Agent {
         &self.0.updates_manager
     }
 
+    pub fn fatal_issue(&self) -> Option<&str> {
+        self.0.fatal_issue.get().map(String::as_str)
+    }
+
+    pub fn shutdown_token(&self) -> &CancellationToken {
+        &self.0.shutdown_token
+    }
+
+    pub fn mark_unhealthy(&self, reason: &str) {
+        let _ = self.0.fatal_issue.set(reason.to_owned());
+        self.0.shutdown_token.cancel();
+    }
+
     pub fn set_cluster_id(&self, cluster_id: ClusterId) {
         self.0.cluster_id.store(Arc::new(cluster_id));
     }
@@ -283,6 +321,7 @@ impl Agent {
             .map_err(|e| format!("could not convert ActorId to uhlc ID: {e}"))?;
         self.clock()
             .update_with_timestamp(&uhlc::Timestamp::new(ts.0, id))
+            .map_err(|e| e.to_string())
     }
 }
 
@@ -493,6 +532,38 @@ pub enum ChangeError {
     },
     #[error("non-contiguous empties range delete")]
     NonContiguousDelete,
+}
+
+impl ChangeError {
+    pub fn fatal_db_issue_for_code(code: rusqlite::ErrorCode) -> Option<&'static str> {
+        match code {
+            rusqlite::ErrorCode::DiskFull => Some("disk full"),
+            rusqlite::ErrorCode::SystemIoFailure => Some("I/O error on database"),
+            rusqlite::ErrorCode::DatabaseCorrupt => Some("database is corrupt"),
+            rusqlite::ErrorCode::ReadOnly => Some("database filesystem is read-only"),
+            _ => None,
+        }
+    }
+
+    pub fn sqlite_error_code(&self) -> Option<rusqlite::ErrorCode> {
+        match self {
+            Self::Rusqlite { source, .. } => source.sqlite_error_code(),
+            _ => None,
+        }
+    }
+
+    pub fn fatal_db_issue(&self) -> Option<&'static str> {
+        self.sqlite_error_code()
+            .and_then(Self::fatal_db_issue_for_code)
+    }
+
+    pub fn is_oom_error(&self) -> bool {
+        self.sqlite_error_code() == Some(rusqlite::ErrorCode::OutOfMemory)
+    }
+
+    pub fn is_interrupt_error(&self) -> bool {
+        self.sqlite_error_code() == Some(rusqlite::ErrorCode::OperationInterrupted)
+    }
 }
 
 #[derive(Debug, thiserror::Error)]

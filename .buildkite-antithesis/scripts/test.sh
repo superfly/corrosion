@@ -22,9 +22,10 @@ response=$(curl --fail -u "flyio:${ANTITHESIS_PASSWORD}" -X POST https://flyio.a
 
 status=$(echo $response | jq -r '.statusCode')
 
-if [ "$status" != "200" ]; then
+if [ "$status" -ge 200 ] && [ "$status" -lt 300 ]; then
+    echo "Launched Antithesis test $response"
+else
     echo "Failed to launch Antithesis test $response"
     exit 1
 fi
 
-echo "Launched Antithesis test $response"
