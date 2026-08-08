@@ -479,7 +479,9 @@ pub async fn apply_fully_buffered_changes_loop(
     let throttle_min = Duration::from_secs(5 * 60);
     let throttle_max = Duration::from_secs(60 * 60);
 
+    // A busy apply queue must not starve retries, but missed ticks should not burst ahead of it.
     let mut retry_interval = tokio::time::interval(Duration::from_secs(5 * 60));
+    retry_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     // map to throttle retries for failed versions that took too long to apply
     let mut limit_retries = ThrottleMap::new(throttle_min, throttle_max);
@@ -487,22 +489,21 @@ pub async fn apply_fully_buffered_changes_loop(
     retry_interval.tick().await;
 
     loop {
-        let partial_version = tokio::select! {
-            biased;
-            _ = &mut tripwire => break,
-            maybe_version = rx_apply.recv() => match maybe_version {
-                Some(version) => version,
-                None => break,
-            },
+        let Some(wakeup) =
+            next_apply_fully_buffered_wakeup(&mut rx_apply, &mut retry_interval, &mut tripwire)
+                .await
+        else {
+            break;
+        };
 
-            _ = retry_interval.tick() => {
-                match find_fully_buffered_partial(&agent).await {
-                    Ok(Some(pair)) => pair,
-                    Ok(None) => continue,
-                    Err(e) => {
-                        warn!("could not query for fully buffered partials: {e}");
-                        continue;
-                    },
+        let partial_version = match wakeup {
+            ApplyFullyBufferedWakeup::Version(version) => version,
+            ApplyFullyBufferedWakeup::Retry => match find_fully_buffered_partial(&agent).await {
+                Ok(Some(pair)) => pair,
+                Ok(None) => continue,
+                Err(e) => {
+                    warn!("could not query for fully buffered partials: {e}");
+                    continue;
                 }
             },
         };
@@ -558,6 +559,25 @@ pub async fn apply_fully_buffered_changes_loop(
     }
 
     info!("fully_buffered_changes_loop ended");
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum ApplyFullyBufferedWakeup {
+    Retry,
+    Version((ActorId, CrsqlDbVersion)),
+}
+
+async fn next_apply_fully_buffered_wakeup(
+    rx_apply: &mut CorroReceiver<(ActorId, CrsqlDbVersion)>,
+    retry_interval: &mut tokio::time::Interval,
+    tripwire: &mut Tripwire,
+) -> Option<ApplyFullyBufferedWakeup> {
+    tokio::select! {
+        biased;
+        _ = tripwire => None,
+        _ = retry_interval.tick() => Some(ApplyFullyBufferedWakeup::Retry),
+        maybe_version = rx_apply.recv() => maybe_version.map(ApplyFullyBufferedWakeup::Version),
+    }
 }
 
 async fn find_fully_buffered_partial(
@@ -1511,4 +1531,34 @@ fn is_pow_10(i: u64) -> bool {
         i,
         1 | 10 | 100 | 1000 | 10000 | 1000000 | 10000000 | 100000000
     )
+}
+
+#[cfg(test)]
+mod apply_fully_buffered_changes_tests {
+    use super::*;
+    use corro_types::channel::bounded;
+
+    #[tokio::test]
+    async fn due_retry_preempts_ready_new_version() {
+        let (tx_apply, mut rx_apply) = bounded(1, "apply_fully_buffered_changes_test");
+        let version = (ActorId::default(), CrsqlDbVersion(1));
+        tx_apply.send(version).await.unwrap();
+
+        let mut retry_interval = tokio::time::interval(Duration::from_secs(60));
+        retry_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        retry_interval.tick().await;
+        retry_interval.reset_at(tokio::time::Instant::now() - Duration::from_secs(1));
+        let (mut tripwire, _tripwire_worker, _tripwire_tx) = Tripwire::new_simple();
+
+        assert_eq!(
+            next_apply_fully_buffered_wakeup(&mut rx_apply, &mut retry_interval, &mut tripwire,)
+                .await,
+            Some(ApplyFullyBufferedWakeup::Retry),
+        );
+        assert_eq!(
+            next_apply_fully_buffered_wakeup(&mut rx_apply, &mut retry_interval, &mut tripwire,)
+                .await,
+            Some(ApplyFullyBufferedWakeup::Version(version)),
+        );
+    }
 }
