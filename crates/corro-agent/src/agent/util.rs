@@ -483,7 +483,7 @@ pub async fn apply_fully_buffered_changes_loop(
     let mut retry_interval = tokio::time::interval(Duration::from_secs(5 * 60));
 
     // map to throttle retries for failed versions that took too long to apply
-    let mut limit_retries = ThrottleMap::new(throttle_min, throttle_max);
+    let mut limit_retries = ThrottleMap::new(throttle_min, Duration::from_secs(throttle_max as u64));
 
     retry_interval.tick().await;
     if !scan_enabled {
