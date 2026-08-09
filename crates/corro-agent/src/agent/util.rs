@@ -486,7 +486,7 @@ pub async fn apply_fully_buffered_changes_loop(
     let mut limit_retries = ThrottleMap::new(throttle_min, throttle_max);
 
     retry_interval.tick().await;
-    if scan_enabled {
+    if !scan_enabled {
         info!("periodic fully-buffered partial scan disabled (partial_retry_backoff = 0)");
     }
 
