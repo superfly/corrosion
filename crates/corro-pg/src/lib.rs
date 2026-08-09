@@ -80,6 +80,7 @@ use crate::{
     sql_state::SqlState,
     utils::CountedTcpStream,
     vtab::{
+        information_schema_tables::InformationSchemaTablesTable,
         pg_class::PgClassTable,
         pg_database::{PgDatabase, PgDatabaseTable},
         pg_namespace::PgNamespaceTable,
@@ -869,9 +870,21 @@ pub async fn start(
                             int_handle.interrupt();
                         });
 
-                        conn.execute_batch("ATTACH ':memory:' AS pg_catalog;")?;
+                        conn.execute_batch(
+                            "ATTACH ':memory:' AS pg_catalog;
+                             ATTACH ':memory:' AS information_schema;",
+                        )?;
 
                         let dbs = Arc::new(vec![PgDatabase::new("state".into())]);
+                        let table_names = Arc::new(
+                            agent
+                                .schema()
+                                .read()
+                                .tables
+                                .keys()
+                                .cloned()
+                                .collect::<Vec<_>>(),
+                        );
 
                         conn.create_module(
                             "pg_database",
@@ -897,6 +910,11 @@ pub async fn start(
                             "pg_class",
                             eponymous_only_module::<PgClassTable>(),
                             None,
+                        )?;
+                        conn.create_module(
+                            "tables",
+                            eponymous_only_module::<InformationSchemaTablesTable>(),
+                            Some(table_names),
                         )?;
 
                         conn.create_scalar_function(

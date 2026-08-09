@@ -75,6 +75,75 @@ async fn setup_pg_test_server(
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn test_information_schema_tables() {
+    let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
+
+    let (_ta, server) = setup_pg_test_server(tripwire, None).await;
+    let conn_str = format!(
+        "host={} port={} user=testuser",
+        server.local_addr.ip(),
+        server.local_addr.port()
+    );
+    let (client, connection) = tokio_postgres::connect(&conn_str, NoTls).await.unwrap();
+    tokio::spawn(connection);
+
+    let rows = client
+        .query(
+            "SELECT table_catalog, table_schema, table_name, table_type, \
+             self_referencing_column_name, reference_generation, \
+             user_defined_type_catalog, user_defined_type_schema, user_defined_type_name, \
+             is_insertable_into, is_typed, commit_action \
+             FROM information_schema.tables \
+             WHERE table_schema = 'public' AND table_type = 'BASE TABLE' \
+             ORDER BY table_name",
+            &[],
+        )
+        .await
+        .unwrap();
+
+    let table_names = rows
+        .iter()
+        .map(|row| row.get::<_, String>("table_name"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        table_names,
+        [
+            "kitchensink",
+            "tests",
+            "tests2",
+            "tests3",
+            "testsblob",
+            "testsbool",
+            "wide",
+        ]
+    );
+
+    for row in rows {
+        assert_eq!(row.get::<_, &str>("table_catalog"), "state");
+        assert_eq!(row.get::<_, &str>("table_schema"), "public");
+        assert_eq!(row.get::<_, &str>("table_type"), "BASE TABLE");
+        assert_eq!(row.get::<_, &str>("is_insertable_into"), "YES");
+        assert_eq!(row.get::<_, &str>("is_typed"), "NO");
+        assert_eq!(
+            row.get::<_, Option<&str>>("self_referencing_column_name"),
+            None
+        );
+        assert_eq!(row.get::<_, Option<&str>>("reference_generation"), None);
+        assert_eq!(
+            row.get::<_, Option<&str>>("user_defined_type_catalog"),
+            None
+        );
+        assert_eq!(row.get::<_, Option<&str>>("user_defined_type_schema"), None);
+        assert_eq!(row.get::<_, Option<&str>>("user_defined_type_name"), None);
+        assert_eq!(row.get::<_, Option<&str>>("commit_action"), None);
+    }
+
+    tripwire_tx.send(()).await.ok();
+    tripwire_worker.await;
+    wait_for_all_pending_handles().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_pg() {
     let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
 
