@@ -1156,7 +1156,13 @@ pub async fn process_multiple_changes(
 
         for (_, changeset, _, _) in changesets.iter() {
             if let Some(ts) = changeset.ts() {
-                let dur = (agent.clock().new_timestamp().get_time() - ts.0).to_duration();
+                let now = agent.clock().new_timestamp();
+                let our_time = now.get_time();
+                let dur = our_time
+                    .0
+                    .checked_sub(ts.0 .0)
+                    .map(|diff| uhlc::NTP64(diff).to_duration())
+                    .unwrap_or_default();
                 histogram!("corro.agent.changes.commit.lag.seconds").record(dur);
                 agent.metrics_tracker().observe_lag(dur.as_secs_f64());
             }
