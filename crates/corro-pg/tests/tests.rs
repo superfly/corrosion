@@ -89,12 +89,28 @@ async fn test_information_schema() {
 
     let rows = client
         .query(
+            "SELECT nspname FROM pg_catalog.pg_namespace \
+             WHERE nspname IN ('main', 'public') \
+             ORDER BY nspname",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.iter()
+            .map(|row| row.get::<_, &str>("nspname"))
+            .collect::<Vec<_>>(),
+        ["main"]
+    );
+
+    let rows = client
+        .query(
             "SELECT table_catalog, table_schema, table_name, table_type, \
              self_referencing_column_name, reference_generation, \
              user_defined_type_catalog, user_defined_type_schema, user_defined_type_name, \
              is_insertable_into, is_typed, commit_action \
              FROM information_schema.tables \
-             WHERE table_schema = 'public' AND table_type = 'BASE TABLE' \
+             WHERE table_schema = 'main' AND table_type = 'BASE TABLE' \
              ORDER BY table_name",
             &[],
         )
@@ -121,7 +137,7 @@ async fn test_information_schema() {
 
     for row in rows {
         assert_eq!(row.get::<_, &str>("table_catalog"), "state");
-        assert_eq!(row.get::<_, &str>("table_schema"), "public");
+        assert_eq!(row.get::<_, &str>("table_schema"), "main");
         assert_eq!(row.get::<_, &str>("table_type"), "BASE TABLE");
         assert_eq!(row.get::<_, &str>("is_insertable_into"), "YES");
         assert_eq!(row.get::<_, &str>("is_typed"), "NO");
@@ -142,7 +158,7 @@ async fn test_information_schema() {
     let rows = client
         .query(
             "SELECT * FROM information_schema.columns \
-             WHERE table_schema = 'public' AND table_name = 'kitchensink' \
+             WHERE table_schema = 'main' AND table_name = 'kitchensink' \
              ORDER BY ordinal_position",
             &[],
         )
@@ -153,7 +169,7 @@ async fn test_information_schema() {
 
     let id = &rows[0];
     assert_eq!(id.get::<_, &str>("table_catalog"), "state");
-    assert_eq!(id.get::<_, &str>("table_schema"), "public");
+    assert_eq!(id.get::<_, &str>("table_schema"), "main");
     assert_eq!(id.get::<_, &str>("table_name"), "kitchensink");
     assert_eq!(id.get::<_, &str>("column_name"), "id");
     assert_eq!(id.get::<_, i64>("ordinal_position"), 1);
@@ -211,7 +227,7 @@ async fn test_information_schema() {
     let rows = client
         .query(
             "SELECT * FROM information_schema.table_constraints \
-             WHERE table_schema = 'public' \
+             WHERE table_schema = 'main' \
              AND table_name IN ('kitchensink', 'wide') \
              ORDER BY table_name",
             &[],
@@ -223,13 +239,13 @@ async fn test_information_schema() {
 
     for (row, table_name) in rows.iter().zip(["kitchensink", "wide"]) {
         assert_eq!(row.get::<_, &str>("constraint_catalog"), "state");
-        assert_eq!(row.get::<_, &str>("constraint_schema"), "public");
+        assert_eq!(row.get::<_, &str>("constraint_schema"), "main");
         assert_eq!(
             row.get::<_, &str>("constraint_name"),
             format!("{table_name}_pkey")
         );
         assert_eq!(row.get::<_, &str>("table_catalog"), "state");
-        assert_eq!(row.get::<_, &str>("table_schema"), "public");
+        assert_eq!(row.get::<_, &str>("table_schema"), "main");
         assert_eq!(row.get::<_, &str>("table_name"), table_name);
         assert_eq!(row.get::<_, &str>("constraint_type"), "PRIMARY KEY");
         assert_eq!(row.get::<_, &str>("is_deferrable"), "NO");

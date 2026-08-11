@@ -7,7 +7,7 @@ use rusqlite::vtab::{
 const PG_NAMESPACES: &[(i64, &str, i64, &str)] = &[
     (99, "pg_toast", 10, ""),
     (11, "pg_catalog", 10, ""),
-    (2200, "public", 10, ""),
+    (2200, "main", 10, ""),
     (13427, "information_schema", 10, ""),
 ];
 

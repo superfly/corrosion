@@ -323,7 +323,7 @@ unsafe impl VTabCursor for InformationSchemaColumnsCursor<'_> {
         if let Some(column) = self.columns.get(self.row_id as usize) {
             match col {
                 0 => ctx.set_result(&"state"),
-                1 => ctx.set_result(&"public"),
+                1 => ctx.set_result(&"main"),
                 2 => ctx.set_result(&column.table_name),
                 3 => ctx.set_result(&column.column_name),
                 4 => ctx.set_result(&column.ordinal_position),
