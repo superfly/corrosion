@@ -182,6 +182,10 @@ pub enum SchemaError {
     NothingParsed,
     #[error("unsupported command: {0}")]
     UnsupportedCmd(Cmd),
+    #[error("DROP INDEX conflicts with a CREATE INDEX in the same schema for '{name}' (would cause create/destroy loop)")]
+    DropIndexWithCreate { name: String },
+    #[error("DROP INDEX without IF EXISTS is not supported; use 'DROP INDEX IF EXISTS {name}'")]
+    DropIndexWithoutIfExists { name: String },
     #[error("missing table for index (table: '{tbl_name}', index: '{name}')")]
     IndexWithoutTable { tbl_name: String, name: String },
     #[error("temporary tables are not supported: {0}")]
@@ -639,7 +643,7 @@ pub fn apply_schema(
 
         for idx_name in dropped_indexes {
             info!("dropping index '{idx_name}'");
-            tx.execute_batch(&format!("DROP INDEX {idx_name}"))?;
+            tx.execute_batch(&format!("DROP INDEX IF EXISTS {idx_name}"))?;
         }
 
         let changed_indexes_iter = table.indexes.iter().filter_map(|(idx_name, index)| {
@@ -674,6 +678,7 @@ pub fn apply_schema(
 pub fn parse_sql_to_schema(schema: &mut Schema, sql: &str) -> Result<(), Box<SchemaError>> {
     trace!("parsing {sql}");
     let mut parser = sqlite3_parser::lexer::sql::Parser::new(sql.as_bytes());
+    let mut dropped_indexes: Vec<String> = Vec::new();
 
     loop {
         match parser.next() {
@@ -735,9 +740,40 @@ pub fn parse_sql_to_schema(schema: &mut Schema, sql: &str) -> Result<(), Box<Sch
                         }));
                     }
                 }
+                Stmt::DropIndex {
+                    if_exists: false,
+                    idx_name,
+                } => {
+                    let idx_name = unquote(idx_name.name.0.as_str())
+                        .unwrap_or_else(|_| idx_name.name.0.clone());
+                    return Err(Box::new(SchemaError::DropIndexWithoutIfExists {
+                        name: idx_name,
+                    }));
+                }
+                Stmt::DropIndex {
+                    if_exists: true,
+                    idx_name,
+                } => {
+                    let idx_name = unquote(idx_name.name.0.as_str())
+                        .unwrap_or_else(|_| idx_name.name.0.clone());
+                    dropped_indexes.push(idx_name);
+                }
                 _ => return Err(Box::new(SchemaError::UnsupportedCmd(cmd.clone()))),
             },
             Ok(Some(cmd)) => return Err(Box::new(SchemaError::UnsupportedCmd(cmd))),
+        }
+    }
+
+    // After full parsing, check that no DROP INDEX targets an index
+    // that was created (CREATE INDEX) in the same batch — that would
+    // cause a create/destroy loop on every schema reload.
+    for idx_name in &dropped_indexes {
+        for table in schema.tables.values() {
+            if table.indexes.contains_key(idx_name) {
+                return Err(Box::new(SchemaError::DropIndexWithCreate {
+                    name: idx_name.clone(),
+                }));
+            }
         }
     }
 
@@ -901,5 +937,65 @@ fn extract_expr_columns(expr: &Expr, cols: &mut Vec<String>) {
             cols.push(unquote(&colname.0).ok().unwrap_or(colname.0.clone()));
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const BASE_TABLE_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS test_tbl (
+    id INTEGER NOT NULL PRIMARY KEY,
+    name TEXT NOT NULL DEFAULT ''
+) WITHOUT ROWID;
+"#;
+
+    #[test]
+    fn test_drop_index_if_exists_no_create() {
+        let sql = format!("{BASE_TABLE_SQL}\nDROP INDEX IF EXISTS test_idx_nonexistent;");
+        let schema = parse_sql(&sql).expect("should parse ok");
+        assert!(schema.tables.get("test_tbl").is_some());
+        assert!(schema.tables["test_tbl"].indexes.is_empty());
+    }
+
+    #[test]
+    fn test_drop_index_if_exists_after_create_rejected() {
+        let sql = format!(
+            "{BASE_TABLE_SQL}\nCREATE INDEX IF NOT EXISTS test_idx ON test_tbl (name);\nDROP INDEX IF EXISTS test_idx;"
+        );
+        let err = parse_sql(&sql).expect_err("should reject");
+        match err.as_ref() {
+            SchemaError::DropIndexWithCreate { name } => {
+                assert_eq!(name, "test_idx");
+            }
+            other => panic!("expected DropIndexWithCreate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_drop_index_if_exists_before_create_rejected() {
+        let sql = format!(
+            "{BASE_TABLE_SQL}\nDROP INDEX IF EXISTS test_idx;\nCREATE INDEX IF NOT EXISTS test_idx ON test_tbl (name);"
+        );
+        let err = parse_sql(&sql).expect_err("should reject");
+        match err.as_ref() {
+            SchemaError::DropIndexWithCreate { name } => {
+                assert_eq!(name, "test_idx");
+            }
+            other => panic!("expected DropIndexWithCreate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_drop_index_without_if_exists_rejected() {
+        let sql = format!("{BASE_TABLE_SQL}\nDROP INDEX test_idx;");
+        let err = parse_sql(&sql).expect_err("should reject");
+        match err.as_ref() {
+            SchemaError::DropIndexWithoutIfExists { name } => {
+                assert_eq!(name, "test_idx");
+            }
+            other => panic!("expected DropIndexWithoutIfExists, got {other:?}"),
+        }
     }
 }
