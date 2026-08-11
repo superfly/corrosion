@@ -4,6 +4,14 @@ use rusqlite::vtab::{
     sqlite3_vtab, sqlite3_vtab_cursor, Filters, IndexInfo, VTab, VTabConnection, VTabCursor,
 };
 
+pub fn load_information_schema_table_names(
+    conn: &rusqlite::Connection,
+) -> rusqlite::Result<Vec<String>> {
+    conn.prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")?
+        .query_map([], |row| row.get(0))?
+        .collect()
+}
+
 #[repr(C)]
 pub struct InformationSchemaTablesTable {
     /// Base class. Must be first

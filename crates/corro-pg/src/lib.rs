@@ -80,7 +80,15 @@ use crate::{
     sql_state::SqlState,
     utils::CountedTcpStream,
     vtab::{
-        information_schema_tables::InformationSchemaTablesTable,
+        information_schema_columns::{
+            load_information_schema_columns, InformationSchemaColumnsTable,
+        },
+        information_schema_table_constraints::{
+            load_information_schema_table_constraints, InformationSchemaTableConstraintsTable,
+        },
+        information_schema_tables::{
+            load_information_schema_table_names, InformationSchemaTablesTable,
+        },
         pg_class::PgClassTable,
         pg_database::{PgDatabase, PgDatabaseTable},
         pg_namespace::PgNamespaceTable,
@@ -876,15 +884,12 @@ pub async fn start(
                         )?;
 
                         let dbs = Arc::new(vec![PgDatabase::new("state".into())]);
-                        let table_names = Arc::new(
-                            agent
-                                .schema()
-                                .read()
-                                .tables
-                                .keys()
-                                .cloned()
-                                .collect::<Vec<_>>(),
+                        let table_names = load_information_schema_table_names(&conn)?;
+                        let columns = Arc::new(load_information_schema_columns(&conn, &table_names)?);
+                        let table_constraints = Arc::new(
+                            load_information_schema_table_constraints(columns.as_slice()),
                         );
+                        let table_names = Arc::new(table_names);
 
                         conn.create_module(
                             "pg_database",
@@ -915,6 +920,16 @@ pub async fn start(
                             "tables",
                             eponymous_only_module::<InformationSchemaTablesTable>(),
                             Some(table_names),
+                        )?;
+                        conn.create_module(
+                            "columns",
+                            eponymous_only_module::<InformationSchemaColumnsTable>(),
+                            Some(columns),
+                        )?;
+                        conn.create_module(
+                            "table_constraints",
+                            eponymous_only_module::<InformationSchemaTableConstraintsTable>(),
+                            Some(table_constraints),
                         )?;
 
                         conn.create_scalar_function(
