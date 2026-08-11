@@ -1085,6 +1085,7 @@ pub async fn start(
                                                             (SqliteType::Null, Some("INT[]")) => Type::INT8_ARRAY,
                                                             (SqliteType::Null, Some("REAL[]")) => Type::FLOAT8_ARRAY,
                                                             (SqliteType::Null, Some("BLOB[]")) => Type::BYTEA_ARRAY,
+                                                            (SqliteType::Null, Some("BOOL[]")) => Type::BOOL_ARRAY,
                                                             (SqliteType::Null, _) => unreachable!(),
                                                             (SqliteType::Text, src) => match src {
                                                                 Some("JSON") => Type::JSON,
@@ -1659,6 +1660,18 @@ pub async fn start(
                                                             }
                                                             t @ &Type::FLOAT8_ARRAY => {
                                                                 let value: Vec<f64> =
+                                                                    from_array_type_and_format(
+                                                                        t,
+                                                                        b,
+                                                                        format_code,
+                                                                    )?;
+                                                                trace!("binding idx {idx} w/ array value: {value:?}");
+                                                                prepped.raw_bind_parameter(
+                                                                    idx, Rc::new(value.into_iter().map(|v| v.into()).collect::<Vec<rusqlite::types::Value>>()),
+                                                                )?;
+                                                            }
+                                                            t @ &Type::BOOL_ARRAY => {
+                                                                let value: Vec<bool> =
                                                                     from_array_type_and_format(
                                                                         t,
                                                                         b,
@@ -2483,6 +2496,16 @@ impl<'conn> Session<'conn> {
                                 }
                             }
                         }
+                        t @ &Type::BOOL => {
+                            encoder
+                                .encode_field_with_type_and_format(
+                                    &row.get::<_, Option<bool>>(idx)?,
+                                    t,
+                                    format,
+                                    format_opts,
+                                )
+                                .unwrap();
+                        }
                         t @ &Type::INT8 => {
                             encoder
                                 .encode_field_with_type_and_format(
@@ -2825,7 +2848,7 @@ impl From<UnsupportedSqliteToPostgresType> for ErrorResponse {
 }
 
 #[derive(Debug, thiserror::Error)]
-#[error("Untyped array argument for unnest() (or corro_unnest()), please use CAST($N AS T) where T is one of: TEXT[] BLOB[] INT[] INTEGER[] BIGINT[] REAL[] FLOAT[] DOUBLE[]")]
+#[error("Untyped array argument for unnest() (or corro_unnest()), please use CAST($N AS T) where T is one of: TEXT[] BLOB[] INT[] INTEGER[] BIGINT[] REAL[] FLOAT[] DOUBLE[] BOOL[] BOOLEAN[]")]
 struct UntypedUnnestParameter;
 
 impl From<UntypedUnnestParameter> for PgWireBackendMessage {
@@ -2852,6 +2875,7 @@ fn name_to_type(name: &str) -> Result<Type, UnsupportedSqliteToPostgresType> {
         "JSONB" => Type::JSONB,
         "JSON" => Type::JSON,
         "FLOAT" => Type::FLOAT8,
+        "BOOL" | "BOOLEAN" => Type::BOOL,
         _ => return Err(UnsupportedSqliteToPostgresType(name.to_string())),
     })
 }
@@ -3294,6 +3318,7 @@ fn handle_table_call_params<'schema, 'stmt>(
                         "BLOB" => Some("BLOB[]"),
                         "INT" | "INTEGER" | "BIGINT" => Some("INT[]"),
                         "REAL" | "FLOAT" | "DOUBLE" => Some("REAL[]"),
+                        "BOOL" | "BOOLEAN" => Some("BOOL[]"),
                         _ => None,
                     };
                     if is_array_type {
