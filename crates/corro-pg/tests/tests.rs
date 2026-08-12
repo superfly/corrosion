@@ -75,6 +75,190 @@ async fn setup_pg_test_server(
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn test_information_schema() {
+    let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
+
+    let (_ta, server) = setup_pg_test_server(tripwire, None).await;
+    let conn_str = format!(
+        "host={} port={} user=testuser",
+        server.local_addr.ip(),
+        server.local_addr.port()
+    );
+    let (client, connection) = tokio_postgres::connect(&conn_str, NoTls).await.unwrap();
+    tokio::spawn(connection);
+
+    let rows = client
+        .query(
+            "SELECT nspname FROM pg_catalog.pg_namespace \
+             WHERE nspname IN ('main', 'public') \
+             ORDER BY nspname",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.iter()
+            .map(|row| row.get::<_, &str>("nspname"))
+            .collect::<Vec<_>>(),
+        ["main"]
+    );
+
+    let rows = client
+        .query(
+            "SELECT table_catalog, table_schema, table_name, table_type, \
+             self_referencing_column_name, reference_generation, \
+             user_defined_type_catalog, user_defined_type_schema, user_defined_type_name, \
+             is_insertable_into, is_typed, commit_action \
+             FROM information_schema.tables \
+             WHERE table_schema = 'main' AND table_type = 'BASE TABLE' \
+             ORDER BY table_name",
+            &[],
+        )
+        .await
+        .unwrap();
+
+    let table_names = rows
+        .iter()
+        .map(|row| row.get::<_, String>("table_name"))
+        .collect::<Vec<_>>();
+    for expected in [
+        "__corro_schema",
+        "kitchensink",
+        "kitchensink__crsql_clock",
+        "kitchensink__crsql_pks",
+        "tests",
+        "wide",
+    ] {
+        assert!(
+            table_names.iter().any(|table_name| table_name == expected),
+            "missing {expected} from information_schema.tables"
+        );
+    }
+
+    for row in rows {
+        assert_eq!(row.get::<_, &str>("table_catalog"), "state");
+        assert_eq!(row.get::<_, &str>("table_schema"), "main");
+        assert_eq!(row.get::<_, &str>("table_type"), "BASE TABLE");
+        assert_eq!(row.get::<_, &str>("is_insertable_into"), "YES");
+        assert_eq!(row.get::<_, &str>("is_typed"), "NO");
+        assert_eq!(
+            row.get::<_, Option<&str>>("self_referencing_column_name"),
+            None
+        );
+        assert_eq!(row.get::<_, Option<&str>>("reference_generation"), None);
+        assert_eq!(
+            row.get::<_, Option<&str>>("user_defined_type_catalog"),
+            None
+        );
+        assert_eq!(row.get::<_, Option<&str>>("user_defined_type_schema"), None);
+        assert_eq!(row.get::<_, Option<&str>>("user_defined_type_name"), None);
+        assert_eq!(row.get::<_, Option<&str>>("commit_action"), None);
+    }
+
+    let rows = client
+        .query(
+            "SELECT * FROM information_schema.columns \
+             WHERE table_schema = 'main' AND table_name = 'kitchensink' \
+             ORDER BY ordinal_position",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 4);
+    assert_eq!(rows[0].columns().len(), 44);
+
+    let id = &rows[0];
+    assert_eq!(id.get::<_, &str>("table_catalog"), "state");
+    assert_eq!(id.get::<_, &str>("table_schema"), "main");
+    assert_eq!(id.get::<_, &str>("table_name"), "kitchensink");
+    assert_eq!(id.get::<_, &str>("column_name"), "id");
+    assert_eq!(id.get::<_, i64>("ordinal_position"), 1);
+    assert_eq!(id.get::<_, Option<&str>>("column_default"), None);
+    assert_eq!(id.get::<_, &str>("is_nullable"), "NO");
+    assert_eq!(id.get::<_, &str>("data_type"), "bigint");
+    assert_eq!(id.get::<_, Option<i64>>("numeric_precision"), Some(64));
+    assert_eq!(id.get::<_, Option<i64>>("numeric_precision_radix"), Some(2));
+    assert_eq!(id.get::<_, Option<i64>>("numeric_scale"), Some(0));
+    assert_eq!(id.get::<_, &str>("udt_catalog"), "state");
+    assert_eq!(id.get::<_, &str>("udt_schema"), "pg_catalog");
+    assert_eq!(id.get::<_, &str>("udt_name"), "int8");
+    assert_eq!(id.get::<_, &str>("dtd_identifier"), "1");
+    assert_eq!(id.get::<_, &str>("is_identity"), "NO");
+    assert_eq!(id.get::<_, &str>("is_generated"), "NEVER");
+    assert_eq!(id.get::<_, &str>("is_updatable"), "YES");
+
+    let other_ts = &rows[1];
+    assert_eq!(other_ts.get::<_, &str>("column_name"), "other_ts");
+    assert_eq!(other_ts.get::<_, &str>("is_nullable"), "YES");
+    assert_eq!(
+        other_ts.get::<_, &str>("data_type"),
+        "timestamp without time zone"
+    );
+    assert_eq!(other_ts.get::<_, &str>("udt_name"), "timestamp");
+    assert_eq!(
+        other_ts.get::<_, Option<i64>>("datetime_precision"),
+        Some(6)
+    );
+
+    let updated_at = &rows[2];
+    assert_eq!(updated_at.get::<_, &str>("column_name"), "updated_at");
+    assert_eq!(updated_at.get::<_, &str>("is_nullable"), "NO");
+    assert_eq!(
+        updated_at.get::<_, Option<&str>>("column_default"),
+        Some("CURRENT_TIMESTAMP")
+    );
+
+    let trusted = &rows[3];
+    assert_eq!(trusted.get::<_, &str>("column_name"), "trusted");
+    assert_eq!(trusted.get::<_, &str>("data_type"), "boolean");
+    assert_eq!(trusted.get::<_, &str>("udt_name"), "bool");
+
+    let internal_columns = client
+        .query(
+            "SELECT column_name FROM information_schema.columns \
+             WHERE table_name = 'kitchensink__crsql_pks' \
+             ORDER BY ordinal_position",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert!(!internal_columns.is_empty());
+
+    let rows = client
+        .query(
+            "SELECT * FROM information_schema.table_constraints \
+             WHERE table_schema = 'main' \
+             AND table_name IN ('kitchensink', 'wide') \
+             ORDER BY table_name",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].columns().len(), 10);
+
+    for (row, table_name) in rows.iter().zip(["kitchensink", "wide"]) {
+        assert_eq!(row.get::<_, &str>("constraint_catalog"), "state");
+        assert_eq!(row.get::<_, &str>("constraint_schema"), "main");
+        assert_eq!(
+            row.get::<_, &str>("constraint_name"),
+            format!("{table_name}_pkey")
+        );
+        assert_eq!(row.get::<_, &str>("table_catalog"), "state");
+        assert_eq!(row.get::<_, &str>("table_schema"), "main");
+        assert_eq!(row.get::<_, &str>("table_name"), table_name);
+        assert_eq!(row.get::<_, &str>("constraint_type"), "PRIMARY KEY");
+        assert_eq!(row.get::<_, &str>("is_deferrable"), "NO");
+        assert_eq!(row.get::<_, &str>("initially_deferred"), "NO");
+        assert_eq!(row.get::<_, &str>("enforced"), "YES");
+    }
+
+    tripwire_tx.send(()).await.ok();
+    tripwire_worker.await;
+    wait_for_all_pending_handles().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_pg() {
     let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
 
