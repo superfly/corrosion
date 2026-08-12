@@ -19,6 +19,9 @@ pub struct PgClassEntry {
     pub relam: i64,
     /// Estimated number of rows (from sqlite_stat1 if available).
     pub reltuples: f64,
+    /// True if this is a synthetic PK index (not backed by a real
+    /// sqlite_master row).  pg_get_indexdef synthesizes a definition for it.
+    pub synthetic_pk: bool,
 }
 
 /// Loads row count estimates from `sqlite_stat1`, keyed by table name.
@@ -83,6 +86,7 @@ pub fn load_pg_class_entries(
             relkind: "r",
             relam: 0,
             reltuples,
+            synthetic_pk: false,
         });
     }
 
@@ -115,6 +119,38 @@ pub fn load_pg_class_entries(
             relkind: "i",
             relam: 403, // btree
             reltuples,
+            synthetic_pk: false,
+        });
+        idx_offset += 1;
+    }
+
+    // Synthetic PK indexes — for each table that has a PRIMARY KEY, add a
+    // <table>_pkey entry to pg_class.  This matches PostgreSQL's naming
+    // convention so tools like TablePlus can recognize primary keys.
+    // The real auto-index (sqlite_autoindex_*) still exists; this synthetic
+    // entry is just for catalog visibility.
+    for (i, table_name) in table_names.iter().enumerate() {
+        let _table_oid = FIRST_USER_OID + i as i64;
+        let has_pk: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_xinfo(?1) WHERE pk > 0)",
+                [table_name],
+                |row| row.get(0),
+            )
+            .unwrap_or(false);
+        if !has_pk {
+            continue;
+        }
+        let oid = FIRST_USER_OID + idx_offset as i64;
+        let reltuples = *row_estimates.get(table_name).unwrap_or(&0.0);
+        entries.push(PgClassEntry {
+            oid,
+            relname: format!("{table_name}_pkey"),
+            relnatts: 1,
+            relkind: "i",
+            relam: 403, // btree
+            reltuples,
+            synthetic_pk: true,
         });
         idx_offset += 1;
     }

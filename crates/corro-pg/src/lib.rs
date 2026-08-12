@@ -1830,18 +1830,19 @@ pub async fn start(
                         // relnames, so pg_get_indexdef can look up index SQL
                         // by OID.
                         conn.execute(
-                            "CREATE TEMP TABLE temp_pg_class_oid_map (oid INTEGER, relname TEXT, relkind TEXT)",
+                            "CREATE TEMP TABLE temp_pg_class_oid_map (oid INTEGER, relname TEXT, relkind TEXT, synthetic_pk INTEGER)",
                             [],
                         )?;
                         {
                             let mut stmt = conn.prepare(
-                                "INSERT INTO temp_pg_class_oid_map (oid, relname, relkind) VALUES (?1, ?2, ?3)",
+                                "INSERT INTO temp_pg_class_oid_map (oid, relname, relkind, synthetic_pk) VALUES (?1, ?2, ?3, ?4)",
                             )?;
                             for entry in pg_class_entries_vec.iter() {
                                 stmt.execute(rusqlite::params![
                                     entry.oid,
                                     &entry.relname,
-                                    entry.relkind
+                                    entry.relkind,
+                                    if entry.synthetic_pk { 1i64 } else { 0i64 }
                                 ])?;
                             }
                         }
@@ -1888,7 +1889,7 @@ pub async fn start(
                         conn.create_module(
                             "tables",
                             eponymous_only_module::<InformationSchemaTablesTable>(),
-                            Some(table_names),
+                            Some(table_names.clone()),
                         )?;
                         conn.create_module(
                             "columns",
@@ -1912,6 +1913,7 @@ pub async fn start(
                             eponymous_only_module::<PgIndexTable>(),
                             Some(pg_index_entries),
                         )?;
+
                         // pg_am — SQLite only uses btree (OID 403).
                         conn.create_module(
                             "pg_am",
@@ -1995,6 +1997,8 @@ pub async fn start(
                         // the SQL from sqlite_master.  For auto-indexes
                         // (sqlite_autoindex_*, sql IS NULL), synthesize a
                         // CREATE INDEX statement from pragma_index_info.
+                        // For synthetic PK indexes (<table>_pkey), synthesize
+                        // from pragma_table_xinfo PK columns.
                         conn.create_scalar_function(
                             "pg_get_indexdef",
                             -1,
@@ -2002,6 +2006,45 @@ pub async fn start(
                             |ctx| {
                                 let oid: i64 = ctx.get(0).unwrap_or(0);
                                 let conn = unsafe { ctx.get_connection()? };
+
+                                // Check if this is a synthetic PK index.
+                                let synthetic: (bool, String) = conn
+                                    .query_row(
+                                        "SELECT synthetic_pk, relname \
+                                         FROM temp_pg_class_oid_map WHERE oid = ?1",
+                                        [oid],
+                                        |row| {
+                                            Ok((
+                                                row.get::<_, i64>(0)? != 0,
+                                                row.get::<_, String>(1)?,
+                                            ))
+                                        },
+                                    )
+                                    .unwrap_or((false, String::new()));
+
+                                if synthetic.0 {
+                                    // Synthetic PK index: <table>_pkey
+                                    // Derive table name by stripping _pkey suffix.
+                                    let index_name = &synthetic.1;
+                                    let tbl_name = index_name
+                                        .strip_suffix("_pkey")
+                                        .unwrap_or(index_name);
+                                    let mut stmt = conn.prepare(
+                                        "SELECT name FROM pragma_table_xinfo(?1) \
+                                         WHERE pk > 0 ORDER BY pk",
+                                    )?;
+                                    let cols: Vec<String> = stmt
+                                        .query_map([tbl_name], |row| row.get::<_, String>(0))?
+                                        .filter_map(|r| r.ok())
+                                        .collect();
+                                    if cols.is_empty() {
+                                        return Ok::<Option<String>, rusqlite::Error>(None);
+                                    }
+                                    let cols_str = cols.join(", ");
+                                    return Ok(Some(format!(
+                                        "CREATE UNIQUE INDEX {index_name} ON {tbl_name} ({cols_str})"
+                                    )));
+                                }
 
                                 // Look up the index name and table name.
                                 let (index_name, tbl_name): (String, String) = conn

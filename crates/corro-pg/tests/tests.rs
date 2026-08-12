@@ -278,6 +278,56 @@ async fn test_information_schema() {
     assert_eq!(pg_class_rows[0].get::<_, &str>("relkind"), "r");
     assert_eq!(pg_class_rows[0].get::<_, i64>("relnatts"), 5);
 
+    // PK auto-indexes should be renamed to <table>_pkey in pg_class
+    // so tools like TablePlus can recognize them as primary keys.
+    let pk_index_rows = client
+        .query(
+            "SELECT oid, relname, relkind \
+             FROM pg_catalog.pg_class \
+             WHERE relname = 'kitchensink_pkey'",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        pk_index_rows.len(),
+        1,
+        "expected kitchensink_pkey in pg_class"
+    );
+    assert_eq!(pk_index_rows[0].get::<_, &str>("relkind"), "i");
+
+    // The index query TablePlus uses should return the PK index with
+    // the _pkey name and a valid index definition.
+    let index_rows = client
+        .query(
+            "SELECT ix.relname as index_name, \
+                    indisunique as is_unique, \
+                    pg_get_indexdef(indexrelid) as index_definition \
+             FROM pg_index i \
+             JOIN pg_class t ON t.oid = i.indrelid \
+             JOIN pg_class ix ON ix.oid = i.indexrelid \
+             JOIN pg_namespace n ON t.relnamespace = n.oid \
+             JOIN pg_am as am ON ix.relam = am.oid \
+             WHERE t.relname = 'kitchensink' AND n.nspname = 'main'",
+            &[],
+        )
+        .await
+        .unwrap();
+    let pk_index = index_rows
+        .iter()
+        .find(|r| r.get::<_, &str>("index_name") == "kitchensink_pkey");
+    assert!(
+        pk_index.is_some(),
+        "expected kitchensink_pkey in index query results"
+    );
+    let pk_index = pk_index.unwrap();
+    assert_eq!(pk_index.get::<_, i64>("is_unique"), 1);
+    let def: &str = pk_index.get("index_definition");
+    assert!(
+        def.contains("UNIQUE"),
+        "expected UNIQUE in index definition: {def}"
+    );
+
     // pg_attribute should be populated from the same source as
     // information_schema.columns, so that tools like TablePlus can JOIN.
     let pg_attr_rows = client
