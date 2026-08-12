@@ -476,15 +476,20 @@ pub async fn apply_fully_buffered_changes_loop(
     let max_timeout_increase: u64 = 6;
     let step_timeout_secs: u64 = 20;
 
+    let throttle_max = agent.config().perf.partial_retry_backoff;
+    let scan_enabled = throttle_max > 0;
     let throttle_min = Duration::from_secs(5 * 60);
-    let throttle_max = Duration::from_secs(60 * 60);
 
     let mut retry_interval = tokio::time::interval(Duration::from_secs(5 * 60));
 
     // map to throttle retries for failed versions that took too long to apply
-    let mut limit_retries = ThrottleMap::new(throttle_min, throttle_max);
+    let mut limit_retries =
+        ThrottleMap::new(throttle_min, Duration::from_secs(throttle_max as u64));
 
     retry_interval.tick().await;
+    if !scan_enabled {
+        info!("periodic fully-buffered partial scan disabled (partial_retry_backoff = 0)");
+    }
 
     loop {
         let partial_version = tokio::select! {
@@ -495,7 +500,7 @@ pub async fn apply_fully_buffered_changes_loop(
                 None => break,
             },
 
-            _ = retry_interval.tick() => {
+            _ = retry_interval.tick(), if scan_enabled => {
                 match find_fully_buffered_partial(&agent).await {
                     Ok(Some(pair)) => pair,
                     Ok(None) => continue,

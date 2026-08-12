@@ -85,6 +85,10 @@ fn default_max_sync_backoff() -> u32 {
     DEFAULT_MAX_SYNC_BACKOFF
 }
 
+fn default_partial_retry_backoff() -> u32 {
+    0
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub db: DbConfig,
@@ -306,6 +310,8 @@ pub struct PerfConfig {
     pub min_sync_backoff: u32,
     #[serde(default = "default_max_sync_backoff")]
     pub max_sync_backoff: u32,
+    #[serde(default = "default_partial_retry_backoff")]
+    pub partial_retry_backoff: u32,
     // How many unapplied changesets corrosion will buffer before starting to drop them
     #[serde(default = "default_processing_queue")]
     pub processing_queue_len: usize,
@@ -344,6 +350,7 @@ impl Default for PerfConfig {
             sql_tx_timeout: default_sql_tx_timeout(),
             min_sync_backoff: default_min_sync_backoff(),
             max_sync_backoff: default_max_sync_backoff(),
+            partial_retry_backoff: default_partial_retry_backoff(),
             processing_queue_len: default_processing_queue(),
             apply_queue_timeout: default_apply_timeout(),
             apply_queue_min_batch_size: default_apply_batch_min(),
