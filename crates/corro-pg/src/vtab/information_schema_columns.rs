@@ -6,10 +6,10 @@ use rusqlite::vtab::{
 
 pub struct InformationSchemaColumn {
     pub(crate) table_name: String,
-    column_name: String,
-    ordinal_position: i64,
-    column_default: Option<String>,
-    nullable: bool,
+    pub(crate) column_name: String,
+    pub(crate) ordinal_position: i64,
+    pub(crate) column_default: Option<String>,
+    pub(crate) nullable: bool,
     data_type: String,
     character_maximum_length: Option<i64>,
     character_octet_length: Option<i64>,
@@ -17,9 +17,9 @@ pub struct InformationSchemaColumn {
     numeric_precision_radix: Option<i64>,
     numeric_scale: Option<i64>,
     datetime_precision: Option<i64>,
-    udt_name: String,
+    pub(crate) udt_name: String,
     dtd_identifier: String,
-    generated: bool,
+    pub(crate) generated: bool,
     pub(crate) primary_key_ordinal: Option<i64>,
 }
 

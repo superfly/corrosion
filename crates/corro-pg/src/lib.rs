@@ -89,7 +89,8 @@ use crate::{
         information_schema_tables::{
             load_information_schema_table_names, InformationSchemaTablesTable,
         },
-        pg_class::PgClassTable,
+        pg_attribute::{load_pg_attributes, PgAttributeTable},
+        pg_class::{load_pg_class_entries, PgClassTable},
         pg_database::{PgDatabase, PgDatabaseTable},
         pg_namespace::PgNamespaceTable,
         pg_range::PgRangeTable,
@@ -889,6 +890,11 @@ pub async fn start(
                         let table_constraints = Arc::new(
                             load_information_schema_table_constraints(columns.as_slice()),
                         );
+                        let pg_class_entries = Arc::new(load_pg_class_entries(&conn, &table_names)?);
+                        let pg_attributes = Arc::new(load_pg_attributes(
+                            columns.as_slice(),
+                            pg_class_entries.as_slice(),
+                        ));
                         let table_names = Arc::new(table_names);
 
                         conn.create_module(
@@ -914,7 +920,12 @@ pub async fn start(
                         conn.create_module(
                             "pg_class",
                             eponymous_only_module::<PgClassTable>(),
-                            None,
+                            Some(pg_class_entries),
+                        )?;
+                        conn.create_module(
+                            "pg_attribute",
+                            eponymous_only_module::<PgAttributeTable>(),
+                            Some(pg_attributes),
                         )?;
                         conn.create_module(
                             "tables",
@@ -2898,17 +2909,25 @@ impl From<UntypedUnnestParameter> for ErrorResponse {
 
 #[allow(clippy::result_large_err)]
 fn name_to_type(name: &str) -> Result<Type, UnsupportedSqliteToPostgresType> {
-    Ok(match name.to_uppercase().as_ref() {
+    // Strip any type modifiers (e.g., "VARCHAR(255)" -> "VARCHAR") so that
+    // parameterized types map correctly.
+    let base = name.split('(').next().unwrap_or(name).trim().to_uppercase();
+    Ok(match base.as_ref() {
         "ANY" => Type::ANY,
         "INT" | "INTEGER" | "BIGINT" => Type::INT8,
-        "DATETIME" => Type::TIMESTAMP,
-        "VARCHAR" => Type::VARCHAR,
+        "DATETIME" | "TIMESTAMP" => Type::TIMESTAMP,
+        "VARCHAR" | "CHARACTER VARYING" | "CHAR VARYING" => Type::VARCHAR,
         "TEXT" => Type::TEXT,
         "BINARY" | "BLOB" => Type::BYTEA,
         "JSONB" => Type::JSONB,
         "JSON" => Type::JSON,
-        "FLOAT" => Type::FLOAT8,
+        "FLOAT" | "REAL" | "DOUBLE" | "DOUBLE PRECISION" => Type::FLOAT8,
         "BOOL" | "BOOLEAN" => Type::BOOL,
+        "NUMERIC" | "DECIMAL" => Type::NUMERIC,
+        "CHAR" | "CHARACTER" => Type::BPCHAR,
+        "CLOB" => Type::TEXT,
+        "DATE" => Type::DATE,
+        "TIME" => Type::TIME,
         _ => return Err(UnsupportedSqliteToPostgresType(name.to_string())),
     })
 }

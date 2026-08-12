@@ -41,7 +41,8 @@ async fn setup_pg_test_server(
                 id BIGINT PRIMARY KEY NOT NULL,
                 other_ts DATETIME,
                 updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                trusted BOOL
+                trusted BOOL,
+                score REAL
             );
         ",
     )
@@ -164,7 +165,7 @@ async fn test_information_schema() {
         )
         .await
         .unwrap();
-    assert_eq!(rows.len(), 4);
+    assert_eq!(rows.len(), 5);
     assert_eq!(rows[0].columns().len(), 44);
 
     let id = &rows[0];
@@ -213,6 +214,12 @@ async fn test_information_schema() {
     assert_eq!(trusted.get::<_, &str>("data_type"), "boolean");
     assert_eq!(trusted.get::<_, &str>("udt_name"), "bool");
 
+    let score = &rows[4];
+    assert_eq!(score.get::<_, &str>("column_name"), "score");
+    assert_eq!(score.get::<_, &str>("is_nullable"), "YES");
+    assert_eq!(score.get::<_, &str>("data_type"), "double precision");
+    assert_eq!(score.get::<_, &str>("udt_name"), "float8");
+
     let internal_columns = client
         .query(
             "SELECT column_name FROM information_schema.columns \
@@ -252,6 +259,61 @@ async fn test_information_schema() {
         assert_eq!(row.get::<_, &str>("initially_deferred"), "NO");
         assert_eq!(row.get::<_, &str>("enforced"), "YES");
     }
+
+    // pg_class should expose user tables with relkind 'r' and the "main" namespace.
+    let pg_class_rows = client
+        .query(
+            "SELECT oid, relname, relnamespace, relkind, relnatts \
+             FROM pg_catalog.pg_class \
+             WHERE relname = 'kitchensink'",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(pg_class_rows.len(), 1);
+    let kitchensink_oid: i64 = pg_class_rows[0].get("oid");
+    assert!(kitchensink_oid >= 16384);
+    assert_eq!(pg_class_rows[0].get::<_, &str>("relname"), "kitchensink");
+    assert_eq!(pg_class_rows[0].get::<_, i64>("relnamespace"), 2200);
+    assert_eq!(pg_class_rows[0].get::<_, &str>("relkind"), "r");
+    assert_eq!(pg_class_rows[0].get::<_, i64>("relnatts"), 5);
+
+    // pg_attribute should be populated from the same source as
+    // information_schema.columns, so that tools like TablePlus can JOIN.
+    let pg_attr_rows = client
+        .query(
+            "SELECT pa.attname, pa.atttypid, pa.attnum, pa.attnotnull, pa.atthasdef \
+             FROM pg_catalog.pg_attribute pa \
+             JOIN pg_catalog.pg_class pc ON pa.attrelid = pc.oid \
+             WHERE pc.relname = 'kitchensink' \
+             ORDER BY pa.attnum",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(pg_attr_rows.len(), 5);
+    assert_eq!(pg_attr_rows[0].get::<_, &str>("attname"), "id");
+    assert_eq!(pg_attr_rows[0].get::<_, i64>("attnum"), 1);
+    assert_eq!(pg_attr_rows[0].get::<_, i64>("attnotnull"), 1);
+    assert_eq!(pg_attr_rows[0].get::<_, i64>("atthasdef"), 0);
+    // int8 OID is 20
+    assert_eq!(pg_attr_rows[0].get::<_, i64>("atttypid"), 20);
+
+    assert_eq!(pg_attr_rows[4].get::<_, &str>("attname"), "score");
+    // float8 OID is 701
+    assert_eq!(pg_attr_rows[4].get::<_, i64>("atttypid"), 701);
+
+    // Querying a table with a REAL column should work (issue #513).
+    client
+        .execute("INSERT INTO kitchensink (id, score) VALUES (1, 2.5)", &[])
+        .await
+        .unwrap();
+    let row = client
+        .query_one("SELECT score FROM kitchensink WHERE id = 1", &[])
+        .await
+        .unwrap();
+    let score: f64 = row.get(0);
+    assert!((score - 2.5).abs() < 1e-9);
 
     tripwire_tx.send(()).await.ok();
     tripwire_worker.await;
