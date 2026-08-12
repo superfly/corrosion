@@ -81,12 +81,6 @@ unsafe impl VTabCursor for EmptyCatalogCursor<'_> {
     }
 }
 
-/// DDL for `pg_index` – matches the PostgreSQL 14 column set.
-pub const PG_INDEX_DDL: &str = "(indexrelid INTEGER, indrelid INTEGER, indnatts INTEGER, indnkeyatts INTEGER, indisunique INTEGER, indisprimary INTEGER, indisexclusion INTEGER, indimmediate INTEGER, indisclustered INTEGER, indisvalid INTEGER, indcheckxmin INTEGER, indisready INTEGER, indislive INTEGER, indisreplident INTEGER, indkey TEXT, indcollation TEXT, indclass TEXT, indoption TEXT, indexprs TEXT, indpred TEXT)";
-
-/// DDL for `pg_am` – matches the PostgreSQL 14 column set.
-pub const PG_AM_DDL: &str = "(oid INTEGER, amname TEXT, amhandler INTEGER, amtype TEXT)";
-
 /// DDL for `pg_proc` – matches the PostgreSQL 14 column set (simplified).
 pub const PG_PROC_DDL: &str = "(oid INTEGER, proname TEXT, pronamespace INTEGER, proowner INTEGER, proargtypes TEXT, prorettype INTEGER)";
 

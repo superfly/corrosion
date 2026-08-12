@@ -8,11 +8,15 @@ use rusqlite::vtab::{
 /// `FirstNormalObjectId`).
 const FIRST_USER_OID: i64 = 16384;
 
-/// Entry in the `pg_class` catalog representing a user table.
+/// Entry in the `pg_class` catalog representing a user table or index.
 pub struct PgClassEntry {
     pub oid: i64,
     pub relname: String,
     pub relnatts: i64,
+    /// 'r' for ordinary table, 'i' for index.
+    pub relkind: &'static str,
+    /// OID of the access method (pg_am.oid).  403 = btree.
+    pub relam: i64,
 }
 
 pub fn load_pg_class_entries(
@@ -20,6 +24,8 @@ pub fn load_pg_class_entries(
     table_names: &[String],
 ) -> rusqlite::Result<Vec<PgClassEntry>> {
     let mut entries = Vec::with_capacity(table_names.len());
+
+    // Tables (relkind = 'r')
     for (i, table_name) in table_names.iter().enumerate() {
         let oid = FIRST_USER_OID + i as i64;
         // Count user-visible columns (cid >= 0, not hidden) via pragma_table_xinfo.
@@ -34,8 +40,36 @@ pub fn load_pg_class_entries(
             oid,
             relname: table_name.clone(),
             relnatts: natts,
+            relkind: "r",
+            relam: 0,
         });
     }
+
+    // Indexes (relkind = 'i') — read from sqlite_master.
+    // Assign OIDs starting after the table OIDs.
+    let mut stmt = conn.prepare(
+        "SELECT name, tbl_name FROM sqlite_master \
+         WHERE type = 'index' AND sql IS NOT NULL \
+         ORDER BY name",
+    )?;
+    let index_rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+
+    let mut idx_offset = table_names.len();
+    for row in index_rows {
+        let (index_name, _tbl_name) = row?;
+        let oid = FIRST_USER_OID + idx_offset as i64;
+        entries.push(PgClassEntry {
+            oid,
+            relname: index_name,
+            relnatts: 1, // indexes have at least 1 key column
+            relkind: "i",
+            relam: 403, // btree
+        });
+        idx_offset += 1;
+    }
+
     Ok(entries)
 }
 
@@ -157,7 +191,7 @@ unsafe impl VTabCursor for PgClassTableCursor<'_> {
                 3 => ctx.set_result(&Option::<i64>::None),     // reltype
                 4 => ctx.set_result(&Option::<i64>::None),     // reloftype
                 5 => ctx.set_result(&10i64),                   // relowner
-                6 => ctx.set_result(&Option::<i64>::None),     // relam
+                6 => ctx.set_result(&entry.relam),             // relam
                 7 => ctx.set_result(&Option::<i64>::None),     // relfilenode
                 8 => ctx.set_result(&0i64),                    // reltablespace
                 9 => ctx.set_result(&0i64),                    // relpages
@@ -167,7 +201,7 @@ unsafe impl VTabCursor for PgClassTableCursor<'_> {
                 13 => ctx.set_result(&0i64),                   // relhasindex
                 14 => ctx.set_result(&0i64),                   // relisshared
                 15 => ctx.set_result(&"p"),                    // relpersistence: permanent
-                16 => ctx.set_result(&"r"),                    // relkind: ordinary table
+                16 => ctx.set_result(&entry.relkind),          // relkind: 'r' or 'i'
                 17 => ctx.set_result(&entry.relnatts),         // relnatts
                 18 => ctx.set_result(&0i64),                   // relchecks
                 19 => ctx.set_result(&0i64),                   // relhasrules

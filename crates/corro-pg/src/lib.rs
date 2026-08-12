@@ -80,9 +80,7 @@ use crate::{
     sql_state::SqlState,
     utils::CountedTcpStream,
     vtab::{
-        empty_catalog::{
-            EmptyCatalogTable, PG_AM_DDL, PG_INDEX_DDL, PG_PROC_DDL, PG_STATIO_USER_TABLES_DDL,
-        },
+        empty_catalog::{EmptyCatalogTable, PG_PROC_DDL, PG_STATIO_USER_TABLES_DDL},
         information_schema_columns::{
             load_information_schema_columns, InformationSchemaColumnsTable,
         },
@@ -95,9 +93,11 @@ use crate::{
         information_schema_triggers::{
             load_information_schema_triggers, InformationSchemaTriggersTable,
         },
+        pg_am::PgAmTable,
         pg_attribute::{load_pg_attributes, PgAttributeTable},
         pg_class::{load_pg_class_entries, PgClassTable},
         pg_database::{PgDatabase, PgDatabaseTable},
+        pg_index::{load_pg_index_entries, PgIndexTable},
         pg_namespace::PgNamespaceTable,
         pg_range::PgRangeTable,
         pg_type::PgTypeTable,
@@ -1449,7 +1449,49 @@ pub async fn start(
                         let table_constraints = Arc::new(
                             load_information_schema_table_constraints(columns.as_slice()),
                         );
-                        let pg_class_entries = Arc::new(load_pg_class_entries(&conn, &table_names)?);
+                        let pg_class_entries_vec = load_pg_class_entries(&conn, &table_names)?;
+
+                        // Build OID maps for pg_index loading.
+                        let table_oid_map: std::collections::HashMap<String, i64> =
+                            pg_class_entries_vec
+                                .iter()
+                                .filter(|e| e.relkind == "r")
+                                .map(|e| (e.relname.clone(), e.oid))
+                                .collect();
+                        let index_oid_map: std::collections::HashMap<String, i64> =
+                            pg_class_entries_vec
+                                .iter()
+                                .filter(|e| e.relkind == "i")
+                                .map(|e| (e.relname.clone(), e.oid))
+                                .collect();
+                        let pg_index_entries = Arc::new(load_pg_index_entries(
+                            &conn,
+                            &table_oid_map,
+                            &index_oid_map,
+                        )?);
+
+                        // Populate a temp table mapping pg_class OIDs to
+                        // relnames, so pg_get_indexdef can look up index SQL
+                        // by OID.
+                        conn.execute(
+                            "CREATE TEMP TABLE temp_pg_class_oid_map (oid INTEGER, relname TEXT, relkind TEXT)",
+                            [],
+                        )?;
+                        {
+                            let mut stmt = conn.prepare(
+                                "INSERT INTO temp_pg_class_oid_map (oid, relname, relkind) VALUES (?1, ?2, ?3)",
+                            )?;
+                            for entry in pg_class_entries_vec.iter() {
+                                stmt.execute(rusqlite::params![
+                                    entry.oid,
+                                    &entry.relname,
+                                    entry.relkind
+                                ])?;
+                            }
+                        }
+
+                        let pg_class_entries = Arc::new(pg_class_entries_vec);
+
                         let pg_attributes = Arc::new(load_pg_attributes(
                             columns.as_slice(),
                             pg_class_entries.as_slice(),
@@ -1508,19 +1550,21 @@ pub async fn start(
                             Some(triggers),
                         )?;
 
-                        // Empty PostgreSQL catalog tables that external tools
-                        // (e.g. TablePlus) reference in JOINs.  Returning an
-                        // empty result set lets the tool degrade gracefully.
+                        // pg_index — populated from sqlite_master indexes.
                         conn.create_module(
                             "pg_index",
-                            eponymous_only_module::<EmptyCatalogTable>(),
-                            Some(PG_INDEX_DDL),
+                            eponymous_only_module::<PgIndexTable>(),
+                            Some(pg_index_entries),
                         )?;
+                        // pg_am — SQLite only uses btree (OID 403).
                         conn.create_module(
                             "pg_am",
-                            eponymous_only_module::<EmptyCatalogTable>(),
-                            Some(PG_AM_DDL),
+                            eponymous_only_module::<PgAmTable>(),
+                            None,
                         )?;
+                        // Empty catalog tables that are referenced in JOINs
+                        // but not yet populated.  Returning empty lets tools
+                        // degrade gracefully.
                         conn.create_module(
                             "pg_proc",
                             eponymous_only_module::<EmptyCatalogTable>(),
@@ -1586,13 +1630,28 @@ pub async fn start(
                         )?;
 
                         // pg_get_indexdef(index_oid) – returns the CREATE INDEX
-                        // statement for an index.  We don't expose indexes yet
-                        // so return NULL.
+                        // statement for an index.  Look up the SQL from
+                        // sqlite_master via the index name in pg_class.
                         conn.create_scalar_function(
                             "pg_get_indexdef",
                             -1,
                             FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
-                            |_ctx| Ok::<Option<String>, rusqlite::Error>(None),
+                            |ctx| {
+                                let oid: i64 = ctx.get(0).unwrap_or(0);
+                                // Look up the index name from the temp OID map,
+                                // then fetch the SQL from sqlite_master.
+                                let conn = unsafe { ctx.get_connection()? };
+                                let sql: Option<String> = conn
+                                    .query_row(
+                                        "SELECT m.sql FROM sqlite_master m \
+                                         JOIN temp_pg_class_oid_map o ON o.relname = m.name \
+                                         WHERE o.oid = ?1 AND m.type = 'index'",
+                                        [oid],
+                                        |row| row.get(0),
+                                    )
+                                    .unwrap_or(None);
+                                Ok(sql)
+                            },
                         )?;
 
                         // pg_total_relation_size(oid) / pg_table_size(oid) /
