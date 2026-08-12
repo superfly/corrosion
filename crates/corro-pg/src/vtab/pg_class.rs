@@ -17,12 +17,51 @@ pub struct PgClassEntry {
     pub relkind: &'static str,
     /// OID of the access method (pg_am.oid).  403 = btree.
     pub relam: i64,
+    /// Estimated number of rows (from sqlite_stat1 if available).
+    pub reltuples: f64,
+}
+
+/// Loads row count estimates from `sqlite_stat1`, keyed by table name.
+/// Returns the maximum `CAST(stat AS INTEGER)` per table (the first number
+/// in the stat field is the row count estimate).
+fn load_row_estimates(
+    conn: &rusqlite::Connection,
+) -> rusqlite::Result<std::collections::HashMap<String, f64>> {
+    // sqlite_stat1 may not exist if ANALYZE hasn't been run.
+    let mut map = std::collections::HashMap::new();
+    let exists: bool = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='sqlite_stat1'",
+            [],
+            |_| Ok(true),
+        )
+        .unwrap_or(false);
+    if !exists {
+        return Ok(map);
+    }
+
+    let mut stmt = conn.prepare(
+        "SELECT tbl, MAX(CAST(stat AS INTEGER)) \
+         FROM sqlite_stat1 GROUP BY tbl",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?))
+    })?;
+    for row in rows {
+        let (tbl, count) = row?;
+        if let Some(c) = count {
+            map.insert(tbl, c as f64);
+        }
+    }
+    Ok(map)
 }
 
 pub fn load_pg_class_entries(
     conn: &rusqlite::Connection,
     table_names: &[String],
 ) -> rusqlite::Result<Vec<PgClassEntry>> {
+    let row_estimates = load_row_estimates(conn)?;
+
     let mut entries = Vec::with_capacity(table_names.len());
 
     // Tables (relkind = 'r')
@@ -36,12 +75,14 @@ pub fn load_pg_class_entries(
                 |row| row.get(0),
             )
             .unwrap_or(0);
+        let reltuples = *row_estimates.get(table_name).unwrap_or(&0.0);
         entries.push(PgClassEntry {
             oid,
             relname: table_name.clone(),
             relnatts: natts,
             relkind: "r",
             relam: 0,
+            reltuples,
         });
     }
 
@@ -60,14 +101,20 @@ pub fn load_pg_class_entries(
 
     let mut idx_offset = table_names.len();
     for row in index_rows {
-        let (index_name, _tbl_name) = row?;
+        let (index_name, tbl_name) = row?;
         let oid = FIRST_USER_OID + idx_offset as i64;
+        // Use the parent table's row estimate for the index too.
+        let reltuples = *row_estimates
+            .get(&index_name)
+            .or_else(|| row_estimates.get(&tbl_name))
+            .unwrap_or(&0.0);
         entries.push(PgClassEntry {
             oid,
             relname: index_name,
             relnatts: 1, // indexes have at least 1 key column
             relkind: "i",
             relam: 403, // btree
+            reltuples,
         });
         idx_offset += 1;
     }
@@ -197,7 +244,7 @@ unsafe impl VTabCursor for PgClassTableCursor<'_> {
                 7 => ctx.set_result(&Option::<i64>::None),     // relfilenode
                 8 => ctx.set_result(&0i64),                    // reltablespace
                 9 => ctx.set_result(&0i64),                    // relpages
-                10 => ctx.set_result(&0.0f64),                 // reltuples
+                10 => ctx.set_result(&entry.reltuples),        // reltuples
                 11 => ctx.set_result(&0i64),                   // relallvisible
                 12 => ctx.set_result(&Option::<i64>::None),    // reltoastrelid
                 13 => ctx.set_result(&0i64),                   // relhasindex
