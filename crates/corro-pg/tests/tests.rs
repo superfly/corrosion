@@ -362,6 +362,65 @@ async fn test_information_schema() {
         .unwrap();
     assert_eq!(count_rows.len(), 1);
 
+    // The TablePlus full column-listing query (with numeric_precision,
+    // datetime_precision, etc.)
+    let full_col_rows = client
+        .query(
+            &format!(
+                "SELECT ordinal_position,column_name,udt_name AS data_type,\
+                 format_type(atttypid, atttypmod) as format_type,\
+                 numeric_precision,datetime_precision,numeric_scale,\
+                 character_maximum_length AS data_length,is_nullable,\
+                 column_name as check,column_name as check_constraint,\
+                 column_default,column_name AS foreign_key,\
+                 pg_catalog.col_description({kitchensink_oid},ordinal_position) as comment \
+                 FROM information_schema.columns \
+                 JOIN pg_attribute pa ON attrelid={kitchensink_oid} AND attname=column_name \
+                 WHERE table_name='kitchensink' AND table_schema='main'"
+            ),
+            &[],
+        )
+        .await;
+    assert!(
+        full_col_rows.is_ok(),
+        "full column listing query failed: {:?}",
+        full_col_rows.err()
+    );
+
+    // The TablePlus index-listing query (uses pg_index, pg_am, pg_get_indexdef,
+    // regexp_replace, etc.)
+    let index_rows = client
+        .query(
+            "SELECT ix.relname as index_name, upper(am.amname) AS index_algorithm, \
+             indisunique as is_unique, pg_get_indexdef(indexrelid) as index_definition, \
+             replace(regexp_replace(regexp_replace(regexp_replace( \
+             pg_get_indexdef(indexrelid), ' WHERE .+|INCLUDE .+', ''), ' WITH .+', ''), \
+             '.*\\((.*)\\)', '\\1'), ' ', '') AS column_name, \
+             CASE WHEN position(' WHERE ' in pg_get_indexdef(indexrelid))>0 \
+             THEN regexp_replace(pg_get_indexdef(indexrelid),'.+WHERE ','') \
+             WHEN position(' WITH ' in pg_get_indexdef(indexrelid))>0 \
+             THEN regexp_replace(pg_get_indexdef(indexrelid),'.+WITH ','') \
+             ELSE '' END AS condition, \
+             CASE WHEN position(' INCLUDE ' in pg_get_indexdef(indexrelid))>0 \
+             THEN regexp_replace(pg_get_indexdef(indexrelid),'.+INCLUDE ','') \
+             WHEN position(' WITH ' in pg_get_indexdef(indexrelid))>0 \
+             THEN regexp_replace(pg_get_indexdef(indexrelid),'.+WITH ','') \
+             ELSE '' END AS include, \
+             pg_catalog.obj_description(i.indexrelid,'pg_class') as comment \
+             FROM pg_index i JOIN pg_class t ON t.oid = i.indrelid \
+             JOIN pg_class ix ON ix.oid = i.indexrelid \
+             JOIN pg_namespace n ON t.relnamespace = n.oid \
+             JOIN pg_am as am ON ix.relam = am.oid \
+             WHERE t.relname = 'kitchensink' AND n.nspname = 'main'",
+            &[],
+        )
+        .await;
+    assert!(
+        index_rows.is_ok(),
+        "index listing query failed: {:?}",
+        index_rows.err()
+    );
+
     tripwire_tx.send(()).await.ok();
     tripwire_worker.await;
     wait_for_all_pending_handles().await;

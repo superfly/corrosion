@@ -483,13 +483,146 @@ fn strip_pg_ast_set_expr(set_expr: &mut sqlparser::ast::SetExpr) {
     }
 }
 
+/// Quotes an identifier if it is a SQLite reserved keyword, so that it can be
+/// used as an alias or column name without causing a syntax error.
+fn quote_sqlite_keyword(ident: &mut sqlparser::ast::Ident) {
+    if ident.quote_style.is_some() {
+        return; // already quoted
+    }
+    if is_sqlite_keyword(&ident.value) {
+        ident.quote_style = Some('"');
+    }
+}
+
+/// Returns true if the given identifier (case-insensitive) is a SQLite reserved
+/// keyword that cannot be used as an unquoted alias.
+fn is_sqlite_keyword(s: &str) -> bool {
+    // This is not the full SQLite keyword list — just the ones that are
+    // commonly used as column/alias names by PostgreSQL tools like TablePlus
+    // and that conflict with SQLite's parser.
+    matches!(
+        s.to_ascii_uppercase().as_str(),
+        "CHECK"
+            | "CONSTRAINT"
+            | "KEY"
+            | "INDEX"
+            | "TABLE"
+            | "COLUMN"
+            | "DEFAULT"
+            | "NULL"
+            | "PRIMARY"
+            | "UNIQUE"
+            | "FOREIGN"
+            | "REFERENCES"
+            | "CAST"
+            | "COLLATE"
+            | "CONFLICT"
+            | "FILTER"
+            | "ROW"
+            | "ROWS"
+            | "VALUES"
+            | "VIEW"
+            | "TEMP"
+            | "TEMPORARY"
+            | "TRIGGER"
+            | "BEGIN"
+            | "COMMIT"
+            | "ROLLBACK"
+            | "END"
+            | "EXPLAIN"
+            | "PRAGMA"
+            | "REPLACE"
+            | "UNION"
+            | "EXCEPT"
+            | "INTERSECT"
+            | "LEFT"
+            | "RIGHT"
+            | "FULL"
+            | "INNER"
+            | "OUTER"
+            | "CROSS"
+            | "NATURAL"
+            | "JOIN"
+            | "ON"
+            | "USING"
+            | "GROUP"
+            | "ORDER"
+            | "HAVING"
+            | "WHERE"
+            | "FROM"
+            | "INTO"
+            | "SET"
+            | "BY"
+            | "AS"
+            | "AND"
+            | "OR"
+            | "NOT"
+            | "IN"
+            | "IS"
+            | "LIKE"
+            | "GLOB"
+            | "BETWEEN"
+            | "ESCAPE"
+            | "EXISTS"
+            | "DISTINCT"
+            | "ALL"
+            | "CASE"
+            | "WHEN"
+            | "THEN"
+            | "ELSE"
+            | "IF"
+            | "MATCH"
+            | "ASC"
+            | "DESC"
+            | "LIMIT"
+            | "OFFSET"
+            | "AUTOINCREMENT"
+            | "ADD"
+            | "ALTER"
+            | "DROP"
+            | "RENAME"
+            | "TO"
+            | "CREATE"
+            | "SELECT"
+            | "INSERT"
+            | "UPDATE"
+            | "DELETE"
+            | "WITH"
+            | "RECURSIVE"
+            | "MATERIALIZED"
+            | "WINDOW"
+            | "OVER"
+            | "PARTITION"
+            | "RETURNING"
+            | "RAISE"
+            | "ABORT"
+            | "ACTION"
+            | "AFTER"
+            | "BEFORE"
+            | "FAIL"
+            | "IGNORE"
+            | "RESTRICT"
+            | "CASCADE"
+            | "DEFERRABLE"
+            | "DEFERRED"
+            | "IMMEDIATE"
+            | "INITIALLY"
+            | "DEFER"
+            | "EXCLUSIVE"
+            | "SHARED"
+            | "UNLOCKED"
+    )
+}
+
 /// Strips PG-specific syntax from a `SelectItem`.
 fn strip_pg_ast_select_item(item: &mut sqlparser::ast::SelectItem) {
     use sqlparser::ast::SelectItem;
     match item {
-        SelectItem::ExprWithAlias { expr, .. } | SelectItem::UnnamedExpr(expr) => {
-            strip_pg_ast_expr(expr)
+        SelectItem::ExprWithAlias { expr, alias } => {
+            strip_pg_ast_expr(expr);
+            quote_sqlite_keyword(alias);
         }
+        SelectItem::UnnamedExpr(expr) => strip_pg_ast_expr(expr),
         _ => {}
     }
 }
@@ -607,13 +740,38 @@ fn pg_data_type_to_sqlite(dt: sqlparser::ast::DataType) -> sqlparser::ast::DataT
     }
 }
 
+/// Builds a simple `Function` AST node for a function call with unnamed args.
+fn make_sqlite_function(name: &str, args: Vec<sqlparser::ast::Expr>) -> sqlparser::ast::Function {
+    use sqlparser::ast::{
+        Function, FunctionArg, FunctionArgExpr, FunctionArgumentList, FunctionArguments, Ident,
+        ObjectName, ObjectNamePart,
+    };
+    Function {
+        name: ObjectName(vec![ObjectNamePart::Identifier(Ident::new(name))]),
+        uses_odbc_syntax: false,
+        parameters: FunctionArguments::None,
+        args: FunctionArguments::List(FunctionArgumentList {
+            duplicate_treatment: None,
+            args: args
+                .into_iter()
+                .map(|e| FunctionArg::Unnamed(FunctionArgExpr::Expr(e)))
+                .collect(),
+            clauses: vec![],
+        }),
+        filter: None,
+        null_treatment: None,
+        over: None,
+        within_group: vec![],
+    }
+}
+
 /// Recursively strips PG-specific syntax from an `Expr`.  The main
 /// transformation is converting `::type` casts to `CAST(expr AS type)` with
 /// SQLite-compatible type names.
-fn strip_pg_ast_expr(expr: &mut sqlparser::ast::Expr) {
+fn strip_pg_ast_expr(outer_expr: &mut sqlparser::ast::Expr) {
     use sqlparser::ast::Expr;
 
-    match expr {
+    match outer_expr {
         // Convert `expr::type` (DoubleColon) casts to `CAST(expr AS type)`
         // which SQLite understands, and map PG-specific type names to
         // SQLite-compatible ones.  `CAST(...)` casts are also normalized.
@@ -701,9 +859,17 @@ fn strip_pg_ast_expr(expr: &mut sqlparser::ast::Expr) {
             strip_pg_ast_expr(right);
         }
         Expr::IsUnknown(expr) | Expr::IsNotUnknown(expr) => strip_pg_ast_expr(expr),
-        Expr::Position { expr, r#in } => {
-            strip_pg_ast_expr(expr);
-            strip_pg_ast_expr(r#in);
+        // Convert `POSITION(substr IN str)` to `INSTR(str, substr)` which
+        // SQLite understands.  SQLite doesn't support the POSITION...IN syntax.
+        Expr::Position {
+            expr: substr,
+            r#in: in_str,
+        } => {
+            strip_pg_ast_expr(substr);
+            strip_pg_ast_expr(in_str);
+            let in_expr = (**in_str).clone();
+            let substr_expr = (**substr).clone();
+            *outer_expr = Expr::Function(make_sqlite_function("INSTR", vec![in_expr, substr_expr]));
         }
         _ => {}
     }
@@ -1431,6 +1597,25 @@ pub async fn start(
                                 |_ctx| Ok(0i64),
                             )?;
                         }
+
+                        // regexp_replace(source, pattern, replacement[, flags])
+                        // – PostgreSQL regex replace function used by TablePlus.
+                        // SQLite doesn't have this builtin, so return the
+                        // source string unchanged as a stub.
+                        conn.create_scalar_function(
+                            "regexp_replace",
+                            -1,
+                            FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+                            |ctx| {
+                                let n = ctx.len();
+                                if n == 0 {
+                                    return Ok::<String, rusqlite::Error>(String::new());
+                                }
+                                // Return the source string unchanged
+                                let source: String = ctx.get(0).unwrap_or_default();
+                                Ok(source)
+                            },
+                        )?;
 
                         let schema = match compute_schema(&conn) {
                             Ok(schema) => schema,
