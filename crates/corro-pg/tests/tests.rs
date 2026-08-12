@@ -421,6 +421,24 @@ async fn test_information_schema() {
         index_rows.err()
     );
 
+    // The TablePlus trigger-listing query.  Corrosion creates internal
+    // triggers (crsql) so we just verify the query executes without error
+    // and returns the expected columns.
+    let trigger_rows = client
+        .query(
+            "SELECT trigger_name as name, event_manipulation as event, \
+             action_timing as timing, action_statement as statement \
+             FROM information_schema.triggers as t \
+             WHERE event_object_table='kitchensink' AND event_object_schema='main'",
+            &[],
+        )
+        .await;
+    assert!(
+        trigger_rows.is_ok(),
+        "trigger listing query failed: {:?}",
+        trigger_rows.err()
+    );
+
     tripwire_tx.send(()).await.ok();
     tripwire_worker.await;
     wait_for_all_pending_handles().await;

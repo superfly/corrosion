@@ -2,6 +2,7 @@ pub mod empty_catalog;
 pub mod information_schema_columns;
 pub mod information_schema_table_constraints;
 pub mod information_schema_tables;
+pub mod information_schema_triggers;
 pub mod pg_attribute;
 pub mod pg_class;
 pub mod pg_database;

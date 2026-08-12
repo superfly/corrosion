@@ -92,6 +92,9 @@ use crate::{
         information_schema_tables::{
             load_information_schema_table_names, InformationSchemaTablesTable,
         },
+        information_schema_triggers::{
+            load_information_schema_triggers, InformationSchemaTriggersTable,
+        },
         pg_attribute::{load_pg_attributes, PgAttributeTable},
         pg_class::{load_pg_class_entries, PgClassTable},
         pg_database::{PgDatabase, PgDatabaseTable},
@@ -1451,6 +1454,7 @@ pub async fn start(
                             columns.as_slice(),
                             pg_class_entries.as_slice(),
                         ));
+                        let triggers = Arc::new(load_information_schema_triggers(&conn)?);
                         let table_names = Arc::new(table_names);
 
                         conn.create_module(
@@ -1497,6 +1501,11 @@ pub async fn start(
                             "table_constraints",
                             eponymous_only_module::<InformationSchemaTableConstraintsTable>(),
                             Some(table_constraints),
+                        )?;
+                        conn.create_module(
+                            "triggers",
+                            eponymous_only_module::<InformationSchemaTriggersTable>(),
+                            Some(triggers),
                         )?;
 
                         // Empty PostgreSQL catalog tables that external tools
