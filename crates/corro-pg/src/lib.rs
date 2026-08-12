@@ -80,7 +80,9 @@ use crate::{
     sql_state::SqlState,
     utils::CountedTcpStream,
     vtab::{
-        empty_catalog::{EmptyCatalogTable, PG_PROC_DDL, PG_STATIO_USER_TABLES_DDL},
+        empty_catalog::{
+            EmptyCatalogTable, PG_EXTENSION_DDL, PG_PROC_DDL, PG_STATIO_USER_TABLES_DDL,
+        },
         information_schema_columns::{
             load_information_schema_columns, InformationSchemaColumnsTable,
         },
@@ -366,6 +368,7 @@ fn parse_query(sql: &str) -> Result<(String, VecDeque<ParsedCmd>), ParseError> {
     // SQL string.  If that string can be parsed by the SQLite parser, we use
     // it — otherwise we fall back to the PG-parsed statement (which will only
     // work for a limited set of statements like BEGIN/COMMIT/SET/SHOW).
+
     let stmts = sqlparser::parser::Parser::parse_sql(
         &sqlparser::dialect::PostgreSqlDialect {},
         normalized,
@@ -617,6 +620,95 @@ fn is_sqlite_keyword(s: &str) -> bool {
     )
 }
 
+/// Builds a JSON array string from a slice of strings, properly escaping
+/// each element.  Used by `string_to_array` and `parse_ident` to represent
+/// PG arrays as JSON arrays (since SQLite has no native array type).
+fn json_array(parts: &[String]) -> String {
+    let items: Vec<String> = parts
+        .iter()
+        .map(|s| {
+            let escaped = s
+                .replace('\\', "\\\\")
+                .replace('"', "\\\"")
+                .replace('\n', "\\n")
+                .replace('\r', "\\r")
+                .replace('\t', "\\t");
+            format!("\"{escaped}\"")
+        })
+        .collect();
+    format!("[{}]", items.join(","))
+}
+
+/// Converts a PG array literal like `{a,b,c}` to a JSON array string.
+fn pg_array_to_json(s: &str) -> String {
+    let trimmed = s.trim();
+    if !trimmed.starts_with('{') || !trimmed.ends_with('}') {
+        return format!("[\"{}\"]", trimmed.replace('"', "\\\""));
+    }
+    let inner = &trimmed[1..trimmed.len() - 1];
+    if inner.is_empty() {
+        return "[]".to_string();
+    }
+    let parts: Vec<String> = inner.split(',').map(String::from).collect();
+    json_array(&parts)
+}
+
+/// Parses a PostgreSQL qualified identifier string (e.g. `"schema"."table"`
+/// or `schema.table`) into its component parts.
+fn parse_pg_ident(s: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut chars = s.chars().peekable();
+    while chars.peek().is_some() {
+        // Skip whitespace
+        while chars.peek().is_some_and(|c| c.is_whitespace()) {
+            chars.next();
+        }
+        if chars.peek().is_none() {
+            break;
+        }
+        if chars.peek() == Some(&'"') {
+            // Quoted identifier
+            chars.next(); // consume opening quote
+            let mut part = String::new();
+            while let Some(&c) = chars.peek() {
+                chars.next();
+                if c == '"' {
+                    if chars.peek() == Some(&'"') {
+                        // Escaped double quote
+                        chars.next();
+                        part.push('"');
+                    } else {
+                        break;
+                    }
+                } else {
+                    part.push(c);
+                }
+            }
+            parts.push(part);
+        } else {
+            // Unquoted identifier — read until dot or whitespace
+            let mut part = String::new();
+            while let Some(&c) = chars.peek() {
+                if c == '.' || c.is_whitespace() {
+                    break;
+                }
+                part.push(c);
+                chars.next();
+            }
+            parts.push(part);
+        }
+        // Skip whitespace
+        while chars.peek().is_some_and(|c| c.is_whitespace()) {
+            chars.next();
+        }
+        // Consume dot separator
+        if chars.peek() == Some(&'.') {
+            chars.next();
+        }
+    }
+    parts
+}
+
 /// Strips PG-specific syntax from a `SelectItem`.
 fn strip_pg_ast_select_item(item: &mut sqlparser::ast::SelectItem) {
     use sqlparser::ast::SelectItem;
@@ -662,9 +754,87 @@ fn strip_pg_ast_table_with_joins(table_with_joins: &mut sqlparser::ast::TableWit
 /// function calls in table function context).
 fn strip_pg_ast_table_factor(table_factor: &mut sqlparser::ast::TableFactor) {
     use sqlparser::ast::{FunctionArg, FunctionArgExpr, TableFactor};
+
+    // Helper: convert a scalar function used as a table factor into a
+    // derived subquery `(SELECT func(args) AS col) alias`.
+    // Also converts `generate_series(start, end) AS i` to
+    // `(SELECT value AS i FROM generate_series(start, end)) AS i`
+    // so that the column is accessible by the alias name.
+    // Returns true if the conversion was performed.
+    fn try_convert_scalar_table_func(
+        table_factor: &mut TableFactor,
+        name: &sqlparser::ast::ObjectName,
+        args: &[FunctionArg],
+        alias: &Option<sqlparser::ast::TableAlias>,
+    ) -> bool {
+        let func_name = name
+            .0
+            .last()
+            .and_then(|p| p.as_ident())
+            .map(|p| p.value.to_ascii_lowercase())
+            .unwrap_or_default();
+        const SCALAR_FUNCS: &[&str] = &[
+            "string_to_array",
+            "current_setting",
+            "parse_ident",
+            "array_to_string",
+        ];
+
+        let alias_name = alias
+            .as_ref()
+            .map(|a| a.name.value.clone())
+            .unwrap_or_else(|| "col".to_string());
+
+        let subquery_sql = if SCALAR_FUNCS.contains(&func_name.as_str()) {
+            // Scalar function: wrap in (SELECT func(args) AS alias_name)
+            let func_call = format!(
+                "{}({})",
+                name,
+                args.iter()
+                    .map(|a| a.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            format!("SELECT {} AS \"{}\"", func_call, alias_name)
+        } else if func_name == "generate_series" {
+            // generate_series: wrap in (SELECT value AS alias_name FROM generate_series(...))
+            let func_call = format!(
+                "{}({})",
+                name,
+                args.iter()
+                    .map(|a| a.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            format!("SELECT value AS \"{}\" FROM {}", alias_name, func_call)
+        } else {
+            return false;
+        };
+
+        // Parse the subquery and replace the table factor
+        if let Ok(sub_stmts) = sqlparser::parser::Parser::parse_sql(
+            &sqlparser::dialect::PostgreSqlDialect {},
+            &subquery_sql,
+        ) {
+            if let Some(sqlparser::ast::Statement::Query(sub_query)) = sub_stmts.into_iter().next()
+            {
+                *table_factor = TableFactor::Derived {
+                    lateral: false,
+                    subquery: sub_query,
+                    alias: alias.clone(),
+                };
+                return true;
+            }
+        }
+        false
+    }
+
     match table_factor {
-        TableFactor::Function { name, args, .. } => {
+        TableFactor::Function {
+            name, args, alias, ..
+        } => {
             strip_pg_catalog_prefix(name);
+            // Process args first
             for arg in args.iter_mut() {
                 let func_arg_expr = match arg {
                     FunctionArg::Named { arg, .. } => arg,
@@ -675,6 +845,42 @@ fn strip_pg_ast_table_factor(table_factor: &mut sqlparser::ast::TableFactor) {
                     strip_pg_ast_expr(e);
                 }
             }
+            let name_clone = name.clone();
+            let args_clone = args.clone();
+            let alias_clone = alias.clone();
+            try_convert_scalar_table_func(table_factor, &name_clone, &args_clone, &alias_clone);
+        }
+        TableFactor::Table {
+            name,
+            args: Some(table_args),
+            alias,
+            ..
+        } => {
+            strip_pg_catalog_prefix(name);
+            // Process args
+            for arg in table_args.args.iter_mut() {
+                let func_arg_expr = match arg {
+                    FunctionArg::Named { arg, .. } => arg,
+                    FunctionArg::ExprNamed { arg, .. } => arg,
+                    FunctionArg::Unnamed(expr) => expr,
+                };
+                if let FunctionArgExpr::Expr(e) = func_arg_expr {
+                    strip_pg_ast_expr(e);
+                }
+            }
+            let name_clone = name.clone();
+            let args_clone = table_args.args.clone();
+            let alias_clone = alias.clone();
+            try_convert_scalar_table_func(table_factor, &name_clone, &args_clone, &alias_clone);
+        }
+        TableFactor::Table {
+            name: _,
+            args: None,
+            ..
+        } => {
+            // Don't strip pg_catalog. prefix from regular table references —
+            // SQLite supports schema.table syntax and the pg_catalog vtabs
+            // are registered with that schema prefix.
         }
         TableFactor::Derived { subquery, .. } => {
             strip_pg_ast_query(subquery);
@@ -790,6 +996,20 @@ fn strip_pg_ast_expr(outer_expr: &mut sqlparser::ast::Expr) {
         }
         Expr::Function(func) => {
             strip_pg_catalog_prefix(&mut func.name);
+            // In PG, `user` is a special keyword equivalent to `current_user`.
+            // The PG parser produces it as Expr::Function with no args.
+            // SQLite doesn't have this, so convert to a string literal.
+            if let Some(ident) = func.name.0.last().and_then(|p| p.as_ident()) {
+                if ident.value.eq_ignore_ascii_case("user")
+                    && ident.quote_style.is_none()
+                    && matches!(func.args, sqlparser::ast::FunctionArguments::None)
+                {
+                    *outer_expr = Expr::Value(
+                        sqlparser::ast::Value::SingleQuotedString("corro".into()).into(),
+                    );
+                    return;
+                }
+            }
             strip_pg_ast_function_args(&mut func.args);
             if let Some(ref mut filter) = func.filter {
                 strip_pg_ast_expr(filter);
@@ -850,6 +1070,35 @@ fn strip_pg_ast_expr(outer_expr: &mut sqlparser::ast::Expr) {
         Expr::Exists { subquery, .. } => strip_pg_ast_query(subquery),
         Expr::Nested(inner) => strip_pg_ast_expr(inner),
         Expr::Extract { expr, .. } => strip_pg_ast_expr(expr),
+        Expr::Trim {
+            expr,
+            trim_what,
+            trim_characters,
+            ..
+        } => {
+            strip_pg_ast_expr(expr);
+            if let Some(tw) = trim_what {
+                strip_pg_ast_expr(tw);
+            }
+            if let Some(tcs) = trim_characters {
+                for tc in tcs {
+                    strip_pg_ast_expr(tc);
+                }
+            }
+        }
+        Expr::Overlay {
+            expr,
+            overlay_what,
+            overlay_from,
+            overlay_for,
+        } => {
+            strip_pg_ast_expr(expr);
+            strip_pg_ast_expr(overlay_what);
+            strip_pg_ast_expr(overlay_from);
+            if let Some(of) = overlay_for {
+                strip_pg_ast_expr(of);
+            }
+        }
         Expr::AtTimeZone {
             timestamp,
             time_zone,
@@ -874,6 +1123,97 @@ fn strip_pg_ast_expr(outer_expr: &mut sqlparser::ast::Expr) {
             let substr_expr = (**substr).clone();
             *outer_expr = Expr::Function(make_sqlite_function("INSTR", vec![in_expr, substr_expr]));
         }
+        // Convert PG array subscript `arr[i]` (parsed as JsonAccess) to `json_extract(arr, '$[' || (i - 1) || ']')`.
+        // PG arrays are 1-indexed; JSON arrays are 0-indexed, so we subtract 1.
+        Expr::JsonAccess { value, path } => {
+            strip_pg_ast_expr(value);
+            if path.path.len() == 1 {
+                if let sqlparser::ast::JsonPathElem::Bracket { key } = &path.path[0] {
+                    let mut idx_expr = key.clone();
+                    strip_pg_ast_expr(&mut idx_expr);
+                    let arr_expr = (**value).clone();
+                    // Build json_extract(arr, '$[' || ((idx) - 1) || ']')
+                    let idx_minus_1 = Expr::Nested(Box::new(Expr::BinaryOp {
+                        left: Box::new(idx_expr),
+                        op: sqlparser::ast::BinaryOperator::Minus,
+                        right: Box::new(Expr::Value(
+                            sqlparser::ast::Value::Number("1".into(), false).into(),
+                        )),
+                    }));
+                    let path_expr = Expr::BinaryOp {
+                        left: Box::new(Expr::BinaryOp {
+                            left: Box::new(Expr::Value(
+                                sqlparser::ast::Value::SingleQuotedString("$[".into()).into(),
+                            )),
+                            op: sqlparser::ast::BinaryOperator::StringConcat,
+                            right: Box::new(idx_minus_1),
+                        }),
+                        op: sqlparser::ast::BinaryOperator::StringConcat,
+                        right: Box::new(Expr::Value(
+                            sqlparser::ast::Value::SingleQuotedString("]".into()).into(),
+                        )),
+                    };
+                    *outer_expr = Expr::Function(make_sqlite_function(
+                        "json_extract",
+                        vec![arr_expr, path_expr],
+                    ));
+                }
+            }
+        }
+        // Convert PG array subscript `arr[i]` to `json_extract(arr, '$[i-1]')`.
+        // PG arrays are 1-indexed; JSON arrays are 0-indexed, so we subtract 1.
+        // Only handles a single subscript index (not slices).
+        Expr::CompoundFieldAccess { root, access_chain } => {
+            strip_pg_ast_expr(root);
+            if access_chain.len() == 1 {
+                if let sqlparser::ast::AccessExpr::Subscript(sqlparser::ast::Subscript::Index {
+                    index,
+                }) = &access_chain[0]
+                {
+                    let mut idx_expr = index.clone();
+                    strip_pg_ast_expr(&mut idx_expr);
+                    let arr_expr = (**root).clone();
+                    // Build json_extract(arr, '$[' || (idx - 1) || ']')
+                    // PG arrays are 1-indexed; JSON arrays are 0-indexed.
+                    let idx_minus_1 = Expr::Nested(Box::new(Expr::BinaryOp {
+                        left: Box::new(idx_expr),
+                        op: sqlparser::ast::BinaryOperator::Minus,
+                        right: Box::new(Expr::Value(
+                            sqlparser::ast::Value::Number("1".into(), false).into(),
+                        )),
+                    }));
+                    // '$[' || (idx - 1) || ']'
+                    let path_expr = Expr::BinaryOp {
+                        left: Box::new(Expr::BinaryOp {
+                            left: Box::new(Expr::Value(
+                                sqlparser::ast::Value::SingleQuotedString("$[".into()).into(),
+                            )),
+                            op: sqlparser::ast::BinaryOperator::StringConcat,
+                            right: Box::new(idx_minus_1),
+                        }),
+                        op: sqlparser::ast::BinaryOperator::StringConcat,
+                        right: Box::new(Expr::Value(
+                            sqlparser::ast::Value::SingleQuotedString("]".into()).into(),
+                        )),
+                    };
+                    *outer_expr = Expr::Function(make_sqlite_function(
+                        "json_extract",
+                        vec![arr_expr, path_expr],
+                    ));
+                    return;
+                }
+            }
+            // Fallback: just recurse into the root
+            for access in access_chain.iter_mut() {
+                match access {
+                    sqlparser::ast::AccessExpr::Dot(e) => strip_pg_ast_expr(e),
+                    sqlparser::ast::AccessExpr::Subscript(sqlparser::ast::Subscript::Index {
+                        index,
+                    }) => strip_pg_ast_expr(index),
+                    _ => {}
+                }
+            }
+        }
         _ => {}
     }
 }
@@ -881,6 +1221,22 @@ fn strip_pg_ast_expr(outer_expr: &mut sqlparser::ast::Expr) {
 #[cfg(test)]
 mod tests {
     use super::pg_stmt_to_sqlite_sql;
+
+    #[test]
+    fn check_normal_pg_dialect_array_subscript() {
+        // Verify the normal PostgreSqlDialect parses s[i] as
+        // CompoundFieldAccess and our walker transforms it to json_extract
+        let stmts = sqlparser::parser::Parser::parse_sql(
+            &sqlparser::dialect::PostgreSqlDialect {},
+            "SELECT s[i] FROM t",
+        )
+        .unwrap();
+        let converted = pg_stmt_to_sqlite_sql(&stmts[0]).unwrap();
+        assert!(
+            converted.contains("json_extract(s,"),
+            "expected json_extract in: {converted}"
+        );
+    }
 
     #[test]
     fn strip_pg_casts_via_ast() {
@@ -1571,6 +1927,11 @@ pub async fn start(
                             Some(PG_PROC_DDL),
                         )?;
                         conn.create_module(
+                            "pg_extension",
+                            eponymous_only_module::<EmptyCatalogTable>(),
+                            Some(PG_EXTENSION_DDL),
+                        )?;
+                        conn.create_module(
                             "pg_statio_user_tables",
                             eponymous_only_module::<EmptyCatalogTable>(),
                             Some(PG_STATIO_USER_TABLES_DDL),
@@ -1730,6 +2091,153 @@ pub async fn start(
                                 // Return the source string unchanged
                                 let source: String = ctx.get(0).unwrap_or_default();
                                 Ok(source)
+                            },
+                        )?;
+
+                        // current_setting(name) – returns the current value
+                        // of a PostgreSQL configuration parameter.  We stub
+                        // the few settings that Grafana and other tools query.
+                        conn.create_scalar_function(
+                            "current_setting",
+                            -1,
+                            FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+                            |ctx| {
+                                let name: String = ctx.get(0).unwrap_or_default();
+                                let val = match name.as_str() {
+                                    "server_version_num" => "140000".to_string(),
+                                    "server_version" => "14.0.0".to_string(),
+                                    "search_path" => "main".to_string(),
+                                    "standard_conforming_strings" => "on".to_string(),
+                                    "TimeZone" => "UTC".to_string(),
+                                    "integer_datetimes" => "on".to_string(),
+                                    "client_encoding" => "UTF8".to_string(),
+                                    "application_name" => String::new(),
+                                    _ => String::new(),
+                                };
+                                Ok(val)
+                            },
+                        )?;
+
+                        // quote_ident(str) – quotes an identifier if it would
+                        // need quoting in PostgreSQL (contains special chars,
+                        // is a reserved word, etc.).  We wrap in double quotes
+                        // when needed; otherwise return as-is.
+                        conn.create_scalar_function(
+                            "quote_ident",
+                            1,
+                            FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+                            |ctx| {
+                                let s: String = ctx.get(0).unwrap_or_default();
+                                let needs_quoting = s.is_empty()
+                                    || s.chars().any(|c| {
+                                        !c.is_ascii_alphanumeric() && c != '_'
+                                    })
+                                    || s.chars().next().is_none_or(|c| c.is_ascii_digit())
+                                    || is_sqlite_keyword(&s);
+                                if needs_quoting {
+                                    // Escape any embedded double quotes
+                                    let escaped = s.replace('"', "\"\"");
+                                    Ok(format!("\"{escaped}\""))
+                                } else {
+                                    Ok(s)
+                                }
+                            },
+                        )?;
+
+                        // string_to_array(str, delimiter) – splits a string
+                        // by delimiter and returns a JSON array string (since
+                        // SQLite has no native array type).  PG arrays are
+                        // represented as JSON arrays throughout our emulation.
+                        conn.create_scalar_function(
+                            "string_to_array",
+                            -1,
+                            FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+                            |ctx| {
+                                let s: String = ctx.get(0).unwrap_or_default();
+                                let delim: String = ctx.get(1).unwrap_or_default();
+                                if delim.is_empty() {
+                                    // PG: empty delimiter splits into characters
+                                    let chars: Vec<String> =
+                                        s.chars().map(|c| c.to_string()).collect();
+                                    return Ok(json_array(&chars));
+                                }
+                                let parts: Vec<String> = s.split(&delim).map(String::from).collect();
+                                Ok(json_array(&parts))
+                            },
+                        )?;
+
+                        // array_length(arr, dim) – returns the length of an
+                        // array dimension.  We delegate to SQLite's builtin
+                        // json_array_length since we represent PG arrays as
+                        // JSON arrays.  dim is ignored (always 1).
+                        conn.create_scalar_function(
+                            "array_length",
+                            -1,
+                            FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+                            |ctx| {
+                                let arr: String = ctx.get(0).unwrap_or_default();
+                                let json_arr = if arr.starts_with('[') {
+                                    arr
+                                } else {
+                                    pg_array_to_json(&arr)
+                                };
+                                let conn = unsafe { ctx.get_connection()? };
+                                let n: i64 = conn
+                                    .query_row(
+                                        "SELECT json_array_length(?1)",
+                                        [&json_arr],
+                                        |row| row.get(0),
+                                    )
+                                    .unwrap_or(0);
+                                Ok(n)
+                            },
+                        )?;
+
+                        // array_lower(arr, dim) – returns the lower bound of
+                        // an array dimension.  PG arrays are 1-indexed.
+                        conn.create_scalar_function(
+                            "array_lower",
+                            -1,
+                            FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+                            |_ctx| Ok(1i64),
+                        )?;
+
+                        // array_upper(arr, dim) – returns the upper bound of
+                        // an array dimension.  Same as array_length for 1-indexed.
+                        conn.create_scalar_function(
+                            "array_upper",
+                            -1,
+                            FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+                            |ctx| {
+                                let arr: String = ctx.get(0).unwrap_or_default();
+                                let json_arr = if arr.starts_with('[') {
+                                    arr
+                                } else {
+                                    pg_array_to_json(&arr)
+                                };
+                                let conn = unsafe { ctx.get_connection()? };
+                                let n: i64 = conn
+                                    .query_row(
+                                        "SELECT json_array_length(?1)",
+                                        [&json_arr],
+                                        |row| row.get(0),
+                                    )
+                                    .unwrap_or(0);
+                                Ok(n)
+                            },
+                        )?;
+
+                        // parse_ident(str) – parses a possibly-qualified
+                        // identifier (e.g. "schema"."table") into an array.
+                        // Returns a JSON array of the identifier parts.
+                        conn.create_scalar_function(
+                            "parse_ident",
+                            -1,
+                            FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+                            |ctx| {
+                                let s: String = ctx.get(0).unwrap_or_default();
+                                let parts = parse_pg_ident(&s);
+                                Ok(json_array(&parts))
                             },
                         )?;
 

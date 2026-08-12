@@ -439,6 +439,83 @@ async fn test_information_schema() {
         trigger_rows.err()
     );
 
+    // Grafana version check query
+    let version_rows = client
+        .query(
+            "SELECT current_setting('server_version_num') as version",
+            &[],
+        )
+        .await;
+    assert!(
+        version_rows.is_ok(),
+        "grafana version query failed: {:?}",
+        version_rows.err()
+    );
+
+    // Grafana TimescaleDB check (pg_extension should exist, return empty)
+    let tsdb_rows = client
+        .query(
+            "SELECT extversion FROM pg_extension WHERE extname = 'timescaledb'",
+            &[],
+        )
+        .await;
+    assert!(
+        tsdb_rows.is_ok(),
+        "grafana timescaledb query failed: {:?}",
+        tsdb_rows.err()
+    );
+
+    // Grafana table listing query (uses quote_ident, current_setting,
+    // string_to_array, generate_series, array_lower/upper, information_schema.tables)
+    let tables_rows = client
+        .query(
+            "SELECT \
+             CASE WHEN quote_ident(table_schema) IN ( \
+             SELECT CASE WHEN trim(s[i]) = '\"$user\"' THEN user ELSE trim(s[i]) END \
+             FROM generate_series( \
+             array_lower(string_to_array(current_setting('search_path'),','),1), \
+             array_upper(string_to_array(current_setting('search_path'),','),1) \
+             ) as i, \
+             string_to_array(current_setting('search_path'),',') s \
+             ) \
+             THEN quote_ident(table_name) \
+             ELSE quote_ident(table_schema) || '.' || quote_ident(table_name) \
+             END AS \"table\" \
+             FROM information_schema.tables \
+             WHERE quote_ident(table_schema) NOT IN ('information_schema','pg_catalog') \
+             ORDER BY 1",
+            &[],
+        )
+        .await;
+    assert!(
+        tables_rows.is_ok(),
+        "grafana table listing query failed: {:?}",
+        tables_rows.err()
+    );
+
+    // Grafana column listing query (uses parse_ident, array_length, quote_ident)
+    let schema_rows = client
+        .query(
+            "SELECT quote_ident(column_name) AS \"column\", data_type AS \"type\" \
+             FROM information_schema.columns \
+             WHERE quote_ident(table_name) = 'kitchensink' \
+             AND quote_ident(table_schema) IN ( \
+             SELECT CASE WHEN trim(s[i]) = '\"$user\"' THEN user ELSE trim(s[i]) END \
+             FROM generate_series( \
+             array_lower(string_to_array(current_setting('search_path'),','),1), \
+             array_upper(string_to_array(current_setting('search_path'),','),1) \
+             ) as i, \
+             string_to_array(current_setting('search_path'),',') s \
+             )",
+            &[],
+        )
+        .await;
+    assert!(
+        schema_rows.is_ok(),
+        "grafana column listing query failed: {:?}",
+        schema_rows.err()
+    );
+
     tripwire_tx.send(()).await.ok();
     tripwire_worker.await;
     wait_for_all_pending_handles().await;

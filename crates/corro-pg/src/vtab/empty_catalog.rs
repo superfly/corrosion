@@ -84,5 +84,8 @@ unsafe impl VTabCursor for EmptyCatalogCursor<'_> {
 /// DDL for `pg_proc` – matches the PostgreSQL 14 column set (simplified).
 pub const PG_PROC_DDL: &str = "(oid INTEGER, proname TEXT, pronamespace INTEGER, proowner INTEGER, proargtypes TEXT, prorettype INTEGER)";
 
+/// DDL for `pg_extension` – matches the PostgreSQL 14 column set.
+pub const PG_EXTENSION_DDL: &str = "(oid INTEGER, extname TEXT, extowner INTEGER, extnamespace INTEGER, extrelocatable INTEGER, extversion TEXT, extconfig TEXT, extcondition TEXT)";
+
 /// DDL for `pg_statio_user_tables` – a PostgreSQL statistics view.
 pub const PG_STATIO_USER_TABLES_DDL: &str = "(relid INTEGER, schemaname TEXT, relname TEXT, heap_blks_read INTEGER, heap_blks_hit INTEGER, idx_blks_read INTEGER, idx_blks_hit INTEGER, toast_blks_read INTEGER, toast_blks_hit INTEGER, tidx_blks_read INTEGER, tidx_blks_hit INTEGER)";
