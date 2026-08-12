@@ -27,35 +27,35 @@ pub fn load_pg_index_entries(
     index_oid_map: &std::collections::HashMap<String, i64>,
 ) -> rusqlite::Result<Vec<PgIndexEntry>> {
     let mut stmt = conn.prepare(
-        "SELECT m.name, m.tbl_name, p.\"unique\" \
+        "SELECT m.name, m.tbl_name, p.\"unique\", p.origin \
          FROM sqlite_master m \
          LEFT JOIN pragma_index_list(m.tbl_name) p ON p.name = m.name \
-         WHERE m.type = 'index' AND m.sql IS NOT NULL \
+         WHERE m.type = 'index' \
          ORDER BY m.name",
     )?;
 
     let rows = stmt.query_map([], |row| {
         Ok((
-            row.get::<_, String>(0)?,      // index name
-            row.get::<_, String>(1)?,      // table name
-            row.get::<_, Option<i64>>(2)?, // unique (from pragma_index_list)
+            row.get::<_, String>(0)?,         // index name
+            row.get::<_, String>(1)?,         // table name
+            row.get::<_, Option<i64>>(2)?,    // unique (from pragma_index_list)
+            row.get::<_, Option<String>>(3)?, // origin: 'c'=create_index, 'u'=unique_constraint, 'pk'=primary_key
         ))
     })?;
 
     let mut entries = Vec::new();
     for row in rows {
-        let (index_name, tbl_name, unique) = row?;
+        let (index_name, tbl_name, unique, origin) = row?;
         let indexrelid = *index_oid_map.get(&index_name).unwrap_or(&0);
         let indrelid = *table_oid_map.get(&tbl_name).unwrap_or(&0);
         let is_unique = unique.unwrap_or(0) != 0;
-        // Primary key indexes in SQLite are auto-created and don't appear in
-        // sqlite_master with type='index' + sql IS NOT NULL, so we can't
-        // detect them here.  Set indisprimary = false for all explicit indexes.
+        // 'pk' origin means this index was auto-created for a PRIMARY KEY.
+        let is_primary = origin.as_deref() == Some("pk");
         entries.push(PgIndexEntry {
             indexrelid,
             indrelid,
             indisunique: is_unique,
-            indisprimary: false,
+            indisprimary: is_primary,
         });
     }
 

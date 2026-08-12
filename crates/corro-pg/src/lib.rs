@@ -1630,27 +1630,75 @@ pub async fn start(
                         )?;
 
                         // pg_get_indexdef(index_oid) – returns the CREATE INDEX
-                        // statement for an index.  Look up the SQL from
-                        // sqlite_master via the index name in pg_class.
+                        // statement for an index.  For explicit indexes, return
+                        // the SQL from sqlite_master.  For auto-indexes
+                        // (sqlite_autoindex_*, sql IS NULL), synthesize a
+                        // CREATE INDEX statement from pragma_index_info.
                         conn.create_scalar_function(
                             "pg_get_indexdef",
                             -1,
                             FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
                             |ctx| {
                                 let oid: i64 = ctx.get(0).unwrap_or(0);
-                                // Look up the index name from the temp OID map,
-                                // then fetch the SQL from sqlite_master.
                                 let conn = unsafe { ctx.get_connection()? };
-                                let sql: Option<String> = conn
+
+                                // Look up the index name and table name.
+                                let (index_name, tbl_name): (String, String) = conn
                                     .query_row(
-                                        "SELECT m.sql FROM sqlite_master m \
-                                         JOIN temp_pg_class_oid_map o ON o.relname = m.name \
+                                        "SELECT o.relname, m.tbl_name \
+                                         FROM temp_pg_class_oid_map o \
+                                         JOIN sqlite_master m ON m.name = o.relname \
                                          WHERE o.oid = ?1 AND m.type = 'index'",
                                         [oid],
+                                        |row| Ok((row.get(0)?, row.get(1)?)),
+                                    )
+                                    .unwrap_or_default();
+
+                                if index_name.is_empty() {
+                                    return Ok::<Option<String>, rusqlite::Error>(None);
+                                }
+
+                                // Try to get the explicit CREATE INDEX SQL.
+                                let sql: Option<String> = conn
+                                    .query_row(
+                                        "SELECT sql FROM sqlite_master WHERE name = ?1 AND type = 'index'",
+                                        [&index_name],
                                         |row| row.get(0),
                                     )
                                     .unwrap_or(None);
-                                Ok(sql)
+
+                                if let Some(s) = sql {
+                                    return Ok(Some(s));
+                                }
+
+                                // Auto-index: synthesize from pragma_index_info.
+                                let mut stmt = conn.prepare(
+                                    "SELECT name FROM pragma_index_info(?1) ORDER BY seqno",
+                                )?;
+                                let cols: Vec<String> = stmt
+                                    .query_map([&index_name], |row| row.get::<_, String>(0))?
+                                    .filter_map(|r| r.ok())
+                                    .collect();
+
+                                if cols.is_empty() {
+                                    return Ok(None);
+                                }
+
+                                // Check if it's unique via pragma_index_list.
+                                let is_unique: bool = conn
+                                    .query_row(
+                                        "SELECT \"unique\" FROM pragma_index_list(?1) WHERE name = ?2",
+                                        rusqlite::params![&tbl_name, &index_name],
+                                        |row| row.get::<_, i64>(0),
+                                    )
+                                    .map(|v| v != 0)
+                                    .unwrap_or(false);
+
+                                let unique_kw = if is_unique { "UNIQUE " } else { "" };
+                                let cols_str = cols.join(", ");
+                                Ok(Some(format!(
+                                    "CREATE {unique_kw}INDEX {index_name} ON {tbl_name} ({cols_str})"
+                                )))
                             },
                         )?;
 

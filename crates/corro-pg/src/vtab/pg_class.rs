@@ -46,10 +46,12 @@ pub fn load_pg_class_entries(
     }
 
     // Indexes (relkind = 'i') — read from sqlite_master.
+    // Include both explicit indexes (sql IS NOT NULL) and auto-indexes
+    // (sqlite_autoindex_*, sql IS NULL) created for PRIMARY KEY / UNIQUE.
     // Assign OIDs starting after the table OIDs.
     let mut stmt = conn.prepare(
         "SELECT name, tbl_name FROM sqlite_master \
-         WHERE type = 'index' AND sql IS NOT NULL \
+         WHERE type = 'index' \
          ORDER BY name",
     )?;
     let index_rows = stmt.query_map([], |row| {
