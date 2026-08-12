@@ -59,7 +59,7 @@ use std::{
     collections::{BTreeMap, HashSet},
     convert::Infallible,
     net::SocketAddr,
-    ops::Deref,
+    ops::{Deref, RangeInclusive},
     sync::{atomic::AtomicI64, Arc},
     time::{Duration, Instant},
 };
@@ -749,6 +749,67 @@ pub fn process_single_version<T: Deref<Target = rusqlite::Connection> + Committa
     Ok((known, changeset))
 }
 
+/// Returns the `0..=last_seq` range for a buffered version if it's gap-free (ready to
+/// apply), without taking the Bookie write lock. `None` if the version isn't known or
+/// still has gaps.
+pub fn version_seq_range(
+    bookie: &Bookie,
+    actor_id: ActorId,
+    version: CrsqlDbVersion,
+) -> Option<RangeInclusive<CrsqlSeq>> {
+    let booked = bookie.ensure(actor_id);
+    let read = booked.read();
+    match read.get_partial(&version) {
+        Some(PartialVersion { seqs, last_seq, .. }) => {
+            if seqs.gaps(&(CrsqlSeq(0)..=*last_seq)).count() != 0 {
+                error!(%actor_id, %version, "found sequence gaps: {:?}, aborting!", seqs.gaps(&(CrsqlSeq(0)..=*last_seq)).collect::<RangeInclusiveSet<CrsqlSeq>>());
+                None
+            } else {
+                Some(CrsqlSeq(0)..=*last_seq)
+            }
+        }
+        None => {
+            warn!(%actor_id, %version, "version not found in cache, returning");
+            None
+        }
+    }
+}
+
+/// Inserts buffered changes for `actor_id`/`version` within `seq_range` into `crsql_changes`.
+/// Does not touch bookkeeping or commit; the caller owns the transaction. Returns the number
+/// of rows impacted by the insertion, as reported by `crsql_rows_impacted()`.
+pub fn insert_buffered_range(
+    tx: &Connection,
+    actor_id: ActorId,
+    version: CrsqlDbVersion,
+    seq_range: RangeInclusive<CrsqlSeq>,
+) -> Result<i64, rusqlite::Error> {
+    let start = Instant::now();
+
+    // insert buffered changes for this seq range into crsql_changes directly from the buffered changes table
+    let count = tx
+        .prepare_cached(
+            r#"
+            INSERT INTO crsql_changes ("table", pk, cid, val, col_version, db_version, site_id, cl, seq, ts)
+                SELECT                 "table", pk, cid, val, col_version, db_version, site_id, cl, seq, ts
+                    FROM __corro_buffered_changes
+                        WHERE site_id = ?
+                        AND db_version = ?
+                        AND seq >= ? AND seq <= ?
+                        ORDER BY db_version ASC, seq ASC
+                        "#,
+        )?
+        .execute(params![actor_id.as_bytes(), version, seq_range.start(), seq_range.end()])?;
+
+    let rows_impacted: i64 = tx
+        .prepare_cached("SELECT crsql_rows_impacted()")?
+        .query_row((), |row| row.get(0))?;
+
+    debug!(%actor_id, %version, ?seq_range, "inserted {count} rows (rows impacted: {rows_impacted}) from buffered into crsql_changes in {:?}", start.elapsed());
+
+    Ok(rows_impacted)
+}
+
 #[tracing::instrument(skip(agent, bookie), err)]
 pub async fn process_fully_buffered_changes(
     agent: &Agent,
@@ -802,45 +863,14 @@ pub async fn process_fully_buffered_changes(
 
             info!(%actor_id, %version, "Processing buffered changes to crsql_changes (actor: {actor_id}, version: {version}, last_seq: {last_seq})");
 
-            let rows_present: bool = tx.prepare_cached("SELECT EXISTS (SELECT 1 FROM __corro_buffered_changes WHERE site_id = ? AND db_version = ?)")
-                                    .map_err(|source| ChangeError::Rusqlite{source, actor_id: Some(actor_id), version: Some(version)})?
-                                    .query_row(params![actor_id, version], |row| row.get(0))
-                                    .map_err(|source| ChangeError::Rusqlite{source, actor_id: Some(actor_id), version: Some(version)})?;
-
-            let start = Instant::now();
-
-            if rows_present {
-                // insert all buffered changes into crsql_changes directly from the buffered changes table
-                let count = tx
-                    .prepare_cached(
-                        r#"
-                        INSERT INTO crsql_changes ("table", pk, cid, val, col_version, db_version, site_id, cl, seq, ts)
-                            SELECT                 "table", pk, cid, val, col_version, db_version, site_id, cl, seq, ts
-                                FROM __corro_buffered_changes
-                                    WHERE site_id = ?
-                                    AND db_version = ?
-                                    ORDER BY db_version ASC, seq ASC
-                                    "#,
-                    ).map_err(|source| ChangeError::Rusqlite{source, actor_id: Some(actor_id), version: Some(version)})?
-                    .execute(params![actor_id.as_bytes(), version]).map_err(|source| ChangeError::Rusqlite{source, actor_id: Some(actor_id), version: Some(version)})?;
-                info!(%actor_id, %version, "Inserted {count} rows from buffered into crsql_changes in {:?}", start.elapsed());
-            } else {
-                info!(%actor_id, %version, "No buffered rows, skipped insertion into crsql_changes");
-            }
-
-            let rows_impacted: i64 = tx
-                .prepare_cached("SELECT crsql_rows_impacted()")
-                .map_err(|source| ChangeError::Rusqlite {
-                    source,
-                    actor_id: Some(actor_id),
-                    version: Some(version),
-                })?
-                .query_row((), |row| row.get(0))
-                .map_err(|source| ChangeError::Rusqlite {
-                    source,
-                    actor_id: Some(actor_id),
-                    version: Some(version),
-                })?;
+            let rows_impacted =
+                insert_buffered_range(&tx, actor_id, version, CrsqlSeq(0)..=last_seq).map_err(
+                    |source| ChangeError::Rusqlite {
+                        source,
+                        actor_id: Some(actor_id),
+                        version: Some(version),
+                    },
+                )?;
 
             debug!(%actor_id, %version, "rows impacted by buffered changes insertion: {rows_impacted}");
 

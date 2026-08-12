@@ -13,6 +13,7 @@ corro-agent = { path = "../corro-agent" }
 eyre = { workspace = true }
 futures = { workspace = true }
 rusqlite = { workspace = true }
+sqlite-pool = { path = "../sqlite-pool" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 spawn = { path = "../spawn" }

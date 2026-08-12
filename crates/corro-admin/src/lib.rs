@@ -5,21 +5,26 @@ use std::{
 };
 
 use camino::Utf8PathBuf;
-use corro_agent::agent::{reload_change_dicts, util::execute_schema_from_paths};
+use corro_agent::agent::{
+    reload_change_dicts,
+    util::{execute_schema_from_paths, insert_buffered_range, version_seq_range},
+};
 use corro_types::{
     actor::{ActorId, ClusterId},
     agent::{Agent, BookedVersions, Bookie, WriteConn},
-    base::{CrsqlDbVersion, CrsqlSeq},
+    base::{CrsqlDbVersion, CrsqlDbVersionRange, CrsqlSeq},
     broadcast::{FocaCmd, FocaInput},
     sqlite::SqlitePoolError,
     sync::generate_sync,
     updates::Handle,
 };
 use futures::{SinkExt, TryStreamExt};
+use rangemap::RangeInclusiveSet;
 use rusqlite::{named_params, params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use spawn::spawn_counted;
+use sqlite_pool::InterruptibleTransaction;
 use time::OffsetDateTime;
 use tokio::{
     net::{UnixListener, UnixStream},
@@ -120,6 +125,11 @@ pub enum SyncCommand {
     Generate,
     ReconcileGaps,
     CheckBookieConsistency,
+    ProcessBufferedChanges {
+        actor_id: ActorId,
+        version: CrsqlDbVersion,
+        chunk_size: u64,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -366,6 +376,131 @@ async fn handle_conn(
                         .await;
                         continue;
                     }
+
+                    send_success(&mut stream).await;
+                }
+                Command::Sync(SyncCommand::ProcessBufferedChanges {
+                    actor_id,
+                    version,
+                    chunk_size,
+                }) => {
+                    let seq_range = match version_seq_range(bookie, actor_id, version) {
+                        Some(seq_range) => seq_range,
+                        None => {
+                            send_error(&mut stream, "version not fully buffered").await;
+                            continue;
+                        }
+                    };
+
+                    let chunk_size = chunk_size.max(1);
+                    let last_seq = seq_range.end().0;
+                    let total_chunks = (last_seq - seq_range.start().0) / chunk_size + 1;
+                    let tx_timeout = Duration::from_secs(agent.config().perf.sql_tx_timeout as u64);
+
+                    let mut total_rows_impacted: i64 = 0;
+                    let mut failed = false;
+                    let mut chunk_start = seq_range.start().0;
+                    let mut chunk_num = 0;
+                    loop {
+                        let chunk_end = chunk_start.saturating_add(chunk_size - 1).min(last_seq);
+                        chunk_num += 1;
+                        let is_last = chunk_end == last_seq;
+
+                        let start = Instant::now();
+                        let mut conn = match agent.pool().write_priority().await {
+                            Ok(conn) => conn,
+                            Err(e) => {
+                                send_error(&mut stream, e).await;
+                                failed = true;
+                                break;
+                            }
+                        };
+
+                        let result = block_in_place(|| {
+                            let mut bookedw = is_last.then(|| {
+                                let booked = bookie.ensure(actor_id);
+                                let bookie_write = bookie.write_lock_blocking();
+                                bookie_write.write_tx(&booked)
+                            });
+
+                            let tx = InterruptibleTransaction::new(
+                                conn.immediate_transaction()?,
+                                Some(tx_timeout),
+                                "process_buffered_changes",
+                            );
+
+                            let rows_impacted = insert_buffered_range(
+                                &tx,
+                                actor_id,
+                                version,
+                                CrsqlSeq(chunk_start)..=CrsqlSeq(chunk_end),
+                            )?;
+
+                            if let Some(bookedw) = bookedw.as_mut() {
+                                bookedw.insert_db(&tx, [version..=version].into())?;
+                                bookedw.clear_partials(
+                                    &tx,
+                                    RangeInclusiveSet::from([version..=version]),
+                                )?;
+                            }
+
+                            tx.commit()?;
+
+                            if let Some(bookedw) = bookedw {
+                                bookedw.commit();
+                                if let Err(e) = agent
+                                    .tx_clear_buf()
+                                    .try_send((actor_id, CrsqlDbVersionRange::single(version)))
+                                {
+                                    error!("could not schedule buffered data clear: {e}");
+                                }
+                            }
+
+                            Ok::<_, rusqlite::Error>(rows_impacted)
+                        });
+
+                        match result {
+                            Ok(rows_impacted) => {
+                                total_rows_impacted += rows_impacted;
+                                info_log(
+                                    &mut stream,
+                                    format!(
+                                        "chunk {chunk_num}/{total_chunks}: done in {:?} (rows impacted: {rows_impacted})",
+                                        start.elapsed()
+                                    ),
+                                )
+                                .await;
+                            }
+                            Err(e) => {
+                                send_error(
+                                    &mut stream,
+                                    format!(
+                                        "chunk {chunk_num}/{total_chunks} (seq {chunk_start}..={chunk_end}) failed: {e}"
+                                    ),
+                                )
+                                .await;
+                                failed = true;
+                                break;
+                            }
+                        }
+
+                        if is_last {
+                            break;
+                        }
+                        chunk_start = chunk_end + 1;
+                    }
+
+                    if failed {
+                        continue;
+                    }
+
+                    info_log(
+                        &mut stream,
+                        format!(
+                            "finished processing buffered changes for actor {actor_id} version {version} (total rows: {total_rows_impacted})"
+                        ),
+                    )
+                    .await;
 
                     send_success(&mut stream).await;
                 }
