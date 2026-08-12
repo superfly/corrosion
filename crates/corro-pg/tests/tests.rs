@@ -315,6 +315,53 @@ async fn test_information_schema() {
     let score: f64 = row.get(0);
     assert!((score - 2.5).abs() < 1e-9);
 
+    // Look up the OID of the kitchensink table from pg_class.
+    let kitchensink_oid: i64 = client
+        .query_one(
+            "SELECT oid FROM pg_catalog.pg_class WHERE relname = 'kitchensink'",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+
+    // The TablePlus column-listing query: JOINs information_schema.columns
+    // with pg_attribute, and calls format_type() and col_description().
+    let col_rows = client
+        .query(
+            &format!(
+                "SELECT ordinal_position, column_name, udt_name AS data_type, \
+                 format_type(atttypid, atttypmod) as format_type, \
+                 pg_catalog.col_description({kitchensink_oid}, ordinal_position) as comment \
+                 FROM information_schema.columns \
+                 JOIN pg_attribute pa ON attrelid = {kitchensink_oid} AND attname = column_name \
+                 WHERE table_name = 'kitchensink' AND table_schema = 'main' \
+                 ORDER BY ordinal_position"
+            ),
+            &[],
+        )
+        .await
+        .unwrap();
+    assert!(
+        !col_rows.is_empty(),
+        "column listing query returned no rows"
+    );
+    assert_eq!(col_rows[0].get::<_, &str>("column_name"), "id");
+    assert_eq!(col_rows[0].get::<_, &str>("format_type"), "bigint");
+    assert_eq!(col_rows[0].get::<_, Option<&str>>("comment"), None);
+
+    // PostgreSQL ::type cast syntax should work (stripped before parsing).
+    let count_rows = client
+        .query(
+            "select reltuples::int8 as count from pg_class c \
+             JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace \
+             where nspname='main' AND relname='kitchensink'",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(count_rows.len(), 1);
+
     tripwire_tx.send(()).await.ok();
     tripwire_worker.await;
     wait_for_all_pending_handles().await;

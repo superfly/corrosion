@@ -1,0 +1,94 @@
+use std::{marker::PhantomData, os::raw::c_int};
+
+use rusqlite::vtab::{
+    sqlite3_vtab, sqlite3_vtab_cursor, Filters, IndexInfo, VTab, VTabConnection, VTabCursor,
+};
+
+/// A virtual table that always returns zero rows.  Used for PostgreSQL system
+/// catalogs that we don't populate yet (e.g. `pg_index`, `pg_am`, `pg_proc`)
+/// but that external tools reference in JOINs.  Returning an empty result set
+/// is safer than erroring because the tool can degrade gracefully.
+#[repr(C)]
+pub struct EmptyCatalogTable {
+    /// Base class. Must be first
+    base: sqlite3_vtab,
+    ddl: &'static str,
+}
+
+unsafe impl<'vtab> VTab<'vtab> for EmptyCatalogTable {
+    type Aux = &'static str;
+    type Cursor = EmptyCatalogCursor<'vtab>;
+
+    fn connect(
+        _: &mut VTabConnection,
+        aux: Option<&&'static str>,
+        args: &[&[u8]],
+    ) -> rusqlite::Result<(String, EmptyCatalogTable)> {
+        let ddl = aux.unwrap();
+        let vtab = EmptyCatalogTable {
+            base: sqlite3_vtab::default(),
+            ddl,
+        };
+        let table_name = std::str::from_utf8(args[0]).map_err(rusqlite::Error::Utf8Error)?;
+        Ok((format!("CREATE TABLE {table_name} {ddl}"), vtab))
+    }
+
+    fn best_index(&self, info: &mut IndexInfo) -> rusqlite::Result<()> {
+        info.set_estimated_cost(1.);
+        Ok(())
+    }
+
+    fn open(&'vtab mut self) -> rusqlite::Result<EmptyCatalogCursor<'vtab>> {
+        Ok(EmptyCatalogCursor {
+            base: sqlite3_vtab_cursor::default(),
+            _phantom: PhantomData,
+        })
+    }
+}
+
+#[derive(Default)]
+#[repr(C)]
+pub struct EmptyCatalogCursor<'vtab> {
+    /// Base class. Must be first
+    base: sqlite3_vtab_cursor,
+    _phantom: PhantomData<&'vtab EmptyCatalogTable>,
+}
+
+unsafe impl VTabCursor for EmptyCatalogCursor<'_> {
+    fn filter(
+        &mut self,
+        _idx_num: c_int,
+        _idx_str: Option<&str>,
+        _args: &Filters<'_>,
+    ) -> rusqlite::Result<()> {
+        Ok(())
+    }
+
+    fn next(&mut self) -> rusqlite::Result<()> {
+        Ok(())
+    }
+
+    fn eof(&self) -> bool {
+        true // always empty
+    }
+
+    fn column(&self, _ctx: &mut rusqlite::vtab::Context, _col: c_int) -> rusqlite::Result<()> {
+        Ok(())
+    }
+
+    fn rowid(&self) -> rusqlite::Result<i64> {
+        Ok(0)
+    }
+}
+
+/// DDL for `pg_index` – matches the PostgreSQL 14 column set.
+pub const PG_INDEX_DDL: &str = "(indexrelid INTEGER, indrelid INTEGER, indnatts INTEGER, indnkeyatts INTEGER, indisunique INTEGER, indisprimary INTEGER, indisexclusion INTEGER, indimmediate INTEGER, indisclustered INTEGER, indisvalid INTEGER, indcheckxmin INTEGER, indisready INTEGER, indislive INTEGER, indisreplident INTEGER, indkey TEXT, indcollation TEXT, indclass TEXT, indoption TEXT, indexprs TEXT, indpred TEXT)";
+
+/// DDL for `pg_am` – matches the PostgreSQL 14 column set.
+pub const PG_AM_DDL: &str = "(oid INTEGER, amname TEXT, amhandler INTEGER, amtype TEXT)";
+
+/// DDL for `pg_proc` – matches the PostgreSQL 14 column set (simplified).
+pub const PG_PROC_DDL: &str = "(oid INTEGER, proname TEXT, pronamespace INTEGER, proowner INTEGER, proargtypes TEXT, prorettype INTEGER)";
+
+/// DDL for `pg_statio_user_tables` – a PostgreSQL statistics view.
+pub const PG_STATIO_USER_TABLES_DDL: &str = "(relid INTEGER, schemaname TEXT, relname TEXT, heap_blks_read INTEGER, heap_blks_hit INTEGER, idx_blks_read INTEGER, idx_blks_hit INTEGER, toast_blks_read INTEGER, toast_blks_hit INTEGER, tidx_blks_read INTEGER, tidx_blks_hit INTEGER)";

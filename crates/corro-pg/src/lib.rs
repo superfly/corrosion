@@ -80,6 +80,9 @@ use crate::{
     sql_state::SqlState,
     utils::CountedTcpStream,
     vtab::{
+        empty_catalog::{
+            EmptyCatalogTable, PG_AM_DDL, PG_INDEX_DDL, PG_PROC_DDL, PG_STATIO_USER_TABLES_DDL,
+        },
         information_schema_columns::{
             load_information_schema_columns, InformationSchemaColumnsTable,
         },
@@ -328,14 +331,16 @@ pub enum ParseError {
     Postgres(#[from] sqlparser::parser::ParserError),
 }
 
-fn parse_query(sql: &str) -> Result<VecDeque<ParsedCmd>, ParseError> {
+fn parse_query(sql: &str) -> Result<(String, VecDeque<ParsedCmd>), ParseError> {
     let mut cmds = VecDeque::new();
 
     let normalized = sql.trim_matches(';').trim();
     if normalized.is_empty() {
-        return Ok(cmds);
+        return Ok((normalized.to_string(), cmds));
     }
 
+    // First, try parsing with the SQLite parser directly — this is the fast
+    // path for all SQLite-compatible SQL.
     let mut parser = sqlite3_parser::lexer::sql::Parser::new(normalized.as_bytes());
     loop {
         match parser.next() {
@@ -343,23 +348,408 @@ fn parse_query(sql: &str) -> Result<VecDeque<ParsedCmd>, ParseError> {
                 cmds.push_back(ParsedCmd::Sqlite(cmd));
             }
             Ok(None) => {
-                break;
+                return Ok((normalized.to_string(), cmds));
             }
             Err(e) => {
                 debug!("could not parse statement ({sql:?}) as sqlite: {e}");
-                let stmts = sqlparser::parser::Parser::parse_sql(
-                    &sqlparser::dialect::PostgreSqlDialect {},
-                    normalized,
-                )?;
-                for stmt in stmts {
-                    cmds.push_back(ParsedCmd::Postgres(stmt));
-                }
                 break;
             }
         }
     }
 
-    Ok(cmds)
+    // The SQLite parser failed.  Try parsing with the PostgreSQL parser, then
+    // strip PG-specific syntax from the AST (e.g. `::type` casts and
+    // `pg_catalog.function()` prefixes) and re-serialize to a SQLite-compatible
+    // SQL string.  If that string can be parsed by the SQLite parser, we use
+    // it — otherwise we fall back to the PG-parsed statement (which will only
+    // work for a limited set of statements like BEGIN/COMMIT/SET/SHOW).
+    let stmts = sqlparser::parser::Parser::parse_sql(
+        &sqlparser::dialect::PostgreSqlDialect {},
+        normalized,
+    )?;
+
+    // Try to convert each PG statement to a SQLite-compatible string.
+    let mut sqlite_compat_sql = String::new();
+    let mut all_convertible = true;
+    for stmt in &stmts {
+        match pg_stmt_to_sqlite_sql(stmt) {
+            Some(converted) => {
+                if !sqlite_compat_sql.is_empty() {
+                    sqlite_compat_sql.push_str("; ");
+                }
+                sqlite_compat_sql.push_str(&converted);
+            }
+            None => {
+                all_convertible = false;
+                break;
+            }
+        }
+    }
+
+    if all_convertible && !sqlite_compat_sql.is_empty() {
+        // Try parsing the converted SQL with the SQLite parser.
+        let mut parser = sqlite3_parser::lexer::sql::Parser::new(sqlite_compat_sql.as_bytes());
+        let mut sqlite_cmds = VecDeque::new();
+        let mut success = true;
+        loop {
+            match parser.next() {
+                Ok(Some(cmd)) => {
+                    sqlite_cmds.push_back(ParsedCmd::Sqlite(cmd));
+                }
+                Ok(None) => {
+                    break;
+                }
+                Err(e) => {
+                    debug!(
+                        "could not parse PG-converted statement ({sqlite_compat_sql:?}) as sqlite: {e}"
+                    );
+                    success = false;
+                    break;
+                }
+            }
+        }
+        if success && !sqlite_cmds.is_empty() {
+            return Ok((sqlite_compat_sql, sqlite_cmds));
+        }
+    }
+
+    // Fall back to the PG-parsed statements.
+    for stmt in stmts {
+        cmds.push_back(ParsedCmd::Postgres(stmt));
+    }
+
+    Ok((normalized.to_string(), cmds))
+}
+
+/// Attempts to convert a `sqlparser` AST statement into a SQLite-compatible SQL
+/// string by stripping PostgreSQL-specific constructs.  Returns `None` if the
+/// statement type is not supported for conversion.
+///
+/// The main transformations are:
+///   - `expr::type` casts → just `expr` (SQLite is dynamically typed)
+///   - `pg_catalog.function(...)` → `function(...)` (SQLite doesn't support
+///     schema-qualified function calls)
+fn pg_stmt_to_sqlite_sql(stmt: &PgStatement) -> Option<String> {
+    use sqlparser::ast::Statement as S;
+
+    match stmt {
+        S::Query(query) => {
+            let mut query = query.clone();
+            strip_pg_ast_query(&mut query);
+            Some(query.to_string())
+        }
+        // Other statement types are handled as PG statements elsewhere
+        // (BEGIN/COMMIT/SET/SHOW) or are not supported.
+        _ => None,
+    }
+}
+
+/// Recursively strips PG-specific syntax from a `Query` AST.
+fn strip_pg_ast_query(query: &mut sqlparser::ast::Query) {
+    strip_pg_ast_set_expr(&mut query.body);
+    if let Some(ref mut order_by) = query.order_by {
+        if let sqlparser::ast::OrderByKind::Expressions(exprs) = &mut order_by.kind {
+            for item in exprs.iter_mut() {
+                strip_pg_ast_expr(&mut item.expr);
+            }
+        }
+    }
+}
+
+/// Recursively strips PG-specific syntax from a `SetExpr`.
+fn strip_pg_ast_set_expr(set_expr: &mut sqlparser::ast::SetExpr) {
+    use sqlparser::ast::SetExpr;
+    match set_expr {
+        SetExpr::Select(select) => {
+            for item in select.projection.iter_mut() {
+                strip_pg_ast_select_item(item);
+            }
+            for table_with_joins in select.from.iter_mut() {
+                strip_pg_ast_table_with_joins(table_with_joins);
+            }
+            if let Some(ref mut expr) = select.selection {
+                strip_pg_ast_expr(expr);
+            }
+            if let Some(ref mut expr) = select.having {
+                strip_pg_ast_expr(expr);
+            }
+        }
+        SetExpr::Query(query) => strip_pg_ast_query(query),
+        SetExpr::SetOperation { left, right, .. } => {
+            strip_pg_ast_set_expr(left);
+            strip_pg_ast_set_expr(right);
+        }
+        _ => {}
+    }
+}
+
+/// Strips PG-specific syntax from a `SelectItem`.
+fn strip_pg_ast_select_item(item: &mut sqlparser::ast::SelectItem) {
+    use sqlparser::ast::SelectItem;
+    match item {
+        SelectItem::ExprWithAlias { expr, .. } | SelectItem::UnnamedExpr(expr) => {
+            strip_pg_ast_expr(expr)
+        }
+        _ => {}
+    }
+}
+
+/// Strips PG-specific syntax from a `TableWithJoins`.
+fn strip_pg_ast_table_with_joins(table_with_joins: &mut sqlparser::ast::TableWithJoins) {
+    strip_pg_ast_table_factor(&mut table_with_joins.relation);
+    for join in table_with_joins.joins.iter_mut() {
+        strip_pg_ast_table_factor(&mut join.relation);
+        match &mut join.join_operator {
+            sqlparser::ast::JoinOperator::Join(constraint)
+            | sqlparser::ast::JoinOperator::Inner(constraint)
+            | sqlparser::ast::JoinOperator::Left(constraint)
+            | sqlparser::ast::JoinOperator::LeftOuter(constraint)
+            | sqlparser::ast::JoinOperator::Right(constraint)
+            | sqlparser::ast::JoinOperator::RightOuter(constraint)
+            | sqlparser::ast::JoinOperator::FullOuter(constraint)
+            | sqlparser::ast::JoinOperator::Semi(constraint)
+            | sqlparser::ast::JoinOperator::LeftSemi(constraint)
+            | sqlparser::ast::JoinOperator::RightSemi(constraint)
+            | sqlparser::ast::JoinOperator::Anti(constraint)
+            | sqlparser::ast::JoinOperator::LeftAnti(constraint)
+            | sqlparser::ast::JoinOperator::RightAnti(constraint) => {
+                if let sqlparser::ast::JoinConstraint::On(expr) = constraint {
+                    strip_pg_ast_expr(expr);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Strips PG-specific syntax from a `TableFactor` (mainly schema-qualified
+/// function calls in table function context).
+fn strip_pg_ast_table_factor(table_factor: &mut sqlparser::ast::TableFactor) {
+    use sqlparser::ast::{FunctionArg, FunctionArgExpr, TableFactor};
+    match table_factor {
+        TableFactor::Function { name, args, .. } => {
+            strip_pg_catalog_prefix(name);
+            for arg in args.iter_mut() {
+                let func_arg_expr = match arg {
+                    FunctionArg::Named { arg, .. } => arg,
+                    FunctionArg::ExprNamed { arg, .. } => arg,
+                    FunctionArg::Unnamed(expr) => expr,
+                };
+                if let FunctionArgExpr::Expr(e) = func_arg_expr {
+                    strip_pg_ast_expr(e);
+                }
+            }
+        }
+        TableFactor::Derived { subquery, .. } => {
+            strip_pg_ast_query(subquery);
+        }
+        _ => {}
+    }
+}
+
+/// Strips the `pg_catalog.` (or other schema) prefix from an `ObjectName` if
+/// it has more than one part, leaving just the last part (the function name).
+fn strip_pg_catalog_prefix(name: &mut sqlparser::ast::ObjectName) {
+    if name.0.len() > 1 {
+        // Keep only the last part (the function/table name).
+        let last = name.0.pop().unwrap();
+        name.0 = vec![last];
+    }
+}
+
+/// Recursively strips PG-specific syntax from function arguments.
+fn strip_pg_ast_function_args(args: &mut sqlparser::ast::FunctionArguments) {
+    use sqlparser::ast::{FunctionArg, FunctionArgExpr, FunctionArguments};
+    if let FunctionArguments::List(arg_list) = args {
+        for arg in arg_list.args.iter_mut() {
+            let func_arg_expr = match arg {
+                FunctionArg::Named { arg, .. } => arg,
+                FunctionArg::ExprNamed { arg, .. } => arg,
+                FunctionArg::Unnamed(expr) => expr,
+            };
+            if let FunctionArgExpr::Expr(e) = func_arg_expr {
+                strip_pg_ast_expr(e);
+            }
+        }
+    }
+}
+/// Maps a PostgreSQL `DataType` to a SQLite-compatible `DataType`.
+///
+/// SQLite's CAST only cares about type affinity (INTEGER, REAL, TEXT, BLOB,
+/// NUMERIC), but the corrosion engine's `name_to_type` function maps a
+/// specific set of type names to PostgreSQL wire types.  This function
+/// converts PG-specific type aliases (e.g. `INT8`, `FLOAT8`) to the
+/// canonical names that `name_to_type` recognizes (e.g. `BIGINT`, `DOUBLE
+/// PRECISION`).
+fn pg_data_type_to_sqlite(dt: sqlparser::ast::DataType) -> sqlparser::ast::DataType {
+    use sqlparser::ast::DataType;
+    match dt {
+        // Integer types → BIGINT (maps to Type::INT8 in name_to_type)
+        DataType::Int2(_) | DataType::Int4(_) | DataType::Int8(_) | DataType::SmallInt(_) => {
+            DataType::BigInt(None)
+        }
+        // Floating-point types → DoublePrecision (maps to Type::FLOAT8)
+        DataType::Real | DataType::Float(_) | DataType::Double(_) | DataType::Float8 => {
+            DataType::DoublePrecision
+        }
+        // Boolean → BOOLEAN (maps to Type::BOOL)
+        DataType::Bool => DataType::Boolean,
+        // Bytea → BLOB (maps to Type::BYTEA)
+        DataType::Bytea => DataType::Blob(None),
+        // Text types → TEXT (maps to Type::TEXT)
+        DataType::Varchar(_) | DataType::CharVarying(_) | DataType::CharacterVarying(_) => {
+            DataType::Text
+        }
+        // Timestamp → TIMESTAMP (maps to Type::TIMESTAMP)
+        DataType::Timestamp(_, _) => DataType::Timestamp(None, sqlparser::ast::TimezoneInfo::None),
+        // Pass through types that are already SQLite-compatible
+        other => other,
+    }
+}
+
+/// Recursively strips PG-specific syntax from an `Expr`.  The main
+/// transformation is converting `::type` casts to `CAST(expr AS type)` with
+/// SQLite-compatible type names.
+fn strip_pg_ast_expr(expr: &mut sqlparser::ast::Expr) {
+    use sqlparser::ast::Expr;
+
+    match expr {
+        // Convert `expr::type` (DoubleColon) casts to `CAST(expr AS type)`
+        // which SQLite understands, and map PG-specific type names to
+        // SQLite-compatible ones.  `CAST(...)` casts are also normalized.
+        Expr::Cast {
+            kind,
+            expr: inner,
+            data_type,
+            ..
+        } => {
+            strip_pg_ast_expr(inner);
+            *kind = sqlparser::ast::CastKind::Cast;
+            *data_type = pg_data_type_to_sqlite(data_type.clone());
+        }
+        Expr::Function(func) => {
+            strip_pg_catalog_prefix(&mut func.name);
+            strip_pg_ast_function_args(&mut func.args);
+            if let Some(ref mut filter) = func.filter {
+                strip_pg_ast_expr(filter);
+            }
+        }
+        Expr::Identifier(_) | Expr::CompoundIdentifier(_) | Expr::Wildcard(_) => {}
+        Expr::BinaryOp { left, right, .. } => {
+            strip_pg_ast_expr(left);
+            strip_pg_ast_expr(right);
+        }
+        Expr::UnaryOp { expr, .. } => strip_pg_ast_expr(expr),
+        Expr::IsNull(expr) | Expr::IsNotNull(expr) | Expr::IsTrue(expr) | Expr::IsFalse(expr) => {
+            strip_pg_ast_expr(expr)
+        }
+        Expr::InList { expr, list, .. } => {
+            strip_pg_ast_expr(expr);
+            for e in list {
+                strip_pg_ast_expr(e);
+            }
+        }
+        Expr::InSubquery { expr, subquery, .. } => {
+            strip_pg_ast_expr(expr);
+            strip_pg_ast_query(subquery);
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            strip_pg_ast_expr(expr);
+            strip_pg_ast_expr(low);
+            strip_pg_ast_expr(high);
+        }
+        Expr::Like { expr, pattern, .. } => {
+            strip_pg_ast_expr(expr);
+            strip_pg_ast_expr(pattern);
+        }
+        Expr::ILike { expr, pattern, .. } => {
+            strip_pg_ast_expr(expr);
+            strip_pg_ast_expr(pattern);
+        }
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            if let Some(op) = operand {
+                strip_pg_ast_expr(op);
+            }
+            for case_when in conditions.iter_mut() {
+                strip_pg_ast_expr(&mut case_when.condition);
+                strip_pg_ast_expr(&mut case_when.result);
+            }
+            if let Some(er) = else_result {
+                strip_pg_ast_expr(er);
+            }
+        }
+        Expr::Subquery(query) => strip_pg_ast_query(query),
+        Expr::Exists { subquery, .. } => strip_pg_ast_query(subquery),
+        Expr::Nested(inner) => strip_pg_ast_expr(inner),
+        Expr::Extract { expr, .. } => strip_pg_ast_expr(expr),
+        Expr::AtTimeZone {
+            timestamp,
+            time_zone,
+        } => {
+            strip_pg_ast_expr(timestamp);
+            strip_pg_ast_expr(time_zone);
+        }
+        Expr::IsDistinctFrom(left, right) | Expr::IsNotDistinctFrom(left, right) => {
+            strip_pg_ast_expr(left);
+            strip_pg_ast_expr(right);
+        }
+        Expr::IsUnknown(expr) | Expr::IsNotUnknown(expr) => strip_pg_ast_expr(expr),
+        Expr::Position { expr, r#in } => {
+            strip_pg_ast_expr(expr);
+            strip_pg_ast_expr(r#in);
+        }
+        _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pg_stmt_to_sqlite_sql;
+
+    #[test]
+    fn strip_pg_casts_via_ast() {
+        let stmts = sqlparser::parser::Parser::parse_sql(
+            &sqlparser::dialect::PostgreSqlDialect {},
+            "SELECT reltuples::int8 FROM pg_class",
+        )
+        .unwrap();
+        let converted = pg_stmt_to_sqlite_sql(&stmts[0]).unwrap();
+        // The ::int8 cast should be converted to CAST(reltuples AS BIGINT)
+        // (INT8 is a PG alias for BIGINT; SQLite + name_to_type understand BIGINT)
+        assert!(!converted.contains("::"));
+        assert!(converted.contains("CAST(reltuples AS BIGINT)"));
+    }
+
+    #[test]
+    fn strip_pg_catalog_function_prefix_via_ast() {
+        let stmts = sqlparser::parser::Parser::parse_sql(
+            &sqlparser::dialect::PostgreSqlDialect {},
+            "SELECT pg_catalog.col_description(16395, ordinal_position) FROM t",
+        )
+        .unwrap();
+        let converted = pg_stmt_to_sqlite_sql(&stmts[0]).unwrap();
+        assert!(!converted.contains("pg_catalog.col_description"));
+        assert!(converted.contains("col_description"));
+    }
+
+    #[test]
+    fn pg_catalog_table_reference_preserved() {
+        let stmts = sqlparser::parser::Parser::parse_sql(
+            &sqlparser::dialect::PostgreSqlDialect {},
+            "SELECT * FROM pg_catalog.pg_class",
+        )
+        .unwrap();
+        let converted = pg_stmt_to_sqlite_sql(&stmts[0]).unwrap();
+        // Table references should keep pg_catalog. prefix since SQLite supports schema.table
+        assert!(converted.contains("pg_catalog.pg_class"));
+    }
 }
 
 #[derive(Default)]
@@ -943,6 +1333,30 @@ pub async fn start(
                             Some(table_constraints),
                         )?;
 
+                        // Empty PostgreSQL catalog tables that external tools
+                        // (e.g. TablePlus) reference in JOINs.  Returning an
+                        // empty result set lets the tool degrade gracefully.
+                        conn.create_module(
+                            "pg_index",
+                            eponymous_only_module::<EmptyCatalogTable>(),
+                            Some(PG_INDEX_DDL),
+                        )?;
+                        conn.create_module(
+                            "pg_am",
+                            eponymous_only_module::<EmptyCatalogTable>(),
+                            Some(PG_AM_DDL),
+                        )?;
+                        conn.create_module(
+                            "pg_proc",
+                            eponymous_only_module::<EmptyCatalogTable>(),
+                            Some(PG_PROC_DDL),
+                        )?;
+                        conn.create_module(
+                            "pg_statio_user_tables",
+                            eponymous_only_module::<EmptyCatalogTable>(),
+                            Some(PG_STATIO_USER_TABLES_DDL),
+                        )?;
+
                         conn.create_scalar_function(
                             "version",
                             0,
@@ -963,6 +1377,60 @@ pub async fn start(
                             FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
                             |_ctx| Ok(false),
                         )?;
+
+                        // format_type(oid, typmod) – returns the PostgreSQL
+                        // type name for a given type OID.  This is used by
+                        // TablePlus and other tools when introspecting columns.
+                        conn.create_scalar_function(
+                            "format_type",
+                            2,
+                            FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+                            |ctx| {
+                                let oid: i64 = ctx.get(0)?;
+                                Ok(format_type_oid(oid as u32))
+                            },
+                        )?;
+
+                        // col_description(table_oid, column_number) – returns
+                        // the comment for a column.  We don't store comments
+                        // so always return NULL.
+                        conn.create_scalar_function(
+                            "col_description",
+                            2,
+                            FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+                            |_ctx| Ok::<Option<String>, rusqlite::Error>(None),
+                        )?;
+
+                        // obj_description(oid, catalog) – returns the comment
+                        // for a database object.  Always return NULL.
+                        conn.create_scalar_function(
+                            "obj_description",
+                            -1,
+                            FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+                            |_ctx| Ok::<Option<String>, rusqlite::Error>(None),
+                        )?;
+
+                        // pg_get_indexdef(index_oid) – returns the CREATE INDEX
+                        // statement for an index.  We don't expose indexes yet
+                        // so return NULL.
+                        conn.create_scalar_function(
+                            "pg_get_indexdef",
+                            -1,
+                            FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+                            |_ctx| Ok::<Option<String>, rusqlite::Error>(None),
+                        )?;
+
+                        // pg_total_relation_size(oid) / pg_table_size(oid) /
+                        // pg_indexes_size(oid) – return the on-disk size of a
+                        // table.  Return 0 as an approximation.
+                        for name in ["pg_total_relation_size", "pg_table_size", "pg_indexes_size"] {
+                            conn.create_scalar_function(
+                                name,
+                                -1,
+                                FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+                                |_ctx| Ok(0i64),
+                            )?;
+                        }
 
                         let schema = match compute_schema(&conn) {
                             Ok(schema) => schema,
@@ -1032,7 +1500,7 @@ pub async fn start(
                                 }
                                 PgWireFrontendMessage::Parse(parse) => {
                                     let name: &str = parse.name.as_deref().unwrap_or_default();
-                                    let mut cmds = match parse_query(&parse.query) {
+                                    let (stripped_sql, mut cmds) = match parse_query(&parse.query) {
                                         Ok(cmds) => cmds,
                                         Err(e) => {
                                             back_tx.blocking_send(
@@ -1083,7 +1551,7 @@ pub async fn start(
 
                                             trace!("parsed cmd: {parsed_cmd:#?}");
 
-                                            let prepped = match session.conn.prepare(&parse.query) {
+                                            let prepped = match session.conn.prepare(&stripped_sql) {
                                                 Ok(prepped) => prepped,
                                                 Err(e) => {
                                                     back_tx.blocking_send(
@@ -1189,7 +1657,7 @@ pub async fn start(
                                             prepared.insert(
                                                 name.into(),
                                                 Prepared::NonEmpty {
-                                                    sql: parse.query.clone(),
+                                                    sql: stripped_sql.clone(),
                                                     param_types,
                                                     fields,
                                                     cmd: Box::new(parsed_cmd),
@@ -1860,7 +2328,7 @@ pub async fn start(
                                     }
                                 }
                                 PgWireFrontendMessage::Query(query) => {
-                                    let parsed_query = match parse_query(&query.query) {
+                                    let (_stripped_sql, parsed_query) = match parse_query(&query.query) {
                                         Ok(q) => q,
                                         Err(e) => {
                                             back_tx.blocking_send(
@@ -2930,6 +3398,32 @@ fn name_to_type(name: &str) -> Result<Type, UnsupportedSqliteToPostgresType> {
         "TIME" => Type::TIME,
         _ => return Err(UnsupportedSqliteToPostgresType(name.to_string())),
     })
+}
+
+/// Maps a PostgreSQL type OID to its human-readable type name, matching the
+/// behaviour of PostgreSQL's `format_type()` builtin.  Used by tools like
+/// TablePlus to display column types.
+fn format_type_oid(oid: u32) -> String {
+    match oid {
+        16 => "boolean".into(),
+        17 => "bytea".into(),
+        18 => "character".into(),
+        20 => "bigint".into(),
+        21 => "smallint".into(),
+        23 => "integer".into(),
+        25 => "text".into(),
+        700 => "real".into(),
+        701 => "double precision".into(),
+        1042 => "character".into(),
+        1043 => "character varying".into(),
+        1082 => "date".into(),
+        1083 => "time without time zone".into(),
+        1114 => "timestamp without time zone".into(),
+        114 => "json".into(),
+        3802 => "jsonb".into(),
+        1700 => "numeric".into(),
+        _ => "unknown".into(),
+    }
 }
 
 fn compute_schema(conn: &Connection) -> Result<Schema, Box<SchemaError>> {
