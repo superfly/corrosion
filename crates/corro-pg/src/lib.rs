@@ -84,8 +84,10 @@ use crate::{
     utils::CountedTcpStream,
     vtab::{
         empty_catalog::{
-            EmptyCatalogTable, PG_ATTRDEF_DDL, PG_DESCRIPTION_DDL, PG_EXTENSION_DDL,
-            PG_SHDESCRIPTION_DDL, PG_STATIO_USER_TABLES_DDL, PG_TRIGGER_DDL,
+            EmptyCatalogTable, PG_ATTRDEF_DDL, PG_AVAILABLE_EXTENSIONS_DDL, PG_CONVERSION_DDL,
+            PG_DEPEND_DDL, PG_DESCRIPTION_DDL, PG_EXTENSION_DDL, PG_INHERITS_DDL,
+            PG_OPCLASS_DDL, PG_OPFAMILY_DDL, PG_SHDESCRIPTION_DDL, PG_STATIO_USER_TABLES_DDL,
+            PG_TRIGGER_DDL,
         },
         information_schema_columns::{
             load_information_schema_columns, InformationSchemaColumnsTable,
@@ -2089,6 +2091,36 @@ pub async fn start(
                             eponymous_only_module::<EmptyCatalogTable>(),
                             Some(PG_TRIGGER_DDL),
                         )?;
+                        conn.create_module(
+                            "pg_depend",
+                            eponymous_only_module::<EmptyCatalogTable>(),
+                            Some(PG_DEPEND_DDL),
+                        )?;
+                        conn.create_module(
+                            "pg_inherits",
+                            eponymous_only_module::<EmptyCatalogTable>(),
+                            Some(PG_INHERITS_DDL),
+                        )?;
+                        conn.create_module(
+                            "pg_available_extensions",
+                            eponymous_only_module::<EmptyCatalogTable>(),
+                            Some(PG_AVAILABLE_EXTENSIONS_DDL),
+                        )?;
+                        conn.create_module(
+                            "pg_conversion",
+                            eponymous_only_module::<EmptyCatalogTable>(),
+                            Some(PG_CONVERSION_DDL),
+                        )?;
+                        conn.create_module(
+                            "pg_opclass",
+                            eponymous_only_module::<EmptyCatalogTable>(),
+                            Some(PG_OPCLASS_DDL),
+                        )?;
+                        conn.create_module(
+                            "pg_opfamily",
+                            eponymous_only_module::<EmptyCatalogTable>(),
+                            Some(PG_OPFAMILY_DDL),
+                        )?;
 
                         conn.create_scalar_function(
                             "version",
@@ -2380,21 +2412,22 @@ pub async fn start(
                         }
 
                         // pg_relation_size(oid) – return the on-disk size
-                        // of a single relation.  Return 0 as an approximation.
+                        // of a single relation.  Return NULL (DBeaver expects
+                        // bigint, and NULL is type-agnostic).
                         conn.create_scalar_function(
                             "pg_relation_size",
                             -1,
                             FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
-                            |_ctx| Ok(0i64),
+                            |_ctx| Ok::<Option<i64>, rusqlite::Error>(None),
                         )?;
 
                         // pg_stat_get_numscans(oid) – return the number of
-                        // sequential scans on a relation.  Return 0.
+                        // sequential scans on a relation.  Return NULL.
                         conn.create_scalar_function(
                             "pg_stat_get_numscans",
                             -1,
                             FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
-                            |_ctx| Ok(0i64),
+                            |_ctx| Ok::<Option<i64>, rusqlite::Error>(None),
                         )?;
 
                         // regexp_replace(source, pattern, replacement[, flags])
