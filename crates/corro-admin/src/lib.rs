@@ -383,28 +383,21 @@ async fn handle_conn(
                     chunk_size,
                 }) => {
                     let (progress_tx, mut progress_rx) = mpsc::channel(64);
-                    let apply = apply_buffered_version_in_chunks(
-                        &agent,
-                        bookie,
-                        actor_id,
-                        version,
-                        chunk_size,
-                        Some(progress_tx),
-                    );
-                    tokio::pin!(apply);
-
-                    let result = loop {
-                        tokio::select! {
-                            biased;
-                            Some(p) = progress_rx.recv() => {
+                    let (result, _) = tokio::join!(
+                        apply_buffered_version_in_chunks(
+                            &agent,
+                            bookie,
+                            actor_id,
+                            version,
+                            chunk_size,
+                            Some(progress_tx),
+                        ),
+                        async {
+                            while let Some(p) = progress_rx.recv().await {
                                 info_log(&mut stream, p.to_string()).await;
                             }
-                            res = &mut apply => break res,
                         }
-                    };
-                    while let Ok(p) = progress_rx.try_recv() {
-                        info_log(&mut stream, p.to_string()).await;
-                    }
+                    );
 
                     match result {
                         Ok(None) => {

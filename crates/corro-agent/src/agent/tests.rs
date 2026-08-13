@@ -22,7 +22,10 @@ use tripwire::Tripwire;
 use uuid::Uuid;
 
 use crate::{
-    agent::{process_multiple_changes, util::execute_schema_from_paths},
+    agent::{
+        process_multiple_changes, setup,
+        util::{apply_buffered_version_in_chunks, execute_schema, execute_schema_from_paths},
+    },
     api::{
         peer::parallel_sync,
         public::{api_v1_transactions, TimeoutParams},
@@ -34,8 +37,9 @@ use corro_types::change::Change;
 use corro_types::{
     actor::{ActorId, MemberId},
     api::{ExecResponse, ExecResult, Statement},
-    base::{dbsr, dbsri, dbvri, CrsqlDbVersion, CrsqlDbVersionRange, CrsqlSeq},
+    base::{dbsr, dbsri, dbvri, CrsqlDbVersion, CrsqlDbVersionRange, CrsqlSeq, CrsqlSeqRange},
     broadcast::{ChangeSource, ChangeV1, Changeset},
+    config::Config,
     sync::generate_sync,
 };
 use corro_types::{
@@ -1536,4 +1540,128 @@ fn check_obj_exists(conn: &rusqlite::Connection, obj_type: &str, obj_name: &str)
         |row| row.get(0),
     )
     .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn test_apply_buffered_version_in_chunks() -> eyre::Result<()> {
+    _ = tracing_subscriber::fmt::try_init();
+    let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
+    let dir = tempfile::tempdir()?;
+    let (agent, _opts) = setup(
+        Config::builder()
+            .db_path(dir.path().join("corrosion.db").display().to_string())
+            .gossip_addr("127.0.0.1:0".parse()?)
+            .api_addr("127.0.0.1:0".parse()?)
+            .build()?,
+        tripwire.clone(),
+    )
+    .await?;
+    execute_schema(&agent, vec![TEST_SCHEMA.to_owned()]).await?;
+    let bookie = agent.bookie().clone();
+
+    let actor_id = ActorId(Uuid::new_v4());
+    let ts = agent.clock().new_timestamp().into();
+    let last_seq = 999u64;
+    let changes: Vec<_> = (0..=last_seq)
+        .map(|i| Change {
+            table: TableName("tests".into()),
+            pk: pack_columns(&vec![(i as i64 + 1).into()]).unwrap(),
+            cid: ColumnName("text".into()),
+            val: format!("row-{i}").into(),
+            col_version: 1,
+            db_version: CrsqlDbVersion(1),
+            seq: CrsqlSeq(i),
+            site_id: actor_id.to_bytes(),
+            cl: 1,
+        })
+        .collect();
+
+    let mid = last_seq.div_ceil(2);
+    process_multiple_changes(
+        agent.clone(),
+        bookie.clone(),
+        vec![
+            (
+                ChangeV1 {
+                    actor_id,
+                    changeset: Changeset::Full {
+                        version: CrsqlDbVersion(1),
+                        changes: changes[..mid as usize].to_vec(),
+                        seqs: CrsqlSeqRange::new(CrsqlSeq(0), CrsqlSeq(mid - 1)),
+                        last_seq: CrsqlSeq(last_seq),
+                        ts,
+                    },
+                },
+                ChangeSource::Sync,
+                Instant::now(),
+            ),
+            (
+                ChangeV1 {
+                    actor_id,
+                    changeset: Changeset::Full {
+                        version: CrsqlDbVersion(1),
+                        changes: changes[mid as usize..].to_vec(),
+                        seqs: CrsqlSeqRange::new(CrsqlSeq(mid), CrsqlSeq(last_seq)),
+                        last_seq: CrsqlSeq(last_seq),
+                        ts,
+                    },
+                },
+                ChangeSource::Sync,
+                Instant::now(),
+            ),
+        ],
+        Duration::from_secs(60),
+    )
+    .await?;
+
+    {
+        let booked = bookie.get(&actor_id).unwrap();
+        let read = booked.read();
+        assert!(read.get_partial(&CrsqlDbVersion(1)).unwrap().is_complete());
+    }
+
+    let (progress_tx, mut progress_rx) = mpsc::channel(128);
+    let total = apply_buffered_version_in_chunks(
+        &agent,
+        &bookie,
+        actor_id,
+        CrsqlDbVersion(1),
+        10,
+        Some(progress_tx),
+    )
+    .await?
+    .expect("version should be fully buffered");
+    assert_eq!(total, 1000);
+
+    let mut progress = Vec::new();
+    while let Ok(p) = progress_rx.try_recv() {
+        progress.push(p);
+    }
+    assert_eq!(progress.len(), 100);
+    assert_eq!(progress[0].seq_start, CrsqlSeq(0));
+    assert_eq!(progress[0].seq_end, CrsqlSeq(9));
+    assert_eq!(progress[99].seq_start, CrsqlSeq(990));
+    assert_eq!(progress[99].seq_end, CrsqlSeq(999));
+
+    {
+        let booked = bookie.get(&actor_id).unwrap();
+        let read = booked.read();
+        assert!(read.get_partial(&CrsqlDbVersion(1)).is_none());
+        assert!(read.contains_version(&CrsqlDbVersion(1)));
+    }
+
+    let conn = agent.pool().read().await?;
+    let count: i64 = conn.query_row("SELECT COUNT(*) FROM tests", [], |row| row.get(0))?;
+    assert_eq!(count, 1000);
+
+    let again =
+        apply_buffered_version_in_chunks(&agent, &bookie, actor_id, CrsqlDbVersion(1), 2, None)
+            .await?;
+    assert_eq!(again, None);
+
+    tripwire_tx.send(()).await.ok();
+    tripwire_worker.await;
+    wait_for_all_pending_handles().await;
+
+    Ok(())
 }

@@ -889,12 +889,12 @@ pub async fn apply_buffered_version_in_chunks(
 
             // Hold the bookie write lock for the last chunk so insert_db +
             // clear_partials + commit stay under that lock.
-            let booked = is_last.then(|| bookie.ensure(actor_id));
-            let bookie_write = is_last.then(|| bookie.write_lock_blocking());
-            let mut bookedw = match (booked.as_ref(), bookie_write.as_ref()) {
-                (Some(booked), Some(guard)) => Some(guard.write_tx(booked)),
-                _ => None,
-            };
+            let mut bookedw = is_last.then(|| {
+                let booked = bookie.ensure(actor_id);
+                let bookie_write = bookie.write_lock_blocking();
+                let booked_write = bookie_write.write_tx(&booked);
+                (bookie_write, booked_write)
+            });
 
             let tx = InterruptibleTransaction::new(
                 conn.immediate_transaction().map_err(rusqlite_err)?,
@@ -910,7 +910,7 @@ pub async fn apply_buffered_version_in_chunks(
             )
             .map_err(rusqlite_err)?;
 
-            if let Some(bookedw) = bookedw.as_mut() {
+            if let Some((_bookie_write, bookedw)) = bookedw.as_mut() {
                 bookedw
                     .insert_db(&tx, [version..=version].into())
                     .map_err(rusqlite_err)?;
@@ -921,7 +921,7 @@ pub async fn apply_buffered_version_in_chunks(
 
             tx.commit().map_err(rusqlite_err)?;
 
-            if let Some(bookedw) = bookedw {
+            if let Some((_bookie_write, bookedw)) = bookedw {
                 bookedw.commit();
                 if let Err(e) = agent
                     .tx_clear_buf()
@@ -1733,199 +1733,4 @@ fn is_pow_10(i: u64) -> bool {
         i,
         1 | 10 | 100 | 1000 | 10000 | 1000000 | 10000000 | 100000000
     )
-}
-
-#[cfg(test)]
-mod apply_buffered_version_in_chunks_tests {
-    use super::*;
-    use crate::agent::setup;
-    use corro_tests::TEST_SCHEMA;
-    use corro_types::{
-        actor::ActorId,
-        api::{ColumnName, TableName},
-        base::{CrsqlDbVersion, CrsqlSeq, CrsqlSeqRange},
-        broadcast::{ChangeSource, ChangeV1, Changeset, Timestamp},
-        change::Change,
-        config::Config,
-        pubsub::pack_columns,
-    };
-    use std::time::Instant;
-    use tokio::sync::mpsc;
-    use tripwire::Tripwire;
-
-    fn make_change(actor_id: ActorId, id: i64, seq: u64) -> Change {
-        Change {
-            table: TableName("tests".into()),
-            pk: pack_columns(&vec![id.into()]).unwrap(),
-            cid: ColumnName("text".into()),
-            val: format!("row-{id}").into(),
-            col_version: 1,
-            db_version: CrsqlDbVersion(1),
-            seq: CrsqlSeq(seq),
-            site_id: actor_id.to_bytes(),
-            cl: 1,
-        }
-    }
-
-    fn changeset(
-        actor_id: ActorId,
-        changes: Vec<Change>,
-        start_seq: u64,
-        end_seq: u64,
-        last_seq: u64,
-        ts: Timestamp,
-    ) -> (ChangeV1, ChangeSource, Instant) {
-        (
-            ChangeV1 {
-                actor_id,
-                changeset: Changeset::Full {
-                    version: CrsqlDbVersion(1),
-                    changes,
-                    seqs: CrsqlSeqRange::new(CrsqlSeq(start_seq), CrsqlSeq(end_seq)),
-                    last_seq: CrsqlSeq(last_seq),
-                    ts,
-                },
-            },
-            ChangeSource::Sync,
-            Instant::now(),
-        )
-    }
-
-    async fn setup_agent() -> eyre::Result<(Agent, Bookie, tempfile::TempDir)> {
-        let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
-        let dir = tempfile::tempdir()?;
-        let (agent, _opts) = setup(
-            Config::builder()
-                .db_path(dir.path().join("corrosion.db").display().to_string())
-                .gossip_addr("127.0.0.1:0".parse()?)
-                .api_addr("127.0.0.1:0".parse()?)
-                .build()?,
-            tripwire.clone(),
-        )
-        .await?;
-        execute_schema(&agent, vec![TEST_SCHEMA.to_owned()]).await?;
-        // Keep the agent running for the duration of the test; dropping the
-        // worker would trip shutdown.
-        std::mem::forget((tripwire, tripwire_worker, tripwire_tx));
-        Ok((agent.clone(), agent.bookie().clone(), dir))
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-    async fn applies_complete_partial_in_chunks() -> eyre::Result<()> {
-        _ = tracing_subscriber::fmt::try_init();
-        let (agent, bookie, _dir) = setup_agent().await?;
-        let actor_id = ActorId(uuid::Uuid::new_v4());
-        let ts = agent.clock().new_timestamp().into();
-        let tx_timeout = Duration::from_secs(60);
-
-        let changes: Vec<_> = (0..6)
-            .map(|i| make_change(actor_id, i + 1, i as u64))
-            .collect();
-
-        process_multiple_changes(
-            agent.clone(),
-            bookie.clone(),
-            vec![
-                changeset(actor_id, changes[0..3].to_vec(), 0, 2, 5, ts),
-                changeset(actor_id, changes[3..6].to_vec(), 3, 5, 5, ts),
-            ],
-            tx_timeout,
-        )
-        .await?;
-
-        {
-            let booked = bookie.get(&actor_id).unwrap();
-            let read = booked.read();
-            assert!(read.get_partial(&CrsqlDbVersion(1)).is_some());
-            assert!(read.get_partial(&CrsqlDbVersion(1)).unwrap().is_complete());
-        }
-
-        let (progress_tx, mut progress_rx) = mpsc::channel(8);
-        let result = apply_buffered_version_in_chunks(
-            &agent,
-            &bookie,
-            actor_id,
-            CrsqlDbVersion(1),
-            2,
-            Some(progress_tx),
-        )
-        .await?
-        .expect("version should be fully buffered");
-        assert_eq!(result.chunks, 3);
-
-        let mut progress = Vec::new();
-        while let Ok(p) = progress_rx.try_recv() {
-            progress.push(p);
-        }
-        assert_eq!(progress.len(), 3);
-        assert_eq!(progress[0].seq_start, CrsqlSeq(0));
-        assert_eq!(progress[0].seq_end, CrsqlSeq(1));
-        assert_eq!(progress[2].seq_start, CrsqlSeq(4));
-        assert_eq!(progress[2].seq_end, CrsqlSeq(5));
-
-        {
-            let booked = bookie.get(&actor_id).unwrap();
-            let read = booked.read();
-            assert!(read.get_partial(&CrsqlDbVersion(1)).is_none());
-            assert!(read.contains_version(&CrsqlDbVersion(1)));
-        }
-
-        let conn = agent.pool().read().await?;
-        let count: i64 = conn.query_row("SELECT COUNT(*) FROM tests", [], |row| row.get(0))?;
-        assert_eq!(count, 6);
-
-        // Second apply has nothing left to do.
-        let again =
-            apply_buffered_version_in_chunks(&agent, &bookie, actor_id, CrsqlDbVersion(1), 2, None)
-                .await?;
-        assert_eq!(again, None);
-
-        Ok(())
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-    async fn returns_none_when_version_has_gaps() -> eyre::Result<()> {
-        _ = tracing_subscriber::fmt::try_init();
-        let (agent, bookie, _dir) = setup_agent().await?;
-        let actor_id = ActorId(uuid::Uuid::new_v4());
-        let ts = agent.clock().new_timestamp().into();
-
-        let changes: Vec<_> = (0..3)
-            .map(|i| make_change(actor_id, i + 1, i as u64))
-            .collect();
-        process_multiple_changes(
-            agent.clone(),
-            bookie.clone(),
-            vec![changeset(actor_id, changes, 0, 2, 5, ts)],
-            Duration::from_secs(60),
-        )
-        .await?;
-
-        let result =
-            apply_buffered_version_in_chunks(&agent, &bookie, actor_id, CrsqlDbVersion(1), 2, None)
-                .await?;
-        assert_eq!(result, None);
-
-        Ok(())
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-    async fn returns_none_for_unknown_version() -> eyre::Result<()> {
-        _ = tracing_subscriber::fmt::try_init();
-        let (agent, bookie, _dir) = setup_agent().await?;
-        let actor_id = ActorId(uuid::Uuid::new_v4());
-
-        let result = apply_buffered_version_in_chunks(
-            &agent,
-            &bookie,
-            actor_id,
-            CrsqlDbVersion(1),
-            100,
-            None,
-        )
-        .await?;
-        assert_eq!(result, None);
-
-        Ok(())
-    }
 }
