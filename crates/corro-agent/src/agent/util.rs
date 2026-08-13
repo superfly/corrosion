@@ -65,6 +65,7 @@ use std::{
 };
 use tokio::{
     net::TcpListener,
+    sync::mpsc,
     task::{block_in_place, JoinHandle},
 };
 use tower::{limit::ConcurrencyLimitLayer, load_shed::LoadShedLayer};
@@ -810,6 +811,160 @@ pub fn insert_buffered_range(
     Ok(rows_impacted)
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct BufferedChunkProgress {
+    pub chunk_num: u64,
+    pub total_chunks: u64,
+    pub seq_start: CrsqlSeq,
+    pub seq_end: CrsqlSeq,
+    pub rows_impacted: i64,
+    pub elapsed: Duration,
+}
+
+impl std::fmt::Display for BufferedChunkProgress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "chunk {}/{}: seq {}..={} done in {:?} (rows impacted: {})",
+            self.chunk_num,
+            self.total_chunks,
+            self.seq_start,
+            self.seq_end,
+            self.elapsed,
+            self.rows_impacted
+        )
+    }
+}
+
+/// Applies a fully-buffered (gap-free) version into `crsql_changes` in seq chunks.
+/// Returns `Ok(None)` if the version isn't known or still has gaps.
+/// Does not match subs/updates; the last chunk updates bookie and schedules buffered-row cleanup.
+///
+/// After each chunk's write connection is released, progress is `try_send`ed to `progress`
+/// (if provided) so the caller can log without this function awaiting on I/O while holding a write.
+#[tracing::instrument(skip(agent, bookie, progress), err)]
+pub async fn apply_buffered_version_in_chunks(
+    agent: &Agent,
+    bookie: &Bookie,
+    actor_id: ActorId,
+    version: CrsqlDbVersion,
+    chunk_size: u64,
+    progress: Option<mpsc::Sender<BufferedChunkProgress>>,
+) -> Result<Option<i64>, ChangeError> {
+    let seq_range = match version_seq_range(bookie, actor_id, version) {
+        Some(seq_range) => seq_range,
+        None => return Ok(None),
+    };
+
+    let chunk_size = chunk_size.max(1);
+    let last_seq = seq_range.end().0;
+    let total_chunks = (last_seq - seq_range.start().0) / chunk_size + 1;
+    let tx_timeout = Duration::from_secs(agent.config().perf.sql_tx_timeout as u64);
+
+    info!(
+        %actor_id,
+        %version,
+        "applying buffered changes in {total_chunks} chunk(s) of at most {chunk_size} seqs (seq {}..={})",
+        seq_range.start(),
+        seq_range.end()
+    );
+
+    let mut total_rows_impacted: i64 = 0;
+    let mut chunk_start = seq_range.start().0;
+    let mut chunk_num = 0;
+    loop {
+        let chunk_end = chunk_start.saturating_add(chunk_size - 1).min(last_seq);
+        chunk_num += 1;
+        let is_last = chunk_end == last_seq;
+
+        let mut conn = agent.pool().write_priority().await?;
+        let start = Instant::now();
+
+        let rows_impacted = block_in_place(|| {
+            let rusqlite_err = |source| ChangeError::Rusqlite {
+                source,
+                actor_id: Some(actor_id),
+                version: Some(version),
+            };
+
+            // Hold the bookie write lock for the last chunk so insert_db +
+            // clear_partials + commit stay under that lock.
+            let booked = is_last.then(|| bookie.ensure(actor_id));
+            let bookie_write = is_last.then(|| bookie.write_lock_blocking());
+            let mut bookedw = match (booked.as_ref(), bookie_write.as_ref()) {
+                (Some(booked), Some(guard)) => Some(guard.write_tx(booked)),
+                _ => None,
+            };
+
+            let tx = InterruptibleTransaction::new(
+                conn.immediate_transaction().map_err(rusqlite_err)?,
+                Some(tx_timeout),
+                "process_buffered_changes",
+            );
+
+            let rows_impacted = insert_buffered_range(
+                &tx,
+                actor_id,
+                version,
+                CrsqlSeq(chunk_start)..=CrsqlSeq(chunk_end),
+            )
+            .map_err(rusqlite_err)?;
+
+            if let Some(bookedw) = bookedw.as_mut() {
+                bookedw
+                    .insert_db(&tx, [version..=version].into())
+                    .map_err(rusqlite_err)?;
+                bookedw
+                    .clear_partials(&tx, RangeInclusiveSet::from([version..=version]))
+                    .map_err(rusqlite_err)?;
+            }
+
+            tx.commit().map_err(rusqlite_err)?;
+
+            if let Some(bookedw) = bookedw {
+                bookedw.commit();
+                if let Err(e) = agent
+                    .tx_clear_buf()
+                    .try_send((actor_id, CrsqlDbVersionRange::single(version)))
+                {
+                    error!("could not schedule buffered data clear: {e}");
+                }
+            }
+
+            Ok::<_, ChangeError>(rows_impacted)
+        })?;
+        drop(conn);
+
+        total_rows_impacted += rows_impacted;
+        let elapsed = start.elapsed();
+        info!(
+            %actor_id,
+            %version,
+            "chunk {chunk_num}/{total_chunks}: seq {chunk_start}..={chunk_end} done in {elapsed:?} (rows impacted: {rows_impacted})"
+        );
+
+        if let Some(tx) = progress.as_ref() {
+            if let Err(e) = tx.try_send(BufferedChunkProgress {
+                chunk_num,
+                total_chunks,
+                seq_start: CrsqlSeq(chunk_start),
+                seq_end: CrsqlSeq(chunk_end),
+                rows_impacted,
+                elapsed,
+            }) {
+                debug!("could not send buffered apply progress: {e}");
+            }
+        }
+
+        if is_last {
+            break;
+        }
+        chunk_start = chunk_end + 1;
+    }
+
+    Ok(Some(total_rows_impacted))
+}
+
 #[tracing::instrument(skip(agent, bookie), err)]
 pub async fn process_fully_buffered_changes(
     agent: &Agent,
@@ -863,14 +1018,45 @@ pub async fn process_fully_buffered_changes(
 
             info!(%actor_id, %version, "Processing buffered changes to crsql_changes (actor: {actor_id}, version: {version}, last_seq: {last_seq})");
 
-            let rows_impacted =
-                insert_buffered_range(&tx, actor_id, version, CrsqlSeq(0)..=last_seq).map_err(
-                    |source| ChangeError::Rusqlite {
-                        source,
-                        actor_id: Some(actor_id),
-                        version: Some(version),
-                    },
-                )?;
+            let rows_present: bool = tx.prepare_cached("SELECT EXISTS (SELECT 1 FROM __corro_buffered_changes WHERE site_id = ? AND db_version = ?)")
+                                    .map_err(|source| ChangeError::Rusqlite{source, actor_id: Some(actor_id), version: Some(version)})?
+                                    .query_row(params![actor_id, version], |row| row.get(0))
+                                    .map_err(|source| ChangeError::Rusqlite{source, actor_id: Some(actor_id), version: Some(version)})?;
+
+            let start = Instant::now();
+
+            if rows_present {
+                // insert all buffered changes into crsql_changes directly from the buffered changes table
+                let count = tx
+                    .prepare_cached(
+                        r#"
+                        INSERT INTO crsql_changes ("table", pk, cid, val, col_version, db_version, site_id, cl, seq, ts)
+                            SELECT                 "table", pk, cid, val, col_version, db_version, site_id, cl, seq, ts
+                                FROM __corro_buffered_changes
+                                    WHERE site_id = ?
+                                    AND db_version = ?
+                                    ORDER BY db_version ASC, seq ASC
+                                    "#,
+                    ).map_err(|source| ChangeError::Rusqlite{source, actor_id: Some(actor_id), version: Some(version)})?
+                    .execute(params![actor_id.as_bytes(), version]).map_err(|source| ChangeError::Rusqlite{source, actor_id: Some(actor_id), version: Some(version)})?;
+                info!(%actor_id, %version, "Inserted {count} rows from buffered into crsql_changes in {:?}", start.elapsed());
+            } else {
+                info!(%actor_id, %version, "No buffered rows, skipped insertion into crsql_changes");
+            }
+
+            let rows_impacted: i64 = tx
+                .prepare_cached("SELECT crsql_rows_impacted()")
+                .map_err(|source| ChangeError::Rusqlite {
+                    source,
+                    actor_id: Some(actor_id),
+                    version: Some(version),
+                })?
+                .query_row((), |row| row.get(0))
+                .map_err(|source| ChangeError::Rusqlite {
+                    source,
+                    actor_id: Some(actor_id),
+                    version: Some(version),
+                })?;
 
             debug!(%actor_id, %version, "rows impacted by buffered changes insertion: {rows_impacted}");
 
@@ -1547,4 +1733,199 @@ fn is_pow_10(i: u64) -> bool {
         i,
         1 | 10 | 100 | 1000 | 10000 | 1000000 | 10000000 | 100000000
     )
+}
+
+#[cfg(test)]
+mod apply_buffered_version_in_chunks_tests {
+    use super::*;
+    use crate::agent::setup;
+    use corro_tests::TEST_SCHEMA;
+    use corro_types::{
+        actor::ActorId,
+        api::{ColumnName, TableName},
+        base::{CrsqlDbVersion, CrsqlSeq, CrsqlSeqRange},
+        broadcast::{ChangeSource, ChangeV1, Changeset, Timestamp},
+        change::Change,
+        config::Config,
+        pubsub::pack_columns,
+    };
+    use std::time::Instant;
+    use tokio::sync::mpsc;
+    use tripwire::Tripwire;
+
+    fn make_change(actor_id: ActorId, id: i64, seq: u64) -> Change {
+        Change {
+            table: TableName("tests".into()),
+            pk: pack_columns(&vec![id.into()]).unwrap(),
+            cid: ColumnName("text".into()),
+            val: format!("row-{id}").into(),
+            col_version: 1,
+            db_version: CrsqlDbVersion(1),
+            seq: CrsqlSeq(seq),
+            site_id: actor_id.to_bytes(),
+            cl: 1,
+        }
+    }
+
+    fn changeset(
+        actor_id: ActorId,
+        changes: Vec<Change>,
+        start_seq: u64,
+        end_seq: u64,
+        last_seq: u64,
+        ts: Timestamp,
+    ) -> (ChangeV1, ChangeSource, Instant) {
+        (
+            ChangeV1 {
+                actor_id,
+                changeset: Changeset::Full {
+                    version: CrsqlDbVersion(1),
+                    changes,
+                    seqs: CrsqlSeqRange::new(CrsqlSeq(start_seq), CrsqlSeq(end_seq)),
+                    last_seq: CrsqlSeq(last_seq),
+                    ts,
+                },
+            },
+            ChangeSource::Sync,
+            Instant::now(),
+        )
+    }
+
+    async fn setup_agent() -> eyre::Result<(Agent, Bookie, tempfile::TempDir)> {
+        let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
+        let dir = tempfile::tempdir()?;
+        let (agent, _opts) = setup(
+            Config::builder()
+                .db_path(dir.path().join("corrosion.db").display().to_string())
+                .gossip_addr("127.0.0.1:0".parse()?)
+                .api_addr("127.0.0.1:0".parse()?)
+                .build()?,
+            tripwire.clone(),
+        )
+        .await?;
+        execute_schema(&agent, vec![TEST_SCHEMA.to_owned()]).await?;
+        // Keep the agent running for the duration of the test; dropping the
+        // worker would trip shutdown.
+        std::mem::forget((tripwire, tripwire_worker, tripwire_tx));
+        Ok((agent.clone(), agent.bookie().clone(), dir))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn applies_complete_partial_in_chunks() -> eyre::Result<()> {
+        _ = tracing_subscriber::fmt::try_init();
+        let (agent, bookie, _dir) = setup_agent().await?;
+        let actor_id = ActorId(uuid::Uuid::new_v4());
+        let ts = agent.clock().new_timestamp().into();
+        let tx_timeout = Duration::from_secs(60);
+
+        let changes: Vec<_> = (0..6)
+            .map(|i| make_change(actor_id, i + 1, i as u64))
+            .collect();
+
+        process_multiple_changes(
+            agent.clone(),
+            bookie.clone(),
+            vec![
+                changeset(actor_id, changes[0..3].to_vec(), 0, 2, 5, ts),
+                changeset(actor_id, changes[3..6].to_vec(), 3, 5, 5, ts),
+            ],
+            tx_timeout,
+        )
+        .await?;
+
+        {
+            let booked = bookie.get(&actor_id).unwrap();
+            let read = booked.read();
+            assert!(read.get_partial(&CrsqlDbVersion(1)).is_some());
+            assert!(read.get_partial(&CrsqlDbVersion(1)).unwrap().is_complete());
+        }
+
+        let (progress_tx, mut progress_rx) = mpsc::channel(8);
+        let result = apply_buffered_version_in_chunks(
+            &agent,
+            &bookie,
+            actor_id,
+            CrsqlDbVersion(1),
+            2,
+            Some(progress_tx),
+        )
+        .await?
+        .expect("version should be fully buffered");
+        assert_eq!(result.chunks, 3);
+
+        let mut progress = Vec::new();
+        while let Ok(p) = progress_rx.try_recv() {
+            progress.push(p);
+        }
+        assert_eq!(progress.len(), 3);
+        assert_eq!(progress[0].seq_start, CrsqlSeq(0));
+        assert_eq!(progress[0].seq_end, CrsqlSeq(1));
+        assert_eq!(progress[2].seq_start, CrsqlSeq(4));
+        assert_eq!(progress[2].seq_end, CrsqlSeq(5));
+
+        {
+            let booked = bookie.get(&actor_id).unwrap();
+            let read = booked.read();
+            assert!(read.get_partial(&CrsqlDbVersion(1)).is_none());
+            assert!(read.contains_version(&CrsqlDbVersion(1)));
+        }
+
+        let conn = agent.pool().read().await?;
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM tests", [], |row| row.get(0))?;
+        assert_eq!(count, 6);
+
+        // Second apply has nothing left to do.
+        let again =
+            apply_buffered_version_in_chunks(&agent, &bookie, actor_id, CrsqlDbVersion(1), 2, None)
+                .await?;
+        assert_eq!(again, None);
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn returns_none_when_version_has_gaps() -> eyre::Result<()> {
+        _ = tracing_subscriber::fmt::try_init();
+        let (agent, bookie, _dir) = setup_agent().await?;
+        let actor_id = ActorId(uuid::Uuid::new_v4());
+        let ts = agent.clock().new_timestamp().into();
+
+        let changes: Vec<_> = (0..3)
+            .map(|i| make_change(actor_id, i + 1, i as u64))
+            .collect();
+        process_multiple_changes(
+            agent.clone(),
+            bookie.clone(),
+            vec![changeset(actor_id, changes, 0, 2, 5, ts)],
+            Duration::from_secs(60),
+        )
+        .await?;
+
+        let result =
+            apply_buffered_version_in_chunks(&agent, &bookie, actor_id, CrsqlDbVersion(1), 2, None)
+                .await?;
+        assert_eq!(result, None);
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn returns_none_for_unknown_version() -> eyre::Result<()> {
+        _ = tracing_subscriber::fmt::try_init();
+        let (agent, bookie, _dir) = setup_agent().await?;
+        let actor_id = ActorId(uuid::Uuid::new_v4());
+
+        let result = apply_buffered_version_in_chunks(
+            &agent,
+            &bookie,
+            actor_id,
+            CrsqlDbVersion(1),
+            100,
+            None,
+        )
+        .await?;
+        assert_eq!(result, None);
+
+        Ok(())
+    }
 }

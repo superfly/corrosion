@@ -878,7 +878,6 @@ dependencies = [
  "serde",
  "serde_json",
  "spawn",
- "sqlite-pool",
  "thiserror 1.0.69",
  "time",
  "tokio",
