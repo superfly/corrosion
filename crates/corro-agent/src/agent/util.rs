@@ -500,11 +500,12 @@ pub async fn apply_fully_buffered_changes_loop(
                 Some(version) => version,
                 None => break,
             },
-
-            _ = retry_interval.tick(), if scan_enabled => {
-                match find_fully_buffered_partial(&agent).await {
-                    Ok(Some(pair)) => pair,
-                    Ok(None) => continue,
+            _ = retry_interval.tick() => {
+                match find_fully_buffered_partial(&agent, Some(1)).await {
+                    Ok(pairs) => match pairs.into_iter().next() {
+                        Some(pair) => pair,
+                        None => continue,
+                    },
                     Err(e) => {
                         warn!("could not query for fully buffered partials: {e}");
                         continue;
@@ -568,23 +569,28 @@ pub async fn apply_fully_buffered_changes_loop(
 
 async fn find_fully_buffered_partial(
     agent: &Agent,
-) -> Result<Option<(ActorId, CrsqlDbVersion)>, ChangeError> {
+    limit: Option<usize>,
+) -> Result<Vec<(ActorId, CrsqlDbVersion)>, ChangeError> {
     let conn = agent.pool().read().await.map_err(ChangeError::SqlitePool)?;
     block_in_place(|| {
-        conn.prepare_cached(
+        let limit = match limit {
+            Some(n) => format!("LIMIT {n}"),
+            None => String::new(),
+        };
+        let sql = format!(
             "SELECT site_id, db_version FROM __corro_seq_bookkeeping
-             WHERE start_seq = 0 AND end_seq = last_seq
-             LIMIT 1",
-        )
-        .and_then(|mut stmt| {
-            stmt.query_row([], |row| Ok((row.get(0)?, row.get(1)?)))
-                .optional()
-        })
-        .map_err(|source| ChangeError::Rusqlite {
-            source,
-            actor_id: None,
-            version: None,
-        })
+             WHERE start_seq = 0 AND end_seq = last_seq {limit}"
+        );
+        conn.prepare_cached(&sql)
+            .and_then(|mut stmt| {
+                stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                    .collect()
+            })
+            .map_err(|source| ChangeError::Rusqlite {
+                source,
+                actor_id: None,
+                version: None,
+            })
     })
 }
 
@@ -1021,45 +1027,14 @@ pub async fn process_fully_buffered_changes(
 
             info!(%actor_id, %version, "Processing buffered changes to crsql_changes (actor: {actor_id}, version: {version}, last_seq: {last_seq})");
 
-            let rows_present: bool = tx.prepare_cached("SELECT EXISTS (SELECT 1 FROM __corro_buffered_changes WHERE site_id = ? AND db_version = ?)")
-                                    .map_err(|source| ChangeError::Rusqlite{source, actor_id: Some(actor_id), version: Some(version)})?
-                                    .query_row(params![actor_id, version], |row| row.get(0))
-                                    .map_err(|source| ChangeError::Rusqlite{source, actor_id: Some(actor_id), version: Some(version)})?;
-
-            let start = Instant::now();
-
-            if rows_present {
-                // insert all buffered changes into crsql_changes directly from the buffered changes table
-                let count = tx
-                    .prepare_cached(
-                        r#"
-                        INSERT INTO crsql_changes ("table", pk, cid, val, col_version, db_version, site_id, cl, seq, ts)
-                            SELECT                 "table", pk, cid, val, col_version, db_version, site_id, cl, seq, ts
-                                FROM __corro_buffered_changes
-                                    WHERE site_id = ?
-                                    AND db_version = ?
-                                    ORDER BY db_version ASC, seq ASC
-                                    "#,
-                    ).map_err(|source| ChangeError::Rusqlite{source, actor_id: Some(actor_id), version: Some(version)})?
-                    .execute(params![actor_id.as_bytes(), version]).map_err(|source| ChangeError::Rusqlite{source, actor_id: Some(actor_id), version: Some(version)})?;
-                info!(%actor_id, %version, "Inserted {count} rows from buffered into crsql_changes in {:?}", start.elapsed());
-            } else {
-                info!(%actor_id, %version, "No buffered rows, skipped insertion into crsql_changes");
-            }
-
-            let rows_impacted: i64 = tx
-                .prepare_cached("SELECT crsql_rows_impacted()")
-                .map_err(|source| ChangeError::Rusqlite {
-                    source,
-                    actor_id: Some(actor_id),
-                    version: Some(version),
-                })?
-                .query_row((), |row| row.get(0))
-                .map_err(|source| ChangeError::Rusqlite {
-                    source,
-                    actor_id: Some(actor_id),
-                    version: Some(version),
-                })?;
+            let rows_impacted =
+                insert_buffered_range(&tx, actor_id, version, CrsqlSeq(0)..=last_seq).map_err(
+                    |source| ChangeError::Rusqlite {
+                        source,
+                        actor_id: Some(actor_id),
+                        version: Some(version),
+                    },
+                )?;
 
             debug!(%actor_id, %version, "rows impacted by buffered changes insertion: {rows_impacted}");
 
@@ -1662,51 +1637,66 @@ pub async fn execute_schema(agent: &Agent, statements: Vec<String>) -> eyre::Res
     let partial_schema = parse_sql(&new_sql)?;
 
     info!("getting write connection to update schema");
-    let mut conn = agent.pool().write_priority().await?;
-    info!("got write connection to update schema");
 
-    // hold onto this lock so nothing else makes changes
-    let mut schema_write = agent.schema().write();
+    {
+        let mut conn = agent.pool().write_priority().await?;
+        info!("got write connection to update schema");
+        // hold onto this lock so nothing else makes changes
+        let mut schema_write = agent.schema().write();
 
-    // clone the previous schema and apply
-    let mut new_schema = {
-        let mut schema = schema_write.clone();
-        for (name, def) in partial_schema.tables.iter() {
-            // overwrite table because users are expected to return a full table def
-            schema.tables.insert(name.clone(), def.clone());
+        // clone the previous schema and apply
+        let mut new_schema = {
+            let mut schema = schema_write.clone();
+            for (name, def) in partial_schema.tables.iter() {
+                // overwrite table because users are expected to return a full table def
+                schema.tables.insert(name.clone(), def.clone());
+            }
+            schema
+        };
+
+        new_schema.constrain()?;
+
+        // conn.trace(Some(|sql| debug!(sql)));
+
+        let apply_res = block_in_place(|| {
+            let tx = conn.immediate_transaction()?;
+
+            apply_schema(&tx, &schema_write, &mut new_schema)?;
+
+            for tbl_name in partial_schema.tables.keys() {
+                tx.execute("DELETE FROM __corro_schema WHERE tbl_name = ?", [tbl_name])?;
+
+                let n = tx.execute("INSERT INTO __corro_schema SELECT tbl_name, type, name, sql, 'api' AS source FROM sqlite_schema WHERE tbl_name = ? AND type IN ('table', 'index') AND name IS NOT NULL AND sql IS NOT NULL", [tbl_name])?;
+                info!("Updated {n} rows in __corro_schema for table {tbl_name}");
+            }
+
+            tx.commit()?;
+
+            // drain the pool of RO connections because they might not get the new tables in cr-sqlite!
+            agent.pool().drain_read();
+
+            Ok::<_, eyre::Report>(())
+        });
+
+        // conn.trace(None);
+        apply_res?;
+
+        *schema_write = new_schema;
+    }
+
+    match find_fully_buffered_partial(agent, None).await {
+        Ok(pairs) => {
+            for (actor_id, version) in pairs {
+                info!(%actor_id, %version, "scheduling apply of fully buffered changes");
+                if let Err(e) = agent.tx_apply().try_send((actor_id, version)) {
+                    error!(%actor_id, %version, "could not schedule buffered changes application: {e}");
+                }
+            }
         }
-        schema
-    };
-
-    new_schema.constrain()?;
-
-    // conn.trace(Some(|sql| debug!(sql)));
-
-    let apply_res = block_in_place(|| {
-        let tx = conn.immediate_transaction()?;
-
-        apply_schema(&tx, &schema_write, &mut new_schema)?;
-
-        for tbl_name in partial_schema.tables.keys() {
-            tx.execute("DELETE FROM __corro_schema WHERE tbl_name = ?", [tbl_name])?;
-
-            let n = tx.execute("INSERT INTO __corro_schema SELECT tbl_name, type, name, sql, 'api' AS source FROM sqlite_schema WHERE tbl_name = ? AND type IN ('table', 'index') AND name IS NOT NULL AND sql IS NOT NULL", [tbl_name])?;
-            info!("Updated {n} rows in __corro_schema for table {tbl_name}");
+        Err(e) => {
+            warn!("could not schedule fully buffered changes after schema update: {e}");
         }
-
-        tx.commit()?;
-
-        // drain the pool of RO connections because they might not get the new tables in cr-sqlite!
-        agent.pool().drain_read();
-
-        Ok::<_, eyre::Report>(())
-    });
-
-    // conn.trace(None);
-
-    apply_res?;
-
-    *schema_write = new_schema;
+    }
 
     Ok(())
 }
