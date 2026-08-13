@@ -100,11 +100,11 @@ impl PgType {
         self.0.name()
     }
 
-    fn typnamespace(&self) -> &'static str {
-        "11"
+    fn typnamespace(&self) -> i64 {
+        11
     }
-    fn typowner(&self) -> &'static str {
-        "10"
+    fn typowner(&self) -> i64 {
+        10
     }
     fn typlen(&self) -> i16 {
         match self.0 {
@@ -183,12 +183,11 @@ impl PgType {
     fn typrelid(&self) -> i64 {
         0
     }
-    fn typelem(&self) -> &'static str {
-        "0"
+    fn typelem(&self) -> i64 {
+        0
     }
-    fn typarray(&self) -> &'static str {
-        // TODO: not default...
-        Default::default()
+    fn typarray(&self) -> i64 {
+        0
     }
     fn typinput(&self) -> String {
         format!("{}in", self.0.name())
@@ -224,8 +223,8 @@ impl PgType {
     fn typnotnull(&self) -> bool {
         false
     }
-    fn typbasetype(&self) -> &'static str {
-        "0"
+    fn typbasetype(&self) -> i64 {
+        0
     }
     fn typtypmod(&self) -> i32 {
         -1
@@ -233,9 +232,8 @@ impl PgType {
     fn typndims(&self) -> i32 {
         0
     }
-    fn typcollation(&self) -> &'static str {
-        // TODO: not default...
-        Default::default()
+    fn typcollation(&self) -> i64 {
+        0
     }
     fn typdefaultbin(&self) -> rusqlite::types::Null {
         rusqlite::types::Null
@@ -362,8 +360,8 @@ mod tests {
 
             assert_eq!(row.get::<_, u32>(0)?, pg_type.oid());
             assert_eq!(row.get::<_, String>(1)?, pg_type.typname());
-            assert_eq!(row.get::<_, String>(2)?, pg_type.typnamespace());
-            assert_eq!(row.get::<_, String>(3)?, pg_type.typowner());
+            assert_eq!(row.get::<_, i64>(2)?, pg_type.typnamespace());
+            assert_eq!(row.get::<_, i64>(3)?, pg_type.typowner());
             assert_eq!(row.get::<_, i16>(4)?, pg_type.typlen());
             assert_eq!(row.get::<_, bool>(5)?, pg_type.typbyval());
             assert_eq!(row.get::<_, String>(6)?, pg_type.typtype());
@@ -372,8 +370,8 @@ mod tests {
             assert_eq!(row.get::<_, bool>(9)?, pg_type.typisdefined());
             assert_eq!(row.get::<_, String>(10)?, pg_type.typdelim());
             assert_eq!(row.get::<_, i64>(11)?, pg_type.typrelid());
-            assert_eq!(row.get::<_, String>(12)?, pg_type.typelem());
-            assert_eq!(row.get::<_, String>(13)?, pg_type.typarray());
+            assert_eq!(row.get::<_, i64>(12)?, pg_type.typelem());
+            assert_eq!(row.get::<_, i64>(13)?, pg_type.typarray());
             assert_eq!(row.get::<_, String>(14)?, pg_type.typinput());
             assert_eq!(row.get::<_, String>(15)?, pg_type.typoutput());
             assert_eq!(row.get::<_, String>(16)?, pg_type.typreceive());
@@ -384,10 +382,10 @@ mod tests {
             assert_eq!(row.get::<_, String>(21)?, pg_type.typalign());
             assert_eq!(row.get::<_, String>(22)?, pg_type.typstorage());
             assert_eq!(row.get::<_, bool>(23)?, pg_type.typnotnull());
-            assert_eq!(row.get::<_, String>(24)?, pg_type.typbasetype());
+            assert_eq!(row.get::<_, i64>(24)?, pg_type.typbasetype());
             assert_eq!(row.get::<_, i32>(25)?, pg_type.typtypmod());
             assert_eq!(row.get::<_, i32>(26)?, pg_type.typndims());
-            assert_eq!(row.get::<_, String>(27)?, pg_type.typcollation());
+            assert_eq!(row.get::<_, i64>(27)?, pg_type.typcollation());
             // assert_eq!(row.get::<_, String>(28)?, pg_type.typdefaultbin(), );
             assert_eq!(
                 row.get::<_, Option<String>>(29)?.as_deref(),
