@@ -1,8 +1,17 @@
+pub mod empty_catalog;
 pub mod information_schema_columns;
+pub mod information_schema_key_column_usage;
 pub mod information_schema_table_constraints;
 pub mod information_schema_tables;
+pub mod information_schema_triggers;
+pub mod pg_am;
+pub mod pg_attribute;
 pub mod pg_class;
+pub mod pg_constraint;
 pub mod pg_database;
+pub mod pg_index;
+pub mod pg_language;
 pub mod pg_namespace;
+pub mod pg_proc;
 pub mod pg_range;
 pub mod pg_type;

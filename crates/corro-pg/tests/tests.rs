@@ -41,7 +41,8 @@ async fn setup_pg_test_server(
                 id BIGINT PRIMARY KEY NOT NULL,
                 other_ts DATETIME,
                 updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                trusted BOOL
+                trusted BOOL,
+                score REAL
             );
         ",
     )
@@ -164,7 +165,7 @@ async fn test_information_schema() {
         )
         .await
         .unwrap();
-    assert_eq!(rows.len(), 4);
+    assert_eq!(rows.len(), 5);
     assert_eq!(rows[0].columns().len(), 44);
 
     let id = &rows[0];
@@ -213,6 +214,12 @@ async fn test_information_schema() {
     assert_eq!(trusted.get::<_, &str>("data_type"), "boolean");
     assert_eq!(trusted.get::<_, &str>("udt_name"), "bool");
 
+    let score = &rows[4];
+    assert_eq!(score.get::<_, &str>("column_name"), "score");
+    assert_eq!(score.get::<_, &str>("is_nullable"), "YES");
+    assert_eq!(score.get::<_, &str>("data_type"), "double precision");
+    assert_eq!(score.get::<_, &str>("udt_name"), "float8");
+
     let internal_columns = client
         .query(
             "SELECT column_name FROM information_schema.columns \
@@ -252,6 +259,321 @@ async fn test_information_schema() {
         assert_eq!(row.get::<_, &str>("initially_deferred"), "NO");
         assert_eq!(row.get::<_, &str>("enforced"), "YES");
     }
+
+    // information_schema.key_column_usage should expose PK columns.
+    let kcu_rows = client
+        .query(
+            "SELECT constraint_name, table_name, column_name, ordinal_position \
+             FROM information_schema.key_column_usage \
+             WHERE table_schema = 'main' \
+             AND table_name IN ('kitchensink', 'wide') \
+             ORDER BY table_name, ordinal_position",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert!(!kcu_rows.is_empty(), "expected key_column_usage rows");
+    for row in &kcu_rows {
+        let constraint_name: &str = row.get("constraint_name");
+        assert!(constraint_name.ends_with("_pkey"));
+        let col: &str = row.get("column_name");
+        assert!(!col.is_empty());
+        let pos: i64 = row.get("ordinal_position");
+        assert!(pos >= 1);
+    }
+
+    // pg_constraint should expose PRIMARY KEY constraints with contype='p'.
+    let pg_constraint_rows = client
+        .query(
+            "SELECT conname, contype, conrelid, conkey, consrc, conindid \
+             FROM pg_catalog.pg_constraint \
+             WHERE contype = 'p' \
+             AND conname IN ('kitchensink_pkey', 'wide_pkey') \
+             ORDER BY conname",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(pg_constraint_rows.len(), 2);
+    for row in &pg_constraint_rows {
+        assert_eq!(row.get::<_, &str>("contype"), "p");
+        let conname: &str = row.get("conname");
+        assert!(conname.ends_with("_pkey"));
+        let conkey: &str = row.get("conkey");
+        assert!(conkey.starts_with('{') && conkey.ends_with('}'));
+        let consrc: &str = row.get("consrc");
+        assert!(consrc.starts_with("PRIMARY KEY ("));
+    }
+
+    // pg_get_constraintdef should return the definition text.
+    let constraint_def_rows = client
+        .query(
+            "SELECT pg_get_constraintdef(oid) AS def \
+             FROM pg_catalog.pg_constraint \
+             WHERE conname = 'kitchensink_pkey'",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(constraint_def_rows.len(), 1);
+    let def: &str = constraint_def_rows[0].get("def");
+    assert!(def.starts_with("PRIMARY KEY ("));
+
+    // pg_class should expose user tables with relkind 'r' and the "main" namespace.
+    let pg_class_rows = client
+        .query(
+            "SELECT oid, relname, relnamespace, relkind, relnatts \
+             FROM pg_catalog.pg_class \
+             WHERE relname = 'kitchensink'",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(pg_class_rows.len(), 1);
+    let kitchensink_oid: i64 = pg_class_rows[0].get("oid");
+    assert!(kitchensink_oid >= 16384);
+    assert_eq!(pg_class_rows[0].get::<_, &str>("relname"), "kitchensink");
+    assert_eq!(pg_class_rows[0].get::<_, i64>("relnamespace"), 2200);
+    assert_eq!(pg_class_rows[0].get::<_, &str>("relkind"), "r");
+    assert_eq!(pg_class_rows[0].get::<_, i64>("relnatts"), 5);
+
+    // pg_attribute should be populated from the same source as
+    // information_schema.columns, so that tools like TablePlus can JOIN.
+    let pg_attr_rows = client
+        .query(
+            "SELECT pa.attname, pa.atttypid, pa.attnum, pa.attnotnull, pa.atthasdef \
+             FROM pg_catalog.pg_attribute pa \
+             JOIN pg_catalog.pg_class pc ON pa.attrelid = pc.oid \
+             WHERE pc.relname = 'kitchensink' \
+             ORDER BY pa.attnum",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(pg_attr_rows.len(), 5);
+    assert_eq!(pg_attr_rows[0].get::<_, &str>("attname"), "id");
+    assert_eq!(pg_attr_rows[0].get::<_, i64>("attnum"), 1);
+    assert_eq!(pg_attr_rows[0].get::<_, i64>("attnotnull"), 1);
+    assert_eq!(pg_attr_rows[0].get::<_, i64>("atthasdef"), 0);
+    // int8 OID is 20
+    assert_eq!(pg_attr_rows[0].get::<_, i64>("atttypid"), 20);
+
+    assert_eq!(pg_attr_rows[4].get::<_, &str>("attname"), "score");
+    // float8 OID is 701
+    assert_eq!(pg_attr_rows[4].get::<_, i64>("atttypid"), 701);
+
+    // Querying a table with a REAL column should work (issue #513).
+    client
+        .execute("INSERT INTO kitchensink (id, score) VALUES (1, 2.5)", &[])
+        .await
+        .unwrap();
+    let row = client
+        .query_one("SELECT score FROM kitchensink WHERE id = 1", &[])
+        .await
+        .unwrap();
+    let score: f64 = row.get(0);
+    assert!((score - 2.5).abs() < 1e-9);
+
+    // Look up the OID of the kitchensink table from pg_class.
+    let kitchensink_oid: i64 = client
+        .query_one(
+            "SELECT oid FROM pg_catalog.pg_class WHERE relname = 'kitchensink'",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+
+    // The TablePlus column-listing query: JOINs information_schema.columns
+    // with pg_attribute, and calls format_type() and col_description().
+    let col_rows = client
+        .query(
+            &format!(
+                "SELECT ordinal_position, column_name, udt_name AS data_type, \
+                 format_type(atttypid, atttypmod) as format_type, \
+                 pg_catalog.col_description({kitchensink_oid}, ordinal_position) as comment \
+                 FROM information_schema.columns \
+                 JOIN pg_attribute pa ON attrelid = {kitchensink_oid} AND attname = column_name \
+                 WHERE table_name = 'kitchensink' AND table_schema = 'main' \
+                 ORDER BY ordinal_position"
+            ),
+            &[],
+        )
+        .await
+        .unwrap();
+    assert!(
+        !col_rows.is_empty(),
+        "column listing query returned no rows"
+    );
+    assert_eq!(col_rows[0].get::<_, &str>("column_name"), "id");
+    assert_eq!(col_rows[0].get::<_, &str>("format_type"), "bigint");
+    assert_eq!(col_rows[0].get::<_, Option<&str>>("comment"), None);
+
+    // PostgreSQL ::type cast syntax should work (stripped before parsing).
+    let count_rows = client
+        .query(
+            "select reltuples::int8 as count from pg_class c \
+             JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace \
+             where nspname='main' AND relname='kitchensink'",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(count_rows.len(), 1);
+
+    // The TablePlus full column-listing query (with numeric_precision,
+    // datetime_precision, etc.)
+    let full_col_rows = client
+        .query(
+            &format!(
+                "SELECT ordinal_position,column_name,udt_name AS data_type,\
+                 format_type(atttypid, atttypmod) as format_type,\
+                 numeric_precision,datetime_precision,numeric_scale,\
+                 character_maximum_length AS data_length,is_nullable,\
+                 column_name as check,column_name as check_constraint,\
+                 column_default,column_name AS foreign_key,\
+                 pg_catalog.col_description({kitchensink_oid},ordinal_position) as comment \
+                 FROM information_schema.columns \
+                 JOIN pg_attribute pa ON attrelid={kitchensink_oid} AND attname=column_name \
+                 WHERE table_name='kitchensink' AND table_schema='main'"
+            ),
+            &[],
+        )
+        .await;
+    assert!(
+        full_col_rows.is_ok(),
+        "full column listing query failed: {:?}",
+        full_col_rows.err()
+    );
+
+    // The TablePlus index-listing query (uses pg_index, pg_am, pg_get_indexdef,
+    // regexp_replace, etc.)
+    let index_rows = client
+        .query(
+            "SELECT ix.relname as index_name, upper(am.amname) AS index_algorithm, \
+             indisunique as is_unique, pg_get_indexdef(indexrelid) as index_definition, \
+             replace(regexp_replace(regexp_replace(regexp_replace( \
+             pg_get_indexdef(indexrelid), ' WHERE .+|INCLUDE .+', ''), ' WITH .+', ''), \
+             '.*\\((.*)\\)', '\\1'), ' ', '') AS column_name, \
+             CASE WHEN position(' WHERE ' in pg_get_indexdef(indexrelid))>0 \
+             THEN regexp_replace(pg_get_indexdef(indexrelid),'.+WHERE ','') \
+             WHEN position(' WITH ' in pg_get_indexdef(indexrelid))>0 \
+             THEN regexp_replace(pg_get_indexdef(indexrelid),'.+WITH ','') \
+             ELSE '' END AS condition, \
+             CASE WHEN position(' INCLUDE ' in pg_get_indexdef(indexrelid))>0 \
+             THEN regexp_replace(pg_get_indexdef(indexrelid),'.+INCLUDE ','') \
+             WHEN position(' WITH ' in pg_get_indexdef(indexrelid))>0 \
+             THEN regexp_replace(pg_get_indexdef(indexrelid),'.+WITH ','') \
+             ELSE '' END AS include, \
+             pg_catalog.obj_description(i.indexrelid,'pg_class') as comment \
+             FROM pg_index i JOIN pg_class t ON t.oid = i.indrelid \
+             JOIN pg_class ix ON ix.oid = i.indexrelid \
+             JOIN pg_namespace n ON t.relnamespace = n.oid \
+             JOIN pg_am as am ON ix.relam = am.oid \
+             WHERE t.relname = 'kitchensink' AND n.nspname = 'main'",
+            &[],
+        )
+        .await;
+    assert!(
+        index_rows.is_ok(),
+        "index listing query failed: {:?}",
+        index_rows.err()
+    );
+
+    // The TablePlus trigger-listing query.  Corrosion creates internal
+    // triggers (crsql) so we just verify the query executes without error
+    // and returns the expected columns.
+    let trigger_rows = client
+        .query(
+            "SELECT trigger_name as name, event_manipulation as event, \
+             action_timing as timing, action_statement as statement \
+             FROM information_schema.triggers as t \
+             WHERE event_object_table='kitchensink' AND event_object_schema='main'",
+            &[],
+        )
+        .await;
+    assert!(
+        trigger_rows.is_ok(),
+        "trigger listing query failed: {:?}",
+        trigger_rows.err()
+    );
+
+    // Grafana version check query
+    let version_rows = client
+        .query(
+            "SELECT current_setting('server_version_num') as version",
+            &[],
+        )
+        .await;
+    assert!(
+        version_rows.is_ok(),
+        "grafana version query failed: {:?}",
+        version_rows.err()
+    );
+
+    // Grafana TimescaleDB check (pg_extension should exist, return empty)
+    let tsdb_rows = client
+        .query(
+            "SELECT extversion FROM pg_extension WHERE extname = 'timescaledb'",
+            &[],
+        )
+        .await;
+    assert!(
+        tsdb_rows.is_ok(),
+        "grafana timescaledb query failed: {:?}",
+        tsdb_rows.err()
+    );
+
+    // Grafana table listing query (uses quote_ident, current_setting,
+    // string_to_array, generate_series, array_lower/upper, information_schema.tables)
+    let tables_rows = client
+        .query(
+            "SELECT \
+             CASE WHEN quote_ident(table_schema) IN ( \
+             SELECT CASE WHEN trim(s[i]) = '\"$user\"' THEN user ELSE trim(s[i]) END \
+             FROM generate_series( \
+             array_lower(string_to_array(current_setting('search_path'),','),1), \
+             array_upper(string_to_array(current_setting('search_path'),','),1) \
+             ) as i, \
+             string_to_array(current_setting('search_path'),',') s \
+             ) \
+             THEN quote_ident(table_name) \
+             ELSE quote_ident(table_schema) || '.' || quote_ident(table_name) \
+             END AS \"table\" \
+             FROM information_schema.tables \
+             WHERE quote_ident(table_schema) NOT IN ('information_schema','pg_catalog') \
+             ORDER BY 1",
+            &[],
+        )
+        .await;
+    assert!(
+        tables_rows.is_ok(),
+        "grafana table listing query failed: {:?}",
+        tables_rows.err()
+    );
+
+    // Grafana column listing query (uses parse_ident, array_length, quote_ident)
+    let schema_rows = client
+        .query(
+            "SELECT quote_ident(column_name) AS \"column\", data_type AS \"type\" \
+             FROM information_schema.columns \
+             WHERE quote_ident(table_name) = 'kitchensink' \
+             AND quote_ident(table_schema) IN ( \
+             SELECT CASE WHEN trim(s[i]) = '\"$user\"' THEN user ELSE trim(s[i]) END \
+             FROM generate_series( \
+             array_lower(string_to_array(current_setting('search_path'),','),1), \
+             array_upper(string_to_array(current_setting('search_path'),','),1) \
+             ) as i, \
+             string_to_array(current_setting('search_path'),',') s \
+             )",
+            &[],
+        )
+        .await;
+    assert!(
+        schema_rows.is_ok(),
+        "grafana column listing query failed: {:?}",
+        schema_rows.err()
+    );
 
     tripwire_tx.send(()).await.ok();
     tripwire_worker.await;
