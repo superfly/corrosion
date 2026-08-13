@@ -84,8 +84,8 @@ use crate::{
     utils::CountedTcpStream,
     vtab::{
         empty_catalog::{
-            EmptyCatalogTable, PG_DESCRIPTION_DDL, PG_EXTENSION_DDL, PG_SHDESCRIPTION_DDL,
-            PG_STATIO_USER_TABLES_DDL,
+            EmptyCatalogTable, PG_ATTRDEF_DDL, PG_DESCRIPTION_DDL, PG_EXTENSION_DDL,
+            PG_SHDESCRIPTION_DDL, PG_STATIO_USER_TABLES_DDL, PG_TRIGGER_DDL,
         },
         information_schema_columns::{
             load_information_schema_columns, InformationSchemaColumnsTable,
@@ -2079,6 +2079,16 @@ pub async fn start(
                             eponymous_only_module::<EmptyCatalogTable>(),
                             Some(PG_SHDESCRIPTION_DDL),
                         )?;
+                        conn.create_module(
+                            "pg_attrdef",
+                            eponymous_only_module::<EmptyCatalogTable>(),
+                            Some(PG_ATTRDEF_DDL),
+                        )?;
+                        conn.create_module(
+                            "pg_trigger",
+                            eponymous_only_module::<EmptyCatalogTable>(),
+                            Some(PG_TRIGGER_DDL),
+                        )?;
 
                         conn.create_scalar_function(
                             "version",
@@ -2368,6 +2378,24 @@ pub async fn start(
                                 |_ctx| Ok(0i64),
                             )?;
                         }
+
+                        // pg_relation_size(oid) – return the on-disk size
+                        // of a single relation.  Return 0 as an approximation.
+                        conn.create_scalar_function(
+                            "pg_relation_size",
+                            -1,
+                            FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+                            |_ctx| Ok(0i64),
+                        )?;
+
+                        // pg_stat_get_numscans(oid) – return the number of
+                        // sequential scans on a relation.  Return 0.
+                        conn.create_scalar_function(
+                            "pg_stat_get_numscans",
+                            -1,
+                            FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+                            |_ctx| Ok(0i64),
+                        )?;
 
                         // regexp_replace(source, pattern, replacement[, flags])
                         // – PostgreSQL regex replace function used by TablePlus

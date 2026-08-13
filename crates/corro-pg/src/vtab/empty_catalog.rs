@@ -93,3 +93,10 @@ pub const PG_DESCRIPTION_DDL: &str =
 
 /// DDL for `pg_shdescription` – stores comments on shared database objects.
 pub const PG_SHDESCRIPTION_DDL: &str = "(objoid INTEGER, classoid INTEGER, description TEXT)";
+
+/// DDL for `pg_attrdef` – stores default values for columns.
+pub const PG_ATTRDEF_DDL: &str =
+    "(oid INTEGER, adrelid INTEGER, adnum INTEGER, adbin TEXT, adsrc TEXT)";
+
+/// DDL for `pg_trigger` – stores trigger definitions.
+pub const PG_TRIGGER_DDL: &str = "(oid INTEGER, tgrelid INTEGER, tgname TEXT, tgfoid INTEGER, tgtype INTEGER, tgenabled TEXT, tgisinternal INTEGER, tgconstrrelid INTEGER, tgconstrindid INTEGER, tgconstraint INTEGER, tgdeferrable INTEGER, tginitdeferred INTEGER, tgnargs INTEGER, tgattr TEXT, tgargs BLOB, tgqual TEXT, tgoldtable TEXT, tgnewtable TEXT)";
