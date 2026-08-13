@@ -2109,7 +2109,7 @@ pub async fn start(
                             2,
                             FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
                             |ctx| {
-                                let oid: i64 = ctx.get(0)?;
+                                let oid: i64 = ctx.get(0).unwrap_or(0);
                                 Ok(format_type_oid(oid as u32))
                             },
                         )?;
