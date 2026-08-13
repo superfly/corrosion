@@ -59,30 +59,6 @@ pub fn load_pg_index_entries(
         });
     }
 
-    // Synthetic PK index entries — one per table that has a PK, pointing to
-    // the synthetic <table>_pkey entry in pg_class.
-    for (table_name, &table_oid) in table_oid_map {
-        let has_pk: bool = conn
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM pragma_table_xinfo(?1) WHERE pk > 0)",
-                [table_name],
-                |row| row.get(0),
-            )
-            .unwrap_or(false);
-        if !has_pk {
-            continue;
-        }
-        let pk_index_name = format!("{table_name}_pkey");
-        if let Some(&pk_index_oid) = index_oid_map.get(&pk_index_name) {
-            entries.push(PgIndexEntry {
-                indexrelid: pk_index_oid,
-                indrelid: table_oid,
-                indisunique: true,
-                indisprimary: true,
-            });
-        }
-    }
-
     Ok(entries)
 }
 
