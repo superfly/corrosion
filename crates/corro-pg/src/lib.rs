@@ -80,9 +80,7 @@ use crate::{
     sql_state::SqlState,
     utils::CountedTcpStream,
     vtab::{
-        empty_catalog::{
-            EmptyCatalogTable, PG_EXTENSION_DDL, PG_PROC_DDL, PG_STATIO_USER_TABLES_DDL,
-        },
+        empty_catalog::{EmptyCatalogTable, PG_EXTENSION_DDL, PG_STATIO_USER_TABLES_DDL},
         information_schema_columns::{
             load_information_schema_columns, InformationSchemaColumnsTable,
         },
@@ -105,6 +103,7 @@ use crate::{
         pg_database::{PgDatabase, PgDatabaseTable},
         pg_index::{load_pg_index_entries, PgIndexTable},
         pg_namespace::PgNamespaceTable,
+        pg_proc::{load_pg_proc_entries, PgProcTable},
         pg_range::PgRangeTable,
         pg_type::PgTypeTable,
     },
@@ -1995,14 +1994,16 @@ pub async fn start(
                             eponymous_only_module::<PgAmTable>(),
                             None,
                         )?;
+                        // pg_proc — populated from pragma_function_list().
+                        let pg_proc_entries = Arc::new(load_pg_proc_entries(&conn)?);
+                        conn.create_module(
+                            "pg_proc",
+                            eponymous_only_module::<PgProcTable>(),
+                            Some(pg_proc_entries),
+                        )?;
                         // Empty catalog tables that are referenced in JOINs
                         // but not yet populated.  Returning empty lets tools
                         // degrade gracefully.
-                        conn.create_module(
-                            "pg_proc",
-                            eponymous_only_module::<EmptyCatalogTable>(),
-                            Some(PG_PROC_DDL),
-                        )?;
                         conn.create_module(
                             "pg_extension",
                             eponymous_only_module::<EmptyCatalogTable>(),
