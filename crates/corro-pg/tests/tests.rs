@@ -328,6 +328,32 @@ async fn test_information_schema() {
         "expected UNIQUE in index definition: {def}"
     );
 
+    // Run the full TablePlus index query with regexp_replace to verify
+    // column_name extraction works for the PK index.
+    let full_index_rows = client
+        .query(
+            "SELECT ix.relname as index_name, \
+                    replace(regexp_replace(regexp_replace(regexp_replace( \
+                        pg_get_indexdef(indexrelid), ' WHERE .+|INCLUDE .+', ''), \
+                        ' WITH .+', ''), '.*\\((.*)\\)', '\\1'), ' ', '') AS column_name \
+             FROM pg_index i \
+             JOIN pg_class t ON t.oid = i.indrelid \
+             JOIN pg_class ix ON ix.oid = i.indexrelid \
+             JOIN pg_namespace n ON t.relnamespace = n.oid \
+             JOIN pg_am as am ON ix.relam = am.oid \
+             WHERE t.relname = 'kitchensink' AND n.nspname = 'main' \
+             AND ix.relname = 'kitchensink_pkey'",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(full_index_rows.len(), 1);
+    let col: &str = full_index_rows[0].get("column_name");
+    assert_eq!(
+        col, "id",
+        "expected column_name='id' for PK index, got '{col}'"
+    );
+
     // pg_attribute should be populated from the same source as
     // information_schema.columns, so that tools like TablePlus can JOIN.
     let pg_attr_rows = client

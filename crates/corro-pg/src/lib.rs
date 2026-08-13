@@ -336,6 +336,27 @@ pub enum ParseError {
     Postgres(#[from] sqlparser::parser::ParserError),
 }
 
+/// Convert PostgreSQL-style backreferences (\1, \2, ...) in a replacement
+/// string to the `regex` crate's format ($1, $2, ...).
+fn convert_pg_backrefs(replacement: &str) -> String {
+    let mut result = String::with_capacity(replacement.len());
+    let mut chars = replacement.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            if let Some(&next) = chars.peek() {
+                if next.is_ascii_digit() {
+                    chars.next();
+                    result.push('$');
+                    result.push(next);
+                    continue;
+                }
+            }
+        }
+        result.push(c);
+    }
+    result
+}
+
 fn parse_query(sql: &str) -> Result<(String, VecDeque<ParsedCmd>), ParseError> {
     let mut cmds = VecDeque::new();
 
@@ -2119,21 +2140,54 @@ pub async fn start(
                         }
 
                         // regexp_replace(source, pattern, replacement[, flags])
-                        // – PostgreSQL regex replace function used by TablePlus.
-                        // SQLite doesn't have this builtin, so return the
-                        // source string unchanged as a stub.
+                        // – PostgreSQL regex replace function used by TablePlus
+                        // to extract column names from index definitions.
+                        // Implemented using the `regex` crate with POSIX-style
+                        // patterns (greedy by default, like PostgreSQL).
                         conn.create_scalar_function(
                             "regexp_replace",
                             -1,
                             FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
                             |ctx| {
                                 let n = ctx.len();
-                                if n == 0 {
+                                if n < 3 {
                                     return Ok::<String, rusqlite::Error>(String::new());
                                 }
-                                // Return the source string unchanged
                                 let source: String = ctx.get(0).unwrap_or_default();
-                                Ok(source)
+                                let pattern: String = ctx.get(1).unwrap_or_default();
+                                let replacement: String = ctx.get(2).unwrap_or_default();
+                                // Optional 4th arg: flags ('g' for global, 'i' for case-insensitive)
+                                let flags: String = if n >= 4 {
+                                    ctx.get(3).unwrap_or_default()
+                                } else {
+                                    String::new()
+                                };
+                                let global = flags.contains('g');
+                                let case_insensitive = flags.contains('i');
+
+                                // Build the regex.  PostgreSQL uses POSIX
+                                // extended regex; the `regex` crate is close
+                                // enough for the patterns TablePlus uses.
+                                let mut builder = regex::RegexBuilder::new(&pattern);
+                                builder.case_insensitive(case_insensitive);
+                                // PostgreSQL defaults to greedy matching.
+                                builder.swap_greed(false);
+
+                                let Ok(re) = builder.build() else {
+                                    // If the pattern is invalid, return the source unchanged.
+                                    return Ok(source);
+                                };
+
+                                // PostgreSQL uses \1, \2, etc. for backreferences
+                                // in the replacement string.  The `regex` crate
+                                // uses $1, $2.  Convert PG-style backrefs.
+                                let repl = convert_pg_backrefs(&replacement);
+
+                                if global {
+                                    Ok(re.replace_all(&source, repl.as_str()).into_owned())
+                                } else {
+                                    Ok(re.replace(&source, repl.as_str()).into_owned())
+                                }
                             },
                         )?;
 
