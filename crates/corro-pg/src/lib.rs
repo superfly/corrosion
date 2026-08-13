@@ -2303,6 +2303,16 @@ pub async fn start(
                             |_ctx| Ok::<Option<String>, rusqlite::Error>(None),
                         )?;
 
+                        // pg_get_partkeydef(oid) – returns the partition key
+                        // expression for a partitioned table.  We don't support
+                        // partitioning, so return NULL.
+                        conn.create_scalar_function(
+                            "pg_get_partkeydef",
+                            -1,
+                            FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+                            |_ctx| Ok::<Option<String>, rusqlite::Error>(None),
+                        )?;
+
                         // array_to_string(array, delimiter[, null_string])
                         // – joins array elements with delimiter.  Our arrays
                         // are PG-style text like "{a,b,c}".  Return empty
