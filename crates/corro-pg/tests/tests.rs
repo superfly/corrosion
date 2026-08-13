@@ -260,6 +260,46 @@ async fn test_information_schema() {
         assert_eq!(row.get::<_, &str>("enforced"), "YES");
     }
 
+    // pg_constraint should expose PRIMARY KEY constraints with contype='p'.
+    let pg_constraint_rows = client
+        .query(
+            "SELECT conname, contype, conrelid, conkey, consrc, conindid \
+             FROM pg_catalog.pg_constraint \
+             WHERE contype = 'p' \
+             AND conname IN ('kitchensink_pkey', 'wide_pkey') \
+             ORDER BY conname",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(pg_constraint_rows.len(), 2);
+    for row in &pg_constraint_rows {
+        assert_eq!(row.get::<_, &str>("contype"), "p");
+        let conname: &str = row.get("conname");
+        assert!(conname.ends_with("_pkey"));
+        let conkey: &str = row.get("conkey");
+        assert!(conkey.starts_with('{') && conkey.ends_with('}'));
+        let consrc: &str = row.get("consrc");
+        assert!(consrc.starts_with("PRIMARY KEY ("));
+        // conindid should point to the synthetic <table>_pkey index
+        let conindid: i64 = row.get("conindid");
+        assert!(conindid > 0, "conindid should be non-zero");
+    }
+
+    // pg_get_constraintdef should return the definition text.
+    let constraint_def_rows = client
+        .query(
+            "SELECT pg_get_constraintdef(oid) AS def \
+             FROM pg_catalog.pg_constraint \
+             WHERE conname = 'kitchensink_pkey'",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(constraint_def_rows.len(), 1);
+    let def: &str = constraint_def_rows[0].get("def");
+    assert!(def.starts_with("PRIMARY KEY ("));
+
     // pg_class should expose user tables with relkind 'r' and the "main" namespace.
     let pg_class_rows = client
         .query(

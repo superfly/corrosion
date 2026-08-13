@@ -98,6 +98,7 @@ use crate::{
         pg_am::PgAmTable,
         pg_attribute::{load_pg_attributes, PgAttributeTable},
         pg_class::{load_pg_class_entries, PgClassTable},
+        pg_constraint::{load_pg_constraint_entries, PgConstraintTable},
         pg_database::{PgDatabase, PgDatabaseTable},
         pg_index::{load_pg_index_entries, PgIndexTable},
         pg_namespace::PgNamespaceTable,
@@ -1933,6 +1934,49 @@ pub async fn start(
                             "pg_index",
                             eponymous_only_module::<PgIndexTable>(),
                             Some(pg_index_entries),
+                        )?;
+
+                        // pg_constraint — populated from PK and unique constraints.
+                        let pg_constraint_entries = Arc::new(load_pg_constraint_entries(
+                            &conn,
+                            &table_names,
+                            &table_oid_map,
+                            &index_oid_map,
+                        )?);
+                        conn.create_module(
+                            "pg_constraint",
+                            eponymous_only_module::<PgConstraintTable>(),
+                            Some(pg_constraint_entries.clone()),
+                        )?;
+
+                        // pg_get_constraintdef(oid) – returns the definition
+                        // text of a constraint.
+                        conn.execute(
+                            "CREATE TEMP TABLE IF NOT EXISTS temp_pg_constraint_map (oid INTEGER, consrc TEXT)",
+                            [],
+                        )?;
+                        for entry in pg_constraint_entries.iter() {
+                            conn.execute(
+                                "INSERT INTO temp_pg_constraint_map VALUES (?1, ?2)",
+                                rusqlite::params![entry.oid, entry.consrc],
+                            )?;
+                        }
+                        conn.create_scalar_function(
+                            "pg_get_constraintdef",
+                            -1,
+                            FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+                            |ctx| {
+                                let oid: i64 = ctx.get(0).unwrap_or(0);
+                                let conn = unsafe { ctx.get_connection()? };
+                                let result: Option<String> = conn
+                                    .query_row(
+                                        "SELECT consrc FROM temp_pg_constraint_map WHERE oid = ?1",
+                                        [oid],
+                                        |row| row.get(0),
+                                    )
+                                    .unwrap_or(None);
+                                Ok(result)
+                            },
                         )?;
 
                         // pg_am — SQLite only uses btree (OID 403).

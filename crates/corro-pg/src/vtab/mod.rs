@@ -6,6 +6,7 @@ pub mod information_schema_triggers;
 pub mod pg_am;
 pub mod pg_attribute;
 pub mod pg_class;
+pub mod pg_constraint;
 pub mod pg_database;
 pub mod pg_index;
 pub mod pg_namespace;
