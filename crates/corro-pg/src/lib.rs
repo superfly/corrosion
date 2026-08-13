@@ -85,9 +85,8 @@ use crate::{
     vtab::{
         empty_catalog::{
             EmptyCatalogTable, PG_ATTRDEF_DDL, PG_AVAILABLE_EXTENSIONS_DDL, PG_CONVERSION_DDL,
-            PG_DEPEND_DDL, PG_DESCRIPTION_DDL, PG_EXTENSION_DDL, PG_INHERITS_DDL,
-            PG_OPCLASS_DDL, PG_OPFAMILY_DDL, PG_SHDESCRIPTION_DDL, PG_STATIO_USER_TABLES_DDL,
-            PG_TRIGGER_DDL,
+            PG_DEPEND_DDL, PG_DESCRIPTION_DDL, PG_EXTENSION_DDL, PG_INHERITS_DDL, PG_OPCLASS_DDL,
+            PG_OPFAMILY_DDL, PG_SHDESCRIPTION_DDL, PG_STATIO_USER_TABLES_DDL, PG_TRIGGER_DDL,
         },
         information_schema_columns::{
             load_information_schema_columns, InformationSchemaColumnsTable,

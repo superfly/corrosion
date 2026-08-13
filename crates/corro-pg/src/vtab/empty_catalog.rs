@@ -105,10 +105,12 @@ pub const PG_TRIGGER_DDL: &str = "(oid INTEGER, tgrelid INTEGER, tgname TEXT, tg
 pub const PG_DEPEND_DDL: &str = "(classid INTEGER, objid INTEGER, objsubid INTEGER, refclassid INTEGER, refobjid INTEGER, refobjsubid INTEGER, deptype TEXT)";
 
 /// DDL for `pg_inherits` – stores partitioning/inheritance hierarchy.
-pub const PG_INHERITS_DDL: &str = "(inhrelid INTEGER, inhparent INTEGER, inhseqno INTEGER, inhdetachpending INTEGER)";
+pub const PG_INHERITS_DDL: &str =
+    "(inhrelid INTEGER, inhparent INTEGER, inhseqno INTEGER, inhdetachpending INTEGER)";
 
 /// DDL for `pg_available_extensions` – lists available extensions.
-pub const PG_AVAILABLE_EXTENSIONS_DDL: &str = "(name TEXT, default_version TEXT, installed_version TEXT, comment TEXT)";
+pub const PG_AVAILABLE_EXTENSIONS_DDL: &str =
+    "(name TEXT, default_version TEXT, installed_version TEXT, comment TEXT)";
 
 /// DDL for `pg_conversion` – stores encoding conversion info.
 pub const PG_CONVERSION_DDL: &str = "(oid INTEGER, conname TEXT, connamespace INTEGER, conowner INTEGER, conforencoding INTEGER, contoencoding INTEGER, conproc TEXT, condefault INTEGER)";
@@ -117,4 +119,5 @@ pub const PG_CONVERSION_DDL: &str = "(oid INTEGER, conname TEXT, connamespace IN
 pub const PG_OPCLASS_DDL: &str = "(oid INTEGER, opcname TEXT, opcnamespace INTEGER, opcowner INTEGER, opcfamily INTEGER, opcintype INTEGER, opcdefault INTEGER, opckeytype INTEGER)";
 
 /// DDL for `pg_opfamily` – stores operator family info for indexes.
-pub const PG_OPFAMILY_DDL: &str = "(oid INTEGER, opfname TEXT, opfnamespace INTEGER, opfowner INTEGER)";
+pub const PG_OPFAMILY_DDL: &str =
+    "(oid INTEGER, opfname TEXT, opfnamespace INTEGER, opfowner INTEGER)";
