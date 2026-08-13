@@ -105,6 +105,7 @@ use crate::{
         pg_constraint::{load_pg_constraint_entries, PgConstraintTable},
         pg_database::{PgDatabase, PgDatabaseTable},
         pg_index::{load_pg_index_entries, PgIndexTable},
+        pg_language::{load_pg_language_entries, PgLanguageTable},
         pg_namespace::PgNamespaceTable,
         pg_proc::{load_pg_proc_entries, PgProcTable},
         pg_range::PgRangeTable,
@@ -2045,6 +2046,13 @@ pub async fn start(
                             eponymous_only_module::<PgProcTable>(),
                             Some(pg_proc_entries),
                         )?;
+                        // pg_language — static list of languages (internal, c, sql).
+                        let pg_language_entries = Arc::new(load_pg_language_entries());
+                        conn.create_module(
+                            "pg_language",
+                            eponymous_only_module::<PgLanguageTable>(),
+                            Some(pg_language_entries),
+                        )?;
                         // Empty catalog tables that are referenced in JOINs
                         // but not yet populated.  Returning empty lets tools
                         // degrade gracefully.
@@ -2197,6 +2205,77 @@ pub async fn start(
                                 let cols_str = cols.join(", ");
                                 Ok(Some(format!(
                                     "CREATE {unique_kw}INDEX {index_name} ON {tbl_name} ({cols_str})"
+                                )))
+                            },
+                        )?;
+
+                        // pg_get_function_identity_arguments(oid) – returns
+                        // the argument list of a function as a string.
+                        // We look up the function in pg_proc and return a
+                        // comma-separated list of argument type names.
+                        conn.create_scalar_function(
+                            "pg_get_function_identity_arguments",
+                            1,
+                            FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+                            |ctx| {
+                                let oid: i64 = ctx.get(0).unwrap_or(0);
+                                let conn = unsafe { ctx.get_connection()? };
+                                let nargs: i64 = conn
+                                    .query_row(
+                                        "SELECT pronargs FROM pg_proc WHERE oid = ?1",
+                                        [oid],
+                                        |row| row.get(0),
+                                    )
+                                    .unwrap_or(0);
+                                if nargs == 0 {
+                                    return Ok::<String, rusqlite::Error>(String::new());
+                                }
+                                // Return placeholder argument types
+                                Ok((0..nargs)
+                                    .map(|_| "anyelement")
+                                    .collect::<Vec<_>>()
+                                    .join(", "))
+                            },
+                        )?;
+
+                        // pg_get_userbyid(oid) – returns the username for a
+                        // role OID.  We always return "postgres" (OID 10).
+                        conn.create_scalar_function(
+                            "pg_get_userbyid",
+                            1,
+                            FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+                            |_ctx| Ok::<String, rusqlite::Error>("postgres".to_string()),
+                        )?;
+
+                        // pg_get_functiondef(oid) – returns the CREATE FUNCTION
+                        // statement for a function.  We synthesize a basic one.
+                        conn.create_scalar_function(
+                            "pg_get_functiondef",
+                            1,
+                            FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+                            |ctx| {
+                                let oid: i64 = ctx.get(0).unwrap_or(0);
+                                let conn = unsafe { ctx.get_connection()? };
+                                let (proname, nargs): (String, i64) = conn
+                                    .query_row(
+                                        "SELECT proname, pronargs FROM pg_proc WHERE oid = ?1",
+                                        [oid],
+                                        |row| Ok((row.get(0)?, row.get(1)?)),
+                                    )
+                                    .unwrap_or_default();
+                                if proname.is_empty() {
+                                    return Ok::<Option<String>, rusqlite::Error>(None);
+                                }
+                                let args = if nargs > 0 {
+                                    (0..nargs)
+                                        .map(|i| format!("arg{i}"))
+                                        .collect::<Vec<_>>()
+                                        .join(", ")
+                                } else {
+                                    String::new()
+                                };
+                                Ok(Some(format!(
+                                    "CREATE OR REPLACE FUNCTION {proname}({args}) RETURNS text LANGUAGE sql AS $$ SELECT NULL $$"
                                 )))
                             },
                         )?;
