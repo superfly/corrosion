@@ -2613,6 +2613,7 @@ pub async fn start(
                                 }
                                 PgWireFrontendMessage::Parse(parse) => {
                                     let name: &str = parse.name.as_deref().unwrap_or_default();
+                                    tracing::info!(target: "TOOL_DEBUG", query = %parse.query, "parse query");
                                     let (stripped_sql, mut cmds) = match parse_query(&parse.query) {
                                         Ok(cmds) => cmds,
                                         Err(e) => {
@@ -3441,6 +3442,7 @@ pub async fn start(
                                     }
                                 }
                                 PgWireFrontendMessage::Query(query) => {
+                                    tracing::info!(target: "TOOL_DEBUG", query = %query.query, "simple query");
                                     let (_stripped_sql, parsed_query) = match parse_query(&query.query) {
                                         Ok(q) => q,
                                         Err(e) => {
