@@ -86,3 +86,10 @@ pub const PG_EXTENSION_DDL: &str = "(oid INTEGER, extname TEXT, extowner INTEGER
 
 /// DDL for `pg_statio_user_tables` – a PostgreSQL statistics view.
 pub const PG_STATIO_USER_TABLES_DDL: &str = "(relid INTEGER, schemaname TEXT, relname TEXT, heap_blks_read INTEGER, heap_blks_hit INTEGER, idx_blks_read INTEGER, idx_blks_hit INTEGER, toast_blks_read INTEGER, toast_blks_hit INTEGER, tidx_blks_read INTEGER, tidx_blks_hit INTEGER)";
+
+/// DDL for `pg_description` – stores comments on database objects.
+pub const PG_DESCRIPTION_DDL: &str =
+    "(objoid INTEGER, classoid INTEGER, objsubid INTEGER, description TEXT)";
+
+/// DDL for `pg_shdescription` – stores comments on shared database objects.
+pub const PG_SHDESCRIPTION_DDL: &str = "(objoid INTEGER, classoid INTEGER, description TEXT)";

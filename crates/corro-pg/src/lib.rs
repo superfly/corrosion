@@ -83,7 +83,10 @@ use crate::{
     sql_state::SqlState,
     utils::CountedTcpStream,
     vtab::{
-        empty_catalog::{EmptyCatalogTable, PG_EXTENSION_DDL, PG_STATIO_USER_TABLES_DDL},
+        empty_catalog::{
+            EmptyCatalogTable, PG_DESCRIPTION_DDL, PG_EXTENSION_DDL, PG_SHDESCRIPTION_DDL,
+            PG_STATIO_USER_TABLES_DDL,
+        },
         information_schema_columns::{
             load_information_schema_columns, InformationSchemaColumnsTable,
         },
@@ -2065,6 +2068,16 @@ pub async fn start(
                             "pg_statio_user_tables",
                             eponymous_only_module::<EmptyCatalogTable>(),
                             Some(PG_STATIO_USER_TABLES_DDL),
+                        )?;
+                        conn.create_module(
+                            "pg_description",
+                            eponymous_only_module::<EmptyCatalogTable>(),
+                            Some(PG_DESCRIPTION_DDL),
+                        )?;
+                        conn.create_module(
+                            "pg_shdescription",
+                            eponymous_only_module::<EmptyCatalogTable>(),
+                            Some(PG_SHDESCRIPTION_DDL),
                         )?;
 
                         conn.create_scalar_function(
