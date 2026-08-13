@@ -128,7 +128,6 @@ unsafe impl<'vtab> VTab<'vtab> for PgProcTable {
                     proparallel      TEXT,
                     proisagg         INTEGER,
                     proiswindow      INTEGER,
-                    prosecdef        INTEGER,
                     pronargs         INTEGER,
                     prorettype       INTEGER,
                     proargtypes      TEXT,
@@ -206,15 +205,14 @@ unsafe impl VTabCursor for PgProcCursor<'_> {
                 15 => ctx.set_result(&"s"),                      // proparallel: safe
                 16 => ctx.set_result(&if entry.proisagg { 1i64 } else { 0i64 }), // proisagg
                 17 => ctx.set_result(&if entry.proiswindow { 1i64 } else { 0i64 }), // proiswindow
-                18 => ctx.set_result(&0i64), // prosecdef (duplicate, kept for column alignment)
-                19 => ctx.set_result(&entry.pronargs), // pronargs
-                20 => ctx.set_result(&entry.prorettype), // prorettype
-                21 => ctx.set_result(&entry.proargtypes), // proargtypes
-                22 => ctx.set_result(&entry.proallargtypes), // proallargtypes
-                23 => ctx.set_result(&entry.proargmodes), // proargmodes
-                24 => ctx.set_result(&entry.proargnames), // proargnames
-                25 => ctx.set_result(&entry.prosrc), // prosrc
-                26 => ctx.set_result(&Option::<String>::None), // proconfig
+                18 => ctx.set_result(&entry.pronargs),           // pronargs
+                19 => ctx.set_result(&entry.prorettype),         // prorettype
+                20 => ctx.set_result(&entry.proargtypes),        // proargtypes
+                21 => ctx.set_result(&entry.proallargtypes),     // proallargtypes
+                22 => ctx.set_result(&entry.proargmodes),        // proargmodes
+                23 => ctx.set_result(&entry.proargnames),        // proargnames
+                24 => ctx.set_result(&entry.prosrc),             // prosrc
+                25 => ctx.set_result(&Option::<String>::None),   // proconfig
                 _ => Err(rusqlite::Error::InvalidColumnIndex(col as usize)),
             }
         } else {
