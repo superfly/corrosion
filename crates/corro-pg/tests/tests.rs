@@ -260,6 +260,28 @@ async fn test_information_schema() {
         assert_eq!(row.get::<_, &str>("enforced"), "YES");
     }
 
+    // information_schema.key_column_usage should expose PK columns.
+    let kcu_rows = client
+        .query(
+            "SELECT constraint_name, table_name, column_name, ordinal_position \
+             FROM information_schema.key_column_usage \
+             WHERE table_schema = 'main' \
+             AND table_name IN ('kitchensink', 'wide') \
+             ORDER BY table_name, ordinal_position",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert!(!kcu_rows.is_empty(), "expected key_column_usage rows");
+    for row in &kcu_rows {
+        let constraint_name: &str = row.get("constraint_name");
+        assert!(constraint_name.ends_with("_pkey"));
+        let col: &str = row.get("column_name");
+        assert!(!col.is_empty());
+        let pos: i64 = row.get("ordinal_position");
+        assert!(pos >= 1);
+    }
+
     // pg_constraint should expose PRIMARY KEY constraints with contype='p'.
     let pg_constraint_rows = client
         .query(

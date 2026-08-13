@@ -86,6 +86,9 @@ use crate::{
         information_schema_columns::{
             load_information_schema_columns, InformationSchemaColumnsTable,
         },
+        information_schema_key_column_usage::{
+            load_information_schema_key_column_usage, InformationSchemaKeyColumnUsageTable,
+        },
         information_schema_table_constraints::{
             load_information_schema_table_constraints, InformationSchemaTableConstraintsTable,
         },
@@ -1827,6 +1830,9 @@ pub async fn start(
                         let table_constraints = Arc::new(
                             load_information_schema_table_constraints(columns.as_slice()),
                         );
+                        let key_column_usage = Arc::new(
+                            load_information_schema_key_column_usage(columns.as_slice()),
+                        );
                         let pg_class_entries_vec = load_pg_class_entries(&conn, &table_names)?;
 
                         // Build OID maps for pg_index loading.
@@ -1922,6 +1928,11 @@ pub async fn start(
                             "table_constraints",
                             eponymous_only_module::<InformationSchemaTableConstraintsTable>(),
                             Some(table_constraints),
+                        )?;
+                        conn.create_module(
+                            "key_column_usage",
+                            eponymous_only_module::<InformationSchemaKeyColumnUsageTable>(),
+                            Some(key_column_usage),
                         )?;
                         conn.create_module(
                             "triggers",
