@@ -31,7 +31,7 @@ corrosion sync check-bookie-consistency
 
 ### `corrosion sync process-buffered-changes`
 
-Applies a single fully-buffered (gap-free) version's changes from `__corro_buffered_changes` into `crsql_changes`, in batches of `--chunk-size` rows instead of one large insert. Useful for a version whose buffered changeset is too large to comfortably apply in one transaction. Versions are normally applied automatically as soon as they become gap-free; use this command to nudge a specific `actor-id`/`version` along in smaller steps. Fails if the given version isn't known or still has gaps.
+Applies one fully buffered (gap-free) version from `__corro_buffered_changes` into `crsql_changes`, in batches of `--chunk-size` seqs instead of a single insert. The agent normally applies these versions automatically; use this only when a changeset is too large for that path to finish. Prefer smaller transactions at write time over relying on this command.
 
 ```bash
 corrosion sync process-buffered-changes <actor-id> <version> --chunk-size 1000

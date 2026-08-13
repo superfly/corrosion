@@ -838,10 +838,8 @@ impl std::fmt::Display for BufferedChunkProgress {
 
 /// Applies a fully-buffered (gap-free) version into `crsql_changes` in seq chunks.
 /// Returns `Ok(None)` if the version isn't known or still has gaps.
-/// Does not match subs/updates; the last chunk updates bookie and schedules buffered-row cleanup.
+/// Sends updates to the progress channel.
 ///
-/// After each chunk's write connection is released, progress is `try_send`ed to `progress`
-/// (if provided) so the caller can log without this function awaiting on I/O while holding a write.
 #[tracing::instrument(skip(agent, bookie, progress), err)]
 pub async fn apply_buffered_version_in_chunks(
     agent: &Agent,
