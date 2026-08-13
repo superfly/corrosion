@@ -52,8 +52,11 @@ use pgwire::{
 use postgres_types::{FromSql, Type};
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use rusqlite::{
-    ffi::SQLITE_CONSTRAINT_UNIQUE, functions::FunctionFlags, types::ValueRef,
-    vtab::eponymous_only_module, Connection, Statement,
+    ffi::SQLITE_CONSTRAINT_UNIQUE,
+    functions::{Aggregate, Context as SqliteCtx, FunctionFlags},
+    types::ValueRef,
+    vtab::eponymous_only_module,
+    Connection, Statement,
 };
 use rustls::ServerConfig;
 use socket2::{SockRef, TcpKeepalive};
@@ -358,6 +361,47 @@ fn convert_pg_backrefs(replacement: &str) -> String {
         result.push(c);
     }
     result
+}
+
+/// Accumulator for string_agg(value, delimiter).
+struct StringAggCtx {
+    parts: Vec<String>,
+    delimiter: String,
+}
+
+/// Aggregate for string_agg(value, delimiter).
+struct StringAgg;
+
+impl Aggregate<StringAggCtx, String> for StringAgg {
+    fn init(&self, _ctx: &mut SqliteCtx<'_>) -> rusqlite::Result<StringAggCtx> {
+        Ok(StringAggCtx {
+            parts: Vec::new(),
+            delimiter: String::new(),
+        })
+    }
+
+    fn step(&self, ctx: &mut SqliteCtx<'_>, acc: &mut StringAggCtx) -> rusqlite::Result<()> {
+        let value: Option<String> = ctx.get(0).unwrap_or(None);
+        if acc.delimiter.is_empty() {
+            acc.delimiter = ctx.get(1).unwrap_or_default();
+        }
+        if let Some(v) = value {
+            acc.parts.push(v);
+        }
+        Ok(())
+    }
+
+    fn finalize(
+        &self,
+        _ctx: &mut SqliteCtx<'_>,
+        acc: Option<StringAggCtx>,
+    ) -> rusqlite::Result<String> {
+        let acc = acc.unwrap_or(StringAggCtx {
+            parts: Vec::new(),
+            delimiter: String::new(),
+        });
+        Ok(acc.parts.join(&acc.delimiter))
+    }
 }
 
 fn parse_query(sql: &str) -> Result<(String, VecDeque<ParsedCmd>), ParseError> {
@@ -2073,11 +2117,15 @@ pub async fn start(
                         // the SQL from sqlite_master.  For auto-indexes
                         // (sqlite_autoindex_*, sql IS NULL), synthesize a
                         // CREATE INDEX statement from pragma_index_info.
+                        //
+                        // pg_get_indexdef(index_oid, colno, pretty) – returns
+                        // just the colno-th column name (1-based) of the index.
                         conn.create_scalar_function(
                             "pg_get_indexdef",
                             -1,
                             FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
                             |ctx| {
+                                let n = ctx.len();
                                 let oid: i64 = ctx.get(0).unwrap_or(0);
                                 let conn = unsafe { ctx.get_connection()? };
 
@@ -2097,6 +2145,26 @@ pub async fn start(
                                     return Ok::<Option<String>, rusqlite::Error>(None);
                                 }
 
+                                // Get column names from pragma_index_info.
+                                let mut stmt = conn.prepare(
+                                    "SELECT name FROM pragma_index_info(?1) ORDER BY seqno",
+                                )?;
+                                let cols: Vec<String> = stmt
+                                    .query_map([&index_name], |row| row.get::<_, String>(0))?
+                                    .filter_map(|r| r.ok())
+                                    .collect();
+
+                                // 3-arg form: return the colno-th column name.
+                                if n >= 3 {
+                                    let colno: i64 = ctx.get(1).unwrap_or(0);
+                                    if colno < 1 || colno as usize > cols.len() {
+                                        return Ok(None);
+                                    }
+                                    return Ok(Some(cols[(colno - 1) as usize].clone()));
+                                }
+
+                                // 1-arg form: return full CREATE INDEX statement.
+
                                 // Try to get the explicit CREATE INDEX SQL.
                                 let sql: Option<String> = conn
                                     .query_row(
@@ -2110,19 +2178,11 @@ pub async fn start(
                                     return Ok(Some(s));
                                 }
 
-                                // Auto-index: synthesize from pragma_index_info.
-                                let mut stmt = conn.prepare(
-                                    "SELECT name FROM pragma_index_info(?1) ORDER BY seqno",
-                                )?;
-                                let cols: Vec<String> = stmt
-                                    .query_map([&index_name], |row| row.get::<_, String>(0))?
-                                    .filter_map(|r| r.ok())
-                                    .collect();
-
                                 if cols.is_empty() {
                                     return Ok(None);
                                 }
 
+                                // Auto-index: synthesize from pragma_index_info.
                                 // Check if it's unique via pragma_index_list.
                                 let is_unique: bool = conn
                                     .query_row(
@@ -2139,6 +2199,60 @@ pub async fn start(
                                     "CREATE {unique_kw}INDEX {index_name} ON {tbl_name} ({cols_str})"
                                 )))
                             },
+                        )?;
+
+                        // pg_get_expr(pg_node_tree, relation_oid) – returns
+                        // the expression text.  We don't have pg_node_tree,
+                        // so return NULL (no partial index expressions).
+                        conn.create_scalar_function(
+                            "pg_get_expr",
+                            -1,
+                            FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+                            |_ctx| Ok::<Option<String>, rusqlite::Error>(None),
+                        )?;
+
+                        // array_to_string(array, delimiter[, null_string])
+                        // – joins array elements with delimiter.  Our arrays
+                        // are PG-style text like "{a,b,c}".  Return empty
+                        // string for NULL arrays.
+                        conn.create_scalar_function(
+                            "array_to_string",
+                            -1,
+                            FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+                            |ctx| {
+                                let n = ctx.len();
+                                if n < 2 {
+                                    return Ok::<String, rusqlite::Error>(String::new());
+                                }
+                                let arr: Option<String> = ctx.get(0).unwrap_or(None);
+                                let delimiter: String = ctx.get(1).unwrap_or_default();
+                                let arr = match arr {
+                                    Some(a) => a,
+                                    None => return Ok(String::new()),
+                                };
+                                // Parse PG array literal "{elem1,elem2,...}"
+                                let inner = arr
+                                    .strip_prefix('{')
+                                    .and_then(|s| s.strip_suffix('}'))
+                                    .unwrap_or(&arr);
+                                let parts: Vec<&str> = if inner.is_empty() {
+                                    Vec::new()
+                                } else {
+                                    inner.split(',').collect()
+                                };
+                                Ok(parts.join(&delimiter))
+                            },
+                        )?;
+
+                        // string_agg(value, delimiter) – aggregate that
+                        // concatenates values with a delimiter.  SQLite has
+                        // group_concat which is similar, but TablePlus calls
+                        // string_agg directly.
+                        conn.create_aggregate_function(
+                            "string_agg",
+                            2,
+                            FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+                            StringAgg,
                         )?;
 
                         // pg_total_relation_size(oid) / pg_table_size(oid) /
