@@ -5,7 +5,10 @@ use std::{
 };
 
 use camino::Utf8PathBuf;
-use corro_agent::agent::{reload_change_dicts, util::execute_schema_from_paths};
+use corro_agent::agent::{
+    reload_change_dicts,
+    util::{apply_buffered_version_in_chunks, execute_schema_from_paths},
+};
 use corro_types::{
     actor::{ActorId, ClusterId},
     agent::{Agent, BookedVersions, Bookie, WriteConn},
@@ -120,6 +123,11 @@ pub enum SyncCommand {
     Generate,
     ReconcileGaps,
     CheckBookieConsistency,
+    ProcessBufferedChanges {
+        actor_id: ActorId,
+        version: CrsqlDbVersion,
+        chunk_size: u64,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -368,6 +376,49 @@ async fn handle_conn(
                     }
 
                     send_success(&mut stream).await;
+                }
+                Command::Sync(SyncCommand::ProcessBufferedChanges {
+                    actor_id,
+                    version,
+                    chunk_size,
+                }) => {
+                    let (progress_tx, mut progress_rx) = mpsc::channel(64);
+                    let (result, _) = tokio::join!(
+                        apply_buffered_version_in_chunks(
+                            &agent,
+                            bookie,
+                            actor_id,
+                            version,
+                            chunk_size,
+                            Some(progress_tx),
+                        ),
+                        async {
+                            while let Some(p) = progress_rx.recv().await {
+                                info_log(&mut stream, p.to_string()).await;
+                            }
+                        }
+                    );
+
+                    match result {
+                        Ok(None) => {
+                            send_error(&mut stream, "version not fully buffered").await;
+                            continue;
+                        }
+                        Ok(Some(total)) => {
+                            info_log(
+                                &mut stream,
+                                format!(
+                                    "finished processing buffered changes for actor {actor_id} version {version} (total rows: {total})",
+                                ),
+                            )
+                            .await;
+                            send_success(&mut stream).await;
+                        }
+                        Err(e) => {
+                            send_error(&mut stream, e).await;
+                            continue;
+                        }
+                    }
                 }
                 Command::Cluster(ClusterCommand::Rejoin) => {
                     let (cb_tx, cb_rx) = oneshot::channel();

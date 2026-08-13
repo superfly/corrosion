@@ -59,12 +59,13 @@ use std::{
     collections::{BTreeMap, HashSet},
     convert::Infallible,
     net::SocketAddr,
-    ops::Deref,
+    ops::{Deref, RangeInclusive},
     sync::{atomic::AtomicI64, Arc},
     time::{Duration, Instant},
 };
 use tokio::{
     net::TcpListener,
+    sync::mpsc,
     task::{block_in_place, JoinHandle},
 };
 use tower::{limit::ConcurrencyLimitLayer, load_shed::LoadShedLayer};
@@ -752,6 +753,219 @@ pub fn process_single_version<T: Deref<Target = rusqlite::Connection> + Committa
     }
 
     Ok((known, changeset))
+}
+
+/// Returns the `0..=last_seq` range for a buffered version if it's gap-free (ready to
+/// apply), without taking the Bookie write lock. `None` if the version isn't known or
+/// still has gaps.
+pub fn version_seq_range(
+    bookie: &Bookie,
+    actor_id: ActorId,
+    version: CrsqlDbVersion,
+) -> Option<RangeInclusive<CrsqlSeq>> {
+    let booked = bookie.ensure(actor_id);
+    let read = booked.read();
+    match read.get_partial(&version) {
+        Some(PartialVersion { seqs, last_seq, .. }) => {
+            if seqs.gaps(&(CrsqlSeq(0)..=*last_seq)).count() != 0 {
+                error!(%actor_id, %version, "found sequence gaps: {:?}, aborting!", seqs.gaps(&(CrsqlSeq(0)..=*last_seq)).collect::<RangeInclusiveSet<CrsqlSeq>>());
+                None
+            } else {
+                Some(CrsqlSeq(0)..=*last_seq)
+            }
+        }
+        None => {
+            warn!(%actor_id, %version, "version not found in cache, returning");
+            None
+        }
+    }
+}
+
+/// Inserts buffered changes for `actor_id`/`version` within `seq_range` into `crsql_changes`.
+/// Does not touch bookkeeping or commit; the caller owns the transaction. Returns the number
+/// of rows impacted by the insertion, as reported by `crsql_rows_impacted()`.
+pub fn insert_buffered_range(
+    tx: &Connection,
+    actor_id: ActorId,
+    version: CrsqlDbVersion,
+    seq_range: RangeInclusive<CrsqlSeq>,
+) -> Result<i64, rusqlite::Error> {
+    let start = Instant::now();
+
+    // insert buffered changes for this seq range into crsql_changes directly from the buffered changes table
+    let count = tx
+        .prepare_cached(
+            r#"
+            INSERT INTO crsql_changes ("table", pk, cid, val, col_version, db_version, site_id, cl, seq, ts)
+                SELECT                 "table", pk, cid, val, col_version, db_version, site_id, cl, seq, ts
+                    FROM __corro_buffered_changes
+                        WHERE site_id = ?
+                        AND db_version = ?
+                        AND seq >= ? AND seq <= ?
+                        ORDER BY db_version ASC, seq ASC
+                        "#,
+        )?
+        .execute(params![actor_id.as_bytes(), version, seq_range.start(), seq_range.end()])?;
+
+    let rows_impacted: i64 = tx
+        .prepare_cached("SELECT crsql_rows_impacted()")?
+        .query_row((), |row| row.get(0))?;
+
+    debug!(%actor_id, %version, ?seq_range, "inserted {count} rows (rows impacted: {rows_impacted}) from buffered into crsql_changes in {:?}", start.elapsed());
+
+    Ok(rows_impacted)
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct BufferedChunkProgress {
+    pub chunk_num: u64,
+    pub total_chunks: u64,
+    pub seq_start: CrsqlSeq,
+    pub seq_end: CrsqlSeq,
+    pub rows_impacted: i64,
+    pub elapsed: Duration,
+}
+
+impl std::fmt::Display for BufferedChunkProgress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "chunk {}/{}: seq {}..={} done in {:?} (rows impacted: {})",
+            self.chunk_num,
+            self.total_chunks,
+            self.seq_start,
+            self.seq_end,
+            self.elapsed,
+            self.rows_impacted
+        )
+    }
+}
+
+/// Applies a fully-buffered (gap-free) version into `crsql_changes` in seq chunks.
+/// Returns `Ok(None)` if the version isn't known or still has gaps.
+/// Sends updates to the progress channel.
+///
+#[tracing::instrument(skip(agent, bookie, progress), err)]
+pub async fn apply_buffered_version_in_chunks(
+    agent: &Agent,
+    bookie: &Bookie,
+    actor_id: ActorId,
+    version: CrsqlDbVersion,
+    chunk_size: u64,
+    progress: Option<mpsc::Sender<BufferedChunkProgress>>,
+) -> Result<Option<i64>, ChangeError> {
+    let seq_range = match version_seq_range(bookie, actor_id, version) {
+        Some(seq_range) => seq_range,
+        None => return Ok(None),
+    };
+
+    let chunk_size = chunk_size.max(1);
+    let last_seq = seq_range.end().0;
+    let total_chunks = (last_seq - seq_range.start().0) / chunk_size + 1;
+    let tx_timeout = Duration::from_secs(agent.config().perf.sql_tx_timeout as u64);
+
+    info!(
+        %actor_id,
+        %version,
+        "applying buffered changes in {total_chunks} chunk(s) of at most {chunk_size} seqs (seq {}..={})",
+        seq_range.start(),
+        seq_range.end()
+    );
+
+    let mut total_rows_impacted: i64 = 0;
+    let mut chunk_start = seq_range.start().0;
+    let mut chunk_num = 0;
+    loop {
+        let chunk_end = chunk_start.saturating_add(chunk_size - 1).min(last_seq);
+        chunk_num += 1;
+        let is_last = chunk_end == last_seq;
+
+        let mut conn = agent.pool().write_priority().await?;
+        let start = Instant::now();
+
+        let rows_impacted = block_in_place(|| {
+            let rusqlite_err = |source| ChangeError::Rusqlite {
+                source,
+                actor_id: Some(actor_id),
+                version: Some(version),
+            };
+
+            // Hold the bookie write lock for the last chunk so insert_db +
+            // clear_partials + commit stay under that lock.
+            let mut bookedw = is_last.then(|| {
+                let booked = bookie.ensure(actor_id);
+                let bookie_write = bookie.write_lock_blocking();
+                let booked_write = bookie_write.write_tx(&booked);
+                (bookie_write, booked_write)
+            });
+
+            let tx = InterruptibleTransaction::new(
+                conn.immediate_transaction().map_err(rusqlite_err)?,
+                Some(tx_timeout),
+                "process_buffered_changes",
+            );
+
+            let rows_impacted = insert_buffered_range(
+                &tx,
+                actor_id,
+                version,
+                CrsqlSeq(chunk_start)..=CrsqlSeq(chunk_end),
+            )
+            .map_err(rusqlite_err)?;
+
+            if let Some((_bookie_write, bookedw)) = bookedw.as_mut() {
+                bookedw
+                    .insert_db(&tx, [version..=version].into())
+                    .map_err(rusqlite_err)?;
+                bookedw
+                    .clear_partials(&tx, RangeInclusiveSet::from([version..=version]))
+                    .map_err(rusqlite_err)?;
+            }
+
+            tx.commit().map_err(rusqlite_err)?;
+
+            if let Some((_bookie_write, bookedw)) = bookedw {
+                bookedw.commit();
+                if let Err(e) = agent
+                    .tx_clear_buf()
+                    .try_send((actor_id, CrsqlDbVersionRange::single(version)))
+                {
+                    error!("could not schedule buffered data clear: {e}");
+                }
+            }
+
+            Ok::<_, ChangeError>(rows_impacted)
+        })?;
+        drop(conn);
+
+        total_rows_impacted += rows_impacted;
+        let elapsed = start.elapsed();
+        info!(
+            %actor_id,
+            %version,
+            "chunk {chunk_num}/{total_chunks}: seq {chunk_start}..={chunk_end} done in {elapsed:?} (rows impacted: {rows_impacted})"
+        );
+
+        if let Some(tx) = progress.as_ref() {
+            if let Err(e) = tx.try_send(BufferedChunkProgress {
+                chunk_num,
+                total_chunks,
+                seq_start: CrsqlSeq(chunk_start),
+                seq_end: CrsqlSeq(chunk_end),
+                rows_impacted,
+                elapsed,
+            }) {
+                debug!("could not send buffered apply progress: {e}");
+            }
+        }
+
+        if is_last {
+            break;
+        }
+        chunk_start = chunk_end + 1;
+    }
+
+    Ok(Some(total_rows_impacted))
 }
 
 #[tracing::instrument(skip(agent, bookie), err)]

@@ -28,3 +28,11 @@ Compares in-memory bookie state with database bookie state for all actors and pr
 ```bash
 corrosion sync check-bookie-consistency
 ```
+
+### `corrosion sync process-buffered-changes`
+
+Applies one fully buffered (gap-free) version from `__corro_buffered_changes` into `crsql_changes`, in batches of `--chunk-size` seqs instead of a single insert. The agent normally applies these versions automatically; use this only when a changeset is too large for that path to finish. Prefer smaller transactions at write time over relying on this command.
+
+```bash
+corrosion sync process-buffered-changes <actor-id> <version> --chunk-size 1000
+```

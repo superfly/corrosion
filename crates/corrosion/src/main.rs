@@ -508,6 +508,21 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
             ))
             .await?;
         }
+        Command::Sync(SyncCommand::ProcessBufferedChanges {
+            actor_id,
+            version,
+            chunk_size,
+        }) => {
+            let mut conn = AdminConn::connect(cli.admin_path()).await?;
+            conn.send_command(corro_admin::Command::Sync(
+                corro_admin::SyncCommand::ProcessBufferedChanges {
+                    actor_id: ActorId(*actor_id),
+                    version: CrsqlDbVersion(*version),
+                    chunk_size: *chunk_size,
+                },
+            ))
+            .await?;
+        }
         Command::Template { template, flags } => {
             command::tpl::run(cli.api_addr()?, template, flags).await?;
         }
@@ -868,6 +883,15 @@ enum SyncCommand {
     /// Check in-memory bookie state against DB-loaded bookie state
     CheckBookieConsistency,
     ReconcileGaps,
+    /// Apply a single fully-buffered (gap-free) version's changes into crsql_changes,
+    /// in smaller batches instead of one large insert
+    ProcessBufferedChanges {
+        actor_id: Uuid,
+        version: u64,
+        /// Number of buffered rows (seqs) to insert per batch
+        #[arg(long, default_value = "1000")]
+        chunk_size: u64,
+    },
 }
 
 #[derive(Subcommand)]
