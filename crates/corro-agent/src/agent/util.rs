@@ -500,7 +500,7 @@ pub async fn apply_fully_buffered_changes_loop(
                 Some(version) => version,
                 None => break,
             },
-            _ = retry_interval.tick() => {
+            _ = retry_interval.tick(), if scan_enabled => {
                 match find_fully_buffered_partial(&agent, Some(1)).await {
                     Ok(pairs) => match pairs.into_iter().next() {
                         Some(pair) => pair,
