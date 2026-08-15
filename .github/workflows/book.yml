@@ -20,10 +20,16 @@ jobs:
 
       - uses: taiki-e/install-action@v2
         with:
-          tool: mdbook@0.4.52,mdbook-linkcheck@0.7.7,mdbook-admonish@1.20.0
+          tool: mdbook@0.5.4
       
       - name: Build Book
         run: mdbook build
+
+      - name: Check links
+        uses: lycheeverse/lychee-action@v2
+        with:
+          args: --no-progress --offline book
+          fail: true
 
       - name: Setup Pages
         uses: actions/configure-pages@v2
@@ -32,7 +38,7 @@ jobs:
         uses: actions/upload-pages-artifact@v3
         with:
           # Upload entire repository
-          path: 'book/html'
+          path: 'book'
       
       - name: Deploy to GitHub Pages
         id: deployment

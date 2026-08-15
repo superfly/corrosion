@@ -6,9 +6,8 @@ The reaper config allows you specify tables so Corrosion will periodically delet
 
 When unset, no reaping is performed and bookkeeping rows for deleted primary keys are kept forever.
 
-```admonish warning
-Reaping a table is an irreversible cluster-wide operation. If a deleted primary key reappears (e.g. a row is recreated using the same id) **after** its retention has elapsed, You may end up with inconsistent state across the cluster if there are nodes that are yet to reap that primary key. Only configure the reaper for tables whose primary keys are guaranteed not to be reused, and prefer generous retention windows.
-```
+> [!WARNING]
+> Reaping a table is an irreversible cluster-wide operation. If a deleted primary key reappears (e.g. a row is recreated using the same id) **after** its retention has elapsed, You may end up with inconsistent state across the cluster if there are nodes that are yet to reap that primary key. Only configure the reaper for tables whose primary keys are guaranteed not to be reused, and prefer generous retention windows.
 
 ### Optional fields
 
