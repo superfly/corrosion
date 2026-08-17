@@ -418,7 +418,11 @@ impl<N: NodeId> PruneThrottle<N> {
     }
 }
 
-const RING_EXTRA_CONFIRMATIONS: u32 = 10;
+// The current rtt measurements from quic are very prone to spikes and can move
+// bucket frequently in a short window. We don't want to rebalance until we are
+// sure a peer has actually moved rings.
+// TODO: implement better rtt measurements in corrosion
+const RING_EXTRA_CONFIRMATIONS: u32 = 8;
 
 /// Full Plumtree protocol state for one local node.
 #[derive(Debug)]
@@ -911,8 +915,7 @@ impl<I: MessageId<NodeId = N>, P: Payload<MessageId = I, NodeId = N>, N: NodeId,
                 self_actor_id = ?self.local_id,
                 "Handling ihave time out for {} requests", graft_requests.len(),
             );
-            // todo: maybe move this after we actually receive a response?
-            self.move_to_eager(&send_to, rt);
+
             for chunk in graft_requests.chunks(10) {
                 rt.send(
                     send_to,
@@ -2423,9 +2426,5 @@ mod tests {
         let (to, m) = &rt_b.sent[0];
         assert_eq!(*to, 30);
         unwrap_graft(m);
-
-        // C is back in eager
-        assert!(b.eager_peers.contains(&30));
-        assert!(!b.lazy_peers.contains(&30));
     }
 }

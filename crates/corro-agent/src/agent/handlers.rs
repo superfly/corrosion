@@ -42,7 +42,7 @@ use rand::{prelude::IteratorRandom, rngs::StdRng, SeedableRng};
 use rangemap::RangeInclusiveSet;
 use serde_json::json;
 use spawn::spawn_counted;
-use tokio::time::sleep;
+use tokio::time::{sleep, MissedTickBehavior};
 use tokio::{
     sync::mpsc::Receiver as TokioReceiver,
     task::{block_in_place, JoinHandle},
@@ -136,6 +136,33 @@ pub fn spawn_incoming_connection_handlers(
         spawn_foca_handler(&agent, &tripwire, &conn);
         uni::spawn_unipayload_handler(&tripwire, &conn, agent.clone());
         bi::spawn_bipayload_handler(&agent, &bookie, &tripwire, &conn);
+    });
+}
+
+const RTT_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Spawn a task that samples the RTT of every live connection on a fixed
+/// interval, so that sample rate is independent of traffic volume.
+pub fn spawn_rtt_sampler(transport: &Transport, tripwire: Tripwire) {
+    spawn_counted({
+        let transport = transport.clone();
+        let mut tripwire = tripwire.clone();
+        async move {
+            let mut interval = tokio::time::interval(RTT_SAMPLE_INTERVAL);
+            interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = &mut tripwire => {
+                        break;
+                    }
+                    _ = interval.tick() => {
+                        transport.sample_rtts().await;
+                    }
+                }
+            }
+            info!("rtt_sampler is done");
+        }
     });
 }
 

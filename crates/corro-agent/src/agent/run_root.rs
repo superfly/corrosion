@@ -106,6 +106,7 @@ async fn run(
     );
 
     //// Update member connection RTTs
+    handlers::spawn_rtt_sampler(&transport, tripwire.clone());
     handlers::spawn_rtt_handler(&agent, rtt_rx, tripwire.clone());
 
     handlers::spawn_swim_announcer(&agent, gossip_addr, tripwire.clone());

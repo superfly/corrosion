@@ -230,10 +230,6 @@ pub fn default_plumtree_prune_threshold() -> u32 {
     5
 }
 
-pub fn default_plumtree_optimization_threshold() -> u32 {
-    7
-}
-
 pub fn default_plumtree_prune_throttle_secs() -> Option<u64> {
     Some(1)
 }
@@ -242,8 +238,8 @@ pub fn default_plumtree_prune_throttle_secs() -> Option<u64> {
 pub struct PlumtreeConfig {
     #[serde(default = "default_plumtree_prune_threshold")]
     pub prune_threshold: u32,
-    #[serde(default = "default_plumtree_optimization_threshold")]
-    pub optimization_threshold: u32,
+    #[serde(default)]
+    pub optimization_threshold: Option<u32>,
     #[serde(default)]
     pub batch_gossip: bool,
     /// Suppress repeat PRUNEs to the same peer within this window. `None` disables.
@@ -258,7 +254,7 @@ impl Default for PlumtreeConfig {
     fn default() -> Self {
         Self {
             prune_threshold: default_plumtree_prune_threshold(),
-            optimization_threshold: default_plumtree_optimization_threshold(),
+            optimization_threshold: None,
             batch_gossip: false,
             prune_throttle_secs: default_plumtree_prune_throttle_secs(),
             eager_ratios: plum_foca::EagerRatios::default(),
@@ -846,6 +842,7 @@ mod tests {
         .unwrap();
         assert_eq!(cfg.broadcast.method(), BroadcastMethod::Plumtree);
         assert_eq!(cfg.plumtree().unwrap().prune_threshold, 7);
+        assert_eq!(cfg.plumtree().unwrap().optimization_threshold, None);
     }
 
     #[test]

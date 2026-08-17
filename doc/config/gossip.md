@@ -77,7 +77,7 @@ If unset, Corrosion uses `gossip`. To enable Plumtree, add a `[gossip.broadcast.
 ```toml
 [gossip.broadcast.plumtree]
 prune_threshold = 5         # optional
-optimization_threshold = 7  # optional
+optimization_threshold = 7  # optional; omit to disable
 batch_gossip = false        # optional
 ```
 
@@ -89,9 +89,9 @@ Higher values tolerate more duplication in exchange for a more stable tree; lowe
 
 ##### `optimization_threshold`
 
-Threshold, in gossip rounds, for switching to a shorter path. When a node learns via a lazy `IHave` that a peer could have delivered a message at least this many rounds sooner than the eager peer that actually delivered it, it grafts the shorter path and prunes the longer one.
+Threshold, in gossip rounds, for switching to a shorter path. When a node learns via a lazy `IHave` that a peer could have delivered a message at least this many rounds sooner than the eager peer that actually delivered it, it grafts the shorter path.
 
-Lower values optimize the tree more aggressively (more `GRAFT`/`PRUNE` churn); higher values leave the tree alone unless the improvement is large. Defaults to `7`.
+Lower values optimize the tree more aggressively (more `GRAFT` churn); higher values leave the tree alone unless the improvement is large. Unset by default, which disables optimization grafts. Set an explicit value to enable them.
 
 ##### `batch_gossip`
 

@@ -355,7 +355,7 @@ pub async fn spawn_plumtree_loop<T: TransportExt + Clone + Send + 'static>(
 
     let config = plum_foca::Config {
         ihave_timeout: Duration::from_millis(150),
-        optimization_threshold: Some(plumtree_config.optimization_threshold),
+        optimization_threshold: plumtree_config.optimization_threshold,
         max_cached_payloads: 5000,
         num_eager: None,
         min_lazy: None,
@@ -403,6 +403,7 @@ pub async fn plumtree_loop<T: TransportExt + Clone + Send + 'static>(
     // send out ihave digests to lazy peers
     let mut ihave_tick_interval = interval(Duration::from_millis(150));
     let mut maintenance_interval = interval(Duration::from_secs(60));
+    maintenance_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
     let mut rt =
         CorrosionPlumtreeRuntime::new(tx_changes, agent.change_dict_slot(), timer_spawner, tx_msgs);
@@ -470,9 +471,12 @@ pub async fn plumtree_loop<T: TransportExt + Clone + Send + 'static>(
                         }
                         PlumtreeMsgV1::Graft(g) => {
                             trace!("handling plumtree graft");
-                            if !g.send {
-                                counter!("corro.plumtree.graft.optimization").increment(1);
-                            }
+                            let reason = if g.send {
+                                "ihave_timeout"
+                            } else {
+                                "optimization"
+                            };
+                            counter!("corro.plumtree.graft", "reason" => reason).increment(1);
                             state.handle_graft(g, &mut rt);
                         }
                         PlumtreeMsgV1::Prune(p) => {

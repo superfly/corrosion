@@ -38,6 +38,8 @@ struct TransportInner {
     conns: RwLock<HashMap<SocketAddr, Arc<Mutex<Option<Connection>>>>>,
     rtt_tx: mpsc::Sender<(SocketAddr, Duration)>,
     path_snapshots: StdMutex<HashMap<SocketAddr, PathSnapshot>>,
+    /// Last `frame_rx.acks` / `path.latest_rtt` observed per peer by [`Transport::sample_rtts`].
+    rtt_marks: StdMutex<HashMap<SocketAddr, RttMark>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -45,6 +47,12 @@ struct PathSnapshot {
     cwnd: u64,
     congestion_events: u64,
     black_holes_detected: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RttMark {
+    acks: u64,
+    latest_rtt: Duration,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -107,6 +115,7 @@ impl Transport {
             conns: Default::default(),
             rtt_tx,
             path_snapshots: Default::default(),
+            rtt_marks: Default::default(),
         })))
     }
 
@@ -276,6 +285,68 @@ impl Transport {
         .await
     }
 
+    /// Push an RTT sample for each live cached connection whose estimator has
+    /// taken a new measurement since the last sweep.
+    ///
+    /// `Connection::rtt` is a smoothed cache. We sample `path.min_rtt`, the
+    /// minimum RTT measurement the connection has seen, so a stall's decay tail does not fill the
+    /// ring window.
+    pub async fn sample_rtts(&self) {
+        // Arc handles only; the map lock is released before any per-connection
+        // lock is taken.
+        let conns = self.0.conns.read().await.clone();
+
+        let mut marks = self
+            .0
+            .rtt_marks
+            .lock()
+            .expect("rtt marks lock should not be poisoned");
+        marks.retain(|addr, _| conns.contains_key(addr));
+
+        for (addr, conn_lock) in conns {
+            // connect() holds this across the handshake, and a peer that is
+            // reconnecting has an RTT belonging to a connection already on its
+            // way out. Skip it rather than stall the sweep.
+            let mark = {
+                let Ok(lock) = conn_lock.try_lock() else {
+                    continue;
+                };
+                let Some(conn) = lock.as_ref() else {
+                    continue;
+                };
+
+                if conn.close_reason().is_some() {
+                    continue;
+                }
+
+                let stats = conn.stats();
+                RttMark {
+                    acks: stats.frame_rx.acks,
+                    latest_rtt: stats.path.min_rtt,
+                }
+            };
+
+            // we don't want a cached rtt value to continue updating the ring
+            // buffer because in that case we will overweigh that value
+            let estimator_moved = marks
+                .get(&addr)
+                .is_none_or(|prev| mark.acks != prev.acks || mark.latest_rtt != prev.latest_rtt);
+
+            if !estimator_moved {
+                counter!("corro.transport.rtt.samples", "result" => "skipped").increment(1);
+                continue;
+            }
+
+            if let Err(e) = self.0.rtt_tx.try_send((addr, mark.latest_rtt)) {
+                debug!("could not send RTT for connection through sender: {e}");
+                counter!("corro.transport.rtt.samples", "result" => "dropped").increment(1);
+            } else {
+                marks.insert(addr, mark);
+                counter!("corro.transport.rtt.samples", "result" => "sent").increment(1);
+            }
+        }
+    }
+
     // this shouldn't block for long...
     async fn get_lock(&self, addr: SocketAddr) -> Arc<Mutex<Option<Connection>>> {
         {
@@ -301,9 +372,6 @@ impl Transport {
 
         if let Some(conn) = lock.as_ref() {
             if test_conn(conn) {
-                if let Err(e) = self.0.rtt_tx.try_send((addr, conn.rtt())) {
-                    debug!("could not send RTT for connection through sender: {e}");
-                }
                 return Ok(conn.clone());
             }
         }

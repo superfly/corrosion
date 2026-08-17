@@ -52,14 +52,10 @@ const RING_BUCKETS: [Range<u64>; 6] = [0..6, 6..15, 15..50, 50..100, 100..200, 2
 /// minimum RTT for ring assignment.
 const RTT_WINDOW: usize = 20;
 
-/// Hysteresis dead-band as a percentage of the shared boundary value, applied
-/// when stepping to an adjacent ring. Prevents ring flapping when the RTT sits
-/// right on a bucket boundary.
-const RING_HYSTERESIS_PCT: u64 = 25;
-
-/// Floor on the hysteresis margin in ms. Percent-only margins are tiny on the
-/// low ring edges (20% of 15ms ≈ 3ms), which is where Near↔Mid flaps in practice.
-const RING_HYSTERESIS_MIN_MS: u64 = 8;
+/// How far past a bucket boundary the RTT must sit before the ring follows it.
+///
+/// This prevents little changes in rtt from changing a nodes ring.
+const RING_HYSTERESIS_MS: u64 = 2;
 
 /// Index of the `RING_BUCKETS` range containing `rtt_ms`. Values at or above
 /// the last bucket (>= 300ms) are clamped into the top bucket so a ring is
@@ -71,17 +67,7 @@ fn bucket_for(rtt_ms: u64) -> u8 {
         .unwrap_or(RING_BUCKETS.len() - 1) as u8
 }
 
-fn hysteresis_margin(boundary: u64) -> u64 {
-    let m = (boundary * RING_HYSTERESIS_PCT / 100).max(RING_HYSTERESIS_MIN_MS);
-    // Never exceed the boundary itself — otherwise a ring could become
-    // impossible to leave downward (e.g. start=6 with margin=8).
-    m.min(boundary)
-}
-
 /// Compute the ring for `rtt_ms`, applying hysteresis on adjacent steps.
-///
-/// Multi-bucket jumps move at most one ring per update so a single noisy
-/// sample cannot skip hysteresis (e.g. ring 2 → 0).
 fn ring_with_hysteresis(current: Option<u8>, rtt_ms: u64) -> u8 {
     let target = bucket_for(rtt_ms);
     let Some(current) = current else {
@@ -94,16 +80,14 @@ fn ring_with_hysteresis(current: Option<u8>, rtt_ms: u64) -> u8 {
     // Step at most one ring toward the target; hysteresis applies to that step.
     if target > current {
         let boundary = RING_BUCKETS[current as usize].end;
-        let margin = hysteresis_margin(boundary);
-        if rtt_ms >= boundary + margin {
+        if rtt_ms >= boundary + RING_HYSTERESIS_MS {
             current + 1
         } else {
             current
         }
     } else {
         let boundary = RING_BUCKETS[current as usize].start;
-        let margin = hysteresis_margin(boundary);
-        if rtt_ms + margin <= boundary {
+        if rtt_ms + RING_HYSTERESIS_MS <= boundary {
             current - 1
         } else {
             current
@@ -119,11 +103,9 @@ pub struct Rtt {
 impl Rtt {
     /// Smallest sample in the window, in milliseconds.
     ///
-    /// Samples are reads of quinn's smoothed RTT, not independent
-    /// measurements: one delayed ACK inflates the estimator and it then decays
-    /// back over roughly a full window, so most of the buffer can be tail from
-    /// a single stall. The minimum recovers the propagation floor, which is
-    /// what the rings are meant to describe.
+    /// Samples are Quinn's latest RTT (the last ACK-based measurement), not
+    /// the smoothed estimator. One delayed ACK still produces a large sample;
+    /// the minimum of the window is the propagation floor the rings describe.
     pub fn min_ms(&self) -> Option<u64> {
         self.buf.iter().min().copied()
     }
@@ -306,25 +288,56 @@ mod tests {
     use super::*;
 
     #[test]
-    fn hysteresis_holds_near_mid_boundary() {
-        // Ring 1 is 6..15, ring 2 is 15..50. Margin at 15ms is max(25%*15, 8) = 8.
-        // Stay in ring 1 until avg >= 23; stay in ring 2 until avg <= 7.
-        assert_eq!(ring_with_hysteresis(Some(1), 18), 1);
-        assert_eq!(ring_with_hysteresis(Some(1), 22), 1);
-        assert_eq!(ring_with_hysteresis(Some(1), 23), 2);
+    fn hysteresis_holds_either_side_of_a_boundary() {
+        // The band around a boundary spans it by RING_HYSTERESIS_MS in each
+        // direction: 4..=8 around the 6ms boundary, 13..=17 around the 15ms one.
+        assert_eq!(ring_with_hysteresis(Some(0), 7), 0);
+        assert_eq!(ring_with_hysteresis(Some(0), 8), 1);
+        assert_eq!(ring_with_hysteresis(Some(1), 5), 1);
+        assert_eq!(ring_with_hysteresis(Some(1), 4), 0);
 
-        assert_eq!(ring_with_hysteresis(Some(2), 12), 2);
-        assert_eq!(ring_with_hysteresis(Some(2), 8), 2);
-        assert_eq!(ring_with_hysteresis(Some(2), 7), 1);
+        assert_eq!(ring_with_hysteresis(Some(1), 16), 1);
+        assert_eq!(ring_with_hysteresis(Some(1), 17), 2);
+        assert_eq!(ring_with_hysteresis(Some(2), 14), 2);
+        assert_eq!(ring_with_hysteresis(Some(2), 13), 1);
     }
 
     #[test]
-    fn hysteresis_steps_one_ring_at_a_time() {
-        // A sudden drop from mid-ring RTT must not skip straight to ring 0.
-        assert_eq!(ring_with_hysteresis(Some(2), 3), 1);
-        // Leaving ring 1 downward still needs to clear its start bound (avg 0).
-        assert_eq!(ring_with_hysteresis(Some(1), 3), 1);
-        assert_eq!(ring_with_hysteresis(Some(1), 0), 0);
+    fn ring_survives_the_jitter_seen_in_production() {
+        // The minimum of the window moved by at most 1ms across every peer
+        // sampled, so a peer wobbling that much on a boundary must keep a ring
+        // that holds at every value it visits.
+        for boundary in [6u64, 15, 50, 100, 200] {
+            let held: Vec<u8> = (0..RING_BUCKETS.len() as u8)
+                .filter(|ring| {
+                    (boundary - 1..=boundary + 1)
+                        .all(|rtt| ring_with_hysteresis(Some(*ring), rtt) == *ring)
+                })
+                .collect();
+            assert!(
+                !held.is_empty(),
+                "a peer wobbling 1ms around {boundary}ms has no ring it can settle on"
+            );
+        }
+    }
+
+    #[test]
+    fn every_rtt_settles_on_exactly_one_ring() {
+        // No RTT may leave the ring oscillating, and no RTT may settle more than
+        // one ring away from the bucket it actually falls in.
+        for rtt in 0..300u64 {
+            let settled: Vec<u8> = (0..RING_BUCKETS.len() as u8)
+                .filter(|ring| ring_with_hysteresis(Some(*ring), rtt) == *ring)
+                .collect();
+            assert!(!settled.is_empty(), "rtt {rtt} never settles");
+            for ring in settled {
+                assert!(
+                    ring.abs_diff(bucket_for(rtt)) <= 1,
+                    "rtt {rtt} settles on ring {ring}, too far from {}",
+                    bucket_for(rtt)
+                );
+            }
+        }
     }
 
     #[test]

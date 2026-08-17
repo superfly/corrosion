@@ -155,8 +155,7 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
     let external_addr = conf.gossip.external_addr;
 
     // RTT handling interacts with the tokio ReceiverStream and as
-    // such needs a raw tokio channel
-    let (rtt_tx, rtt_rx) = tokio_channel(128);
+    let (rtt_tx, rtt_rx) = tokio_channel(1024);
 
     let transport = Transport::new(&conf.gossip, rtt_tx).await?;
 
