@@ -1355,6 +1355,7 @@ enum TxState {
     Started {
         kind: OpenTxKind,
         permits: Option<(OwnedSemaphorePermit, BookieWriteGuard)>,
+        failed: bool,
     },
     #[default]
     Ended,
@@ -1365,12 +1366,14 @@ impl TxState {
         Self::Started {
             kind: OpenTxKind::Implicit,
             permits: None,
+            failed: false,
         }
     }
     fn explicit() -> Self {
         Self::Started {
             kind: OpenTxKind::Explicit,
             permits: None,
+            failed: false,
         }
     }
 
@@ -1415,6 +1418,28 @@ impl TxState {
     }
     fn is_ended(&self) -> bool {
         matches!(self, TxState::Ended)
+    }
+
+    fn is_failed(&self) -> bool {
+        matches!(
+            self,
+            TxState::Started {
+                kind: OpenTxKind::Explicit,
+                failed: true,
+                ..
+            }
+        )
+    }
+
+    fn fail_explicit(&mut self) {
+        if let TxState::Started {
+            kind: OpenTxKind::Explicit,
+            failed,
+            ..
+        } = self
+        {
+            *failed = true;
+        }
     }
 
     fn start_implicit(&mut self) {
@@ -3515,12 +3540,6 @@ pub async fn start(
                                         })?;
 
                                         discard_until_sync = true;
-
-                                        send_ready(
-                                            &mut session,
-                                            discard_until_sync,
-                                            &back_tx,
-                                        )?;
                                         continue;
                                     }
                                 }
@@ -3545,7 +3564,7 @@ pub async fn start(
                                             )?;
                                             send_ready(
                                                 &mut session,
-                                                discard_until_sync,
+                                                true,
                                                 &back_tx,
                                             )?;
                                             continue;
@@ -3581,7 +3600,7 @@ pub async fn start(
                                             })?;
                                             send_ready(
                                                 &mut session,
-                                                discard_until_sync,
+                                                true,
                                                 &back_tx,
                                             )?;
                                             continue 'outer;
@@ -3897,6 +3916,8 @@ impl<'conn> Session<'conn> {
         back_tx: &Sender<BackendResponse>,
         send_row_desc: bool,
     ) -> Result<(), QueryError> {
+        self.validate_transaction_command(cmd)?;
+
         if cmd.is_show() {
             back_tx
                 .blocking_send(
@@ -4065,6 +4086,8 @@ impl<'conn> Session<'conn> {
         max_rows: usize,
         back_tx: &Sender<BackendResponse>,
     ) -> Result<(), QueryError> {
+        self.validate_transaction_command(cmd)?;
+
         // TODO: maybe we don't need to recompute this...
         let fields = field_types(prepped, cmd, FieldFormats::Each(result_formats))?;
 
@@ -4104,8 +4127,10 @@ impl<'conn> Session<'conn> {
             } else {
                 self.commit_db()?;
             }
+        } else if cmd.is_rollback() {
+            let _permits = self.tx_state.end();
+            self.conn.execute_batch("ROLLBACK")?;
         } else if cmd.is_begin() {
-            // do nothing
             debug!("cmd is BEGIN");
         } else {
             if !self.tx_state.is_writing() && !prepped.readonly() {
@@ -4312,6 +4337,18 @@ impl<'conn> Session<'conn> {
         Ok(())
     }
 
+    fn validate_transaction_command(&self, cmd: &ParsedCmd) -> Result<(), QueryError> {
+        if self.tx_state.is_failed() && !cmd.is_rollback() {
+            return Err(QueryError::InFailedTransaction);
+        }
+
+        if self.tx_state.is_explicit() && cmd.is_begin() {
+            return Err(QueryError::ActiveTransaction);
+        }
+
+        Ok(())
+    }
+
     fn commit_db(&self) -> Result<(), ChangeError> {
         let actor_id = self.agent.actor_id();
         self.conn
@@ -4388,6 +4425,10 @@ fn send_ready(
     discard_until_sync: bool,
     back_tx: &Sender<BackendResponse>,
 ) -> Result<(), BoxError> {
+    if discard_until_sync {
+        session.tx_state.fail_explicit();
+    }
+
     let ready_status = if session.tx_state.is_implicit() {
         let permits = session.tx_state.end(); // do this first, in case of failure
         if discard_until_sync {
@@ -4406,7 +4447,7 @@ fn send_ready(
 
         TransactionStatus::Idle
     } else if session.tx_state.is_explicit() {
-        if discard_until_sync {
+        if session.tx_state.is_failed() {
             TransactionStatus::Error
         } else {
             TransactionStatus::Transaction
@@ -4444,6 +4485,10 @@ enum QueryError {
     PermitAcquire(#[from] AcquireError),
     #[error(transparent)]
     Change(#[from] ChangeError),
+    #[error("current transaction is aborted, commands ignored until end of transaction block")]
+    InFailedTransaction,
+    #[error("there is already a transaction in progress")]
+    ActiveTransaction,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -4483,6 +4528,18 @@ impl TryFrom<QueryError> for PgWireBackendMessage {
             QueryError::Change(e) => {
                 ErrorInfo::new("ERROR".to_owned(), "XX000".to_owned(), e.to_string()).into()
             }
+            e @ QueryError::InFailedTransaction => ErrorInfo::new(
+                "ERROR".to_owned(),
+                SqlState::IN_FAILED_SQL_TRANSACTION.code().into(),
+                e.to_string(),
+            )
+            .into(),
+            e @ QueryError::ActiveTransaction => ErrorInfo::new(
+                "ERROR".to_owned(),
+                SqlState::ACTIVE_SQL_TRANSACTION.code().into(),
+                e.to_string(),
+            )
+            .into(),
         }))
     }
 }
