@@ -633,14 +633,9 @@ pub async fn upsert_sub(
             return Err(MatcherUpsertError::SubFromWithoutMatcher);
         }
 
-        let (sub_tx, sub_rx) = broadcast::channel(10240);
+        let (sub_tx, sub_rx) = broadcast::channel(SUB_BROADCAST_CHANNEL_CAPACITY);
 
-        tokio::spawn(forward_sub_to_sender(
-            handle.clone(),
-            sub_rx,
-            tx,
-            params.skip_rows,
-        ));
+        tokio::spawn(catch_up_sub(handle.clone(), params, sub_rx, tx));
 
         bcast_write.insert(handle.id(), sub_tx.clone());
 
@@ -732,6 +727,7 @@ pub async fn api_v1_subs(
         .expect("could not generate ok http response for query request")
 }
 
+const SUB_BROADCAST_CHANNEL_CAPACITY: usize = 10240;
 const MAX_EVENTS_BUFFER_SIZE: usize = 1024;
 
 async fn forward_sub_to_sender(
@@ -1310,6 +1306,86 @@ mod tests {
                 assert_ne!(s[i].sub_id, s[j].sub_id);
             }
         }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_initial_subscription_survives_broadcast_backpressure() -> eyre::Result<()> {
+        _ = tracing_subscriber::fmt::try_init();
+        let test = PubSubTest::with_n_agents(1).await?;
+        let agent = &test.agents[0];
+
+        let data: Vec<Vec<SqliteValue>> =
+            vec![vec!["service-id-0".into(), "service-name-0".into()]];
+        agent.insert_test_data(&data).await?;
+
+        let subs = agent.ta.agent.subs_manager();
+        let (handle, maybe_created) = subs.get_or_insert(
+            TEST_QUERY1,
+            &agent.ta.agent.config().db.subscriptions_path(),
+            &agent.ta.agent.schema().read(),
+            agent.ta.agent.pool(),
+            agent.tripwire.clone(),
+        )?;
+
+        assert!(maybe_created.is_some());
+
+        let (tx, mut rx) = mpsc::channel(1);
+        let mut bcast_write = agent.subs_bcast_cache.write().await;
+
+        let sub_id = upsert_sub(
+            handle,
+            maybe_created,
+            subs,
+            &mut bcast_write,
+            SubParams {
+                from: None,
+                skip_rows: false,
+            },
+            tx,
+        )
+        .await?;
+
+        let sub_tx = bcast_write
+            .get(&sub_id)
+            .cloned()
+            .expect("missing subscription broadcaster");
+
+        drop(bcast_write);
+
+        timeout(Duration::from_secs(5), async {
+            while rx.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("initial subscription did not start");
+
+        for i in 0..(SUB_BROADCAST_CHANNEL_CAPACITY as u64 * 2) {
+            sub_tx
+                .send((Bytes::new(), QueryEventMeta::Row(RowId(10_000 + i))))
+                .expect("subscription receiver dropped");
+
+            if i % 16 == 0 {
+                tokio::task::yield_now().await;
+            }
+        }
+
+        let (_, meta) = timeout(Duration::from_secs(5), rx.recv())
+            .await?
+            .ok_or_else(|| eyre::eyre!("subscription closed before columns"))?;
+        assert!(matches!(meta, QueryEventMeta::Columns));
+
+        let (_, meta) = timeout(Duration::from_secs(5), rx.recv())
+            .await?
+            .ok_or_else(|| eyre::eyre!("subscription closed before initial row"))?;
+        assert!(matches!(meta, QueryEventMeta::Row(_)));
+
+        let (_, meta) = timeout(Duration::from_secs(5), rx.recv())
+            .await?
+            .ok_or_else(|| eyre::eyre!("subscription closed before end of initial query"))?;
+        assert!(matches!(meta, QueryEventMeta::EndOfQuery(_)));
+
         Ok(())
     }
 
