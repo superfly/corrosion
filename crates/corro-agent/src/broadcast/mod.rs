@@ -43,7 +43,7 @@ use corro_types::{
     sqlite::unnest_param,
 };
 
-use crate::{agent::util::log_at_pow_10, transport::TransportExt};
+use crate::{agent::util::log_at_pow_10, transport::Transport};
 
 #[derive(Clone)]
 pub struct TimerSpawner<T: Send + 'static> {
@@ -417,7 +417,7 @@ impl Default for BroadcastOpts {
 pub(crate) async fn handle_broadcasts(
     agent: Agent,
     mut rx_bcast: CorroReceiver<BroadcastInput>,
-    transport: impl TransportExt + Clone + Send + 'static,
+    transport: Transport,
     config: Arc<RwLock<foca::Config>>,
     mut tripwire: Tripwire,
     opts: BroadcastOpts,
@@ -1082,7 +1082,7 @@ pub(crate) enum TransmitError {
 pub(crate) fn try_transmit_uni(
     bytes_per_sec: &TransmitRateLimiter,
     payload: Bytes,
-    transport: impl TransportExt + Send + 'static,
+    transport: Transport,
     addr: SocketAddr,
 ) -> Result<Pin<Box<dyn Future<Output = ()> + Send>>, TransmitError> {
     trace!("singly broadcasting to {addr}");
@@ -1132,7 +1132,6 @@ mod tests {
         base::{dbsr, CrsqlDbVersion, CrsqlSeq},
         broadcast::{BroadcastV1, ChangeV1, Changeset},
     };
-    // use plum_foca::PlumtreeMsg;
     use std::collections::HashSet;
     use uuid::Uuid;
 

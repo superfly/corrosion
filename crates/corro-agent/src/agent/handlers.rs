@@ -391,7 +391,6 @@ pub async fn handle_notifications(
                     MemberAddedResult::Updated(_) => {
                         debug!("Member Updated {actor:?}");
                         // anything else to do here?
-                        // TODO: do we want to send rtt updates to plumtree
                     }
                     MemberAddedResult::Ignored => {
                         // TODO: it's unclear if this is needed or
@@ -491,7 +490,8 @@ async fn send_plumtree_member_update(agent: &Agent, actor: &Actor, result: Membe
     };
 
     if let Some(update) = update {
-        if let Err(e) = agent.tx_plumtree_updates().send(update).await {
+        // plumtree periodically checks member state so it is fine if this is best effort
+        if let Err(e) = agent.tx_plumtree_updates().try_send(update) {
             error!("could not forward plumtree update: {e}");
         }
     }

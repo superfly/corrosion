@@ -1,4 +1,10 @@
-use std::{collections::BTreeMap, net::SocketAddr, ops::Range, time::Duration};
+use std::{
+    cmp::Ordering,
+    collections::{btree_map::Entry, BTreeMap},
+    net::SocketAddr,
+    ops::Range,
+    time::Duration,
+};
 
 use circular_buffer::CircularBuffer;
 use serde::{Deserialize, Serialize};
@@ -156,7 +162,6 @@ impl Members {
     // cluster member addresses has changed
     pub fn add_member(&mut self, actor: &Actor) -> MemberAddedResult {
         let actor_id = actor.id();
-        let mut ret = MemberAddedResult::Ignored;
 
         if actor.member_id() != self.member_id {
             info!(
@@ -173,50 +178,36 @@ impl Members {
             };
         }
 
-        let is_new = !self.states.contains_key(&actor_id);
-        let member = self.states.entry(actor_id).or_insert_with(|| {
-            MemberState::new(
-                actor.addr(),
-                actor.ts(),
-                actor.cluster_id(),
-                actor.member_id(),
-            )
-        });
+        match self.states.entry(actor_id) {
+            Entry::Vacant(e) => {
+                let member = MemberState::new(
+                    actor.addr(),
+                    actor.ts(),
+                    actor.cluster_id(),
+                    actor.member_id(),
+                );
+                trace!("member: {member:?}");
+                e.insert(member.clone());
+                self.by_addr.insert(actor.addr(), actor_id);
+                self.recalculate_rings(actor.addr());
+                MemberAddedResult::NewMember(member)
+            }
+            Entry::Occupied(mut e) => {
+                let member = e.get_mut();
+                trace!("member: {member:?}");
 
-        if is_new {
-            ret = MemberAddedResult::NewMember(member.clone());
+                match actor.ts().to_duration().cmp(&member.ts.to_duration()) {
+                    Ordering::Less | Ordering::Equal => MemberAddedResult::Ignored,
+                    Ordering::Greater => {
+                        member.addr = actor.addr();
+                        member.ts = actor.ts();
+                        member.cluster_id = actor.cluster_id();
+                        member.member_id = actor.member_id();
+                        MemberAddedResult::Updated(member.clone())
+                    }
+                }
+            }
         }
-
-        trace!("member: {member:?}");
-
-        // The received timestamp is older than the previously known
-        // one.  If we just added the member this shouldn't ever
-        // trigger (because the timestamps would be the same).
-        if actor.ts().to_duration() < member.ts.to_duration() {
-            debug!("older timestamp, ignoring");
-            return MemberAddedResult::Ignored;
-        }
-
-        // If the new timestamp is newer than what we had on file we
-        // update the member, then set the return to "Update".
-        // Because a newly inserted member would always have the same
-        // timestamp this code doesn't run if we just inserted.
-        if actor.ts().to_duration() > member.ts.to_duration() {
-            member.addr = actor.addr();
-            member.ts = actor.ts();
-            member.cluster_id = actor.cluster_id();
-            member.member_id = actor.member_id();
-            ret = MemberAddedResult::Updated(member.clone());
-        }
-
-        // If we just inserted, add the actor to the by_addr set and
-        // recalculate the RTT rings.
-        if matches!(ret, MemberAddedResult::NewMember(_)) {
-            self.by_addr.insert(actor.addr(), actor.id());
-            self.recalculate_rings(actor.addr());
-        }
-
-        ret
     }
 
     // A result of `true` means that the effective list of

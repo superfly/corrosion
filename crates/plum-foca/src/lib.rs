@@ -640,7 +640,11 @@ impl<I: MessageId<NodeId = N>, P: Payload<MessageId = I, NodeId = N>, N: NodeId,
         self.cache.insert(id.clone(), payload.clone(), round);
         rt.deliver(payload.clone());
 
-        let next_round = round + 1;
+        let next_round = round.saturating_add(1);
+        if next_round == round {
+            warn!(?self_actor_id, ?id, "plumtree gossip round overflowed");
+        }
+
         let peers: Vec<N> = self
             .eager_peers
             .iter()
@@ -692,7 +696,6 @@ impl<I: MessageId<NodeId = N>, P: Payload<MessageId = I, NodeId = N>, N: NodeId,
                 }),
                 PlumPrio::P0,
             );
-            self.move_to_eager(&entry.ihave_sender, rt);
 
             // paper has a prune here but we might prune a good path for different sender,
             // possibly need more info to determine if we should prune.
@@ -996,9 +999,7 @@ impl<I: MessageId<NodeId = N>, P: Payload<MessageId = I, NodeId = N>, N: NodeId,
     ) {
         for (peer, info) in peers {
             if peer != self.local_id {
-                self.known_peers.insert(peer);
-                self.peer_topology.insert(peer, info);
-                self.pending_topology.remove(&peer);
+                self.commit_topology(peer, info);
             }
         }
         self.maybe_recompute_fanout();
@@ -1011,9 +1012,7 @@ impl<I: MessageId<NodeId = N>, P: Payload<MessageId = I, NodeId = N>, N: NodeId,
             return;
         }
 
-        self.peer_topology.insert(peer, rtt.unwrap_or_default());
-        self.known_peers.insert(peer);
-        self.pending_topology.remove(&peer);
+        self.commit_topology(peer, rtt.unwrap_or_default());
         self.maybe_recompute_fanout();
         if self.eager_peers.len() < self.num_eager() {
             self.move_to_eager(&peer, rt);
