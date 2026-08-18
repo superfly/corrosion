@@ -1665,3 +1665,151 @@ async fn test_apply_buffered_version_in_chunks() -> eyre::Result<()> {
 
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_schema_change_retries_all_fully_buffered_partials() -> eyre::Result<()> {
+    _ = tracing_subscriber::fmt::try_init();
+
+    let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
+    let dir = tempfile::tempdir()?;
+
+    let mut config = Config::builder()
+        .db_path(dir.path().join("corrosion.db").display().to_string())
+        .gossip_addr("127.0.0.1:0".parse()?)
+        .api_addr("127.0.0.1:0".parse()?)
+        .build()?;
+
+    config.perf.partial_retry_backoff = 60 * 60;
+
+    let (agent, opts) = setup(config, tripwire.clone()).await?;
+    let bookie = agent.bookie().clone();
+    let mut rx_apply = opts.rx_apply;
+
+    let actor_a = ActorId(Uuid::new_v4());
+    let actor_b = ActorId(Uuid::new_v4());
+    let version = CrsqlDbVersion(1);
+    let ts = agent.clock().new_timestamp().into();
+
+    let make_part = |actor_id: ActorId, seq: u64, id: i64, text: &str| {
+        (
+            ChangeV1 {
+                actor_id,
+                changeset: Changeset::Full {
+                    version,
+                    changes: vec![Change {
+                        table: TableName("retry_after_schema_change".into()),
+                        pk: pack_columns(&vec![id.into()]).unwrap(),
+                        cid: ColumnName("text".into()),
+                        val: text.to_owned().into(),
+                        col_version: 1,
+                        db_version: version,
+                        seq: CrsqlSeq(seq),
+                        site_id: actor_id.to_bytes(),
+                        cl: 1,
+                    }],
+                    seqs: CrsqlSeqRange::new(CrsqlSeq(seq), CrsqlSeq(seq)),
+                    last_seq: CrsqlSeq(1),
+                    ts,
+                },
+            },
+            ChangeSource::Sync,
+            Instant::now(),
+        )
+    };
+
+    process_multiple_changes(
+        agent.clone(),
+        bookie.clone(),
+        vec![
+            make_part(actor_a, 0, 1, "a-first"),
+            make_part(actor_a, 1, 2, "a-second"),
+            make_part(actor_b, 0, 3, "b-first"),
+            make_part(actor_b, 1, 4, "b-second"),
+        ],
+        Duration::from_secs(60),
+    )
+    .await?;
+
+    for actor_id in [actor_a, actor_b] {
+        let booked = bookie.get(&actor_id).unwrap();
+        let read = booked.read();
+        assert!(read.get_partial(&version).unwrap().is_complete());
+    }
+
+    for _ in 0..2 {
+        let initial_apply = timeout(Duration::from_secs(1), rx_apply.recv()).await?;
+        assert!(initial_apply.is_some());
+    }
+
+    for actor_id in [actor_a, actor_b] {
+        let result = crate::agent::util::process_fully_buffered_changes(
+            &agent,
+            &bookie,
+            actor_id,
+            version,
+            Duration::from_secs(60),
+        )
+        .await;
+
+        assert!(result.is_err());
+    }
+
+    let apply_loop = tokio::spawn(crate::agent::util::apply_fully_buffered_changes_loop(
+        agent.clone(),
+        bookie.clone(),
+        rx_apply,
+        tripwire.clone(),
+    ));
+
+    tokio::task::yield_now().await;
+
+    execute_schema(
+        &agent,
+        vec![r#"
+            CREATE TABLE retry_after_schema_change (
+                id INTEGER NOT NULL PRIMARY KEY,
+                text TEXT NOT NULL DEFAULT ''
+            ) WITHOUT ROWID;
+            "#
+        .to_owned()],
+    )
+    .await?;
+
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let count: i64 = agent
+                .pool()
+                .read()
+                .await
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM retry_after_schema_change",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+
+            if count == 4 {
+                break;
+            }
+
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("schema change should retry all fully buffered partials");
+
+    for actor_id in [actor_a, actor_b] {
+        let booked = bookie.get(&actor_id).unwrap();
+        let read = booked.read();
+        assert!(read.get_partial(&version).is_none());
+        assert!(read.contains_version(&version));
+    }
+
+    tripwire_tx.send(()).await.ok();
+    tripwire_worker.await;
+    apply_loop.await?;
+    wait_for_all_pending_handles().await;
+
+    Ok(())
+}

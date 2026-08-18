@@ -54,6 +54,12 @@ use super::members::Members;
 #[derive(Clone)]
 pub struct Agent(Arc<AgentInner>);
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ApplyTrigger {
+    Version(ActorId, CrsqlDbVersion),
+    SchemaChanged,
+}
+
 pub struct AgentConfig {
     pub actor_id: ActorId,
     pub pool: SplitPool,
@@ -68,7 +74,7 @@ pub struct AgentConfig {
     pub bookie: Bookie,
 
     pub tx_bcast: CorroSender<BroadcastInput>,
-    pub tx_apply: CorroSender<(ActorId, CrsqlDbVersion)>,
+    pub tx_apply: CorroSender<ApplyTrigger>,
     pub tx_clear_buf: CorroSender<(ActorId, CrsqlDbVersionRange)>,
     pub tx_changes: CorroSender<(ChangeV1, ChangeSource, Option<BroadcastV1>)>,
     pub tx_foca: CorroSender<FocaInput>,
@@ -106,7 +112,7 @@ pub struct AgentInner {
     booked: Booked,
     bookie: Bookie,
     tx_bcast: CorroSender<BroadcastInput>,
-    tx_apply: CorroSender<(ActorId, CrsqlDbVersion)>,
+    tx_apply: CorroSender<ApplyTrigger>,
     tx_clear_buf: CorroSender<(ActorId, CrsqlDbVersionRange)>,
     tx_changes: CorroSender<(ChangeV1, ChangeSource, Option<BroadcastV1>)>,
     tx_foca: CorroSender<FocaInput>,
@@ -202,7 +208,7 @@ impl Agent {
         &self.0.tx_bcast
     }
 
-    pub fn tx_apply(&self) -> &CorroSender<(ActorId, CrsqlDbVersion)> {
+    pub fn tx_apply(&self) -> &CorroSender<ApplyTrigger> {
         &self.0.tx_apply
     }
 

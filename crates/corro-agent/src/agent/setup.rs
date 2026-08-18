@@ -37,8 +37,8 @@ use crate::{
 };
 use corro_types::{
     actor::ActorId,
-    agent::{migrate, Agent, AgentConfig, BookedVersions, Bookie, SplitPool},
-    base::{CrsqlDbVersion, CrsqlDbVersionRange},
+    agent::{migrate, Agent, AgentConfig, ApplyTrigger, BookedVersions, Bookie, SplitPool},
+    base::CrsqlDbVersionRange,
     broadcast::{BroadcastInput, BroadcastV1, ChangeSource, ChangeV1, FocaInput},
     channel::{bounded, CorroReceiver},
     compress::ZstdDicts,
@@ -57,7 +57,7 @@ pub struct AgentOptions {
     pub transport: Transport,
     pub api_listeners: Vec<TcpListener>,
     pub rx_bcast: CorroReceiver<BroadcastInput>,
-    pub rx_apply: CorroReceiver<(ActorId, CrsqlDbVersion)>,
+    pub rx_apply: CorroReceiver<ApplyTrigger>,
     pub rx_clear_buf: CorroReceiver<(ActorId, CrsqlDbVersionRange)>,
     pub rx_changes: CorroReceiver<(ChangeV1, ChangeSource, Option<BroadcastV1>)>,
     pub rx_foca: CorroReceiver<FocaInput>,
