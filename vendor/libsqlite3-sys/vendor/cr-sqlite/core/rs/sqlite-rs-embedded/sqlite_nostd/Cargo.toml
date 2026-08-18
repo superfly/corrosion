@@ -17,3 +17,4 @@ num-derive = "0.4.1"
 loadable_extension = ["sqlite3_capi/loadable_extension"]
 static = ["sqlite3_capi/static"]
 omit_load_extension = ["sqlite3_capi/omit_load_extension"]
+host = []

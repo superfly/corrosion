@@ -3,6 +3,7 @@
 extern crate alloc;
 
 use core::ffi::c_char;
+#[cfg(not(feature = "host"))]
 use core::panic::PanicInfo;
 use crsql_core;
 use crsql_core::sqlite3_crsqlcore_init;
@@ -12,16 +13,18 @@ use crsql_fractindex_core::sqlite3_crsqlfractionalindex_init;
 #[cfg(feature = "test")]
 use libc_print::std_name::println;
 use sqlite_nostd as sqlite;
+#[cfg(not(feature = "host"))]
 use sqlite_nostd::SQLite3Allocator;
 
 // This must be our allocator so we can transfer ownership of memory to SQLite and have SQLite free that memory for us.
 // This drastically reduces copies when passing strings and blobs back and forth between Rust and C.
+#[cfg(not(feature = "host"))]
 #[global_allocator]
 static ALLOCATOR: SQLite3Allocator = SQLite3Allocator {};
 
 // This must be our panic handler for WASM builds. For simplicity, we make it our panic handler for
 // all builds. Abort is also more portable than unwind, enabling us to go to more embedded use cases.
-#[cfg(not(feature = "test"))]
+#[cfg(all(not(feature = "test"), not(feature = "host")))]
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {
     //core::intrinsics::abort()
