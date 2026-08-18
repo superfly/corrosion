@@ -18,7 +18,10 @@ use crate::{
 use antithesis_sdk::assert_sometimes;
 use corro_types::{
     actor::{Actor, ActorId},
-    agent::{Agent, Booked, Bookie, ChangeError, CurrentVersion, KnownDbVersion, PartialVersion},
+    agent::{
+        Agent, ApplyTrigger, Booked, Bookie, ChangeError, CurrentVersion, KnownDbVersion,
+        PartialVersion,
+    },
     api::TableName,
     base::{CrsqlDbVersion, CrsqlDbVersionRange, CrsqlSeq},
     bookie::BookieDbParams,
@@ -468,7 +471,7 @@ pub async fn sync_loop(agent: Agent, bookie: Bookie, transport: Transport, mut t
 pub async fn apply_fully_buffered_changes_loop(
     agent: Agent,
     bookie: Bookie,
-    mut rx_apply: CorroReceiver<(ActorId, CrsqlDbVersion)>,
+    mut rx_apply: CorroReceiver<ApplyTrigger>,
     mut tripwire: Tripwire,
 ) {
     info!("Starting apply_fully_buffered_changes loop");
@@ -493,17 +496,34 @@ pub async fn apply_fully_buffered_changes_loop(
     }
 
     loop {
-        let partial_version = tokio::select! {
+        let partial_versions = tokio::select! {
             biased;
             _ = &mut tripwire => break,
-            maybe_version = rx_apply.recv() => match maybe_version {
-                Some(version) => version,
+            maybe_trigger = rx_apply.recv() => match maybe_trigger {
+                Some(ApplyTrigger::Version(actor_id, version)) => {
+                    vec![(actor_id, version)]
+                }
+                Some(ApplyTrigger::SchemaChanged) => {
+                    match find_fully_buffered_partials(&agent).await {
+                        Ok(partials) if partials.is_empty() => continue,
+                        Ok(partials) => {
+                            for partial in &partials {
+                                limit_retries.unblock(partial);
+                            }
+                            partials
+                        }
+                        Err(e) => {
+                            warn!("could not query for fully buffered partials: {e}");
+                            continue;
+                        }
+                    }
+                }
                 None => break,
             },
 
             _ = retry_interval.tick(), if scan_enabled => {
                 match find_fully_buffered_partial(&agent).await {
-                    Ok(Some(pair)) => pair,
+                    Ok(Some(pair)) => vec![pair],
                     Ok(None) => continue,
                     Err(e) => {
                         warn!("could not query for fully buffered partials: {e}");
@@ -513,57 +533,83 @@ pub async fn apply_fully_buffered_changes_loop(
             },
         };
 
-        if let Some(blocked_until) = limit_retries.is_throttled(&partial_version) {
-            let next_retry = blocked_until.duration_since(Instant::now()).as_secs();
-            warn!(
-                ?partial_version,
-                "previous attempt to apply buffered changes took too long, will retry in {next_retry} seconds"
-            );
-            continue;
-        }
-
-        let (actor_id, version) = partial_version;
-        let throttle_count = limit_retries
-            .throttle_count(&(actor_id, version))
-            .min(max_timeout_increase);
-        let tx_timeout =
-            sql_tx_timeout_secs + Duration::from_secs(step_timeout_secs * throttle_count);
-
-        debug!(%actor_id, %version, ?tx_timeout, "picked up background apply of buffered changes");
-        let start = Instant::now();
-        let res =
-            process_fully_buffered_changes(&agent, &bookie, actor_id, version, tx_timeout).await;
-        let elapsed = start.elapsed();
-        match res {
-            Ok(false) => {
-                warn!(%actor_id, %version, "did not apply buffered changes");
-                limit_retries.remove(&(actor_id, version));
+        for partial_version in partial_versions {
+            if let Some(blocked_until) = limit_retries.is_throttled(&partial_version) {
+                let next_retry = blocked_until.duration_since(Instant::now()).as_secs();
+                warn!(
+                    ?partial_version,
+                    "previous attempt to apply buffered changes took too long, will retry in {next_retry} seconds"
+                );
+                continue;
             }
-            Ok(true) => {
-                debug!(%actor_id, %version, "succesfully applied buffered changes");
-                histogram!("corro.agent.changes.processing.time.seconds", "source" => "buffered")
-                    .record(elapsed.as_secs_f64());
-                limit_retries.remove(&(actor_id, version));
-            }
-            Err(e) => {
-                let is_interrupt_error = e.is_interrupt_error();
-                error!(%actor_id, %version, "could not apply fully buffered changes with timeout {tx_timeout:?}: {e}");
-                if let Some(issue) = e.fatal_db_issue() {
-                    error!("fatal DB issue detected: {issue}");
-                    agent.mark_unhealthy(issue);
+
+            let (actor_id, version) = partial_version;
+            let throttle_count = limit_retries
+                .throttle_count(&(actor_id, version))
+                .min(max_timeout_increase);
+            let tx_timeout =
+                sql_tx_timeout_secs + Duration::from_secs(step_timeout_secs * throttle_count);
+
+            debug!(%actor_id, %version, ?tx_timeout, "picked up background apply of buffered changes");
+            let start = Instant::now();
+            let res =
+                process_fully_buffered_changes(&agent, &bookie, actor_id, version, tx_timeout)
+                    .await;
+            let elapsed = start.elapsed();
+
+            match res {
+                Ok(false) => {
+                    warn!(%actor_id, %version, "did not apply buffered changes");
+                    limit_retries.remove(&(actor_id, version));
                 }
-                let details = json!({"error": e.to_string()});
-                assert_unreachable!("could not apply fully buffered changes", &details);
+                Ok(true) => {
+                    debug!(%actor_id, %version, "succesfully applied buffered changes");
+                    histogram!("corro.agent.changes.processing.time.seconds", "source" => "buffered")
+                        .record(elapsed.as_secs_f64());
+                    limit_retries.remove(&(actor_id, version));
+                }
+                Err(e) => {
+                    let is_interrupt_error = e.is_interrupt_error();
+                    error!(%actor_id, %version, "could not apply fully buffered changes with timeout {tx_timeout:?}: {e}");
 
-                // processing time came close to timeout, limit retry with exponential backoff
-                if is_interrupt_error {
-                    limit_retries.throttle((actor_id, version));
+                    if let Some(issue) = e.fatal_db_issue() {
+                        error!("fatal DB issue detected: {issue}");
+                        agent.mark_unhealthy(issue);
+                    }
+
+                    let details = json!({"error": e.to_string()});
+                    assert_unreachable!("could not apply fully buffered changes", &details);
+
+                    if is_interrupt_error {
+                        limit_retries.throttle((actor_id, version));
+                    }
                 }
             }
         }
     }
 
     info!("fully_buffered_changes_loop ended");
+}
+
+async fn find_fully_buffered_partials(
+    agent: &Agent,
+) -> Result<Vec<(ActorId, CrsqlDbVersion)>, ChangeError> {
+    let conn = agent.pool().read().await.map_err(ChangeError::SqlitePool)?;
+    block_in_place(|| {
+        conn.prepare_cached(
+            "SELECT site_id, db_version FROM __corro_seq_bookkeeping
+             WHERE start_seq = 0 AND end_seq = last_seq",
+        )
+        .and_then(|mut stmt| {
+            stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()
+        })
+        .map_err(|source| ChangeError::Rusqlite {
+            source,
+            actor_id: None,
+            version: None,
+        })
+    })
 }
 
 async fn find_fully_buffered_partial(
@@ -1395,7 +1441,10 @@ pub async fn process_multiple_changes(
                 debug!(%actor_id, %version, "partial is now complete, notifying for background apply");
                 let tx_apply = agent.tx_apply().clone();
                 tokio::spawn(async move {
-                    if let Err(e) = tx_apply.send((actor_id, version)).await {
+                    if let Err(e) = tx_apply
+                        .send(ApplyTrigger::Version(actor_id, version))
+                        .await
+                    {
                         error!(
                             "could not send trigger for applying fully buffered changes later: {e}"
                         );
@@ -1668,6 +1717,14 @@ pub async fn execute_schema(agent: &Agent, statements: Vec<String>) -> eyre::Res
     // hold onto this lock so nothing else makes changes
     let mut schema_write = agent.schema().write();
 
+    let schema_changed = partial_schema.tables.iter().any(|(name, table)| {
+        schema_write.tables.get(name).is_none_or(|current| {
+            current.pk != table.pk
+                || current.columns != table.columns
+                || current.indexes != table.indexes
+        })
+    });
+
     // clone the previous schema and apply
     let mut new_schema = {
         let mut schema = schema_write.clone();
@@ -1707,6 +1764,16 @@ pub async fn execute_schema(agent: &Agent, statements: Vec<String>) -> eyre::Res
     apply_res?;
 
     *schema_write = new_schema;
+    drop(schema_write);
+
+    if schema_changed {
+        let tx_apply = agent.tx_apply().clone();
+        tokio::spawn(async move {
+            if let Err(e) = tx_apply.send(ApplyTrigger::SchemaChanged).await {
+                error!("could not schedule buffered changes retry after schema update: {e}");
+            }
+        });
+    }
 
     Ok(())
 }

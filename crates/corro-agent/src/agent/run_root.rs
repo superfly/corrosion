@@ -15,7 +15,7 @@ use crate::{
 };
 
 use corro_types::{
-    agent::{Agent, Bookie},
+    agent::{Agent, ApplyTrigger, Bookie},
     base::CrsqlSeq,
     channel::bounded,
     config::{Config, PerfConfig},
@@ -169,7 +169,10 @@ async fn run(
                     let tx_apply = agent.tx_apply().clone();
                     let version = *version;
                     tokio::spawn(async move {
-                        if let Err(e) = tx_apply.send((actor_id, version)).await {
+                        if let Err(e) = tx_apply
+                            .send(ApplyTrigger::Version(actor_id, version))
+                            .await
+                        {
                             error!("could not schedule buffered changes application: {e}");
                         }
                     });

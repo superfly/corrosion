@@ -168,6 +168,12 @@ where
         entry.throttle_count = entry.throttle_count.saturating_add(1);
     }
 
+    pub fn unblock(&mut self, key: &K) {
+        if let Some(entry) = self.inner.get_mut(key) {
+            entry.blocked_until = Instant::now();
+        }
+    }
+
     pub fn clear_expired(&mut self) {
         let now = Instant::now();
         self.inner.retain(|_, entry| entry.blocked_until > now);
@@ -224,7 +230,15 @@ mod tests {
         m.throttle("a");
         assert_eq!(m.throttle_count(&"a"), 2);
         assert!(m.is_throttled(&"a").is_some());
-        std::thread::sleep(Duration::from_millis(95));
+
+        m.unblock(&"a");
+        assert!(m.is_throttled(&"a").is_none());
+        assert_eq!(m.throttle_count(&"a"), 2);
+
+        m.throttle("a");
+        assert_eq!(m.throttle_count(&"a"), 3);
+        assert!(m.is_throttled(&"a").is_some());
+        std::thread::sleep(Duration::from_millis(175));
         assert!(m.is_throttled(&"a").is_none());
 
         m.remove(&"a");
