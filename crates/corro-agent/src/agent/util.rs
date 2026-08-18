@@ -504,7 +504,7 @@ pub async fn apply_fully_buffered_changes_loop(
                     vec![(actor_id, version)]
                 }
                 Some(ApplyTrigger::SchemaChanged) => {
-                    match find_fully_buffered_partials(&agent).await {
+                    match find_fully_buffered_partials(&agent, None).await {
                         Ok(partials) if partials.is_empty() => continue,
                         Ok(partials) => {
                             for partial in &partials {
@@ -522,9 +522,9 @@ pub async fn apply_fully_buffered_changes_loop(
             },
 
             _ = retry_interval.tick(), if scan_enabled => {
-                match find_fully_buffered_partial(&agent).await {
-                    Ok(Some(pair)) => vec![pair],
-                    Ok(None) => continue,
+                match find_fully_buffered_partials(&agent, Some(1)).await {
+                    Ok(partials) if partials.is_empty() => continue,
+                    Ok(partials) => partials,
                     Err(e) => {
                         warn!("could not query for fully buffered partials: {e}");
                         continue;
@@ -593,38 +593,20 @@ pub async fn apply_fully_buffered_changes_loop(
 
 async fn find_fully_buffered_partials(
     agent: &Agent,
+    limit: Option<i64>,
 ) -> Result<Vec<(ActorId, CrsqlDbVersion)>, ChangeError> {
     let conn = agent.pool().read().await.map_err(ChangeError::SqlitePool)?;
-    block_in_place(|| {
-        conn.prepare_cached(
-            "SELECT site_id, db_version FROM __corro_seq_bookkeeping
-             WHERE start_seq = 0 AND end_seq = last_seq",
-        )
-        .and_then(|mut stmt| {
-            stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-                .collect::<rusqlite::Result<Vec<_>>>()
-        })
-        .map_err(|source| ChangeError::Rusqlite {
-            source,
-            actor_id: None,
-            version: None,
-        })
-    })
-}
+    let limit = limit.unwrap_or(-1);
 
-async fn find_fully_buffered_partial(
-    agent: &Agent,
-) -> Result<Option<(ActorId, CrsqlDbVersion)>, ChangeError> {
-    let conn = agent.pool().read().await.map_err(ChangeError::SqlitePool)?;
     block_in_place(|| {
         conn.prepare_cached(
             "SELECT site_id, db_version FROM __corro_seq_bookkeeping
              WHERE start_seq = 0 AND end_seq = last_seq
-             LIMIT 1",
+             LIMIT ?1",
         )
         .and_then(|mut stmt| {
-            stmt.query_row([], |row| Ok((row.get(0)?, row.get(1)?)))
-                .optional()
+            stmt.query_map([limit], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()
         })
         .map_err(|source| ChangeError::Rusqlite {
             source,
