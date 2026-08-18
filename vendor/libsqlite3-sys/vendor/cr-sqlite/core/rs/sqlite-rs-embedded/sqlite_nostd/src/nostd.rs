@@ -693,6 +693,14 @@ impl ManagedStmt {
     #[inline]
     pub fn column_blob(&self, i: i32) -> Result<&[u8], ResultCode> {
         let len = column_bytes(self.stmt, i);
+        if len == 0 {
+            return if self.column_type(i)? == ColumnType::Null {
+                Err(ResultCode::NULL)
+            } else {
+                Ok(&[])
+            };
+        }
+
         let ptr = column_blob(self.stmt, i);
         if ptr.is_null() {
             Err(ResultCode::NULL)
@@ -823,15 +831,24 @@ impl Context for *mut context {
     /// The blob must have been allocated with `sqlite3_malloc`!
     #[inline]
     fn result_text_owned(&self, text: String) {
-        let (ptr, len, _) = text.into_raw_parts();
+        #[cfg(feature = "host")]
         result_text(
             *self,
-            ptr as *const c_char,
-            len as i32,
-            // TODO: this drop code does not seem to work
-            // Valgrind tells us we have a memory leak when using `result_text_owned`
-            Destructor::CUSTOM(droprust),
+            text.as_ptr() as *const c_char,
+            text.len() as i32,
+            Destructor::TRANSIENT,
         );
+
+        #[cfg(not(feature = "host"))]
+        {
+            let (ptr, len, _) = text.into_raw_parts();
+            result_text(
+                *self,
+                ptr as *const c_char,
+                len as i32,
+                Destructor::CUSTOM(droprust),
+            );
+        }
     }
 
     /// Takes a reference to a string, has SQLite copy the contents
@@ -862,8 +879,19 @@ impl Context for *mut context {
     /// The blob must have been allocated with `sqlite3_malloc`!
     #[inline]
     fn result_blob_owned(&self, blob: Vec<u8>) {
-        let (ptr, len, _) = blob.into_raw_parts();
-        result_blob(*self, ptr, len as i32, Destructor::CUSTOM(droprust));
+        #[cfg(feature = "host")]
+        result_blob(
+            *self,
+            blob.as_ptr(),
+            blob.len() as i32,
+            Destructor::TRANSIENT,
+        );
+
+        #[cfg(not(feature = "host"))]
+        {
+            let (ptr, len, _) = blob.into_raw_parts();
+            result_blob(*self, ptr, len as i32, Destructor::CUSTOM(droprust));
+        }
     }
 
     /// SQLite will make a copy of the blob
@@ -970,14 +998,28 @@ impl Stmt for *mut stmt {
 
     #[inline]
     fn bind_blob_owned(&self, i: i32, val: Vec<u8>) -> Result<ResultCode, ResultCode> {
-        let (ptr, len, _) = val.into_raw_parts();
-        convert_rc(bind_blob(
-            *self,
-            i,
-            ptr as *const c_void,
-            len as i32,
-            Destructor::CUSTOM(droprust),
-        ))
+        #[cfg(feature = "host")]
+        {
+            return convert_rc(bind_blob(
+                *self,
+                i,
+                val.as_ptr() as *const c_void,
+                val.len() as i32,
+                Destructor::TRANSIENT,
+            ));
+        }
+
+        #[cfg(not(feature = "host"))]
+        {
+            let (ptr, len, _) = val.into_raw_parts();
+            convert_rc(bind_blob(
+                *self,
+                i,
+                ptr as *const c_void,
+                len as i32,
+                Destructor::CUSTOM(droprust),
+            ))
+        }
     }
 
     #[inline]
@@ -1003,14 +1045,28 @@ impl Stmt for *mut stmt {
 
     #[inline]
     fn bind_text_owned(&self, i: i32, text: String) -> Result<ResultCode, ResultCode> {
-        let (ptr, len, _) = text.into_raw_parts();
-        convert_rc(bind_text(
-            *self,
-            i,
-            ptr as *const c_char,
-            len as i32,
-            Destructor::CUSTOM(droprust),
-        ))
+        #[cfg(feature = "host")]
+        {
+            return convert_rc(bind_text(
+                *self,
+                i,
+                text.as_ptr() as *const c_char,
+                text.len() as i32,
+                Destructor::TRANSIENT,
+            ));
+        }
+
+        #[cfg(not(feature = "host"))]
+        {
+            let (ptr, len, _) = text.into_raw_parts();
+            convert_rc(bind_text(
+                *self,
+                i,
+                ptr as *const c_char,
+                len as i32,
+                Destructor::CUSTOM(droprust),
+            ))
+        }
     }
 
     #[inline]
@@ -1051,6 +1107,10 @@ impl Stmt for *mut stmt {
     #[inline]
     fn column_blob(&self, i: i32) -> &[u8] {
         let len = column_bytes(*self, i);
+        if len == 0 {
+            return &[];
+        }
+
         let ptr = column_blob(*self, i);
         unsafe { core::slice::from_raw_parts(ptr as *const u8, len as usize) }
     }
@@ -1142,6 +1202,50 @@ impl Value for *mut value {
     }
 }
 
+pub fn into_sqlite_owned_cstring(value: CString) -> *mut c_char {
+    #[cfg(feature = "host")]
+    {
+        let bytes = value.as_bytes_with_nul();
+        let ptr = malloc(bytes.len());
+        if ptr.is_null() {
+            return null_mut();
+        }
+
+        unsafe {
+            core::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len());
+        }
+
+        ptr as *mut c_char
+    }
+
+    #[cfg(not(feature = "host"))]
+    {
+        value.into_raw()
+    }
+}
+
+pub fn into_sqlite_owned_bytes(value: Vec<u8>) -> *mut u8 {
+    #[cfg(feature = "host")]
+    {
+        let ptr = malloc(value.len());
+        if ptr.is_null() {
+            return null_mut();
+        }
+
+        unsafe {
+            core::ptr::copy_nonoverlapping(value.as_ptr(), ptr, value.len());
+        }
+
+        ptr
+    }
+
+    #[cfg(not(feature = "host"))]
+    {
+        let (ptr, _, _) = value.into_raw_parts();
+        ptr
+    }
+}
+
 pub trait StrRef {
     fn set(&self, val: &str);
 }
@@ -1157,11 +1261,9 @@ impl StrRef for *mut *mut c_char {
                 return;
             }
             if let Ok(cstring) = CString::new(val) {
-                **self = cstring.into_raw();
-            } else {
-                if let Ok(s) = CString::new("Failed setting error message.") {
-                    **self = s.into_raw();
-                }
+                **self = into_sqlite_owned_cstring(cstring);
+            } else if let Ok(s) = CString::new("Failed setting error message.") {
+                **self = into_sqlite_owned_cstring(s);
             }
         }
     }
@@ -1209,7 +1311,7 @@ impl VTab for *mut vtab {
                 return;
             }
             if let Ok(e) = CString::new(val) {
-                (**self).zErrMsg = e.into_raw();
+                (**self).zErrMsg = into_sqlite_owned_cstring(e);
             }
         }
     }
