@@ -83,7 +83,13 @@ jobs:
 
       - uses: taiki-e/install-action@v2
         with:
-          tool: mdbook@0.4.52,mdbook-linkcheck@0.7.7,mdbook-admonish@1.20.0
+          tool: mdbook@0.5.4
 
       - name: Build Book
         run: mdbook build
+
+      - name: Check links
+        uses: lycheeverse/lychee-action@v2
+        with:
+          args: --no-progress --offline --root-dir "$GITHUB_WORKSPACE/book" book
+          fail: true
