@@ -454,22 +454,28 @@ fn wal_checkpoint(conn: &rusqlite::Connection, timeout: u64) -> eyre::Result<()>
 /// until it is below the limit
 ///
 async fn vacuum_db(pool: &SplitPool, lim: u64) -> eyre::Result<()> {
-    let mut freelist: u64 = {
+    let (vacuum, mut freelist): (u64, u64) = {
         let conn = pool.read().await?;
 
-        let vacuum: u64 = conn.pragma_query_value(None, "auto_vacuum", |row| row.get(0))?;
-        if vacuum != 2 {
-            warn!("auto_vacuum isn't set to INCREMENTAL");
-            return Err(rusqlite::Error::ModuleError(
-                "auto_vacuum has to be set to INCREMENTAL".to_string(),
-            )
-            .into());
-        }
-
-        conn.pragma_query_value(None, "freelist_count", |row| row.get(0))?
+        (
+            conn.pragma_query_value(None, "auto_vacuum", |row| row.get(0))?,
+            conn.pragma_query_value(None, "freelist_count", |row| row.get(0))?,
+        )
     };
 
+    gauge!("corro.db.freelist.pages").set(freelist as f64);
     debug!("freelist count: {freelist:?}");
+
+    if vacuum == 0 {
+        return Ok(());
+    }
+
+    if vacuum != 2 {
+        warn!("unexpected auto_vacuum mode: {vacuum}");
+        return Err(
+            rusqlite::Error::ModuleError(format!("unexpected auto_vacuum mode: {vacuum}")).into(),
+        );
+    }
 
     let (busy_timeout, cache_size) = {
         // update settings in write conn

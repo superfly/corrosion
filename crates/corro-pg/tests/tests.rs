@@ -74,6 +74,121 @@ async fn setup_pg_test_server(
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn test_pg_mixed_transaction_upgrades_to_canonical() {
+    let (tripwire, _tripwire_worker, _tripwire_tx) = Tripwire::new_simple();
+    let (_ta, server) = setup_pg_test_server(tripwire, None).await;
+
+    let conn_str = format!(
+        "host={} port={} user=testuser",
+        server.local_addr.ip(),
+        server.local_addr.port()
+    );
+
+    let (mut client, conn) = tokio_postgres::connect(&conn_str, NoTls).await.unwrap();
+    tokio::spawn(conn);
+
+    let tx = client.transaction().await.unwrap();
+
+    let affected = tx
+        .execute(
+            "INSERT INTO tests VALUES ($1, $2)",
+            &[&201i64, &"before-upgrade"],
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(affected, 1);
+
+    tx.batch_execute(
+        "CREATE TABLE pg_upgrade_marker (
+            id INTEGER PRIMARY KEY
+        )",
+    )
+    .await
+    .unwrap();
+
+    tx.commit().await.unwrap();
+
+    let row = client
+        .query_one("SELECT text FROM tests WHERE id = 201", &[])
+        .await
+        .unwrap();
+
+    assert_eq!(row.get::<_, String>(0), "before-upgrade");
+
+    let row = client
+        .query_one(
+            "SELECT COUNT(*) FROM sqlite_schema \
+             WHERE type = 'table' AND name = 'pg_upgrade_marker'",
+            &[],
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(row.get::<_, i64>(0), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_pg_concurrent_writers() {
+    let (tripwire, _tripwire_worker, _tripwire_tx) = Tripwire::new_simple();
+    let (ta, server) = setup_pg_test_server(tripwire, None).await;
+
+    let sema = ta.agent.write_sema().clone();
+    let conn_str = format!(
+        "host={} port={} user=testuser",
+        server.local_addr.ip(),
+        server.local_addr.port()
+    );
+
+    let (mut client1, conn1) = tokio_postgres::connect(&conn_str, NoTls).await.unwrap();
+    let (mut client2, conn2) = tokio_postgres::connect(&conn_str, NoTls).await.unwrap();
+
+    tokio::spawn(conn1);
+    tokio::spawn(conn2);
+
+    let tx1 = client1.transaction().await.unwrap();
+    let tx2 = client2.transaction().await.unwrap();
+
+    let permit = sema.acquire().await.unwrap();
+
+    let (write1, write2) = tokio::join!(
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            tx1.execute(
+                "INSERT INTO tests VALUES ($1, $2)",
+                &[&101i64, &"writer-one"],
+            ),
+        ),
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            tx2.execute(
+                "INSERT INTO tests VALUES ($1, $2)",
+                &[&102i64, &"writer-two"],
+            ),
+        ),
+    );
+
+    assert_eq!(write1.expect("first speculative write blocked").unwrap(), 1);
+    assert_eq!(
+        write2.expect("second speculative write blocked").unwrap(),
+        1
+    );
+
+    drop(permit);
+
+    let (commit1, commit2) = tokio::join!(tx1.commit(), tx2.commit());
+    commit1.unwrap();
+    commit2.unwrap();
+
+    let row = client1
+        .query_one("SELECT COUNT(*) FROM tests WHERE id IN (101, 102)", &[])
+        .await
+        .unwrap();
+
+    assert_eq!(row.get::<_, i64>(0), 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_pg() {
     let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
 

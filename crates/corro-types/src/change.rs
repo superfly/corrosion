@@ -4,13 +4,14 @@ use antithesis_sdk::assert_always;
 pub use corro_api_types::SqliteValue;
 use corro_api_types::{ColumnName, TableName};
 use corro_base_types::{CrsqlDbVersion, CrsqlSeqRange};
-use rusqlite::{Connection, Row};
+use rusqlite::{params, Connection, Row};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use speedy::{Readable, Writable};
 use tracing::{debug, trace, warn};
 
 use crate::{
+    actor::ActorId,
     agent::{Agent, BookedVersions, ChangeError, VersionsSnapshot},
     base::CrsqlSeq,
     broadcast::{ChangesetPerTable, Timestamp},
@@ -188,6 +189,95 @@ pub struct InsertChangesInfo {
     pub snap: VersionsSnapshot,
 }
 
+#[derive(Debug, Clone)]
+struct PendingLocalChange {
+    change: Change,
+    ts: Option<String>,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct PendingLocalChanges {
+    changes: Vec<PendingLocalChange>,
+}
+
+impl PendingLocalChanges {
+    pub fn capture(conn: &Connection, actor_id: ActorId) -> rusqlite::Result<Self> {
+        let db_version: CrsqlDbVersion =
+            conn.query_row("SELECT crsql_peek_next_db_version()", (), |row| row.get(0))?;
+
+        let mut stmt = conn.prepare_cached(
+            r#"
+            SELECT
+                "table",
+                pk,
+                cid,
+                val,
+                col_version,
+                db_version,
+                seq,
+                site_id,
+                cl,
+                ts
+            FROM crsql_changes
+            WHERE site_id = ?
+              AND db_version = ?
+            ORDER BY seq
+            "#,
+        )?;
+
+        let changes = stmt
+            .query_map((actor_id, db_version), |row| {
+                Ok(PendingLocalChange {
+                    change: row_to_change(row)?,
+                    ts: row.get(9)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        Ok(Self { changes })
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.changes.is_empty()
+    }
+
+    pub fn replay(&self, conn: &Connection) -> rusqlite::Result<Option<CrsqlDbVersion>> {
+        if self.changes.is_empty() {
+            return Ok(None);
+        }
+
+        let db_version: CrsqlDbVersion =
+            conn.query_row("SELECT crsql_next_db_version()", (), |row| row.get(0))?;
+
+        let mut stmt = conn.prepare_cached(
+            r#"
+            INSERT INTO crsql_changes
+                ("table", pk, cid, val, col_version, db_version, site_id, cl, seq, ts)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )?;
+
+        for pending in &self.changes {
+            let change = &pending.change;
+
+            stmt.execute(params![
+                &change.table,
+                &change.pk,
+                &change.cid,
+                &change.val,
+                change.col_version,
+                db_version,
+                &change.site_id,
+                change.cl,
+                change.seq,
+                &pending.ts,
+            ])?;
+        }
+
+        Ok(Some(db_version))
+    }
+}
+
 pub fn insert_local_changes(
     agent: &Agent,
     tx: &Connection,
@@ -265,6 +355,63 @@ pub fn insert_local_changes(
 mod tests {
     use super::*;
     use crate::base::dbsr;
+
+    #[test]
+    fn test_pending_local_changes_capture_and_replay() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("pending-local-changes.db");
+
+        let speculative = crate::sqlite::rusqlite_to_crsqlite(Connection::open(&path)?)?;
+
+        speculative.execute_batch(
+            "
+            CREATE TABLE foo (
+                id INTEGER NOT NULL PRIMARY KEY,
+                value TEXT NOT NULL DEFAULT ''
+            );
+            SELECT crsql_as_crr('foo');
+            BEGIN CONCURRENT;
+            ",
+        )?;
+
+        let actor_id: ActorId =
+            speculative.query_row("SELECT crsql_site_id()", (), |row| row.get(0))?;
+
+        let _: String =
+            speculative.query_row("SELECT crsql_set_ts('401')", (), |row| row.get(0))?;
+
+        speculative.execute("INSERT INTO foo (id, value) VALUES (1, 'speculative')", ())?;
+
+        let pending = PendingLocalChanges::capture(&speculative, actor_id)?;
+        assert!(!pending.is_empty());
+
+        speculative.execute_batch("ROLLBACK;")?;
+
+        let canonical = crate::sqlite::rusqlite_to_crsqlite(Connection::open(&path)?)?;
+
+        canonical.execute_batch("BEGIN IMMEDIATE;")?;
+
+        let db_version = pending
+            .replay(&canonical)?
+            .expect("expected a reserved db version");
+
+        let rows: i64 = canonical.query_row(
+            "SELECT COUNT(*) FROM crsql_changes WHERE site_id = ? AND db_version = ?",
+            (actor_id, db_version),
+            |row| row.get(0),
+        )?;
+
+        assert_eq!(rows, 1);
+
+        canonical.execute_batch("COMMIT;")?;
+
+        let value: String =
+            canonical.query_row("SELECT value FROM foo WHERE id = 1", (), |row| row.get(0))?;
+
+        assert_eq!(value, "speculative");
+
+        Ok(())
+    }
 
     #[test]
     fn test_change_chunker() {

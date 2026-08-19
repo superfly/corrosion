@@ -66,6 +66,26 @@ pub struct AgentOptions {
     pub tripwire: Tripwire,
 }
 
+fn prepare_db_for_concurrent_writes(conn: &Connection) -> rusqlite::Result<()> {
+    let auto_vacuum: u64 = conn.pragma_query_value(None, "auto_vacuum", |row| row.get(0))?;
+
+    if auto_vacuum != 0 {
+        info!(
+            auto_vacuum,
+            "migrating database to auto_vacuum=NONE for concurrent writes"
+        );
+
+        conn.execute_batch(
+            "
+            PRAGMA auto_vacuum = NONE;
+            VACUUM;
+            ",
+        )?;
+    }
+
+    Ok(())
+}
+
 /// Setup an agent runtime and state with a configuration
 pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, AgentOptions)> {
     debug!("setting up corrosion @ {}", conf.db.path);
@@ -78,9 +98,8 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
     let members = Members::new(conf.gossip.member_id);
 
     let actor_id = {
-        // we need to set auto_vacuum before any tables are created
         let db_conn = Connection::open(&conf.db.path)?;
-        db_conn.execute_batch("PRAGMA auto_vacuum = INCREMENTAL")?;
+        prepare_db_for_concurrent_writes(&db_conn)?;
 
         let conn = CrConn::init(db_conn)?;
         conn.query_row("SELECT crsql_site_id();", [], |row| {
@@ -344,4 +363,73 @@ async fn setup_spawn_subscriptions(
     }
 
     Ok(Arc::new(TokioRwLock::new(subs_bcast_cache)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn migrates_legacy_auto_vacuum_for_concurrent_writes() -> eyre::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("legacy-auto-vacuum.db");
+
+        {
+            let conn = Connection::open(&path)?;
+
+            conn.execute_batch(
+                "
+                PRAGMA auto_vacuum = INCREMENTAL;
+                VACUUM;
+
+                CREATE TABLE legacy_probe (
+                    id INTEGER PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
+
+                INSERT INTO legacy_probe (id, value)
+                VALUES (1, 'preserved');
+                ",
+            )?;
+
+            let auto_vacuum: u64 =
+                conn.pragma_query_value(None, "auto_vacuum", |row| row.get(0))?;
+
+            assert_eq!(
+                auto_vacuum, 2,
+                "legacy fixture must actually use INCREMENTAL auto_vacuum"
+            );
+        }
+
+        let conn = Connection::open(&path)?;
+
+        let before: u64 = conn.pragma_query_value(None, "auto_vacuum", |row| row.get(0))?;
+        assert_eq!(before, 2);
+
+        let before_value: String =
+            conn.query_row("SELECT value FROM legacy_probe WHERE id = 1", (), |row| {
+                row.get(0)
+            })?;
+        assert_eq!(before_value, "preserved");
+
+        prepare_db_for_concurrent_writes(&conn)?;
+
+        let after: u64 = conn.pragma_query_value(None, "auto_vacuum", |row| row.get(0))?;
+        assert_eq!(after, 0);
+
+        let after_value: String =
+            conn.query_row("SELECT value FROM legacy_probe WHERE id = 1", (), |row| {
+                row.get(0)
+            })?;
+        assert_eq!(after_value, "preserved");
+
+        conn.execute_batch(
+            "
+            BEGIN CONCURRENT;
+            ROLLBACK;
+            ",
+        )?;
+
+        Ok(())
+    }
 }

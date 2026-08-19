@@ -25,7 +25,7 @@ use compact_str::CompactString;
 use corro_types::{
     agent::{Agent, ChangeError},
     broadcast::{broadcast_changes, Timestamp},
-    change::{insert_local_changes, InsertChangesInfo},
+    change::{insert_local_changes, InsertChangesInfo, PendingLocalChanges},
     config::PgConfig,
     persistent_gauge,
     schema::{parse_sql, Column, Schema, SchemaError, SqliteType, Table},
@@ -355,7 +355,9 @@ fn parse_query(sql: &str) -> Result<VecDeque<ParsedCmd>, ParseError> {
 enum TxState {
     Started {
         kind: OpenTxKind,
+        writing: bool,
         write_permit: Option<OwnedSemaphorePermit>,
+        ts: Option<Timestamp>,
     },
     #[default]
     Ended,
@@ -365,17 +367,26 @@ impl TxState {
     fn implicit() -> Self {
         Self::Started {
             kind: OpenTxKind::Implicit,
+            writing: false,
             write_permit: None,
+            ts: None,
         }
     }
+
     fn explicit() -> Self {
         Self::Started {
             kind: OpenTxKind::Explicit,
+            writing: false,
             write_permit: None,
+            ts: None,
         }
     }
 
     fn is_writing(&self) -> bool {
+        matches!(self, TxState::Started { writing: true, .. })
+    }
+
+    fn is_canonical(&self) -> bool {
         matches!(
             self,
             TxState::Started {
@@ -385,12 +396,28 @@ impl TxState {
         )
     }
 
-    fn set_write_permit(&mut self, permit: OwnedSemaphorePermit) {
-        match self {
-            TxState::Started { write_permit, .. } => *write_permit = Some(permit),
-            TxState::Ended => {
-                // do nothing, maybe bomb?
+    fn mark_writing(&mut self, ts: Timestamp) {
+        if let TxState::Started {
+            writing, ts: tx_ts, ..
+        } = self
+        {
+            *writing = true;
+            if tx_ts.is_none() {
+                *tx_ts = Some(ts);
             }
+        }
+    }
+
+    fn set_write_permit(&mut self, permit: OwnedSemaphorePermit) {
+        if let TxState::Started { write_permit, .. } = self {
+            *write_permit = Some(permit);
+        }
+    }
+
+    fn timestamp(&self) -> Option<Timestamp> {
+        match self {
+            TxState::Started { ts, .. } => *ts,
+            TxState::Ended => None,
         }
     }
 
@@ -403,6 +430,7 @@ impl TxState {
             }
         )
     }
+
     fn is_explicit(&self) -> bool {
         matches!(
             self,
@@ -412,6 +440,7 @@ impl TxState {
             }
         )
     }
+
     fn is_ended(&self) -> bool {
         matches!(self, TxState::Ended)
     }
@@ -429,6 +458,7 @@ impl TxState {
             TxState::Started { write_permit, .. } => write_permit.take(),
             TxState::Ended => None,
         };
+
         *self = TxState::Ended;
         permit
     }
@@ -1859,9 +1889,9 @@ pub async fn start(
                                     // automatically commit an implicit tx
                                     if session.tx_state.is_implicit() {
                                         trace!("committing IMPLICIT tx");
-                                        let _permit = session.tx_state.end();
+                                        let permit = session.tx_state.end();
 
-                                        if let Err(e) = session.handle_commit() {
+                                        if let Err(e) = session.handle_commit(permit.is_some()) {
                                             back_tx.blocking_send(
                                                 (
                                                     PgWireBackendMessage::ErrorResponse(
@@ -2155,6 +2185,93 @@ struct Session<'conn> {
 }
 
 impl<'conn> Session<'conn> {
+    fn write_is_replayable(&self, cmd: &ParsedCmd) -> bool {
+        let table = match cmd {
+            ParsedCmd::Sqlite(Cmd::Stmt(
+                Stmt::Insert { tbl_name, .. }
+                | Stmt::Update { tbl_name, .. }
+                | Stmt::Delete { tbl_name, .. },
+            )) => {
+                if let Some(db_name) = &tbl_name.db_name {
+                    if !db_name.0.as_str().eq_ignore_ascii_case("main") {
+                        return false;
+                    }
+                }
+
+                &tbl_name.name.0
+            }
+            _ => return false,
+        };
+
+        self.agent.schema().read().tables.contains_key(table)
+    }
+
+    fn prepare_write(&mut self, cmd: &ParsedCmd) -> Result<(), QueryError> {
+        if !self.tx_state.is_writing() {
+            let ts = self.set_ts()?;
+            self.tx_state.mark_writing(ts);
+        }
+
+        if !self.tx_state.is_canonical() && !self.write_is_replayable(cmd) {
+            self.upgrade_to_canonical()?;
+        }
+
+        Ok(())
+    }
+
+    fn upgrade_to_canonical(&mut self) -> Result<(), QueryError> {
+        let actor_id = self.agent.actor_id();
+        let pending = PendingLocalChanges::capture(self.conn, actor_id)?;
+        let ts = self.tx_state.timestamp();
+
+        self.conn.execute_batch("ROLLBACK")?;
+
+        let permit = self.agent.write_permit_blocking()?;
+
+        let result = (|| -> rusqlite::Result<()> {
+            self.conn.execute_batch("BEGIN IMMEDIATE")?;
+
+            if let Some(ts) = ts {
+                self.set_ts_value(ts)?;
+            }
+
+            if let Some(reserved_version) = pending.replay(self.conn)? {
+                let replayed: bool = self.conn.query_row(
+                    r#"
+                    SELECT EXISTS (
+                        SELECT 1
+                        FROM crsql_changes
+                        WHERE site_id = ?
+                          AND db_version = ?
+                    )
+                    "#,
+                    (actor_id, reserved_version),
+                    |row| row.get(0),
+                )?;
+
+                if !replayed {
+                    self.conn.execute_batch("ROLLBACK; BEGIN IMMEDIATE;")?;
+
+                    if let Some(ts) = ts {
+                        self.set_ts_value(ts)?;
+                    }
+                }
+            }
+
+            Ok(())
+        })();
+
+        if let Err(err) = result {
+            let _ = self.conn.execute_batch("ROLLBACK");
+            return Err(err.into());
+        }
+
+        counter!("corro.acquired.write.permit.count", "protocol" => "pg").increment(1);
+        self.tx_state.set_write_permit(permit);
+
+        Ok(())
+    }
+
     fn handle_query(
         &mut self,
         cmd: &ParsedCmd,
@@ -2189,14 +2306,14 @@ impl<'conn> Session<'conn> {
 
         // need to start an implicit transaction
         if self.tx_state.is_ended() && !cmd.is_begin() {
-            self.conn.execute_batch("BEGIN")?;
+            self.conn.execute_batch("BEGIN CONCURRENT")?;
             trace!("started IMPLICIT tx");
             self.tx_state.start_implicit();
         } else if self.tx_state.is_implicit() && cmd.is_begin() {
             trace!("committing IMPLICIT tx");
-            let _permit = self.tx_state.end();
+            let permit = self.tx_state.end();
 
-            self.handle_commit()?;
+            self.handle_commit(permit.is_some())?;
             trace!("committed IMPLICIT tx");
         }
 
@@ -2205,12 +2322,12 @@ impl<'conn> Session<'conn> {
         let mut changes = 0usize;
 
         let count = if cmd.is_begin() {
-            self.conn.execute_batch("BEGIN")?;
+            self.conn.execute_batch("BEGIN CONCURRENT")?;
             self.tx_state.start_explicit();
             0
         } else if cmd.is_commit() {
-            let _permit = self.tx_state.end();
-            self.handle_commit()?;
+            let permit = self.tx_state.end();
+            self.handle_commit(permit.is_some())?;
             0
         } else if cmd.is_rollback() {
             let _permit = self.tx_state.end();
@@ -2241,13 +2358,9 @@ impl<'conn> Session<'conn> {
 
             let schema = Arc::new(fields);
 
-            if !self.tx_state.is_writing() && !prepped.readonly() {
-                trace!("query statement writes, acquiring permit...");
-                self.tx_state
-                    .set_write_permit(self.agent.write_permit_blocking()?);
-
-                counter!("corro.acquired.write.permit.count", "protocol" => "pg").increment(1);
-                self.set_ts()?;
+            if !prepped.readonly() {
+                trace!("query statement writes");
+                self.prepare_write(cmd)?;
             }
 
             let mut rows = prepped.raw_query();
@@ -2335,13 +2448,13 @@ impl<'conn> Session<'conn> {
             if !cmd.is_begin() && !prepped.readonly() {
                 debug!("tx is_ended && !cmd.is_begin() && !prepped.readonly()");
                 // NOT in a tx and statement mutates DB...
-                self.conn.execute_batch("BEGIN")?;
+                self.conn.execute_batch("BEGIN CONCURRENT")?;
 
                 self.tx_state.start_implicit();
                 opened_implicit_tx = true;
             } else if cmd.is_begin() {
                 debug!("cmd is BEGIN");
-                self.conn.execute_batch("BEGIN")?;
+                self.conn.execute_batch("BEGIN CONCURRENT")?;
                 self.tx_state.start_explicit();
                 debug!("started EXPLICIT tx");
             }
@@ -2353,18 +2466,15 @@ impl<'conn> Session<'conn> {
         let mut changes = 0usize;
 
         if cmd.is_commit() {
-            let _permit = self.tx_state.end();
-            self.handle_commit()?;
+            let permit = self.tx_state.end();
+            self.handle_commit(permit.is_some())?;
         } else if cmd.is_begin() {
             // do nothing
             debug!("cmd is BEGIN");
         } else {
-            if !self.tx_state.is_writing() && !prepped.readonly() {
-                trace!("statement writes, acquiring permit...");
-                self.tx_state
-                    .set_write_permit(self.agent.write_permit_blocking()?);
-
-                self.set_ts()?;
+            if !prepped.readonly() {
+                trace!("statement writes");
+                self.prepare_write(cmd)?;
             }
             let mut rows = prepped.raw_query();
             loop {
@@ -2506,8 +2616,8 @@ impl<'conn> Session<'conn> {
             }
 
             if opened_implicit_tx {
-                let _permit = self.tx_state.end();
-                self.handle_commit()?;
+                let permit = self.tx_state.end();
+                self.handle_commit(permit.is_some())?;
             }
         }
 
@@ -2529,24 +2639,122 @@ impl<'conn> Session<'conn> {
         Ok(())
     }
 
-    fn handle_commit(&self) -> Result<(), ChangeError> {
+    fn handle_commit(&self, canonical: bool) -> Result<(), ChangeError> {
         trace!("HANDLE COMMIT");
-
-        let mut book_writer = self
-            .agent
-            .booked()
-            .blocking_write::<&str, _>("handle_write_tx(book_writer)", None);
 
         let actor_id = self.agent.actor_id();
 
-        let insert_info = insert_local_changes(&self.agent, self.conn, &mut book_writer)?;
+        if canonical {
+            let mut book_writer = self
+                .agent
+                .booked()
+                .blocking_write::<&str, _>("handle_write_tx(booked writer)", None);
+
+            let result = (|| {
+                let insert_info = insert_local_changes(&self.agent, self.conn, &mut book_writer)?;
+
+                self.conn
+                    .execute_batch("COMMIT")
+                    .map_err(|source| ChangeError::Rusqlite {
+                        source,
+                        actor_id: Some(actor_id),
+                        version: insert_info.as_ref().map(|info| info.db_version),
+                    })?;
+
+                Ok::<_, ChangeError>(insert_info)
+            })();
+
+            let insert_info = match result {
+                Ok(insert_info) => insert_info,
+                Err(err) => {
+                    let _ = self.conn.execute_batch("ROLLBACK");
+                    return Err(err);
+                }
+            };
+
+            if let Some(InsertChangesInfo {
+                db_version,
+                last_seq,
+                ts,
+                snap,
+            }) = insert_info
+            {
+                book_writer.commit_snapshot(snap);
+
+                let agent = self.agent.clone();
+                spawn_counted(
+                    async move { broadcast_changes(agent, db_version, last_seq, ts).await },
+                );
+            }
+
+            return Ok(());
+        }
+
+        let pending = match PendingLocalChanges::capture(self.conn, actor_id) {
+            Ok(pending) => pending,
+            Err(source) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                return Err(ChangeError::Rusqlite {
+                    source,
+                    actor_id: Some(actor_id),
+                    version: None,
+                });
+            }
+        };
+
         self.conn
-            .execute_batch("COMMIT")
+            .execute_batch("ROLLBACK")
             .map_err(|source| ChangeError::Rusqlite {
                 source,
                 actor_id: Some(actor_id),
                 version: None,
             })?;
+
+        if pending.is_empty() {
+            return Ok(());
+        }
+
+        let mut conn =
+            tokio::runtime::Handle::current().block_on(self.agent.pool().write_priority())?;
+
+        let mut book_writer = self
+            .agent
+            .booked()
+            .blocking_write::<&str, _>("handle_write_tx(booked writer)", None);
+
+        let tx = conn
+            .immediate_transaction()
+            .map_err(|source| ChangeError::Rusqlite {
+                source,
+                actor_id: Some(actor_id),
+                version: None,
+            })?;
+
+        let reserved_version = pending
+            .replay(&tx)
+            .map_err(|source| ChangeError::Rusqlite {
+                source,
+                actor_id: Some(actor_id),
+                version: None,
+            })?;
+
+        let insert_info = insert_local_changes(&self.agent, &tx, &mut book_writer)?;
+
+        if reserved_version.is_some() && insert_info.is_none() {
+            tx.rollback().map_err(|source| ChangeError::Rusqlite {
+                source,
+                actor_id: Some(actor_id),
+                version: reserved_version,
+            })?;
+
+            return Ok(());
+        }
+
+        tx.commit().map_err(|source| ChangeError::Rusqlite {
+            source,
+            actor_id: Some(actor_id),
+            version: insert_info.as_ref().map(|info| info.db_version),
+        })?;
 
         if let Some(InsertChangesInfo {
             db_version,
@@ -2560,20 +2768,28 @@ impl<'conn> Session<'conn> {
             book_writer.commit_snapshot(snap);
 
             let agent = self.agent.clone();
-
             spawn_counted(async move { broadcast_changes(agent, db_version, last_seq, ts).await });
         }
 
         Ok(())
     }
 
-    fn set_ts(&self) -> Result<(), rusqlite::Error> {
+    fn set_ts(&self) -> Result<Timestamp, rusqlite::Error> {
         let ts = Timestamp::from(self.agent.clock().new_timestamp());
 
-        let _ = self
+        let _: String = self
             .conn
             .prepare_cached("SELECT crsql_set_ts(?)")?
-            .query_row([&ts], |row| row.get::<_, String>(0))?;
+            .query_row([&ts], |row| row.get(0))?;
+
+        Ok(ts)
+    }
+
+    fn set_ts_value(&self, ts: Timestamp) -> Result<(), rusqlite::Error> {
+        let _: String = self
+            .conn
+            .prepare_cached("SELECT crsql_set_ts(?)")?
+            .query_row([&ts], |row| row.get(0))?;
 
         Ok(())
     }
@@ -2598,7 +2814,7 @@ fn send_ready(
     back_tx: &Sender<BackendResponse>,
 ) -> Result<(), BoxError> {
     let ready_status = if session.tx_state.is_implicit() {
-        let _permit = session.tx_state.end(); // do this first, in case of failure
+        let permit = session.tx_state.end(); // do this first, in case of failure
         if discard_until_sync {
             // an error occured, rollback implicit tx!
             warn!("receive Sync message w/ an error to send, rolling back implicit tx");
@@ -2606,7 +2822,7 @@ fn send_ready(
         } else {
             // no error, commit implicit tx
             warn!("receive Sync message, committing implicit tx");
-            session.handle_commit()?;
+            session.handle_commit(permit.is_some())?;
         }
 
         TransactionStatus::Idle
