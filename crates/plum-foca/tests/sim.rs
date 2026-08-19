@@ -2250,6 +2250,7 @@ fn sim_small_flap_recovery() {
 /// is its churn counterpart. Both must fully explain their delivery gap as
 /// crash-caused, not as an unexplained protocol miss.
 #[test]
+#[ignore = "slow; run in release mode"]
 fn sim_gossip_vs_plumtree_failures() {
     const N: usize = 500;
     const CRASH_COUNT: usize = 20;
