@@ -1,28 +1,28 @@
-use std::sync::Arc;
-
-use arc_swap::ArcSwapOption;
 use corro_types::{
-    actor::ClusterId,
-    broadcast::{BroadcastV1, ChangeSource, ChangeV1, UniPayload, UniPayloadV1},
-    channel::CorroSender,
-    compress::ZstdDicts,
+    agent::Agent,
+    broadcast::{
+        BroadcastV1, ChangeSource, ChangeV1, PlumtreeInput, PlumtreeMsgV1, PlumtreePayload,
+        PlumtreeWire, UniPayload, UniPayloadV1,
+    },
+    config::BroadcastMethod,
 };
 use metrics::counter;
+use plum_foca::{GossipMsg, Payload};
 use speedy::Readable;
 use tokio_stream::StreamExt;
 use tokio_util::codec::{FramedRead, LengthDelimitedCodec};
-use tracing::{debug, error, trace};
+use tracing::{debug, error, trace, warn};
 use tripwire::Tripwire;
 
 /// Spawn a task that accepts unidirectional broadcast streams, then
 /// spawns another task for each incoming stream to handle.
-pub fn spawn_unipayload_handler(
-    tripwire: &Tripwire,
-    conn: &quinn::Connection,
-    cluster_id: ClusterId,
-    tx_changes: CorroSender<(ChangeV1, ChangeSource, Option<BroadcastV1>)>,
-    change_dict: Arc<ArcSwapOption<ZstdDicts>>,
-) {
+pub fn spawn_unipayload_handler(tripwire: &Tripwire, conn: &quinn::Connection, agent: Agent) {
+    let cluster_id = agent.cluster_id();
+    let broadcast_method = agent.broadcast_method();
+    let tx_changes = agent.tx_changes().clone();
+    let tx_plumtree = agent.tx_plumtree().clone();
+    let change_dict = agent.change_dict_slot();
+
     tokio::spawn({
         let conn = conn.clone();
         let mut tripwire = tripwire.clone();
@@ -50,9 +50,12 @@ pub fn spawn_unipayload_handler(
                 );
 
                 let change_dict = change_dict.load_full();
+                let remote_addr = conn.remote_address();
 
                 tokio::spawn({
                     let tx_changes = tx_changes.clone();
+                    let tx_plumtree = tx_plumtree.clone();
+                    let broadcast_method = broadcast_method;
                     async move {
                         let mut framed = FramedRead::new(
                             rx,
@@ -61,7 +64,8 @@ pub fn spawn_unipayload_handler(
                                 .new_codec(),
                         );
 
-                        let mut changes = vec![];
+                        let mut changes: Vec<(ChangeV1, ChangeSource, Option<BroadcastV1>)> =
+                            vec![];
                         loop {
                             match StreamExt::next(&mut framed).await {
                                 Some(Ok(b)) => {
@@ -97,6 +101,62 @@ pub fn spawn_unipayload_handler(
                                                         }
                                                     }
                                                 }
+                                                UniPayload::V1 {
+                                                    data:
+                                                        UniPayloadV1::Plumtree(PlumtreeWire::V1 {
+                                                            data: wire_msg,
+                                                        }),
+                                                    cluster_id: payload_cluster_id,
+                                                } => {
+                                                    if cluster_id != payload_cluster_id {
+                                                        continue;
+                                                    }
+                                                    let tx = tx_plumtree.clone();
+
+                                                    match broadcast_method {
+                                                        // route gossips if we are using broadcast method
+                                                        BroadcastMethod::Gossip => {
+                                                            if let PlumtreeMsgV1::Gossip(msg) =
+                                                                wire_msg
+                                                            {
+                                                                warn!("broadcast algorithm set to gossip but node receieved plumtree message");
+                                                                let compressed = msg
+                                                                    .payload
+                                                                    .bcast
+                                                                    .is_compressed();
+                                                                match msg.payload.bcast.into_change(
+                                                                    change_dict.as_deref(),
+                                                                ) {
+                                                                    Ok(change) => {
+                                                                        changes.push((
+                                                                            change,
+                                                                            ChangeSource::Broadcast,
+                                                                            compressed.then_some(
+                                                                                msg.payload.bcast,
+                                                                            ),
+                                                                        ));
+                                                                    }
+                                                                    Err(e) => {
+                                                                        error!(
+                                                                            "could not decode plumtree broadcast change: {e}"
+                                                                        );
+                                                                        continue;
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                        BroadcastMethod::Plumtree => {
+                                                            if let Err(e) = tx
+                                                                .send(PlumtreeInput::Wire(wire_msg))
+                                                                .await
+                                                            {
+                                                                error!(
+                                                                    "could not route Plumtree msg: {e}"
+                                                                );
+                                                            }
+                                                        }
+                                                    }
+                                                }
                                             }
                                         }
                                         Err(e) => {
@@ -112,10 +172,42 @@ pub fn spawn_unipayload_handler(
                             }
                         }
 
-                        for change in changes.into_iter().rev() {
-                            if let Err(e) = tx_changes.send(change).await {
-                                error!("could not send change for processing: {e}");
-                                return;
+                        match broadcast_method {
+                            BroadcastMethod::Plumtree => {
+                                if let Some((change, _, _)) = changes.first() {
+                                    warn!(
+                                        %remote_addr,
+                                        id = ?change.message_id(),
+                                        count = changes.len(),
+                                        "broadcast algorithm set to plumtree but node received gossip message"
+                                    );
+                                }
+                                for (change, _, original_bcast) in changes.into_iter().rev() {
+                                    let id = change.message_id();
+                                    let bcast = original_bcast
+                                        .unwrap_or_else(|| BroadcastV1::Change(change));
+                                    let wire = PlumtreeMsgV1::Gossip(GossipMsg {
+                                        round: 1,
+                                        sender: id.actor_id,
+                                        payload: PlumtreePayload { id, bcast },
+                                    });
+                                    if let Err(e) =
+                                        tx_plumtree.send(PlumtreeInput::Wire(wire)).await
+                                    {
+                                        error!(
+                                            "could not route legacy gossip change to plumtree: {e}"
+                                        );
+                                        return;
+                                    }
+                                }
+                            }
+                            BroadcastMethod::Gossip => {
+                                for change in changes.into_iter().rev() {
+                                    if let Err(e) = tx_changes.send(change).await {
+                                        error!("could not send change for processing: {e}");
+                                        return;
+                                    }
+                                }
                             }
                         }
                     }

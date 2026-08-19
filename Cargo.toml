@@ -1,7 +1,7 @@
 [workspace]
 members = [ ".antithesis/client/rust-load-generator",
 	"crates/*",
-	"integration-tests"
+	"integration-tests",
 ]
 resolver = "2"
 
@@ -124,3 +124,10 @@ codegen-units = 16
 opt-level = 2
 
 [workspace.lints.clippy]
+
+[patch.crates-io]
+# branch: superfly/expose-rtt-latest-min
+quinn = { git = "https://github.com/somtochiama/quinn", rev = "ed052b9aac0ab803a4c8838b9a21034aa919dcbc" } 
+quinn-proto = { git = "https://github.com/somtochiama/quinn", rev = "ed052b9aac0ab803a4c8838b9a21034aa919dcbc" }
+quinn-udp = { git = "https://github.com/somtochiama/quinn", rev = "ed052b9aac0ab803a4c8838b9a21034aa919dcbc" }
+

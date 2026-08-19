@@ -13,7 +13,8 @@ use corro_types::{
     actor::{ActorId, ClusterId},
     agent::{Agent, BookedVersions, Bookie, WriteConn},
     base::{CrsqlDbVersion, CrsqlSeq},
-    broadcast::{FocaCmd, FocaInput},
+    broadcast::{FocaCmd, FocaInput, PlumtreeInput},
+    config::BroadcastMethod,
     sqlite::SqlitePoolError,
     sync::generate_sync,
     updates::Handle,
@@ -114,8 +115,14 @@ pub enum Command {
     Actor(ActorCommand),
     Subs(SubsCommand),
     Log(LogCommand),
+    Plumtree(PlumtreeCommand),
     Reload,
     ReloadDicts,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum PlumtreeCommand {
+    Stats,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -702,6 +709,49 @@ async fn handle_conn(
                         }
                     }
                 },
+                Command::Plumtree(cmd) => {
+                    if !matches!(agent.broadcast_method(), BroadcastMethod::Plumtree) {
+                        send_error(
+                            &mut stream,
+                            "plumtree broadcast method is not enabled on this node",
+                        )
+                        .await;
+                        continue;
+                    }
+
+                    match cmd {
+                        PlumtreeCommand::Stats => {
+                            let (tx, rx) = oneshot::channel();
+                            if let Err(e) = agent
+                                .tx_plumtree()
+                                .send(PlumtreeInput::QueryStats(tx))
+                                .await
+                            {
+                                send_error(&mut stream, e).await;
+                                continue;
+                            }
+
+                            let stats = match rx.await {
+                                Ok(stats) => stats,
+                                Err(e) => {
+                                    send_error(&mut stream, e).await;
+                                    continue;
+                                }
+                            };
+
+                            let value = match serde_json::to_value(&stats) {
+                                Ok(json) => json,
+                                Err(e) => {
+                                    send_error(&mut stream, e).await;
+                                    continue;
+                                }
+                            };
+
+                            send(&mut stream, Response::Json(value)).await;
+                            send_success(&mut stream).await;
+                        }
+                    }
+                }
             },
             Ok(None) => {
                 debug!("done with admin conn");

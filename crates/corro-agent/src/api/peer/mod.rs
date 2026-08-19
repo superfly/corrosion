@@ -1720,7 +1720,8 @@ mod tests {
         api::{ColumnName, TableName},
         broadcast::ChangesetPerTable,
         config::{
-            CompressionConfig, Config, TlsClientConfig, TlsConfig, DEFAULT_GOSSIP_CLIENT_ADDR,
+            BroadcastConfig, CompressionConfig, Config, TlsClientConfig, TlsConfig,
+            DEFAULT_GOSSIP_CLIENT_ADDR,
         },
         pubsub::pack_columns,
         tls::{generate_ca, generate_client_cert, generate_server_cert},
@@ -2473,6 +2474,7 @@ mod tests {
                 dict_dir: None,
                 dict_file: None,
             }),
+            broadcast: BroadcastConfig::Gossip,
         };
 
         let server = gossip_server_endpoint(&gossip_config).await?;

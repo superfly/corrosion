@@ -670,6 +670,13 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
             conn.send_command(corro_admin::Command::Log(corro_admin::LogCommand::Reset))
                 .await?;
         }
+        Command::Plumtree(PlumtreeCommand::Stats) => {
+            let mut conn = AdminConn::connect(cli.admin_path()).await?;
+            conn.send_command(corro_admin::Command::Plumtree(
+                corro_admin::PlumtreeCommand::Stats,
+            ))
+            .await?;
+        }
     }
 
     Ok(())
@@ -854,6 +861,16 @@ enum Command {
     /// Log related commands
     #[command(subcommand)]
     Log(LogCommand),
+
+    /// Plumtree broadcast overlay commands
+    #[command(subcommand)]
+    Plumtree(PlumtreeCommand),
+}
+
+#[derive(Subcommand)]
+enum PlumtreeCommand {
+    /// Dump key plumtree overlay stats
+    Stats,
 }
 
 #[derive(Subcommand)]

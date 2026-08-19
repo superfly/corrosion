@@ -896,6 +896,7 @@ version = "0.1.0"
 dependencies = [
  "antithesis_sdk",
  "arc-swap",
+ "async-trait",
  "axum",
  "axum-extra",
  "backoff",
@@ -926,6 +927,7 @@ dependencies = [
  "opentelemetry",
  "parking_lot",
  "pin-project-lite",
+ "plum-foca",
  "quinn",
  "quinn-plaintext",
  "quinn-proto",
@@ -1080,6 +1082,8 @@ dependencies = [
 name = "corro-tests"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "bytes",
  "corro-agent",
  "corro-client",
  "corro-types",
@@ -1150,6 +1154,7 @@ dependencies = [
  "opentelemetry",
  "papaya",
  "parking_lot",
+ "plum-foca",
  "rand 0.9.2",
  "rangemap",
  "rcgen",
@@ -3651,6 +3656,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "plum-foca"
+version = "0.1.0"
+dependencies = [
+ "indexmap 2.11.0",
+ "rand 0.9.2",
+ "serde",
+ "speedy",
+ "strum",
+ "thiserror 1.0.69",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "portable-atomic"
 version = "1.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3853,8 +3872,7 @@ dependencies = [
 [[package]]
 name = "quinn"
 version = "0.11.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b9e20a958963c291dc322d98411f541009df2ced7b5a4f2bd52337638cfccf20"
+source = "git+https://github.com/somtochiama/quinn?rev=ed052b9aac0ab803a4c8838b9a21034aa919dcbc#ed052b9aac0ab803a4c8838b9a21034aa919dcbc"
 dependencies = [
  "bytes",
  "cfg_aliases",
@@ -3863,7 +3881,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls",
- "socket2 0.6.0",
+ "socket2 0.5.10",
  "thiserror 2.0.16",
  "tokio",
  "tracing",
@@ -3885,8 +3903,7 @@ dependencies = [
 [[package]]
 name = "quinn-proto"
 version = "0.11.13"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f1906b49b0c3bc04b5fe5d86a77925ae6524a19b816ae38ce1e426255f1d8a31"
+source = "git+https://github.com/somtochiama/quinn?rev=ed052b9aac0ab803a4c8838b9a21034aa919dcbc#ed052b9aac0ab803a4c8838b9a21034aa919dcbc"
 dependencies = [
  "bytes",
  "fastbloom",
@@ -3908,15 +3925,14 @@ dependencies = [
 [[package]]
 name = "quinn-udp"
 version = "0.5.14"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "addec6a0dcad8a8d96a771f815f0eaf55f9d1805756410b39f5fa81332574cbd"
+source = "git+https://github.com/somtochiama/quinn?rev=ed052b9aac0ab803a4c8838b9a21034aa919dcbc#ed052b9aac0ab803a4c8838b9a21034aa919dcbc"
 dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.6.0",
+ "socket2 0.5.10",
  "tracing",
- "windows-sys 0.60.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

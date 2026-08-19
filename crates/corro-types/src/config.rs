@@ -215,6 +215,89 @@ pub enum AuthzConfig {
     BearerToken(String),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BroadcastMethod {
+    Gossip,
+    Plumtree,
+}
+
+fn default_broadcast_config() -> BroadcastConfig {
+    BroadcastConfig::Gossip
+}
+
+pub fn default_plumtree_prune_threshold() -> u32 {
+    5
+}
+
+pub fn default_plumtree_prune_throttle_secs() -> Option<u64> {
+    Some(1)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlumtreeConfig {
+    #[serde(default = "default_plumtree_prune_threshold")]
+    pub prune_threshold: u32,
+    #[serde(default)]
+    pub optimization_threshold: Option<u32>,
+    #[serde(default)]
+    pub batch_gossip: bool,
+    /// Suppress repeat PRUNEs to the same peer within this window. `None` disables.
+    #[serde(default = "default_plumtree_prune_throttle_secs")]
+    pub prune_throttle_secs: Option<u64>,
+    /// Near/Mid/Far split when selecting eager and lazy peers.
+    #[serde(default)]
+    pub eager_ratios: plum_foca::EagerRatios,
+}
+
+impl Default for PlumtreeConfig {
+    fn default() -> Self {
+        Self {
+            prune_threshold: default_plumtree_prune_threshold(),
+            optimization_threshold: None,
+            batch_gossip: false,
+            prune_throttle_secs: default_plumtree_prune_throttle_secs(),
+            eager_ratios: plum_foca::EagerRatios::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BroadcastConfig {
+    Gossip,
+    Plumtree(PlumtreeConfig),
+}
+
+impl Default for BroadcastConfig {
+    fn default() -> Self {
+        Self::Gossip
+    }
+}
+
+impl BroadcastConfig {
+    pub fn method(&self) -> BroadcastMethod {
+        match self {
+            Self::Gossip => BroadcastMethod::Gossip,
+            Self::Plumtree(_) => BroadcastMethod::Plumtree,
+        }
+    }
+
+    pub fn plumtree(&self) -> Option<&PlumtreeConfig> {
+        match self {
+            Self::Plumtree(cfg) => Some(cfg),
+            Self::Gossip => None,
+        }
+    }
+
+    pub fn from_method(method: BroadcastMethod) -> Self {
+        match method {
+            BroadcastMethod::Gossip => Self::Gossip,
+            BroadcastMethod::Plumtree => Self::Plumtree(PlumtreeConfig::default()),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GossipConfig {
     #[serde(alias = "addr")]
@@ -238,11 +321,21 @@ pub struct GossipConfig {
     pub member_id: Option<MemberId>,
     #[serde(default)]
     pub compression: Option<CompressionConfig>,
+    #[serde(default = "default_broadcast_config")]
+    pub broadcast: BroadcastConfig,
 }
 
 impl GossipConfig {
     pub fn compression_config(&self) -> CompressionConfig {
         self.compression.clone().unwrap_or_default()
+    }
+
+    pub fn broadcast_method(&self) -> BroadcastMethod {
+        self.broadcast.method()
+    }
+
+    pub fn plumtree(&self) -> Option<&PlumtreeConfig> {
+        self.broadcast.plumtree()
     }
 }
 
@@ -429,6 +522,8 @@ pub enum ConfigError {
     InvalidCompressionLevel { value: i32 },
     #[error("gossip.compression.dict_file requires gossip.compression.dict_dir to be set")]
     DictFileWithoutDictDir,
+    #[error("{0}")]
+    InvalidEagerRatios(#[from] plum_foca::EagerRatiosError),
 }
 
 impl Config {
@@ -462,6 +557,9 @@ impl Config {
         if compression.dict_file.is_some() && compression.dict_dir.is_none() {
             return Err(ConfigError::DictFileWithoutDictDir);
         }
+        if let Some(plumtree) = self.gossip.plumtree() {
+            plumtree.eager_ratios.validate()?;
+        }
         Ok(())
     }
 }
@@ -488,6 +586,7 @@ pub struct ConfigBuilder {
     disable_gso: bool,
     compression: Option<bool>,
     compression_level: Option<i32>,
+    broadcast: Option<BroadcastConfig>,
 }
 
 impl ConfigBuilder {
@@ -567,6 +666,21 @@ impl ConfigBuilder {
         self
     }
 
+    pub fn broadcast_method(mut self, method: BroadcastMethod) -> Self {
+        self.broadcast = Some(BroadcastConfig::from_method(method));
+        self
+    }
+
+    pub fn broadcast(mut self, broadcast: BroadcastConfig) -> Self {
+        self.broadcast = Some(broadcast);
+        self
+    }
+
+    pub fn plumtree(mut self, plumtree: PlumtreeConfig) -> Self {
+        self.broadcast = Some(BroadcastConfig::Plumtree(plumtree));
+        self
+    }
+
     /// Disable Generic Segmentation Offload (GSO) for the QUIC gossip transport.
     pub fn disable_gso(mut self, disable: bool) -> Self {
         self.disable_gso = disable;
@@ -633,6 +747,7 @@ impl ConfigBuilder {
                     dict_dir: None,
                     dict_file: None,
                 }),
+                broadcast: self.broadcast.unwrap_or_else(default_broadcast_config),
             },
             perf: self.perf.unwrap_or_default(),
             admin: AdminConfig {
@@ -698,4 +813,46 @@ pub struct TableReapConfig {
     /// that match the filter e.g "id LIKE 'throwaway-%'"
     #[serde(default)]
     pub match_filter: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn broadcast_config_defaults_to_gossip() {
+        let cfg: GossipConfig = serde_json::from_value(serde_json::json!({
+            "bind_addr": "127.0.0.1:4001",
+        }))
+        .unwrap();
+        assert_eq!(cfg.broadcast.method(), BroadcastMethod::Gossip);
+        assert!(cfg.plumtree().is_none());
+    }
+
+    #[test]
+    fn broadcast_config_plumtree() {
+        let cfg: GossipConfig = serde_json::from_value(serde_json::json!({
+            "bind_addr": "127.0.0.1:4001",
+            "broadcast": {
+                "plumtree": {
+                    "prune_threshold": 7
+                }
+            }
+        }))
+        .unwrap();
+        assert_eq!(cfg.broadcast.method(), BroadcastMethod::Plumtree);
+        assert_eq!(cfg.plumtree().unwrap().prune_threshold, 7);
+        assert_eq!(cfg.plumtree().unwrap().optimization_threshold, None);
+    }
+
+    #[test]
+    fn plumtree_eager_ratios_must_sum_to_100() {
+        let ratios = plum_foca::EagerRatios {
+            near_pct: 60,
+            mid_pct: 30,
+            far_pct: 20,
+        };
+        assert!(ratios.validate().is_err());
+        assert!(plum_foca::EagerRatios::default().validate().is_ok());
+    }
 }
