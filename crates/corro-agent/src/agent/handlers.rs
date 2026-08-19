@@ -443,9 +443,16 @@ pub async fn handle_notifications(
                     (del_res, add_res)
                 };
 
+                // we've just re-inserted the same id, no plumtree updates needed
+                if a.id() == b.id() && del_res && matches!(add_res, MemberAddedResult::NewMember(_))
+                {
+                    continue;
+                }
+
                 if del_res {
                     send_plumtree_member_update(&agent, &a, MemberAddedResult::Removed).await;
                 }
+
                 send_plumtree_member_update(&agent, &b, add_res).await;
             }
             OwnedNotification::Active => {
