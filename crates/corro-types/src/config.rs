@@ -52,7 +52,7 @@ const fn default_processing_queue() -> usize {
 }
 
 const fn default_plumtree_send_queue() -> usize {
-    40000
+    30000
 }
 
 /// Used for the apply channel
@@ -238,6 +238,10 @@ pub fn default_plumtree_prune_throttle_secs() -> Option<u64> {
     Some(1)
 }
 
+pub fn default_plumtree_ring_locked_radius() -> usize {
+    1
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlumtreeConfig {
     #[serde(default = "default_plumtree_prune_threshold")]
@@ -252,6 +256,10 @@ pub struct PlumtreeConfig {
     /// Near/Mid/Far split when selecting eager and lazy peers.
     #[serde(default)]
     pub eager_ratios: plum_foca::EagerRatios,
+    /// Neighbors locked eager on each side of the identity ring.
+    /// Total locked peers is `2 * radius` (default 1 → 2).
+    #[serde(default = "default_plumtree_ring_locked_radius")]
+    pub ring_locked_radius: usize,
 }
 
 impl Default for PlumtreeConfig {
@@ -262,6 +270,7 @@ impl Default for PlumtreeConfig {
             batch_gossip: false,
             prune_throttle_secs: default_plumtree_prune_throttle_secs(),
             eager_ratios: plum_foca::EagerRatios::default(),
+            ring_locked_radius: default_plumtree_ring_locked_radius(),
         }
     }
 }
@@ -853,6 +862,7 @@ mod tests {
         assert_eq!(cfg.broadcast.method(), BroadcastMethod::Plumtree);
         assert_eq!(cfg.plumtree().unwrap().prune_threshold, 7);
         assert_eq!(cfg.plumtree().unwrap().optimization_threshold, None);
+        assert_eq!(cfg.plumtree().unwrap().ring_locked_radius, 1);
     }
 
     #[test]

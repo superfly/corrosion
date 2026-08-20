@@ -366,6 +366,7 @@ pub async fn spawn_plumtree_loop(
         max_received_entries: max_queue_len,
         prune_throttle: plumtree_config.prune_throttle_secs.map(Duration::from_secs),
         eager_ratios: plumtree_config.eager_ratios,
+        ring_locked_radius: plumtree_config.ring_locked_radius,
     };
 
     plumtree_loop(
@@ -580,7 +581,7 @@ struct PendingPlumtreeSend {
     shed_key: ShedKey,
 }
 
-/// Kind of a queued message, used to break ties between equal rounds 
+/// Kind of a queued message, used to break ties between equal rounds
 /// when dropping queue items.
 /// mirrors `PlumtreeMsg`
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]

@@ -400,6 +400,7 @@ impl Params {
             max_cached_payloads: 4096,
             prune_throttle: self.prune_throttle,
             eager_ratios: self.eager_ratios,
+            ring_locked_radius: 1,
         }
     }
 }

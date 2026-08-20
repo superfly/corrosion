@@ -125,6 +125,9 @@ pub struct Config {
     pub prune_throttle: Option<Duration>,
     /// Near/Mid/Far split when selecting eager and lazy peers during rebalance.
     pub eager_ratios: EagerRatios,
+    /// Neighbors locked eager on each side of the identity ring.
+    /// Total locked peers is `2 * radius` (default 1 → 2).
+    pub ring_locked_radius: usize,
 }
 
 impl Default for Config {
@@ -140,6 +143,7 @@ impl Default for Config {
             max_cached_payloads: 8192,
             prune_throttle: Some(Duration::from_secs(1)),
             eager_ratios: EagerRatios::default(),
+            ring_locked_radius: 1,
         }
     }
 }
@@ -441,8 +445,8 @@ pub struct PlumtreeState<
     lazy_peers: IndexSet<N>,
     /// Every peer we know about, eager or lazy; drives.
     known_peers: HashSet<N>,
-    /// Eager peers pinned to the tree because they are our immediate ring
-    /// neighbors; they are never pruned, ensuring a node is never isolated.
+    /// Eager peers pinned to the tree because they are our ring neighbors
+    /// within `Config::ring_locked_radius`; they are never pruned.
     ring_locked: HashSet<N>,
     /// Per-per rtt information.
     peer_topology: HashMap<N, RttInfo>,
@@ -719,7 +723,7 @@ impl<I: MessageId<NodeId = N>, P: Payload<MessageId = I, NodeId = N>, N: NodeId,
             if self.seen.contains(&digest.id) {
                 continue;
             }
-            // todo: maybe we can store peers that have sent ihave's 
+            // todo: maybe we can store peers that have sent ihave's
             // and use them as a fallback
             if self.missing.contains_key(&digest.id) {
                 continue;
@@ -1255,8 +1259,7 @@ impl<I: MessageId<NodeId = N>, P: Payload<MessageId = I, NodeId = N>, N: NodeId,
 
     /// Recompute ring neighbors based on current known_peers.
     ///
-    /// Clears old ring_locked set and recalculates the two peers that
-    /// are immediately before and after local_id in sorted order.
+    /// Locks `ring_locked_radius` peers on each side of `local_id` in sorted order.
     fn set_ring_neighbors(&mut self) {
         self.ring_locked.clear();
 
@@ -1267,13 +1270,20 @@ impl<I: MessageId<NodeId = N>, P: Payload<MessageId = I, NodeId = N>, N: NodeId,
         }
 
         peers.sort();
-        if let Some(position) = peers.iter().position(|p| *p == &self.local_id) {
-            let len = peers.len();
-            let after_idx = (position + 1) % len;
-            let before_idx = (position + len - 1) % len;
-
-            self.ring_locked.insert(*peers[before_idx]);
-            self.ring_locked.insert(*peers[after_idx]);
+        let Some(position) = peers.iter().position(|p| *p == &self.local_id) else {
+            return;
+        };
+        let len = peers.len();
+        let radius = self.config.ring_locked_radius.max(1);
+        for i in 1..=radius {
+            let after = *peers[(position + i) % len];
+            let before = *peers[(position + len - i) % len];
+            if after != self.local_id {
+                self.ring_locked.insert(after);
+            }
+            if before != self.local_id {
+                self.ring_locked.insert(before);
+            }
         }
     }
 
@@ -1462,6 +1472,7 @@ mod tests {
             max_received_entries: 10000,
             prune_throttle: None,
             eager_ratios: EagerRatios::default(),
+            ring_locked_radius: 1,
         }
     }
 
@@ -1680,6 +1691,27 @@ mod tests {
         assert!(!s.eager_peers().contains(&6));
         assert!(!s.lazy_peers().contains(&6));
         assert_eq!(s.known_peers().len(), 5);
+    }
+
+    #[test]
+    fn ring_locked_radius_locks_both_sides() {
+        let mut cfg = test_config();
+        cfg.ring_locked_radius = 2;
+        let mut s = PlumtreeState::new_with_store(0u8, cfg, TestSeenStore::default());
+        let mut rt = AccumulatingRuntime::default();
+        for i in 1..=6 {
+            s.peer_up(i, None, &mut rt);
+        }
+        s.update_peer_topology(iter::empty::<(TestNodeId, RttInfo)>(), &mut rt);
+
+        // sorted ring: 0,1,2,3,4,5,6 → radius 2 locks 5,6 and 1,2
+        assert_eq!(s.ring_locked_peers().len(), 4);
+        for p in [1u8, 2, 5, 6] {
+            assert!(s.ring_locked_peers().contains(&p));
+            assert!(s.eager_peers().contains(&p));
+        }
+        assert!(!s.ring_locked_peers().contains(&3));
+        assert!(!s.ring_locked_peers().contains(&4));
     }
 
     #[test]
