@@ -645,7 +645,7 @@ async fn send_messages_loop(
     transport: Transport,
     mut rx_msgs: CorroReceiver<(Vec<ActorId>, PlumtreeMsgV1)>,
 ) {
-    const MAX_INFLIGHT: usize = 500;
+    const MAX_INFLIGHT: usize = 700;
     const GOSSIP_BATCH_INTERVAL: Duration = Duration::from_millis(10);
     const GOSSIP_BATCH_CUTOFF: usize = 1024 * 1024;
 
@@ -672,6 +672,8 @@ async fn send_messages_loop(
         shed_key: ShedKey(Round::MAX, ShedKind::Gossip),
     };
     let mut gossip_batch_interval = interval(GOSSIP_BATCH_INTERVAL);
+    let mut metrics_interval = interval(Duration::from_secs(10));
+    metrics_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut join_set = JoinSet::new();
     let mut limited_log_count = 0;
     let mut drop_log_count = 0;
@@ -684,6 +686,12 @@ async fn send_messages_loop(
     loop {
         let msg = tokio::select! {
             biased;
+            _ = metrics_interval.tick() => {
+                gauge!("corro.plumtree.send_queue.len", "queue" => "local").set(local_queue.len() as f64);
+                gauge!("corro.plumtree.send_queue.len", "queue" => "remote").set(remote_queue.len() as f64);
+                gauge!("corro.plumtree.send.inflight").set(join_set.len() as f64);
+                continue;
+            },
             _ = join_set.join_next(), if !join_set.is_empty() => {
                 continue;
             },
@@ -780,10 +788,6 @@ async fn send_messages_loop(
             counter!("corro.plumtree.send.dropped", "kind" => shed.shed_key.label(was_local))
                 .increment(1);
         }
-
-        gauge!("corro.plumtree.send_queue.len", "queue" => "local").set(local_queue.len() as f64);
-        gauge!("corro.plumtree.send_queue.len", "queue" => "remote").set(remote_queue.len() as f64);
-        gauge!("corro.plumtree.send.inflight").set(join_set.len() as f64);
     }
 
     info!("plumtree send loop is done");
