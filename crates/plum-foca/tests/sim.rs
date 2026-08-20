@@ -25,8 +25,8 @@ static SIM_EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
 
 use indexmap::IndexMap;
 use plum_foca::{
-    Config, EagerRatios, Notification, Payload, PlumPrio, PlumtreeMsg, PlumtreeState, Round,
-    RttInfo, Runtime, SeenStore, Timer,
+    Config, EagerRatios, Notification, Payload, PlumtreeMsg, PlumtreeState, Round, RttInfo,
+    Runtime, SeenStore, Timer,
 };
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
@@ -197,16 +197,11 @@ struct SimRuntime {
 }
 
 impl Runtime<MId, SimPayload, NId> for SimRuntime {
-    fn send(&mut self, to: NId, msg: PlumtreeMsg<MId, SimPayload, NId>, _prio: PlumPrio) {
+    fn send(&mut self, to: NId, msg: PlumtreeMsg<MId, SimPayload, NId>) {
         self.outbox.push((to, msg));
     }
 
-    fn send_all(
-        &mut self,
-        peers: Vec<NId>,
-        msg: PlumtreeMsg<MId, SimPayload, NId>,
-        _prio: PlumPrio,
-    ) {
+    fn send_all(&mut self, peers: Vec<NId>, msg: PlumtreeMsg<MId, SimPayload, NId>) {
         for peer in peers {
             self.outbox.push((peer, msg.clone()));
         }

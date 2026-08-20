@@ -29,12 +29,6 @@ impl<T> NodeId for T where T: Copy + Eq + Hash + Ord + Debug + Send + 'static {}
 
 pub type Round = u32;
 
-#[derive(Clone, Copy)]
-pub enum PlumPrio {
-    P0,
-    P1,
-}
-
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct RttInfo {
     pub ring: Option<u8>,
@@ -206,10 +200,14 @@ pub enum Notification<'a, I: MessageId, N: NodeId> {
 
 pub trait Runtime<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId> {
     /// Send a protocol message to a specific peer.
-    fn send(&mut self, to: N, msg: PlumtreeMsg<I, P, N>, prio: PlumPrio);
+    ///
+    /// The transport decides send and shed order from the message itself --
+    /// `GossipMsg::round` and the message variant -- so no separate priority
+    /// is passed down from the protocol.
+    fn send(&mut self, to: N, msg: PlumtreeMsg<I, P, N>);
 
     // Send a message to a group of peers
-    fn send_all(&mut self, peers: Vec<N>, msg: PlumtreeMsg<I, P, N>, prio: PlumPrio);
+    fn send_all(&mut self, peers: Vec<N>, msg: PlumtreeMsg<I, P, N>);
 
     /// Deliver a received message to the application layer.
     fn deliver(&mut self, payload: P);
@@ -628,7 +626,6 @@ impl<I: MessageId<NodeId = N>, P: Payload<MessageId = I, NodeId = N>, N: NodeId,
                             sender: self.local_id,
                             triggered_by: Some(id.clone()),
                         }),
-                        PlumPrio::P1,
                     );
                     self.move_to_lazy(&sender, rt);
                 }
@@ -665,7 +662,6 @@ impl<I: MessageId<NodeId = N>, P: Payload<MessageId = I, NodeId = N>, N: NodeId,
                     sender: self.local_id,
                     payload,
                 }),
-                PlumPrio::P1,
             );
         }
 
@@ -694,7 +690,6 @@ impl<I: MessageId<NodeId = N>, P: Payload<MessageId = I, NodeId = N>, N: NodeId,
                         round: entry.round,
                     }],
                 }),
-                PlumPrio::P0,
             );
 
             // paper has a prune here but we might prune a good path for different sender,
@@ -724,6 +719,8 @@ impl<I: MessageId<NodeId = N>, P: Payload<MessageId = I, NodeId = N>, N: NodeId,
             if self.seen.contains(&digest.id) {
                 continue;
             }
+            // todo: maybe we can store peers that have sent ihave's 
+            // and use them as a fallback
             if self.missing.contains_key(&digest.id) {
                 continue;
             }
@@ -790,7 +787,6 @@ impl<I: MessageId<NodeId = N>, P: Payload<MessageId = I, NodeId = N>, N: NodeId,
                         sender: self.local_id,
                         payload,
                     }),
-                    PlumPrio::P0,
                 );
             } else {
                 debug!(
@@ -826,7 +822,6 @@ impl<I: MessageId<NodeId = N>, P: Payload<MessageId = I, NodeId = N>, N: NodeId,
                 sender: self.local_id,
                 triggered_by: None,
             }),
-            PlumPrio::P1,
         );
     }
 
@@ -857,7 +852,6 @@ impl<I: MessageId<NodeId = N>, P: Payload<MessageId = I, NodeId = N>, N: NodeId,
                 sender: self.local_id,
                 payload,
             }),
-            PlumPrio::P0,
         );
 
         self.enqueue_ihave(id, 0);
@@ -927,7 +921,6 @@ impl<I: MessageId<NodeId = N>, P: Payload<MessageId = I, NodeId = N>, N: NodeId,
                         send: true,
                         requests: chunk.to_vec(),
                     }),
-                    PlumPrio::P0,
                 );
             }
             // supress prunes for a recently grafted peers
@@ -943,7 +936,7 @@ impl<I: MessageId<NodeId = N>, P: Payload<MessageId = I, NodeId = N>, N: NodeId,
                         retries: retries + 1,
                         senders,
                     },
-                    self.config.ihave_timeout / 2,
+                    self.config.ihave_timeout,
                 );
             } else {
                 rt.notify(Notification::MessageMissing(ids.len()));
@@ -969,7 +962,6 @@ impl<I: MessageId<NodeId = N>, P: Payload<MessageId = I, NodeId = N>, N: NodeId,
                 sender: self.local_id,
                 digests: digests.unwrap(),
             }),
-            PlumPrio::P1,
         );
     }
 
@@ -1513,19 +1505,13 @@ mod tests {
             &mut self,
             peers: Vec<TestNodeId>,
             msg: PlumtreeMsg<TestMsgId, TestPayload, TestNodeId>,
-            _prio: PlumPrio,
         ) {
             for peer in peers {
-                self.send(peer, msg.clone(), PlumPrio::P0);
+                self.send(peer, msg.clone());
             }
         }
 
-        fn send(
-            &mut self,
-            to: TestNodeId,
-            msg: PlumtreeMsg<TestMsgId, TestPayload, TestNodeId>,
-            _prio: PlumPrio,
-        ) {
+        fn send(&mut self, to: TestNodeId, msg: PlumtreeMsg<TestMsgId, TestPayload, TestNodeId>) {
             self.sent.push((to, msg));
         }
 

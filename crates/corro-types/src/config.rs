@@ -51,6 +51,10 @@ const fn default_processing_queue() -> usize {
     20000
 }
 
+const fn default_plumtree_send_queue() -> usize {
+    40000
+}
+
 /// Used for the apply channel
 const fn default_huge_channel() -> usize {
     2048
@@ -408,6 +412,11 @@ pub struct PerfConfig {
     // How many unapplied changesets corrosion will buffer before starting to drop them
     #[serde(default = "default_processing_queue")]
     pub processing_queue_len: usize,
+    // How many outgoing plumtree messages to buffer before shedding.
+    // Kept separate from processing_queue_len so the send queue can be sized
+    // without also growing the plumtree payload and seen caches.
+    #[serde(default = "default_plumtree_send_queue")]
+    pub plumtree_send_queue_len: usize,
     // How many ms corrosion will wait before proceeding to apply a batch of changes
     // We wait either for apply_queue_timeout or untill at least apply_queue_min_batch_size changes accumulate
     #[serde(default = "default_apply_timeout")]
@@ -445,6 +454,7 @@ impl Default for PerfConfig {
             max_sync_backoff: default_max_sync_backoff(),
             partial_retry_backoff: default_partial_retry_backoff(),
             processing_queue_len: default_processing_queue(),
+            plumtree_send_queue_len: default_plumtree_send_queue(),
             apply_queue_timeout: default_apply_timeout(),
             apply_queue_min_batch_size: default_apply_batch_min(),
             apply_queue_step_base: default_apply_batch_step(),
