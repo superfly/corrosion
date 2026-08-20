@@ -1121,6 +1121,9 @@ pub async fn handle_changes(
         if let Some(recv_lag) = recv_lag {
             histogram!("corro.agent.changes.recv.lag.seconds", "source" => src_str)
                 .record(recv_lag.as_secs_f64());
+            if recv_lag > Duration::from_secs(5) {
+                warn!(actor_id = %change.actor_id, version = ?change.versions(), ts = ?change.ts(), "change recv lag exceeded 5s");
+            }
         }
 
         // If we need to drop an old change, drop it from the seen cache aswell
