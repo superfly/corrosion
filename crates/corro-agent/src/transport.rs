@@ -324,7 +324,7 @@ impl Transport {
 
                 RttMark {
                     acks: stats.frame_rx.acks,
-                    min_rtt: stats.path.min_rtt,
+                    min_rtt: stats.path.latest_rtt,
                 }
             };
 
