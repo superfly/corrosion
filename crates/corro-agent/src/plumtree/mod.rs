@@ -339,57 +339,77 @@ impl plum_foca::Runtime<ChangeId, PlumtreePayload, ActorId> for CorrosionPlumtre
     }
 }
 
-pub async fn spawn_plumtree_loop(
+pub(super) struct PlumtreeActor {
     agent: Agent,
     transport: Transport,
     rx_plumtree: CorroReceiver<PlumtreeInput>,
     rx_plumtree_updates: CorroReceiver<PlumtreeUpdates>,
     tx_changes: CorroSender<(ChangeV1, ChangeSource, Option<BroadcastV1>)>,
-    tripwire: Tripwire,
-) {
-    let plumtree_config = agent
-        .config()
-        .gossip
-        .plumtree()
-        .cloned()
-        .unwrap_or_default();
+}
 
-    let max_queue_len = agent.config().perf.processing_queue_len;
+impl PlumtreeActor {
+    pub(super) fn new(
+        agent: Agent,
+        transport: Transport,
+        rx_plumtree: CorroReceiver<PlumtreeInput>,
+        rx_plumtree_updates: CorroReceiver<PlumtreeUpdates>,
+        tx_changes: CorroSender<(ChangeV1, ChangeSource, Option<BroadcastV1>)>,
+    ) -> Self {
+        Self {
+            agent,
+            transport,
+            rx_plumtree,
+            rx_plumtree_updates,
+            tx_changes,
+        }
+    }
 
-    let config = plum_foca::Config {
-        ihave_timeout: Duration::from_millis(150),
-        optimization_threshold: plumtree_config.optimization_threshold,
-        max_cached_payloads: max_queue_len,
-        num_eager: None,
-        min_lazy: None,
-        max_lazy: None,
-        prune_threshold: plumtree_config.prune_threshold,
-        max_received_entries: max_queue_len,
-        prune_throttle: plumtree_config.prune_throttle_secs.map(Duration::from_secs),
-        eager_ratios: plumtree_config.eager_ratios,
-    };
+    pub(super) async fn run(&mut self, tripwire: Tripwire) -> eyre::Result<()> {
+        let plumtree_config = self
+            .agent
+            .config()
+            .gossip
+            .plumtree()
+            .cloned()
+            .unwrap_or_default();
 
-    plumtree_loop(
-        agent,
-        transport,
-        rx_plumtree,
-        rx_plumtree_updates,
-        tx_changes,
-        config,
-        tripwire,
-    )
-    .await;
+        let max_queue_len = self.agent.config().perf.processing_queue_len;
+
+        let config = plum_foca::Config {
+            ihave_timeout: Duration::from_millis(150),
+            optimization_threshold: plumtree_config.optimization_threshold,
+            max_cached_payloads: max_queue_len,
+            num_eager: None,
+            min_lazy: None,
+            max_lazy: None,
+            prune_threshold: plumtree_config.prune_threshold,
+            max_received_entries: max_queue_len,
+            prune_throttle: plumtree_config.prune_throttle_secs.map(Duration::from_secs),
+            eager_ratios: plumtree_config.eager_ratios,
+        };
+
+        plumtree_loop(
+            self.agent.clone(),
+            self.transport.clone(),
+            &mut self.rx_plumtree,
+            &mut self.rx_plumtree_updates,
+            self.tx_changes.clone(),
+            config,
+            tripwire,
+        )
+        .await
+    }
 }
 
 pub async fn plumtree_loop(
     agent: Agent,
     transport: Transport,
-    mut rx_plumtree: CorroReceiver<PlumtreeInput>,
-    mut rx_plumtree_updates: CorroReceiver<PlumtreeUpdates>,
+    rx_plumtree: &mut CorroReceiver<PlumtreeInput>,
+    rx_plumtree_updates: &mut CorroReceiver<PlumtreeUpdates>,
     tx_changes: CorroSender<(ChangeV1, ChangeSource, Option<BroadcastV1>)>,
     config: plum_foca::Config,
     mut tripwire: Tripwire,
-) {
+) -> eyre::Result<()> {
     let seen = ChangeSeenStore::new(config.max_received_entries, agent.bookie().clone());
     let mut state: PlumtreeState<ChangeId, PlumtreePayload, ActorId, ChangeSeenStore> =
         PlumtreeState::new_with_store(agent.actor_id(), config, seen);
@@ -401,7 +421,9 @@ pub async fn plumtree_loop(
 
     let send_agent = agent.clone();
     let send_transport = transport.clone();
-    let send_msgs_handle = tokio::spawn(send_messages_loop(send_agent, send_transport, rx_msgs));
+
+    let mut sender_tasks = JoinSet::new();
+    sender_tasks.spawn(send_messages_loop(send_agent, send_transport, rx_msgs));
 
     // send out ihave digests to lazy peers
     let mut ihave_tick_interval = interval(Duration::from_millis(150));
@@ -431,6 +453,29 @@ pub async fn plumtree_loop(
                 state.handle_shutdown(&mut rt);
                 break;
             },
+
+            sender_result = sender_tasks.join_next(),
+                if !sender_tasks.is_empty() =>
+            {
+                match sender_result {
+                    Some(Ok(())) => {
+                        return Err(eyre::eyre!(
+                            "plumtree send loop exited unexpectedly"
+                        ));
+                    }
+                    Some(Err(e)) => {
+                        return Err(eyre::eyre!(
+                            "plumtree send loop task failed: {e}"
+                        ));
+                    }
+                    None => {
+                        return Err(eyre::eyre!(
+                            "plumtree sender task set became empty"
+                        ));
+                    }
+                }
+            },
+
             updates = rx_plumtree_updates.recv() => match updates {
                 Some(updates) => Branch::Updates(updates),
                 None => {
@@ -570,9 +615,14 @@ pub async fn plumtree_loop(
     }
 
     drop(rt);
-    if let Err(e) = send_msgs_handle.await {
-        error!("plumtree send loop task failed to join: {e}");
+
+    while let Some(result) = sender_tasks.join_next().await {
+        if let Err(e) = result {
+            error!("plumtree send loop task failed to join: {e}");
+        }
     }
+
+    Ok(())
 }
 
 struct PendingPlumtreeSend {

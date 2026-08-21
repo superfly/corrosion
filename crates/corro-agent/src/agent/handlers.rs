@@ -19,7 +19,7 @@ use crate::{
     transport::Transport,
 };
 use antithesis_sdk::{assert_always, assert_sometimes};
-use camino::Utf8Path;
+use camino::{Utf8Path, Utf8PathBuf};
 use corro_types::{
     actor::{Actor, ActorId},
     agent::{Agent, Bookie, SplitPool},
@@ -305,7 +305,7 @@ pub fn spawn_swim_announcer(agent: &Agent, gossip_addr: SocketAddr, tripwire: Tr
 // TODO: we may be able to inline this code where it is needed
 pub async fn handle_gossip_to_send(
     transport: Transport,
-    mut swim_to_send_rx: CorroReceiver<(Actor, Bytes)>,
+    swim_to_send_rx: &mut CorroReceiver<(Actor, Bytes)>,
     mut tripwire: Tripwire,
 ) {
     let spawn_sender_fn = |(actor, data): (Actor, Bytes)| {
@@ -348,7 +348,7 @@ pub async fn handle_gossip_to_send(
 /// and apply any incoming changes to the local actor/ agent state.
 pub async fn handle_notifications(
     agent: Agent,
-    mut notification_rx: CorroReceiver<OwnedNotification<Actor>>,
+    notification_rx: &mut CorroReceiver<OwnedNotification<Actor>>,
     mut tripwire: Tripwire,
 ) {
     while let Outcome::Completed(Some(notification)) =
@@ -591,58 +591,124 @@ async fn vacuum_db(pool: &SplitPool, lim: u64) -> eyre::Result<()> {
     Ok::<_, eyre::Report>(())
 }
 
-/// See `db_cleanup` and `vacuum_db`
-pub fn spawn_handle_db_maintenance(agent: &Agent) {
-    let mut wal_path = agent.config().db.path.clone();
-    let wal_threshold = agent.config().perf.wal_threshold_mb as u64;
-    wal_path.set_extension(format!("{}-wal", wal_path.extension().unwrap_or_default()));
+/// Periodically vacuum the database and truncate an oversized WAL.
+pub(super) struct DbMaintenanceActor {
+    wal_path: Utf8PathBuf,
+    pool: SplitPool,
+    truncate_wal_threshold: u64,
+    interval_duration: Duration,
+    startup_delay: Duration,
+    initial_checkpoint_done: bool,
+    startup_delay_done: bool,
+    vacuum_interval: Option<tokio::time::Interval>,
+}
 
-    let pool = agent.pool().clone();
+impl DbMaintenanceActor {
+    pub(super) fn new(agent: &Agent) -> Self {
+        let mut wal_path = agent.config().db.path.clone();
+        let wal_threshold = agent.config().perf.wal_threshold_mb as u64;
 
-    let on_antithesis = std::env::var("ANTITHESIS_OUTPUT_DIR").is_ok();
+        wal_path.set_extension(format!("{}-wal", wal_path.extension().unwrap_or_default()));
 
-    // reduce interval if we are running in antithesis
-    let interval_secs = if on_antithesis { 30 } else { 5 * 60 };
+        let on_antithesis = std::env::var("ANTITHESIS_OUTPUT_DIR").is_ok();
 
-    tokio::spawn(async move {
-        let truncate_wal_threshold: u64 = wal_threshold * 1024 * 1024;
+        let interval_secs = if on_antithesis { 30 } else { 5 * 60 };
 
-        // try to initially truncate the WAL
-        match wal_checkpoint_over_threshold(wal_path.as_path(), &pool, truncate_wal_threshold).await
+        Self {
+            wal_path,
+            pool: agent.pool().clone(),
+            truncate_wal_threshold: wal_threshold * 1024 * 1024,
+            interval_duration: Duration::from_secs(interval_secs),
+            startup_delay: if on_antithesis {
+                Duration::ZERO
+            } else {
+                Duration::from_secs(60)
+            },
+            initial_checkpoint_done: false,
+            startup_delay_done: on_antithesis,
+            vacuum_interval: None,
+        }
+    }
+
+    async fn run_initial_checkpoint(&mut self) {
+        match wal_checkpoint_over_threshold(
+            self.wal_path.as_path(),
+            &self.pool,
+            self.truncate_wal_threshold,
+        )
+        .await
         {
-            Ok(truncated) if truncated => {
+            Ok(true) => {
                 info!("initially truncated WAL");
             }
+            Ok(false) => {}
             Err(e) => {
                 error!("could not initially truncate WAL: {e}");
             }
-            _ => {}
         }
 
-        // large sleep right at the start to give node time to sync
+        self.initial_checkpoint_done = true;
+    }
 
-        if !on_antithesis {
-            sleep(Duration::from_secs(60)).await;
-        }
-
-        let mut vacuum_interval = tokio::time::interval(Duration::from_secs(interval_secs));
-
+    async fn run_maintenance(&self) {
         const MAX_DB_FREE_PAGES: u64 = 10000;
 
-        loop {
-            vacuum_interval.tick().await;
-            if let Err(e) = vacuum_db(&pool, MAX_DB_FREE_PAGES).await {
-                error!("could not check freelist and vacuum: {e}");
-            }
+        if let Err(e) = vacuum_db(&self.pool, MAX_DB_FREE_PAGES).await {
+            error!("could not check freelist and vacuum: {e}");
+        }
 
-            if let Err(e) =
-                wal_checkpoint_over_threshold(wal_path.as_path(), &pool, truncate_wal_threshold)
-                    .await
-            {
-                error!("could not wal_checkpoint truncate: {e}");
+        if let Err(e) = wal_checkpoint_over_threshold(
+            self.wal_path.as_path(),
+            &self.pool,
+            self.truncate_wal_threshold,
+        )
+        .await
+        {
+            error!("could not wal_checkpoint truncate: {e}");
+        }
+    }
+
+    pub(super) async fn run(&mut self, mut tripwire: Tripwire) {
+        if !self.initial_checkpoint_done {
+            self.run_initial_checkpoint().await;
+        }
+
+        if !self.startup_delay_done {
+            tokio::select! {
+                _ = &mut tripwire => {
+                    return;
+                }
+                _ = sleep(self.startup_delay) => {
+                    self.startup_delay_done = true;
+                }
             }
         }
-    });
+
+        if self.vacuum_interval.is_none() {
+            self.vacuum_interval = Some(tokio::time::interval(self.interval_duration));
+        }
+
+        loop {
+            {
+                let interval = self
+                    .vacuum_interval
+                    .as_mut()
+                    .expect("maintenance interval must be initialized");
+
+                tokio::select! {
+                    biased;
+
+                    _ = &mut tripwire => {
+                        break;
+                    }
+
+                    _ = interval.tick() => {}
+                }
+            }
+
+            self.run_maintenance().await;
+        }
+    }
 }
 
 async fn wal_checkpoint_over_threshold(
@@ -775,7 +841,7 @@ impl HandleChangesState {
 
     /// Get the threshold for immediate spawning based on configured ratio
     fn batch_threshold(&self) -> usize {
-        (self.current_batch_size as f64 * self.batch_threshold_ratio) as usize
+        ((self.current_batch_size as f64 * self.batch_threshold_ratio) as usize).max(1)
     }
 
     /// Drain a batch from the queue and spawn processing task
@@ -986,178 +1052,227 @@ impl HandleChangesState {
 /// apply changes more efficiently.
 ///
 /// This function used by broadcast receivers and sync receivers
-pub async fn handle_changes(
+pub(super) struct ChangesActor {
     agent: Agent,
     bookie: Bookie,
-    mut rx_changes: CorroReceiver<(ChangeV1, ChangeSource, Option<BroadcastV1>)>,
-    mut tripwire: Tripwire,
-) {
-    let max_queue_len: usize = agent.config().perf.processing_queue_len;
+    rx_changes: CorroReceiver<(ChangeV1, ChangeSource, Option<BroadcastV1>)>,
+    state: HandleChangesState,
+    max_seen_cache_len: usize,
+    keep_seen_cache_size: usize,
+    seen: IndexMap<(ActorId, corro_types::base::CrsqlDbVersion), RangeInclusiveSet<CrsqlSeq>>,
+}
 
-    // Initialize batch processor state
-    let mut state = HandleChangesState::new(
-        agent.config().perf.apply_queue_min_batch_size,
-        agent.config().perf.apply_queue_step_base,
-        agent.config().perf.apply_queue_max_batch_size,
-        agent.config().perf.apply_queue_batch_threshold_ratio,
-        Duration::from_millis(agent.config().perf.apply_queue_timeout as u64),
-        Duration::from_secs(agent.config().perf.sql_tx_timeout as u64),
-        max_queue_len,
-    );
+impl ChangesActor {
+    pub(super) fn new(
+        agent: Agent,
+        bookie: Bookie,
+        rx_changes: CorroReceiver<(ChangeV1, ChangeSource, Option<BroadcastV1>)>,
+    ) -> Self {
+        let max_queue_len = agent.config().perf.processing_queue_len;
 
-    let max_seen_cache_len: usize = max_queue_len;
-    let metrics_tracker = agent.metrics_tracker();
+        let state = HandleChangesState::new(
+            agent.config().perf.apply_queue_min_batch_size,
+            agent.config().perf.apply_queue_step_base,
+            agent.config().perf.apply_queue_max_batch_size,
+            agent.config().perf.apply_queue_batch_threshold_ratio,
+            Duration::from_millis(agent.config().perf.apply_queue_timeout as u64),
+            Duration::from_secs(agent.config().perf.sql_tx_timeout as u64),
+            max_queue_len,
+        );
 
-    // unlikely, but max_seen_cache_len can be less than 10, in that case we want to just clear the whole cache
-    // (todo): put some validation in config instead
-    let keep_seen_cache_size: usize = if max_seen_cache_len > 10 {
-        cmp::max(10, max_seen_cache_len / 10)
-    } else {
-        0
-    };
-    let mut seen: IndexMap<_, RangeInclusiveSet<CrsqlSeq>> = IndexMap::new();
-
-    loop {
-        let (change, src, original_bcast) = tokio::select! {
-            biased;
-
-            // Processing task finished
-            res = async { state.processing_task.as_mut().unwrap().await }, if state.processing_task.is_some() => {
-                state.handle_task_completion(&agent, &bookie, res);
-                continue;
-            },
-
-            // New changes arrive
-            maybe_change_src = rx_changes.recv() => match maybe_change_src {
-                Some((change, src, original_bcast)) => (change, src, original_bcast),
-                None => break,
-            },
-
-            // Timeout fires
-            _ = async { state.max_wait.as_mut().unwrap().await }, if state.max_wait.is_some() => {
-                // Emit metrics
-                gauge!("corro.agent.changes.in_queue").set(state.buf_cost as f64);
-                gauge!("corro.agent.changesets.in_queue").set(state.queue.len() as f64);
-                gauge!("corro.agent.changes.processing.jobs").set(if state.processing_task.is_some() { 1.0 } else { 0.0 });
-                metrics_tracker.observe_queue_size(state.queue.len() as u64);
-
-                state.handle_timeout(&agent, &bookie);
-
-                // Cleanup seen cache
-                if seen.len() > max_seen_cache_len {
-                    seen.drain(..seen.len() - keep_seen_cache_size);
-                }
-
-                continue;
-            },
-
-            // Corrosion is shutting down
-            _ = &mut tripwire => {
-                break;
-            }
+        let max_seen_cache_len = max_queue_len;
+        let keep_seen_cache_size = if max_seen_cache_len > 10 {
+            cmp::max(10, max_seen_cache_len / 10)
+        } else {
+            0
         };
 
-        let change_len = change.len();
-        counter!("corro.agent.changes.recv").increment(std::cmp::max(change_len, 1) as u64); // count empties...
-
-        // Skip changes from ourselves
-        if change.actor_id == agent.actor_id() {
-            continue;
+        Self {
+            agent,
+            bookie,
+            rx_changes,
+            state,
+            max_seen_cache_len,
+            keep_seen_cache_size,
+            seen: IndexMap::new(),
         }
+    }
 
-        // Skip changes we've already seen recently in the seen cache
-        if let Some(mut seqs) = change.seqs() {
-            let v = change.versions().start();
-            if let Some(seen_seqs) = seen.get(&(change.actor_id, v)) {
-                if seqs.all(|seq| seen_seqs.contains(&seq)) {
-                    if matches!(src, ChangeSource::Broadcast) {
-                        counter!("corro.broadcast.duplicate.count", "from" => "cache").increment(1);
+    pub(super) fn mark_unhealthy(&self, reason: &str) {
+        self.agent.mark_unhealthy(reason);
+    }
+
+    pub(super) async fn run(&mut self, mut tripwire: Tripwire) {
+        let agent = self.agent.clone();
+        let bookie = self.bookie.clone();
+        let rx_changes = &mut self.rx_changes;
+        let state = &mut self.state;
+        let seen = &mut self.seen;
+        let max_seen_cache_len = self.max_seen_cache_len;
+        let keep_seen_cache_size = self.keep_seen_cache_size;
+        let metrics_tracker = agent.metrics_tracker();
+
+        loop {
+            let (change, src, original_bcast) = tokio::select! {
+                biased;
+
+                res = async { state.processing_task.as_mut().unwrap().await }, if state.processing_task.is_some() => {
+                    state.handle_task_completion(&agent, &bookie, res);
+                    continue;
+                },
+
+                maybe_change_src = rx_changes.recv() => match maybe_change_src {
+                    Some((change, src, original_bcast)) => (change, src, original_bcast),
+                    None => break,
+                },
+
+                _ = async { state.max_wait.as_mut().unwrap().await }, if state.max_wait.is_some() => {
+                    gauge!("corro.agent.changes.in_queue").set(state.buf_cost as f64);
+                    gauge!("corro.agent.changesets.in_queue").set(state.queue.len() as f64);
+                    gauge!("corro.agent.changes.processing.jobs")
+                        .set(if state.processing_task.is_some() { 1.0 } else { 0.0 });
+
+                    metrics_tracker.observe_queue_size(state.queue.len() as u64);
+
+                    state.handle_timeout(&agent, &bookie);
+
+                    if seen.len() > max_seen_cache_len {
+                        seen.drain(..seen.len() - keep_seen_cache_size);
                     }
+
+                    continue;
+                },
+
+                _ = &mut tripwire => {
+                    break;
+                }
+            };
+
+            let change_len = change.len();
+            counter!("corro.agent.changes.recv").increment(std::cmp::max(change_len, 1) as u64);
+
+            if change.actor_id == agent.actor_id() {
+                continue;
+            }
+
+            if let Some(mut seqs) = change.seqs() {
+                let v = change.versions().start();
+
+                if let Some(seen_seqs) = seen.get(&(change.actor_id, v)) {
+                    if seqs.all(|seq| seen_seqs.contains(&seq)) {
+                        if matches!(src, ChangeSource::Broadcast) {
+                            counter!(
+                                "corro.broadcast.duplicate.count",
+                                "from" => "cache"
+                            )
+                            .increment(1);
+                        }
+                        continue;
+                    }
+                }
+            } else if change
+                .versions()
+                .all(|v| seen.contains_key(&(change.actor_id, v)))
+            {
+                if matches!(src, ChangeSource::Broadcast) {
+                    counter!(
+                        "corro.broadcast.duplicate.count",
+                        "from" => "cache"
+                    )
+                    .increment(1);
+                }
+                continue;
+            }
+
+            let src_str: &'static str = src.into();
+
+            let recv_lag = change.ts().and_then(|ts| {
+                let mut our_ts = Timestamp::from(agent.clock().new_timestamp());
+
+                if ts > our_ts {
+                    if let Err(e) = agent.update_clock_with_timestamp(change.actor_id, ts) {
+                        error!("could not update clock from actor {}: {e}", change.actor_id);
+                        return None;
+                    }
+
+                    counter!(
+                        "corro.agent.clock.update",
+                        "source" => src_str
+                    )
+                    .increment(1);
+
+                    our_ts = Timestamp::from(agent.clock().new_timestamp());
+                }
+
+                Some((our_ts.0 - ts.0).to_duration())
+            });
+
+            if matches!(src, ChangeSource::Broadcast) {
+                counter!(
+                    "corro.broadcast.recv.count",
+                    "kind" => "change"
+                )
+                .increment(1);
+            }
+
+            let booked = bookie.get(&change.actor_id);
+
+            if let Some(booked) = booked {
+                if booked.read().contains_all(change.versions(), change.seqs()) {
+                    trace!("already seen, stop disseminating");
+
+                    if matches!(src, ChangeSource::Broadcast) {
+                        counter!(
+                            "corro.broadcast.duplicate.count",
+                            "from" => "bookie"
+                        )
+                        .increment(1);
+                    }
+
                     continue;
                 }
             }
-        } else if change
-            .versions()
-            .all(|v| seen.contains_key(&(change.actor_id, v)))
-        {
-            if matches!(src, ChangeSource::Broadcast) {
-                counter!("corro.broadcast.duplicate.count", "from" => "cache").increment(1);
-            }
-            continue;
-        }
 
-        // Update logical clock if needed
-        let src_str: &'static str = src.into();
-        let recv_lag = change.ts().and_then(|ts| {
-            let mut our_ts = Timestamp::from(agent.clock().new_timestamp());
-            if ts > our_ts {
-                if let Err(e) = agent.update_clock_with_timestamp(change.actor_id, ts) {
-                    error!("could not update clock from actor {}: {e}", change.actor_id);
-                    return None;
-                }
-                counter!("corro.agent.clock.update", "source" => src_str).increment(1);
-                // update our_ts to the new timestamp
-                our_ts = Timestamp::from(agent.clock().new_timestamp());
-            }
-            Some((our_ts.0 - ts.0).to_duration())
-        });
-
-        if matches!(src, ChangeSource::Broadcast) {
-            counter!("corro.broadcast.recv.count", "kind" => "change").increment(1);
-        }
-
-        // Skip changes we've already seen in the bookie
-        let booked = bookie.get(&change.actor_id);
-        if let Some(booked) = booked {
-            if booked.read().contains_all(change.versions(), change.seqs()) {
-                trace!("already seen, stop disseminating");
-                if matches!(src, ChangeSource::Broadcast) {
-                    counter!("corro.broadcast.duplicate.count", "from" => "bookie").increment(1);
-                }
-                continue;
-            }
-        }
-
-        if let Some(recv_lag) = recv_lag {
-            histogram!("corro.agent.changes.recv.lag.seconds", "source" => src_str)
+            if let Some(recv_lag) = recv_lag {
+                histogram!(
+                    "corro.agent.changes.recv.lag.seconds",
+                    "source" => src_str
+                )
                 .record(recv_lag.as_secs_f64());
-        }
+            }
 
-        // If we need to drop an old change, drop it from the seen cache aswell
-        while let Some(dropped_change) = state.maybe_drop_old_change() {
-            for v in dropped_change.versions() {
-                if let Entry::Occupied(mut entry) = seen.entry((change.actor_id, v)) {
-                    if let Some(seqs) = dropped_change.seqs() {
-                        entry.get_mut().remove(seqs.into());
-                    } else {
-                        entry.swap_remove_entry();
+            while let Some(dropped_change) = state.maybe_drop_old_change() {
+                for v in dropped_change.versions() {
+                    if let Entry::Occupied(mut entry) = seen.entry((change.actor_id, v)) {
+                        if let Some(seqs) = dropped_change.seqs() {
+                            entry.get_mut().remove(seqs.into());
+                        } else {
+                            entry.swap_remove_entry();
+                        }
                     }
-                };
+                }
             }
-        }
 
-        // Register the new change in the seen cache
-        // this will only run once for a non-empty changeset
-        for v in change.versions() {
-            let entry = seen.entry((change.actor_id, v)).or_default();
-            if let Some(seqs) = change.seqs() {
-                entry.extend([seqs.into()]);
+            for v in change.versions() {
+                let entry = seen.entry((change.actor_id, v)).or_default();
+
+                if let Some(seqs) = change.seqs() {
+                    entry.extend([seqs.into()]);
+                }
             }
+
+            assert_sometimes!(
+                matches!(src, ChangeSource::Sync),
+                "Corrosion receives changes through sync"
+            );
+
+            if matches!(src, ChangeSource::Broadcast) && !change.is_empty() {
+                assert_sometimes!(true, "Corrosion rebroadcasts changes");
+                agent.broadcaster().rebroadcast(&change, original_bcast);
+            }
+
+            state.handle_new_change(&agent, &bookie, change, src);
         }
-
-        assert_sometimes!(
-            matches!(src, ChangeSource::Sync),
-            "Corrosion receives changes through sync"
-        );
-
-        // Rebroadcast changes received from broadcast (gossip method).
-        if matches!(src, ChangeSource::Broadcast) && !change.is_empty() {
-            assert_sometimes!(true, "Corrosion rebroadcasts changes");
-            agent.broadcaster().rebroadcast(&change, original_bcast);
-        }
-
-        // Handle the new change - queue it and potentially spawn a batch
-        state.handle_new_change(&agent, &bookie, change, src);
     }
 }
 
@@ -1308,6 +1423,21 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn batch_threshold_never_rounds_to_zero() {
+        let state = HandleChangesState::new(
+            1,
+            0,
+            1,
+            0.9,
+            Duration::from_millis(1),
+            Duration::from_secs(1),
+            1,
+        );
+
+        assert_eq!(state.batch_threshold(), 1);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn test_loadshed_handle_changes() -> eyre::Result<()> {
         _ = tracing_subscriber::fmt::try_init();
@@ -1331,12 +1461,15 @@ mod tests {
 
         let other_actor = ActorId(uuid::Uuid::new_v4());
         let bookie = Bookie::new(Default::default());
-        tokio::spawn(handle_changes(
-            agent.clone(),
-            bookie.clone(),
-            agent_options.rx_changes,
-            tripwire,
-        ));
+
+        let actor_agent = agent.clone();
+        let actor_bookie = bookie.clone();
+        let rx_changes = agent_options.rx_changes;
+
+        tokio::spawn(async move {
+            let mut actor = ChangesActor::new(actor_agent, actor_bookie, rx_changes);
+            actor.run(tripwire).await;
+        });
 
         {
             // hold write connection so that max_concurrency is reached
