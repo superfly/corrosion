@@ -329,7 +329,7 @@ impl Transport {
             };
 
             let measured = marks.get(&addr).is_none_or(|prev| {
-                prev.acks != mark.acks || prev.min_rtt.as_millis() != mark.min_rtt.as_millis()
+                prev.min_rtt.as_millis() != mark.min_rtt.as_millis()
             });
 
             if !measured {
