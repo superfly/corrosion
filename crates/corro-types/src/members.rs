@@ -55,7 +55,7 @@ impl MemberState {
 const RING_BUCKETS: [Range<u64>; 6] = [0..6, 6..15, 15..50, 50..100, 100..200, 200..300];
 
 /// Number of recent RTT samples retained per member and used to compute the
-/// median RTT for ring assignment.
+/// max RTT for ring assignment.
 const RTT_WINDOW: usize = 20;
 
 /// How far past a bucket boundary the RTT must sit before an adjacent ring
@@ -108,19 +108,9 @@ pub struct Rtt {
 }
 
 impl Rtt {
-    /// Median sample in the window, in milliseconds.
-    pub fn median_ms(&self) -> Option<u64> {
-        let mut samples: Vec<u64> = self.buf.iter().copied().collect();
-        if samples.is_empty() {
-            return None;
-        }
-        samples.sort_unstable();
-        let n = samples.len();
-        Some(if n % 2 == 1 {
-            samples[n / 2]
-        } else {
-            (samples[n / 2 - 1] + samples[n / 2]) / 2
-        })
+    /// Max sample in the window, in milliseconds.
+    pub fn max_ms(&self) -> Option<u64> {
+        self.buf.iter().copied().max()
     }
 }
 
@@ -158,11 +148,11 @@ impl Members {
         }
     }
 
-    /// Median RTT in milliseconds for this member (same statistic as
+    /// Max RTT in milliseconds for this member (same statistic as
     /// [`Self::recalculate_rings`]), or `None` if there are no samples yet.
     pub fn min_rtt_ms(&self, actor_id: &ActorId) -> Option<u64> {
         let addr = self.states.get(actor_id)?.addr;
-        self.rtts.get(&addr)?.median_ms()
+        self.rtts.get(&addr)?.max_ms()
     }
 
     // A result of `true` means that the effective list of
@@ -244,22 +234,22 @@ impl Members {
         self.recalculate_rings(addr)
     }
 
-    /// For a given member, calculate the median RTT and update `self.ring`
+    /// For a given member, calculate the max RTT and update `self.ring`
     /// with the index of the corresponding bucket in `RING_BUCKETS`, applying
     /// hysteresis on moves between adjacent buckets (see [`ring_with_hysteresis`])
     /// to avoid flapping when the RTT sits near a bucket boundary.
     fn recalculate_rings(&mut self, addr: SocketAddr) {
         if let Some(actor_id) = self.by_addr.get(&addr) {
             if let Some(rtt) = self.rtts.get(&addr) {
-                let median = rtt.median_ms();
+                let max = rtt.max_ms();
 
                 let (b1, b2) = rtt.buf.as_slices();
-                if let Some(median) = median {
+                if let Some(max) = max {
                     if let Some(state) = self.states.get_mut(actor_id) {
-                        let new_ring = ring_with_hysteresis(state.ring, median);
+                        let new_ring = ring_with_hysteresis(state.ring, max);
                         if state.ring != Some(new_ring) {
                             debug!(
-                                "actor: {actor_id}, old ring: {:?}, new ring: {new_ring}, median: {median}, buf: {:?} {:?}",
+                                "actor: {actor_id}, old ring: {:?}, new ring: {new_ring}, max: {max}, buf: {:?} {:?}",
                                 state.ring, b1, b2
                             );
                         }

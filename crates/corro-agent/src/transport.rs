@@ -283,8 +283,8 @@ impl Transport {
     ///
     /// `Connection::rtt` is a smoothed cache. We sample `path.min_rtt` so a
     /// stall's decay tail does not fill the ring window. A stable floor is
-    /// still pushed when ACKs arrive, so the median window fills with the
-    /// current path rather than a single outlier.
+    /// still pushed when ACKs arrive, so the window fills with the current
+    /// path rather than a single outlier.
     pub async fn sample_rtts(&self) {
         // Arc handles only; the map lock is released before any per-connection
         // lock is taken.
