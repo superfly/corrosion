@@ -55,12 +55,11 @@ impl MemberState {
 const RING_BUCKETS: [Range<u64>; 6] = [0..6, 6..15, 15..50, 50..100, 100..200, 200..300];
 
 /// Number of recent RTT samples retained per member and used to compute the
-/// minimum RTT for ring assignment.
+/// max RTT for ring assignment.
 const RTT_WINDOW: usize = 20;
 
-/// How far past a bucket boundary the RTT must sit before the ring follows it.
-///
-/// This prevents little changes in rtt from changing a nodes ring.
+/// How far past a bucket boundary the RTT must sit before an adjacent ring
+/// step follows it. Stops 1ms wobble on a boundary from flipping rings.
 const RING_HYSTERESIS_MS: u64 = 2;
 
 /// Index of the `RING_BUCKETS` range containing `rtt_ms`. Values at or above
@@ -82,8 +81,10 @@ fn ring_with_hysteresis(current: Option<u8>, rtt_ms: u64) -> u8 {
     if target == current {
         return target;
     }
+    if target.abs_diff(current) > 1 {
+        return target;
+    }
 
-    // Step at most one ring toward the target; hysteresis applies to that step.
     if target > current {
         let boundary = RING_BUCKETS[current as usize].end;
         if rtt_ms >= boundary + RING_HYSTERESIS_MS {
@@ -107,13 +108,9 @@ pub struct Rtt {
 }
 
 impl Rtt {
-    /// Smallest sample in the window, in milliseconds.
-    ///
-    /// Samples are Quinn's latest RTT (the last ACK-based measurement), not
-    /// the smoothed estimator. One delayed ACK still produces a large sample;
-    /// the minimum of the window is the propagation floor the rings describe.
-    pub fn min_ms(&self) -> Option<u64> {
-        self.buf.iter().min().copied()
+    /// Max sample in the window, in milliseconds.
+    pub fn max_ms(&self) -> Option<u64> {
+        self.buf.iter().copied().max()
     }
 }
 
@@ -151,11 +148,11 @@ impl Members {
         }
     }
 
-    /// Minimum RTT in milliseconds for this member (same statistic as
+    /// Max RTT in milliseconds for this member (same statistic as
     /// [`Self::recalculate_rings`]), or `None` if there are no samples yet.
     pub fn min_rtt_ms(&self, actor_id: &ActorId) -> Option<u64> {
         let addr = self.states.get(actor_id)?.addr;
-        self.rtts.get(&addr)?.min_ms()
+        self.rtts.get(&addr)?.max_ms()
     }
 
     // A result of `true` means that the effective list of
@@ -234,26 +231,25 @@ impl Members {
             .or_default()
             .buf
             .push_front(rtt.subsec_millis() as u64 + (rtt.as_secs() * 1000));
-
         self.recalculate_rings(addr)
     }
 
-    /// For a given member, calculate the minimum RTT and update `self.ring`
+    /// For a given member, calculate the max RTT and update `self.ring`
     /// with the index of the corresponding bucket in `RING_BUCKETS`, applying
     /// hysteresis on moves between adjacent buckets (see [`ring_with_hysteresis`])
     /// to avoid flapping when the RTT sits near a bucket boundary.
     fn recalculate_rings(&mut self, addr: SocketAddr) {
         if let Some(actor_id) = self.by_addr.get(&addr) {
             if let Some(rtt) = self.rtts.get(&addr) {
-                let min = rtt.min_ms();
+                let max = rtt.max_ms();
 
                 let (b1, b2) = rtt.buf.as_slices();
-                if let Some(min) = min {
+                if let Some(max) = max {
                     if let Some(state) = self.states.get_mut(actor_id) {
-                        let new_ring = ring_with_hysteresis(state.ring, min);
+                        let new_ring = ring_with_hysteresis(state.ring, max);
                         if state.ring != Some(new_ring) {
                             debug!(
-                                "actor: {actor_id}, old ring: {:?}, new ring: {new_ring}, min: {min}, buf: {:?} {:?}",
+                                "actor: {actor_id}, old ring: {:?}, new ring: {new_ring}, max: {max}, buf: {:?} {:?}",
                                 state.ring, b1, b2
                             );
                         }
@@ -295,9 +291,8 @@ mod tests {
 
     #[test]
     fn ring_survives_the_jitter_seen_in_production() {
-        // The minimum of the window moved by at most 1ms across every peer
-        // sampled, so a peer wobbling that much on a boundary must keep a ring
-        // that holds at every value it visits.
+        // A peer wobbling 1ms on a boundary must keep a ring that holds at
+        // every value it visits.
         for boundary in [6u64, 15, 50, 100, 200] {
             let held: Vec<u8> = (0..RING_BUCKETS.len() as u8)
                 .filter(|ring| {

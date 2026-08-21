@@ -24,7 +24,7 @@ use corro_types::{
 use governor::{Quota, RateLimiter};
 use indexmap::IndexMap;
 use metrics::{counter, gauge, histogram};
-use plum_foca::{Payload, PlumPrio, PlumtreeState, RttInfo, SeenStore, Timer};
+use plum_foca::{Payload, PlumtreeState, Round, RttInfo, SeenStore, Timer};
 use rangemap::RangeInclusiveSet;
 use speedy::Writable;
 use tokio::{
@@ -234,7 +234,7 @@ struct CorrosionPlumtreeRuntime {
     tx_changes: CorroSender<(ChangeV1, ChangeSource, Option<BroadcastV1>)>,
     change_dict: Arc<ArcSwapOption<ZstdDicts>>,
     timer_spawner: TimerSpawner<plum_foca::Timer<ChangeId, ActorId>>,
-    tx_msgs: CorroSender<(PlumPrio, Vec<ActorId>, PlumtreeMsgV1)>,
+    tx_msgs: CorroSender<(Vec<ActorId>, PlumtreeMsgV1)>,
 }
 
 impl CorrosionPlumtreeRuntime {
@@ -242,7 +242,7 @@ impl CorrosionPlumtreeRuntime {
         tx_changes: CorroSender<(ChangeV1, ChangeSource, Option<BroadcastV1>)>,
         change_dict: Arc<ArcSwapOption<ZstdDicts>>,
         timer_spawner: TimerSpawner<plum_foca::Timer<ChangeId, ActorId>>,
-        tx_msgs: CorroSender<(PlumPrio, Vec<ActorId>, PlumtreeMsgV1)>,
+        tx_msgs: CorroSender<(Vec<ActorId>, PlumtreeMsgV1)>,
     ) -> Self {
         Self {
             tx_changes,
@@ -258,15 +258,14 @@ impl plum_foca::Runtime<ChangeId, PlumtreePayload, ActorId> for CorrosionPlumtre
         &mut self,
         peers: Vec<ActorId>,
         msg: plum_foca::PlumtreeMsg<ChangeId, PlumtreePayload, ActorId>,
-        priority: PlumPrio,
     ) {
-        if let Err(e) = self.tx_msgs.try_send((priority, peers, msg)) {
+        if let Err(e) = self.tx_msgs.try_send((peers, msg)) {
             error!("plumtree: could not send message: {e}");
         }
     }
 
-    fn send(&mut self, to: ActorId, msg: PlumtreeMsgV1, prio: PlumPrio) {
-        if let Err(e) = self.tx_msgs.try_send((prio, vec![to], msg)) {
+    fn send(&mut self, to: ActorId, msg: PlumtreeMsgV1) {
+        if let Err(e) = self.tx_msgs.try_send((vec![to], msg)) {
             error!("plumtree: could not send message: {e}");
         }
     }
@@ -367,6 +366,7 @@ pub async fn spawn_plumtree_loop(
         max_received_entries: max_queue_len,
         prune_throttle: plumtree_config.prune_throttle_secs.map(Duration::from_secs),
         eager_ratios: plumtree_config.eager_ratios,
+        ring_locked_radius: plumtree_config.ring_locked_radius,
     };
 
     plumtree_loop(
@@ -578,19 +578,79 @@ pub async fn plumtree_loop(
 struct PendingPlumtreeSend {
     peers: Vec<ActorId>,
     payload: BytesMut,
+    shed_key: ShedKey,
+}
+
+/// Kind of a queued message, used to break ties between equal rounds
+/// when dropping queue items.
+/// mirrors `PlumtreeMsg`
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum ShedKind {
+    Gossip,
+    Graft,
+    IHave,
+    Prune,
+}
+
+/// Shed priority for a queued send. Round first then kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct ShedKey(Round, ShedKind);
+
+impl ShedKey {
+    /// Classify a message: `true` means it belongs on the local queue.
+    ///
+    fn of(msg: &PlumtreeMsgV1) -> (bool, Self) {
+        match msg {
+            // Round 0 gossip is ours: either a fresh local broadcast or a
+            // graft reply serving our own cached payload.
+            PlumtreeMsgV1::Gossip(g) if g.round == 0 => (true, Self(0, ShedKind::Gossip)),
+            PlumtreeMsgV1::Gossip(g) => (false, Self(g.round, ShedKind::Gossip)),
+            PlumtreeMsgV1::IHave(m) => {
+                let round = m
+                    .digests
+                    .iter()
+                    .map(|d| d.round)
+                    .min()
+                    .unwrap_or(Round::MAX);
+                (false, Self(round, ShedKind::IHave))
+            }
+            PlumtreeMsgV1::Graft(m) => {
+                let round = m
+                    .requests
+                    .iter()
+                    .map(|r| r.round)
+                    .min()
+                    .unwrap_or(Round::MAX);
+                (false, Self(round, ShedKind::Graft))
+            }
+            PlumtreeMsgV1::Prune(_) => (false, Self(Round::MAX, ShedKind::Prune)),
+        }
+    }
+
+    fn label(&self, is_local: bool) -> &'static str {
+        if is_local {
+            return "local_gossip";
+        }
+        match self.1 {
+            ShedKind::Gossip => "forwarded_gossip",
+            ShedKind::Graft => "graft",
+            ShedKind::IHave => "i_have",
+            ShedKind::Prune => "prune",
+        }
+    }
 }
 
 async fn send_messages_loop(
     agent: Agent,
     transport: Transport,
-    mut rx_msgs: CorroReceiver<(PlumPrio, Vec<ActorId>, PlumtreeMsgV1)>,
+    mut rx_msgs: CorroReceiver<(Vec<ActorId>, PlumtreeMsgV1)>,
 ) {
-    const MAX_INFLIGHT: usize = 500;
-    const P1_GOSSIP_BATCH_INTERVAL: Duration = Duration::from_millis(10);
-    const P1_GOSSIP_BATCH_CUTOFF: usize = 1024 * 1024;
+    const MAX_INFLIGHT: usize = 700;
+    const GOSSIP_BATCH_INTERVAL: Duration = Duration::from_millis(10);
+    const GOSSIP_BATCH_CUTOFF: usize = 1024 * 1024;
 
     let cluster_id = agent.cluster_id();
-    let max_queue_len = agent.config().perf.processing_queue_len;
+    let max_queue_len = agent.config().perf.plumtree_send_queue_len;
     let batch_gossip = agent
         .config()
         .gossip
@@ -604,13 +664,16 @@ async fn send_messages_loop(
     let mut ser_buf = BytesMut::new();
     let mut frame_buf = BytesMut::new();
 
-    let mut p0_queue: VecDeque<PendingPlumtreeSend> = VecDeque::new();
-    let mut p1_queue: VecDeque<PendingPlumtreeSend> = VecDeque::new();
-    let mut p1_gossip_batch = PendingPlumtreeSend {
+    let mut local_queue: VecDeque<PendingPlumtreeSend> = VecDeque::new();
+    let mut remote_queue: VecDeque<PendingPlumtreeSend> = VecDeque::new();
+    let mut gossip_batch = PendingPlumtreeSend {
         peers: Vec::new(),
         payload: BytesMut::new(),
+        shed_key: ShedKey(Round::MAX, ShedKind::Gossip),
     };
-    let mut gossip_batch_interval = interval(P1_GOSSIP_BATCH_INTERVAL);
+    let mut gossip_batch_interval = interval(GOSSIP_BATCH_INTERVAL);
+    let mut metrics_interval = interval(Duration::from_secs(10));
+    metrics_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut join_set = JoinSet::new();
     let mut limited_log_count = 0;
     let mut drop_log_count = 0;
@@ -623,14 +686,24 @@ async fn send_messages_loop(
     loop {
         let msg = tokio::select! {
             biased;
+            _ = metrics_interval.tick() => {
+                gauge!("corro.plumtree.send_queue.len", "queue" => "local").set(local_queue.len() as f64);
+                gauge!("corro.plumtree.send_queue.len", "queue" => "remote").set(remote_queue.len() as f64);
+                gauge!("corro.plumtree.send.inflight").set(join_set.len() as f64);
+                continue;
+            },
             _ = join_set.join_next(), if !join_set.is_empty() => {
                 continue;
             },
             _ = gossip_batch_interval.tick(), if batch_gossip => {
-                if !p1_gossip_batch.payload.is_empty() {
-                    p1_queue.push_back(PendingPlumtreeSend {
-                        peers: std::mem::take(&mut p1_gossip_batch.peers),
-                        payload: std::mem::take(&mut p1_gossip_batch.payload),
+                if !gossip_batch.payload.is_empty() {
+                    remote_queue.push_back(PendingPlumtreeSend {
+                        peers: std::mem::take(&mut gossip_batch.peers),
+                        payload: std::mem::take(&mut gossip_batch.payload),
+                        shed_key: std::mem::replace(
+                            &mut gossip_batch.shed_key,
+                            ShedKey(Round::MAX, ShedKind::Gossip),
+                        ),
                     });
                 }
                 continue;
@@ -645,33 +718,43 @@ async fn send_messages_loop(
         };
 
         let mut rate_limited = false;
-        let (prio, peers, msg) = msg;
+        let (peers, msg) = msg;
         trace!("plumtree: msg: {msg:?}, peers: {peers:?}");
-        let p1_gossip = matches!(&msg, PlumtreeMsgV1::Gossip(_));
+        let (is_local, shed_key) = ShedKey::of(&msg);
+
+        let batchable = !is_local && matches!(&msg, PlumtreeMsgV1::Gossip(_));
         let payload =
             match encode_plumtree_wire(cluster_id, &mut codec, &mut ser_buf, &mut frame_buf, msg) {
                 Ok(payload) => payload,
                 Err(()) => continue,
             };
 
-        if batch_gossip && p1_gossip {
+        if batch_gossip && batchable {
             // gossip is sent to latest eager peers
-            p1_gossip_batch.peers = peers;
-            p1_gossip_batch.payload.extend_from_slice(&payload);
-            if p1_gossip_batch.payload.len() >= P1_GOSSIP_BATCH_CUTOFF {
-                p1_queue.push_back(PendingPlumtreeSend {
-                    peers: std::mem::take(&mut p1_gossip_batch.peers),
-                    payload: std::mem::take(&mut p1_gossip_batch.payload),
+            gossip_batch.peers = peers;
+            gossip_batch.payload.extend_from_slice(&payload);
+            // A batch is only as sheddable as its most valuable member.
+            gossip_batch.shed_key = gossip_batch.shed_key.min(shed_key);
+            if gossip_batch.payload.len() >= GOSSIP_BATCH_CUTOFF {
+                remote_queue.push_back(PendingPlumtreeSend {
+                    peers: std::mem::take(&mut gossip_batch.peers),
+                    payload: std::mem::take(&mut gossip_batch.payload),
+                    shed_key: std::mem::replace(
+                        &mut gossip_batch.shed_key,
+                        ShedKey(Round::MAX, ShedKind::Gossip),
+                    ),
                 });
             }
         } else {
             let pending = PendingPlumtreeSend {
                 peers,
                 payload: BytesMut::from(payload),
+                shed_key,
             };
-            match prio {
-                PlumPrio::P0 => p0_queue.push_back(pending),
-                PlumPrio::P1 => p1_queue.push_back(pending),
+            if is_local {
+                local_queue.push_back(pending);
+            } else {
+                remote_queue.push_back(pending);
             }
         }
 
@@ -680,7 +763,7 @@ async fn send_messages_loop(
             &transport,
             &bytes_per_sec,
             &mut join_set,
-            &mut p0_queue,
+            &mut local_queue,
             MAX_INFLIGHT,
             &mut rate_limited,
             &mut limited_log_count,
@@ -691,19 +774,19 @@ async fn send_messages_loop(
                 &transport,
                 &bytes_per_sec,
                 &mut join_set,
-                &mut p1_queue,
+                &mut remote_queue,
                 MAX_INFLIGHT,
                 &mut rate_limited,
                 &mut limited_log_count,
             );
         }
 
-        if drop_oldest_plumtree_send(&mut p0_queue, &mut p1_queue, max_queue_len).is_some() {
-            log_at_pow_10(
-                "dropped old plumtree message from send queue",
-                &mut drop_log_count,
-            );
-            counter!("corro.plumtree.send.dropped").increment(1);
+        if let Some((was_local, shed)) =
+            shed_plumtree_send(&mut local_queue, &mut remote_queue, max_queue_len)
+        {
+            log_at_pow_10("shed plumtree message from send queue", &mut drop_log_count);
+            counter!("corro.plumtree.send.dropped", "kind" => shed.shed_key.label(was_local))
+                .increment(1);
         }
     }
 
@@ -811,16 +894,34 @@ fn drain_plumtree_queue(
     }
 }
 
-fn drop_oldest_plumtree_send(
-    p0_queue: &mut VecDeque<PendingPlumtreeSend>,
-    p1_queue: &mut VecDeque<PendingPlumtreeSend>,
+/// How many of the oldest queued entries `shed_plumtree_send` inspects when
+/// choosing a victim. Bounds the cost of shedding under overload.
+const SHED_SCAN_WINDOW: usize = 512;
+
+/// Drop items from queue, we drop from priority queue (based on ShedKey) first,
+/// then local queue
+fn shed_plumtree_send(
+    local_queue: &mut VecDeque<PendingPlumtreeSend>,
+    remote_queue: &mut VecDeque<PendingPlumtreeSend>,
     max: usize,
-) -> Option<PendingPlumtreeSend> {
-    if p0_queue.len() + p1_queue.len() <= max {
+) -> Option<(bool, PendingPlumtreeSend)> {
+    if local_queue.len() + remote_queue.len() <= max {
         return None;
     }
-    // drop from low-priority queue first
-    p1_queue.pop_back().or_else(|| p0_queue.pop_back())
+
+    let (was_local, queue) = if remote_queue.is_empty() {
+        (true, local_queue)
+    } else {
+        (false, remote_queue)
+    };
+    let victim = queue
+        .iter()
+        .enumerate()
+        .take(SHED_SCAN_WINDOW)
+        // Highest shed key wins; Reverse(i) breaks ties toward the oldest.
+        .max_by_key(|(i, pending)| (pending.shed_key, std::cmp::Reverse(*i)))
+        .map(|(i, _)| i)?;
+    queue.remove(victim).map(|pending| (was_local, pending))
 }
 
 /// Ring + RTT snapshot from in-memory [`Members`].
@@ -905,5 +1006,176 @@ mod tests {
 
         // After seeding, a second gossip for the same change is a real duplicate.
         assert_eq!(store.observe(booked_id, round), Some(1));
+    }
+
+    fn pending(round: Round, kind: ShedKind, tag: u8) -> PendingPlumtreeSend {
+        PendingPlumtreeSend {
+            peers: vec![ActorId(uuid::Uuid::new_v4())],
+            payload: BytesMut::from(&[tag][..]),
+            shed_key: ShedKey(round, kind),
+        }
+    }
+
+    fn gossip(round: Round, tag: u8) -> PendingPlumtreeSend {
+        pending(round, ShedKind::Gossip, tag)
+    }
+
+    fn prune(tag: u8) -> PendingPlumtreeSend {
+        pending(Round::MAX, ShedKind::Prune, tag)
+    }
+
+    fn tag(shed: Option<(bool, PendingPlumtreeSend)>) -> u8 {
+        shed.expect("expected a shed").1.payload[0]
+    }
+
+    #[test]
+    fn shed_does_nothing_under_capacity() {
+        let mut local = VecDeque::from(vec![gossip(0, 1)]);
+        let mut remote = VecDeque::from(vec![gossip(9, 2)]);
+        assert!(shed_plumtree_send(&mut local, &mut remote, 2).is_none());
+        assert_eq!(local.len(), 1);
+        assert_eq!(remote.len(), 1);
+    }
+
+    #[test]
+    fn shed_picks_highest_round_first() {
+        // Rounds queued out of order; the most-travelled one must go first.
+        let mut local = VecDeque::new();
+        let mut remote = VecDeque::from(vec![gossip(3, 1), gossip(12, 2), gossip(7, 3)]);
+        assert_eq!(tag(shed_plumtree_send(&mut local, &mut remote, 2)), 2);
+        assert_eq!(tag(shed_plumtree_send(&mut local, &mut remote, 1)), 3);
+        assert_eq!(tag(shed_plumtree_send(&mut local, &mut remote, 0)), 1);
+    }
+
+    #[test]
+    fn shed_breaks_ties_toward_oldest() {
+        let mut local = VecDeque::new();
+        let mut remote = VecDeque::from(vec![
+            gossip(5, 1), // oldest
+            gossip(5, 2),
+            gossip(5, 3), // newest
+        ]);
+        assert_eq!(
+            tag(shed_plumtree_send(&mut local, &mut remote, 2)),
+            1,
+            "equal rounds should shed the oldest entry"
+        );
+    }
+
+    #[test]
+    fn shed_prune_goes_first_regardless_of_round() {
+        // A PRUNE carries no round, so it must shed ahead of even the
+        // highest-round gossip.
+        let mut local = VecDeque::new();
+        let mut remote = VecDeque::from(vec![gossip(Round::MAX, 1), prune(2), gossip(500, 3)]);
+        assert_eq!(tag(shed_plumtree_send(&mut local, &mut remote, 2)), 2);
+    }
+
+    #[test]
+    fn shed_orders_gossip_graft_ihave_at_equal_round() {
+        // Same round: ihave sheds first, then graft, and gossip is kept longest.
+        let mut local = VecDeque::new();
+        let mut remote = VecDeque::from(vec![
+            pending(4, ShedKind::Gossip, 1),
+            pending(4, ShedKind::Graft, 2),
+            pending(4, ShedKind::IHave, 3),
+        ]);
+        assert_eq!(tag(shed_plumtree_send(&mut local, &mut remote, 2)), 3);
+        assert_eq!(tag(shed_plumtree_send(&mut local, &mut remote, 1)), 2);
+        assert_eq!(tag(shed_plumtree_send(&mut local, &mut remote, 0)), 1);
+    }
+
+    #[test]
+    fn shed_round_outranks_kind() {
+        // A low-round ihave must survive a high-round gossip: round is primary.
+        let mut local = VecDeque::new();
+        let mut remote = VecDeque::from(vec![
+            pending(1, ShedKind::IHave, 1),
+            pending(30, ShedKind::Gossip, 2),
+        ]);
+        assert_eq!(tag(shed_plumtree_send(&mut local, &mut remote, 1)), 2);
+    }
+
+    #[test]
+    fn shed_never_touches_local_while_remote_has_anything() {
+        let mut local = VecDeque::from(vec![gossip(0, 1)]);
+        let mut remote = VecDeque::from(vec![gossip(2, 2)]);
+        let shed = shed_plumtree_send(&mut local, &mut remote, 1).expect("should shed");
+        assert!(!shed.0, "should come off the remote queue");
+        assert_eq!(shed.1.payload[0], 2);
+        assert_eq!(local.len(), 1, "our own broadcast must survive");
+    }
+
+    #[test]
+    fn shed_key_classifies_messages() {
+        use corro_types::broadcast::PlumtreePayload;
+        use plum_foca::{GossipMsg, GraftMsg, GraftRequest, IHaveDigest, IHaveMsg, PruneMsg};
+
+        let actor = ActorId(uuid::Uuid::new_v4());
+        let id = full_change_id(actor, 1, 0, 0, 0);
+
+        let prune: PlumtreeMsgV1 = plum_foca::PlumtreeMsg::Prune(PruneMsg {
+            sender: actor,
+            triggered_by: None,
+        });
+        assert_eq!(
+            ShedKey::of(&prune),
+            (false, ShedKey(Round::MAX, ShedKind::Prune))
+        );
+
+        // IHave and Graft take the minimum round of their batch: a batch is
+        // only as sheddable as its most valuable member.
+        let ihave: PlumtreeMsgV1 = plum_foca::PlumtreeMsg::IHave(IHaveMsg {
+            sender: actor,
+            digests: vec![
+                IHaveDigest {
+                    id: id.clone(),
+                    round: 9,
+                },
+                IHaveDigest {
+                    id: id.clone(),
+                    round: 3,
+                },
+            ],
+        });
+        assert_eq!(ShedKey::of(&ihave), (false, ShedKey(3, ShedKind::IHave)));
+
+        let graft: PlumtreeMsgV1 = plum_foca::PlumtreeMsg::Graft(GraftMsg {
+            sender: actor,
+            send: true,
+            requests: vec![
+                GraftRequest {
+                    id: id.clone(),
+                    round: 7,
+                },
+                GraftRequest {
+                    id: id.clone(),
+                    round: 2,
+                },
+            ],
+        });
+        assert_eq!(ShedKey::of(&graft), (false, ShedKey(2, ShedKind::Graft)));
+
+        // round 0 gossip is ours and routes to the local queue
+        let payload = PlumtreePayload {
+            id: id.clone(),
+            bcast: corro_types::broadcast::BroadcastV1::CompressedChange(vec![0u8; 4]),
+        };
+        let local: PlumtreeMsgV1 = plum_foca::PlumtreeMsg::Gossip(GossipMsg {
+            round: 0,
+            sender: actor,
+            payload: payload.clone(),
+        });
+        assert_eq!(ShedKey::of(&local), (true, ShedKey(0, ShedKind::Gossip)));
+
+        let forwarded: PlumtreeMsgV1 = plum_foca::PlumtreeMsg::Gossip(GossipMsg {
+            round: 6,
+            sender: actor,
+            payload,
+        });
+        assert_eq!(
+            ShedKey::of(&forwarded),
+            (false, ShedKey(6, ShedKind::Gossip))
+        );
     }
 }
