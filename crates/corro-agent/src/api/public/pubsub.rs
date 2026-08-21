@@ -618,6 +618,63 @@ pub async fn catch_up_sub(
     forward_sub_to_sender(matcher, sub_rx, evt_tx, params.skip_rows).await
 }
 
+async fn forward_created_sub_to_sender(
+    handle: MatcherHandle,
+    subs: SubsManager,
+    sub_tx: broadcast::Sender<(Bytes, QueryEventMeta)>,
+    sub_rx: broadcast::Receiver<(Bytes, QueryEventMeta)>,
+    mut evt_rx: mpsc::Receiver<QueryEvent>,
+    tx: mpsc::Sender<(Bytes, QueryEventMeta)>,
+    skip_rows: bool,
+) {
+    let mut buf = BytesMut::new();
+    let mut subscriber_open = true;
+
+    while let Some(query_evt) = evt_rx.recv().await {
+        let initial_done = matches!(
+            query_evt,
+            QueryEvent::EndOfQuery { .. } | QueryEvent::Error(_)
+        );
+
+        let skip_event = skip_rows
+            && matches!(
+                query_evt,
+                QueryEvent::Columns(_) | QueryEvent::Row(_, _) | QueryEvent::EndOfQuery { .. }
+            );
+
+        if subscriber_open && !skip_event {
+            let event = match make_query_event_bytes(&mut buf, &query_evt) {
+                Ok(event) => event,
+                Err(e) => {
+                    _ = tx
+                        .send((
+                            error_to_query_event_bytes(&mut buf, e),
+                            QueryEventMeta::Error,
+                        ))
+                        .await;
+                    handle.cleanup().await;
+                    subs.remove(&handle.id());
+                    return;
+                }
+            };
+
+            if tx.send(event).await.is_err() {
+                subscriber_open = false;
+            }
+        }
+
+        if initial_done {
+            break;
+        }
+    }
+
+    tokio::spawn(process_sub_channel(subs, handle.id(), sub_tx, evt_rx));
+
+    if subscriber_open {
+        forward_sub_to_sender(handle, sub_rx, tx, skip_rows).await;
+    }
+}
+
 pub async fn upsert_sub(
     handle: MatcherHandle,
     maybe_created: Option<MatcherCreated>,
@@ -635,15 +692,16 @@ pub async fn upsert_sub(
 
         let (sub_tx, sub_rx) = broadcast::channel(SUB_BROADCAST_CHANNEL_CAPACITY);
 
-        tokio::spawn(catch_up_sub(handle.clone(), params, sub_rx, tx));
-
         bcast_write.insert(handle.id(), sub_tx.clone());
 
-        tokio::spawn(process_sub_channel(
+        tokio::spawn(forward_created_sub_to_sender(
+            handle.clone(),
             subs.clone(),
-            handle.id(),
             sub_tx,
+            sub_rx,
             created.evt_rx,
+            tx,
+            params.skip_rows,
         ));
 
         Ok(handle.id())
@@ -1310,13 +1368,16 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_initial_subscription_survives_broadcast_backpressure() -> eyre::Result<()> {
+    async fn test_initial_subscription_survives_receiver_backpressure() -> eyre::Result<()> {
         _ = tracing_subscriber::fmt::try_init();
         let test = PubSubTest::with_n_agents(1).await?;
         let agent = &test.agents[0];
 
-        let data: Vec<Vec<SqliteValue>> =
-            vec![vec!["service-id-0".into(), "service-name-0".into()]];
+        let data: Vec<Vec<SqliteValue>> = vec![
+            vec!["service-id-0".into(), "service-name-0".into()],
+            vec!["service-id-1".into(), "service-name-1".into()],
+            vec!["service-id-2".into(), "service-name-2".into()],
+        ];
         agent.insert_test_data(&data).await?;
 
         let subs = agent.ta.agent.subs_manager();
@@ -1333,7 +1394,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(1);
         let mut bcast_write = agent.subs_bcast_cache.write().await;
 
-        let sub_id = upsert_sub(
+        upsert_sub(
             handle,
             maybe_created,
             subs,
@@ -1346,30 +1407,67 @@ mod tests {
         )
         .await?;
 
-        let sub_tx = bcast_write
-            .get(&sub_id)
-            .cloned()
-            .expect("missing subscription broadcaster");
-
         drop(bcast_write);
 
-        timeout(Duration::from_secs(5), async {
-            while rx.is_empty() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("initial subscription did not start");
+        tokio::time::sleep(Duration::from_millis(50)).await;
 
-        for i in 0..(SUB_BROADCAST_CHANNEL_CAPACITY as u64 * 2) {
-            sub_tx
-                .send((Bytes::new(), QueryEventMeta::Row(RowId(10_000 + i))))
-                .expect("subscription receiver dropped");
+        let (_, meta) = timeout(Duration::from_secs(5), rx.recv())
+            .await?
+            .ok_or_else(|| eyre::eyre!("subscription closed before columns"))?;
+        assert!(matches!(meta, QueryEventMeta::Columns));
 
-            if i % 16 == 0 {
-                tokio::task::yield_now().await;
-            }
+        for _ in &data {
+            let (_, meta) = timeout(Duration::from_secs(5), rx.recv())
+                .await?
+                .ok_or_else(|| eyre::eyre!("subscription closed before initial row"))?;
+            assert!(matches!(meta, QueryEventMeta::Row(_)));
         }
+
+        let (_, meta) = timeout(Duration::from_secs(5), rx.recv())
+            .await?
+            .ok_or_else(|| eyre::eyre!("subscription closed before end of initial query"))?;
+        assert!(matches!(meta, QueryEventMeta::EndOfQuery(_)));
+
+        subs.drop_handles().await;
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_initial_subscription_forwards_matcher_runtime_error() -> eyre::Result<()> {
+        _ = tracing_subscriber::fmt::try_init();
+        let test = PubSubTest::with_n_agents(1).await?;
+        let agent = &test.agents[0];
+
+        let data: Vec<Vec<SqliteValue>> = vec![vec!["service-id-0".into(), "not-json".into()]];
+        agent.insert_test_data(&data).await?;
+
+        let subs = agent.ta.agent.subs_manager();
+        let (handle, maybe_created) = subs.get_or_insert(
+            "select id, json(text) from tests",
+            &agent.ta.agent.config().db.subscriptions_path(),
+            &agent.ta.agent.schema().read(),
+            agent.ta.agent.pool(),
+            agent.tripwire.clone(),
+        )?;
+
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut bcast_write = agent.subs_bcast_cache.write().await;
+
+        upsert_sub(
+            handle,
+            maybe_created,
+            subs,
+            &mut bcast_write,
+            SubParams {
+                from: None,
+                skip_rows: false,
+            },
+            tx,
+        )
+        .await?;
+
+        drop(bcast_write);
 
         let (_, meta) = timeout(Duration::from_secs(5), rx.recv())
             .await?
@@ -1378,13 +1476,10 @@ mod tests {
 
         let (_, meta) = timeout(Duration::from_secs(5), rx.recv())
             .await?
-            .ok_or_else(|| eyre::eyre!("subscription closed before initial row"))?;
-        assert!(matches!(meta, QueryEventMeta::Row(_)));
+            .ok_or_else(|| eyre::eyre!("subscription closed before matcher error"))?;
+        assert!(matches!(meta, QueryEventMeta::Error));
 
-        let (_, meta) = timeout(Duration::from_secs(5), rx.recv())
-            .await?
-            .ok_or_else(|| eyre::eyre!("subscription closed before end of initial query"))?;
-        assert!(matches!(meta, QueryEventMeta::EndOfQuery(_)));
+        subs.drop_handles().await;
 
         Ok(())
     }
