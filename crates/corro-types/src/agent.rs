@@ -470,6 +470,10 @@ pub enum ChangeError {
     },
     #[error("non-contiguous empties range delete")]
     NonContiguousDelete,
+    #[error(
+        "database schema changed during speculative transaction (expected version {expected}, found {actual})"
+    )]
+    SchemaChanged { expected: i64, actual: i64 },
 }
 
 #[derive(Debug, thiserror::Error)]

@@ -27,8 +27,8 @@ use corro_types::{
     agent::{Agent, ChangeError},
     broadcast::{broadcast_changes, Timestamp},
     change::{
-        database_has_foreign_keys, database_has_user_triggers, insert_local_changes,
-        InsertChangesInfo, PendingLocalChanges,
+        database_has_foreign_keys, database_has_user_triggers, database_schema_version,
+        insert_local_changes, InsertChangesInfo, PendingLocalChanges,
     },
     config::PgConfig,
     persistent_gauge,
@@ -363,6 +363,7 @@ enum TxState {
         failed: bool,
         write_permit: Option<OwnedSemaphorePermit>,
         ts: Option<Timestamp>,
+        schema_version: Option<i64>,
     },
     #[default]
     Ended,
@@ -376,6 +377,7 @@ impl TxState {
             failed: false,
             write_permit: None,
             ts: None,
+            schema_version: None,
         }
     }
 
@@ -386,6 +388,7 @@ impl TxState {
             failed: false,
             write_permit: None,
             ts: None,
+            schema_version: None,
         }
     }
 
@@ -413,14 +416,20 @@ impl TxState {
         }
     }
 
-    fn mark_writing(&mut self, ts: Timestamp) {
+    fn mark_writing(&mut self, ts: Timestamp, schema_version: i64) {
         if let TxState::Started {
-            writing, ts: tx_ts, ..
+            writing,
+            ts: tx_ts,
+            schema_version: tx_schema_version,
+            ..
         } = self
         {
             *writing = true;
             if tx_ts.is_none() {
                 *tx_ts = Some(ts);
+            }
+            if tx_schema_version.is_none() {
+                *tx_schema_version = Some(schema_version);
             }
         }
     }
@@ -440,6 +449,13 @@ impl TxState {
     fn timestamp(&self) -> Option<Timestamp> {
         match self {
             TxState::Started { ts, .. } => *ts,
+            TxState::Ended => None,
+        }
+    }
+
+    fn schema_version(&self) -> Option<i64> {
+        match self {
+            TxState::Started { schema_version, .. } => *schema_version,
             TxState::Ended => None,
         }
     }
@@ -2287,7 +2303,8 @@ impl<'conn> Session<'conn> {
     fn prepare_write(&mut self, cmd: &ParsedCmd) -> Result<(), QueryError> {
         if !self.tx_state.is_writing() {
             let ts = self.set_ts()?;
-            self.tx_state.mark_writing(ts);
+            let schema_version = database_schema_version(self.conn)?;
+            self.tx_state.mark_writing(ts, schema_version);
         }
 
         let replayable = match self.write_is_replayable(cmd) {
@@ -2300,6 +2317,25 @@ impl<'conn> Session<'conn> {
 
         if !self.tx_state.is_canonical() && !replayable {
             self.upgrade_to_canonical()?;
+        }
+
+        Ok(())
+    }
+
+    fn ensure_schema_unchanged(&self, conn: &Connection) -> Result<(), ChangeError> {
+        let Some(expected) = self.tx_state.schema_version() else {
+            return Ok(());
+        };
+
+        let actual =
+            database_schema_version(conn).map_err(|source| ChangeError::Rusqlite {
+                source,
+                actor_id: Some(self.agent.actor_id()),
+                version: None,
+            })?;
+
+        if actual != expected {
+            return Err(ChangeError::SchemaChanged { expected, actual });
         }
 
         Ok(())
@@ -2344,8 +2380,9 @@ impl<'conn> Session<'conn> {
         };
         self.tx_state.set_write_permit(permit);
 
-        let result = (|| -> rusqlite::Result<()> {
+        let result = (|| -> Result<(), QueryError> {
             self.conn.execute_batch("BEGIN IMMEDIATE")?;
+            self.ensure_schema_unchanged(self.conn)?;
 
             if let Some(ts) = ts {
                 self.set_ts_value(ts)?;
@@ -2382,7 +2419,7 @@ impl<'conn> Session<'conn> {
             if let Err(cleanup_err) = self.rollback_sqlite_tx() {
                 return Err(cleanup_err.into());
             }
-            return Err(err.into());
+            return Err(err);
         }
 
         counter!("corro.acquired.write.permit.count", "protocol" => "pg").increment(1);
@@ -2904,6 +2941,8 @@ impl<'conn> Session<'conn> {
                 actor_id: Some(actor_id),
                 version: None,
             })?;
+
+        self.ensure_schema_unchanged(&tx)?;
 
         let reserved_version = pending
             .replay(&tx)

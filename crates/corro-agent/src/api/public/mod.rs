@@ -19,8 +19,8 @@ use corro_types::{
     base::CrsqlDbVersion,
     broadcast::Timestamp,
     change::{
-        database_has_foreign_keys, database_has_user_triggers, insert_local_changes,
-        InsertChangesInfo, PendingLocalChanges, SqliteValue,
+        database_has_foreign_keys, database_has_user_triggers, database_schema_version,
+        insert_local_changes, InsertChangesInfo, PendingLocalChanges, SqliteValue,
     },
     persistent_gauge,
     schema::{apply_schema, parse_sql},
@@ -102,6 +102,13 @@ where
                 version: None,
             })?;
 
+        let schema_version =
+            database_schema_version(&conn).map_err(|source| ChangeError::Rusqlite {
+                source,
+                actor_id: Some(actor_id),
+                version: None,
+            })?;
+
         let replay_safe = !database_has_user_triggers(&conn).unwrap_or(true)
             && !database_has_foreign_keys(&conn).unwrap_or(true);
 
@@ -156,10 +163,10 @@ where
                 version: None,
             })?;
 
-        Ok::<_, ChangeError>(Some((ret, pending)))
+        Ok::<_, ChangeError>(Some((ret, pending, schema_version)))
     })?;
 
-    let Some((ret, pending)) = speculative else {
+    let Some((ret, pending, schema_version)) = speculative else {
         return Ok(SpeculativeChanges::RequiresCanonical);
     };
 
@@ -184,6 +191,20 @@ where
                 actor_id: Some(actor_id),
                 version: None,
             })?;
+
+        let current_schema_version =
+            database_schema_version(&tx).map_err(|source| ChangeError::Rusqlite {
+                source,
+                actor_id: Some(actor_id),
+                version: None,
+            })?;
+
+        if current_schema_version != schema_version {
+            return Err(ChangeError::SchemaChanged {
+                expected: schema_version,
+                actual: current_schema_version,
+            });
+        }
 
         let reserved_version = pending
             .replay(&tx)
@@ -1304,6 +1325,99 @@ mod tests {
             |row| row.get(0),
         )?;
         assert_eq!(recovery_rows, 1);
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_api_schema_change_aborts_speculative_replay() -> eyre::Result<()> {
+        let (_dir, agent) = setup_api_test_agent().await?;
+
+        {
+            let conn = agent.pool().write_priority().await?;
+            block_in_place(|| {
+                conn.execute_batch(
+                    "
+                    CREATE TABLE http_schema_race_audit (
+                        id INTEGER PRIMARY KEY,
+                        seen TEXT NOT NULL
+                    );
+                    ",
+                )
+            })?;
+        }
+
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+
+        let speculative = {
+            let agent = agent.clone();
+
+            tokio::spawn(async move {
+                make_broadcastable_changes(&agent, None, move |tx| {
+                    tx.execute(
+                        "INSERT INTO tests (id, text) VALUES ('schema-race', 'old-schema')",
+                        &[],
+                    )
+                    .map_err(|source| ChangeError::Rusqlite {
+                        source,
+                        actor_id: None,
+                        version: None,
+                    })?;
+
+                    let _ = entered_tx.send(());
+                    release_rx
+                        .recv_timeout(Duration::from_secs(5))
+                        .expect("speculative write was not released");
+
+                    Ok(())
+                })
+                .await
+            })
+        };
+
+        entered_rx.await?;
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut conn = agent.pool().write_normal().await?;
+
+            block_in_place(|| -> eyre::Result<()> {
+                let tx = conn.immediate_transaction()?;
+                tx.execute_batch(
+                    "
+                    CREATE TRIGGER tests_schema_race_audit
+                    AFTER INSERT ON tests
+                    BEGIN
+                        INSERT INTO http_schema_race_audit (id, seen)
+                        VALUES (NEW.id, NEW.text);
+                    END;
+                    ",
+                )?;
+                tx.commit()?;
+                Ok(())
+            })
+        })
+        .await
+        .expect("schema change was blocked by speculative transaction")??;
+
+        release_tx.send(())?;
+
+        let result = speculative.await?;
+        assert!(matches!(result, Err(ChangeError::SchemaChanged { .. })));
+
+        let conn = agent.pool().read().await?;
+        let tracked_rows: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM tests WHERE id = 'schema-race'",
+            (),
+            |row| row.get(0),
+        )?;
+        let audit_rows: i64 =
+            conn.query_row("SELECT COUNT(*) FROM http_schema_race_audit", (), |row| {
+                row.get(0)
+            })?;
+
+        assert_eq!(tracked_rows, 0);
+        assert_eq!(audit_rows, 0);
 
         Ok(())
     }

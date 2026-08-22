@@ -189,6 +189,10 @@ pub struct InsertChangesInfo {
     pub snap: VersionsSnapshot,
 }
 
+pub fn database_schema_version(conn: &Connection) -> rusqlite::Result<i64> {
+    conn.query_row("PRAGMA main.schema_version", (), |row| row.get(0))
+}
+
 pub fn database_has_user_triggers(conn: &Connection) -> rusqlite::Result<bool> {
     conn.query_row(
         r#"

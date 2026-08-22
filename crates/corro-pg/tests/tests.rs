@@ -189,6 +189,80 @@ async fn test_pg_concurrent_writers() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn test_pg_schema_change_aborts_speculative_replay() {
+    let (tripwire, _tripwire_worker, _tripwire_tx) = Tripwire::new_simple();
+    let (_ta, server) = setup_pg_test_server(tripwire, None).await;
+
+    let conn_str = format!(
+        "host={} port={} user=testuser",
+        server.local_addr.ip(),
+        server.local_addr.port()
+    );
+
+    let (mut client1, conn1) = tokio_postgres::connect(&conn_str, NoTls).await.unwrap();
+    let (client2, conn2) = tokio_postgres::connect(&conn_str, NoTls).await.unwrap();
+    tokio::spawn(conn1);
+    tokio::spawn(conn2);
+
+    client2
+        .batch_execute(
+            "CREATE TABLE pg_schema_race_audit (
+                id INTEGER PRIMARY KEY,
+                seen TEXT NOT NULL
+            )",
+        )
+        .await
+        .unwrap();
+
+    let tx = client1.transaction().await.unwrap();
+    let affected = tx
+        .execute(
+            "INSERT INTO tests (id, text) VALUES (951, 'old-schema')",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(affected, 1);
+
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        client2.batch_execute(
+            "CREATE TRIGGER tests_schema_race_audit
+             AFTER INSERT ON tests
+             BEGIN
+                 INSERT INTO pg_schema_race_audit (id, seen)
+                 VALUES (NEW.id, NEW.text);
+             END",
+        ),
+    )
+    .await
+    .expect("schema change was blocked by speculative transaction")
+    .unwrap();
+
+    let err = tx.commit().await.unwrap_err();
+    let db_error = err.as_db_error().expect("commit error was not a database error");
+    assert!(
+        db_error
+            .message()
+            .contains("database schema changed during speculative transaction"),
+        "{db_error:?}"
+    );
+
+    let row = client2
+        .query_one(
+            "SELECT
+                 (SELECT COUNT(*) FROM tests WHERE id = 951),
+                 (SELECT COUNT(*) FROM pg_schema_race_audit)",
+            &[],
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(row.get::<_, i64>(0), 0);
+    assert_eq!(row.get::<_, i64>(1), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_pg_user_trigger_forces_canonical_path() {
     let (tripwire, _tripwire_worker, _tripwire_tx) = Tripwire::new_simple();
     let (ta, server) = setup_pg_test_server(tripwire, None).await;
