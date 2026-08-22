@@ -356,6 +356,8 @@ enum TxState {
     Started {
         kind: OpenTxKind,
         writing: bool,
+        sqlite_tx_active: bool,
+        failed: bool,
         write_permit: Option<OwnedSemaphorePermit>,
         ts: Option<Timestamp>,
     },
@@ -368,6 +370,8 @@ impl TxState {
         Self::Started {
             kind: OpenTxKind::Implicit,
             writing: false,
+            sqlite_tx_active: true,
+            failed: false,
             write_permit: None,
             ts: None,
         }
@@ -377,6 +381,8 @@ impl TxState {
         Self::Started {
             kind: OpenTxKind::Explicit,
             writing: false,
+            sqlite_tx_active: true,
+            failed: false,
             write_permit: None,
             ts: None,
         }
@@ -396,6 +402,35 @@ impl TxState {
         )
     }
 
+    fn sqlite_tx_active(&self) -> bool {
+        matches!(
+            self,
+            TxState::Started {
+                sqlite_tx_active: true,
+                ..
+            }
+        )
+    }
+
+    fn set_sqlite_tx_active(&mut self, active: bool) {
+        if let TxState::Started {
+            sqlite_tx_active, ..
+        } = self
+        {
+            *sqlite_tx_active = active;
+        }
+    }
+
+    fn is_failed(&self) -> bool {
+        matches!(self, TxState::Started { failed: true, .. })
+    }
+
+    fn mark_failed(&mut self) {
+        if let TxState::Started { failed, .. } = self {
+            *failed = true;
+        }
+    }
+
     fn mark_writing(&mut self, ts: Timestamp) {
         if let TxState::Started {
             writing, ts: tx_ts, ..
@@ -411,6 +446,12 @@ impl TxState {
     fn set_write_permit(&mut self, permit: OwnedSemaphorePermit) {
         if let TxState::Started { write_permit, .. } = self {
             *write_permit = Some(permit);
+        }
+    }
+
+    fn release_write_permit(&mut self) {
+        if let TxState::Started { write_permit, .. } = self {
+            *write_permit = None;
         }
     }
 
@@ -1889,29 +1930,37 @@ pub async fn start(
                                     // automatically commit an implicit tx
                                     if session.tx_state.is_implicit() {
                                         trace!("committing IMPLICIT tx");
-                                        let permit = session.tx_state.end();
+                                        let failed = session.tx_state.is_failed();
 
-                                        if let Err(e) = session.handle_commit(permit.is_some()) {
-                                            back_tx.blocking_send(
-                                                (
-                                                    PgWireBackendMessage::ErrorResponse(
-                                                        ErrorInfo::new(
-                                                            "ERROR".to_owned(),
-                                                            "XX000".to_owned(),
-                                                            e.to_string(),
-                                                        )
+                                        if failed {
+                                            session.rollback_sqlite_tx()?;
+                                            let _permit = session.tx_state.end();
+                                        } else {
+                                            let permit = session.tx_state.end();
+                                            if let Err(e) =
+                                                session.handle_commit(permit.is_some())
+                                            {
+                                                back_tx.blocking_send(
+                                                    (
+                                                        PgWireBackendMessage::ErrorResponse(
+                                                            ErrorInfo::new(
+                                                                "ERROR".to_owned(),
+                                                                "XX000".to_owned(),
+                                                                e.to_string(),
+                                                            )
+                                                            .into(),
+                                                        ),
+                                                        true,
+                                                    )
                                                         .into(),
-                                                    ),
-                                                    true,
-                                                )
-                                                    .into(),
-                                            )?;
-                                            send_ready(
-                                                &mut session,
-                                                discard_until_sync,
-                                                &back_tx,
-                                            )?;
-                                            continue;
+                                                )?;
+                                                send_ready(
+                                                    &mut session,
+                                                    discard_until_sync,
+                                                    &back_tx,
+                                                )?;
+                                                continue;
+                                            }
                                         }
                                         trace!("committed IMPLICIT tx");
                                     }
@@ -2185,7 +2234,7 @@ struct Session<'conn> {
 }
 
 impl<'conn> Session<'conn> {
-    fn write_is_replayable(&self, cmd: &ParsedCmd) -> bool {
+    fn write_is_replayable(&self, cmd: &ParsedCmd) -> rusqlite::Result<bool> {
         let table = match cmd {
             ParsedCmd::Sqlite(Cmd::Stmt(
                 Stmt::Insert { tbl_name, .. }
@@ -2194,16 +2243,31 @@ impl<'conn> Session<'conn> {
             )) => {
                 if let Some(db_name) = &tbl_name.db_name {
                     if !db_name.0.as_str().eq_ignore_ascii_case("main") {
-                        return false;
+                        return Ok(false);
+                    }
+                } else {
+                    let shadowed: bool = self.conn.query_row(
+                        "SELECT EXISTS (
+                            SELECT 1
+                            FROM sqlite_temp_schema
+                            WHERE name = ?1 COLLATE NOCASE
+                              AND type IN ('table', 'view')
+                        )",
+                        [tbl_name.name.0.as_str()],
+                        |row| row.get(0),
+                    )?;
+
+                    if shadowed {
+                        return Ok(false);
                     }
                 }
 
                 &tbl_name.name.0
             }
-            _ => return false,
+            _ => return Ok(false),
         };
 
-        self.agent.schema().read().tables.contains_key(table)
+        Ok(self.agent.schema().read().tables.contains_key(table))
     }
 
     fn prepare_write(&mut self, cmd: &ParsedCmd) -> Result<(), QueryError> {
@@ -2212,24 +2276,65 @@ impl<'conn> Session<'conn> {
             self.tx_state.mark_writing(ts);
         }
 
-        if !self.tx_state.is_canonical() && !self.write_is_replayable(cmd) {
+        let replayable = match self.write_is_replayable(cmd) {
+            Ok(replayable) => replayable,
+            Err(err) => {
+                self.tx_state.mark_failed();
+                return Err(err.into());
+            }
+        };
+
+        if !self.tx_state.is_canonical() && !replayable {
             self.upgrade_to_canonical()?;
         }
 
         Ok(())
     }
 
+    fn rollback_sqlite_tx(&mut self) -> rusqlite::Result<()> {
+        let result = if self.conn.is_autocommit() {
+            Ok(())
+        } else {
+            self.conn.execute_batch("ROLLBACK")
+        };
+
+        let active = !self.conn.is_autocommit();
+        self.tx_state.set_sqlite_tx_active(active);
+        if !active {
+            self.tx_state.release_write_permit();
+        }
+
+        result
+    }
+
     fn upgrade_to_canonical(&mut self) -> Result<(), QueryError> {
         let actor_id = self.agent.actor_id();
-        let pending = PendingLocalChanges::capture(self.conn, actor_id)?;
+        let pending = match PendingLocalChanges::capture(self.conn, actor_id) {
+            Ok(pending) => pending,
+            Err(err) => {
+                self.tx_state.mark_failed();
+                return Err(err.into());
+            }
+        };
         let ts = self.tx_state.timestamp();
 
-        self.conn.execute_batch("ROLLBACK")?;
+        if let Err(err) = self.rollback_sqlite_tx() {
+            self.tx_state.mark_failed();
+            return Err(err.into());
+        }
 
-        let permit = self.agent.write_permit_blocking()?;
+        let permit = match self.agent.write_permit_blocking() {
+            Ok(permit) => permit,
+            Err(err) => {
+                self.tx_state.mark_failed();
+                return Err(err.into());
+            }
+        };
+        self.tx_state.set_write_permit(permit);
 
         let result = (|| -> rusqlite::Result<()> {
             self.conn.execute_batch("BEGIN IMMEDIATE")?;
+            self.tx_state.set_sqlite_tx_active(true);
 
             if let Some(ts) = ts {
                 self.set_ts_value(ts)?;
@@ -2262,12 +2367,15 @@ impl<'conn> Session<'conn> {
         })();
 
         if let Err(err) = result {
-            let _ = self.conn.execute_batch("ROLLBACK");
+            self.tx_state.mark_failed();
+            if let Err(cleanup_err) = self.rollback_sqlite_tx() {
+                return Err(cleanup_err.into());
+            }
             return Err(err.into());
         }
 
+        self.tx_state.set_sqlite_tx_active(true);
         counter!("corro.acquired.write.permit.count", "protocol" => "pg").increment(1);
-        self.tx_state.set_write_permit(permit);
 
         Ok(())
     }
@@ -2278,6 +2386,10 @@ impl<'conn> Session<'conn> {
         back_tx: &Sender<BackendResponse>,
         send_row_desc: bool,
     ) -> Result<(), QueryError> {
+        if self.tx_state.is_failed() && !cmd.is_commit() && !cmd.is_rollback() {
+            return Err(QueryError::TransactionAborted);
+        }
+
         if cmd.is_show() {
             back_tx
                 .blocking_send(
@@ -2326,12 +2438,17 @@ impl<'conn> Session<'conn> {
             self.tx_state.start_explicit();
             0
         } else if cmd.is_commit() {
-            let permit = self.tx_state.end();
-            self.handle_commit(permit.is_some())?;
+            if self.tx_state.is_failed() {
+                self.rollback_sqlite_tx()?;
+                let _permit = self.tx_state.end();
+            } else {
+                let permit = self.tx_state.end();
+                self.handle_commit(permit.is_some())?;
+            }
             0
         } else if cmd.is_rollback() {
+            self.rollback_sqlite_tx()?;
             let _permit = self.tx_state.end();
-            self.conn.execute_batch("ROLLBACK")?;
             0
         } else {
             let mut prepped = if cmd.is_pg() {
@@ -2433,6 +2550,10 @@ impl<'conn> Session<'conn> {
         max_rows: usize,
         back_tx: &Sender<BackendResponse>,
     ) -> Result<(), QueryError> {
+        if self.tx_state.is_failed() && !cmd.is_commit() && !cmd.is_rollback() {
+            return Err(QueryError::TransactionAborted);
+        }
+
         // TODO: maybe we don't need to recompute this...
         let fields = field_types(prepped, cmd, FieldFormats::Each(result_formats))?;
 
@@ -2466,8 +2587,16 @@ impl<'conn> Session<'conn> {
         let mut changes = 0usize;
 
         if cmd.is_commit() {
-            let permit = self.tx_state.end();
-            self.handle_commit(permit.is_some())?;
+            if self.tx_state.is_failed() {
+                self.rollback_sqlite_tx()?;
+                let _permit = self.tx_state.end();
+            } else {
+                let permit = self.tx_state.end();
+                self.handle_commit(permit.is_some())?;
+            }
+        } else if cmd.is_rollback() {
+            self.rollback_sqlite_tx()?;
+            let _permit = self.tx_state.end();
         } else if cmd.is_begin() {
             // do nothing
             debug!("cmd is BEGIN");
@@ -2798,12 +2927,12 @@ impl<'conn> Session<'conn> {
 impl<'conn> Drop for Session<'conn> {
     fn drop(&mut self) {
         if !self.tx_state.is_ended() {
-            let _permit = self.tx_state.end();
-            if let Err(e) = self.conn.execute_batch("ROLLBACK") {
+            if let Err(e) = self.rollback_sqlite_tx() {
                 warn!("failed to rollback tx: {e}");
             } else {
                 debug!("rolled back tx");
             }
+            let _permit = self.tx_state.end();
         }
     }
 }
@@ -2814,20 +2943,19 @@ fn send_ready(
     back_tx: &Sender<BackendResponse>,
 ) -> Result<(), BoxError> {
     let ready_status = if session.tx_state.is_implicit() {
-        let permit = session.tx_state.end(); // do this first, in case of failure
-        if discard_until_sync {
-            // an error occured, rollback implicit tx!
+        if discard_until_sync || session.tx_state.is_failed() {
             warn!("receive Sync message w/ an error to send, rolling back implicit tx");
-            session.conn.execute_batch("ROLLBACK")?;
+            session.rollback_sqlite_tx()?;
+            let _permit = session.tx_state.end();
         } else {
-            // no error, commit implicit tx
             warn!("receive Sync message, committing implicit tx");
+            let permit = session.tx_state.end();
             session.handle_commit(permit.is_some())?;
         }
 
         TransactionStatus::Idle
     } else if session.tx_state.is_explicit() {
-        if discard_until_sync {
+        if discard_until_sync || session.tx_state.is_failed() {
             TransactionStatus::Error
         } else {
             TransactionStatus::Transaction
@@ -2865,6 +2993,8 @@ enum QueryError {
     PermitAcquire(#[from] AcquireError),
     #[error(transparent)]
     Change(#[from] ChangeError),
+    #[error("current transaction is aborted, commands ignored until end of transaction block")]
+    TransactionAborted,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -2898,11 +3028,14 @@ impl TryFrom<QueryError> for PgWireBackendMessage {
                 ErrorInfo::new("ERROR".to_owned(), "XX000".to_owned(), e.to_string()).into()
             }
             e @ QueryError::PermitAcquire(_) => {
-                ErrorInfo::new("FATAL".to_owned(), "XX000".to_owned(), e.to_string()).into()
+                ErrorInfo::new("ERROR".to_owned(), "XX000".to_owned(), e.to_string()).into()
             }
             QueryError::BackendResponseSendFailed => return Err(ChannelClosed),
             QueryError::Change(e) => {
                 ErrorInfo::new("ERROR".to_owned(), "XX000".to_owned(), e.to_string()).into()
+            }
+            e @ QueryError::TransactionAborted => {
+                ErrorInfo::new("ERROR".to_owned(), "25P02".to_owned(), e.to_string()).into()
             }
         }))
     }

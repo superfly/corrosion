@@ -189,6 +189,139 @@ async fn test_pg_concurrent_writers() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn test_pg_temp_table_shadow_is_not_silently_rolled_back() {
+    let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
+    let (_ta, server) = setup_pg_test_server(tripwire, None).await;
+
+    let conn_str = format!(
+        "host={} port={} user=testuser",
+        server.local_addr.ip(),
+        server.local_addr.port()
+    );
+
+    {
+        let (mut client, client_conn) =
+            tokio_postgres::connect(&conn_str, NoTls).await.unwrap();
+        tokio::spawn(client_conn);
+
+        client
+            .batch_execute(
+                "CREATE TEMP TABLE tests (
+                    id BIGINT PRIMARY KEY NOT NULL,
+                    text TEXT NOT NULL
+                )",
+            )
+            .await
+            .unwrap();
+
+        let tx = client.transaction().await.unwrap();
+        let affected = tx
+            .execute(
+                "INSERT INTO tests (id, text) VALUES (301, 'temp-shadow')",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(affected, 1);
+        tx.commit().await.unwrap();
+
+        let temp_count = client
+            .query_one(
+                "SELECT COUNT(*) FROM temp.tests WHERE id = 301",
+                &[],
+            )
+            .await
+            .unwrap()
+            .get::<_, i64>(0);
+        assert_eq!(temp_count, 1);
+
+        let main_count = client
+            .query_one(
+                "SELECT COUNT(*) FROM main.tests WHERE id = 301",
+                &[],
+            )
+            .await
+            .unwrap()
+            .get::<_, i64>(0);
+        assert_eq!(main_count, 0);
+    }
+
+    tripwire_tx.send(()).await.ok();
+    tripwire_worker.await;
+    wait_for_all_pending_handles().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_pg_upgrade_acquire_failure_remains_rollbackable() {
+    let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
+    let (ta, server) = setup_pg_test_server(tripwire, None).await;
+
+    let conn_str = format!(
+        "host={} port={} user=testuser",
+        server.local_addr.ip(),
+        server.local_addr.port()
+    );
+
+    {
+        let (mut client, client_conn) =
+            tokio_postgres::connect(&conn_str, NoTls).await.unwrap();
+        tokio::spawn(client_conn);
+
+        client
+            .batch_execute(
+                "CREATE TEMP TABLE upgrade_target (
+                    id BIGINT PRIMARY KEY NOT NULL
+                )",
+            )
+            .await
+            .unwrap();
+
+        let tx = client.transaction().await.unwrap();
+        tx.execute(
+            "INSERT INTO main.tests (id, text) VALUES (302, 'rolled-back')",
+            &[],
+        )
+        .await
+        .unwrap();
+
+        ta.agent.write_sema().close();
+
+        tx.execute("INSERT INTO temp.upgrade_target (id) VALUES (1)", &[])
+            .await
+            .expect_err("canonical upgrade must fail after the write semaphore closes");
+
+        let aborted = tx
+            .query_one("SELECT 1", &[])
+            .await
+            .expect_err("failed upgrade must abort the explicit transaction");
+        assert_eq!(
+            aborted.as_db_error().map(|error| error.code().code()),
+            Some("25P02")
+        );
+
+        tx.rollback()
+            .await
+            .expect("failed upgrade must leave the explicit transaction rollbackable");
+
+        let main_count = client
+            .query_one(
+                "SELECT COUNT(*) FROM main.tests WHERE id = 302",
+                &[],
+            )
+            .await
+            .unwrap()
+            .get::<_, i64>(0);
+        assert_eq!(main_count, 0);
+
+        client.simple_query("SELECT 1").await.unwrap();
+    }
+
+    tripwire_tx.send(()).await.ok();
+    tripwire_worker.await;
+    wait_for_all_pending_handles().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_pg() {
     let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
 

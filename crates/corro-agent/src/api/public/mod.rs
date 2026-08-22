@@ -1005,6 +1005,146 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_api_speculative_failure_rolls_back_and_releases_writer() -> eyre::Result<()> {
+        let (_dir, agent) = setup_api_test_agent().await?;
+        let booked_before = agent
+            .booked()
+            .read::<&str, _>("test_api_speculative_failure", None)
+            .await
+            .last();
+
+        let (status_code, body) = api_v1_transactions(
+            Extension(agent.clone()),
+            axum::extract::Query(TimeoutParams { timeout: None }),
+            axum::Json(vec![
+                Statement::Simple(
+                    "INSERT INTO tests (id, text) VALUES ('http-speculative-failure', 'first')"
+                        .into(),
+                ),
+                Statement::Simple(
+                    "INSERT INTO tests (id, text) VALUES ('http-speculative-failure', 'duplicate')"
+                        .into(),
+                ),
+            ]),
+        )
+        .await;
+
+        assert_eq!(status_code, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(body.0.version.is_none());
+
+        {
+            let conn = agent.pool().read().await?;
+            let rows: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM tests WHERE id = 'http-speculative-failure'",
+                (),
+                |row| row.get(0),
+            )?;
+            assert_eq!(rows, 0);
+        }
+
+        let booked_after = agent
+            .booked()
+            .read::<&str, _>("test_api_speculative_failure", None)
+            .await
+            .last();
+        assert_eq!(booked_after, booked_before);
+
+        let (status_code, body) = api_v1_transactions(
+            Extension(agent.clone()),
+            axum::extract::Query(TimeoutParams { timeout: None }),
+            axum::Json(vec![Statement::Simple(
+                "INSERT INTO tests (id, text) VALUES ('http-speculative-recovery', 'ok')".into(),
+            )]),
+        )
+        .await;
+
+        assert_eq!(status_code, StatusCode::OK, "{body:?}");
+        assert!(body.0.version.is_some());
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_api_canonical_failure_rolls_back_and_releases_writer() -> eyre::Result<()> {
+        let (_dir, agent) = setup_api_test_agent().await?;
+
+        {
+            let conn = agent.pool().write_priority().await?;
+            block_in_place(|| {
+                conn.execute_batch(
+                    "CREATE TABLE http_canonical_side (
+                        id INTEGER PRIMARY KEY
+                    )",
+                )
+            })?;
+        }
+
+        let booked_before = agent
+            .booked()
+            .read::<&str, _>("test_api_canonical_failure", None)
+            .await
+            .last();
+
+        let (status_code, body) = api_v1_transactions(
+            Extension(agent.clone()),
+            axum::extract::Query(TimeoutParams { timeout: None }),
+            axum::Json(vec![
+                Statement::Simple(
+                    "INSERT INTO tests (id, text) VALUES ('http-canonical-failure', 'first')"
+                        .into(),
+                ),
+                Statement::Simple(
+                    "INSERT INTO http_canonical_side (id) VALUES (1)".into(),
+                ),
+                Statement::Simple(
+                    "INSERT INTO http_canonical_side (id) VALUES (1)".into(),
+                ),
+            ]),
+        )
+        .await;
+
+        assert_eq!(status_code, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(body.0.version.is_none());
+
+        {
+            let conn = agent.pool().read().await?;
+            let tracked_rows: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM tests WHERE id = 'http-canonical-failure'",
+                (),
+                |row| row.get(0),
+            )?;
+            let side_rows: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM http_canonical_side WHERE id = 1",
+                (),
+                |row| row.get(0),
+            )?;
+            assert_eq!(tracked_rows, 0);
+            assert_eq!(side_rows, 0);
+        }
+
+        let booked_after = agent
+            .booked()
+            .read::<&str, _>("test_api_canonical_failure", None)
+            .await
+            .last();
+        assert_eq!(booked_after, booked_before);
+
+        let (status_code, body) = api_v1_transactions(
+            Extension(agent.clone()),
+            axum::extract::Query(TimeoutParams { timeout: None }),
+            axum::Json(vec![Statement::Simple(
+                "INSERT INTO tests (id, text) VALUES ('http-canonical-recovery', 'ok')".into(),
+            )]),
+        )
+        .await;
+
+        assert_eq!(status_code, StatusCode::OK, "{body:?}");
+        assert!(body.0.version.is_some());
+
+        Ok(())
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_api_speculative_write_does_not_block_normal_writer() -> eyre::Result<()> {
         let (_dir, agent) = setup_api_test_agent().await?;
