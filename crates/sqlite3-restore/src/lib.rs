@@ -350,6 +350,7 @@ mod tests {
                 conn.pragma_query_value(None, "journal_mode", |row| row.get(0))?;
 
             assert_eq!(journal_mode, "wal");
+            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
         }
 
         let restored = restore(src, &dst, Duration::from_secs(2))?;

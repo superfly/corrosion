@@ -200,8 +200,7 @@ async fn test_pg_temp_table_shadow_is_not_silently_rolled_back() {
     );
 
     {
-        let (mut client, client_conn) =
-            tokio_postgres::connect(&conn_str, NoTls).await.unwrap();
+        let (mut client, client_conn) = tokio_postgres::connect(&conn_str, NoTls).await.unwrap();
         tokio::spawn(client_conn);
 
         client
@@ -226,20 +225,14 @@ async fn test_pg_temp_table_shadow_is_not_silently_rolled_back() {
         tx.commit().await.unwrap();
 
         let temp_count = client
-            .query_one(
-                "SELECT COUNT(*) FROM temp.tests WHERE id = 301",
-                &[],
-            )
+            .query_one("SELECT COUNT(*) FROM temp.tests WHERE id = 301", &[])
             .await
             .unwrap()
             .get::<_, i64>(0);
         assert_eq!(temp_count, 1);
 
         let main_count = client
-            .query_one(
-                "SELECT COUNT(*) FROM main.tests WHERE id = 301",
-                &[],
-            )
+            .query_one("SELECT COUNT(*) FROM main.tests WHERE id = 301", &[])
             .await
             .unwrap()
             .get::<_, i64>(0);
@@ -255,10 +248,7 @@ async fn test_pg_temp_table_shadow_is_not_silently_rolled_back() {
         assert_eq!(affected, 1);
 
         let qualified_main_count = client
-            .query_one(
-                "SELECT COUNT(*) FROM main.tests WHERE id = 303",
-                &[],
-            )
+            .query_one("SELECT COUNT(*) FROM main.tests WHERE id = 303", &[])
             .await
             .unwrap()
             .get::<_, i64>(0);
@@ -282,8 +272,7 @@ async fn test_pg_upgrade_acquire_failure_remains_rollbackable() {
     );
 
     {
-        let (mut client, client_conn) =
-            tokio_postgres::connect(&conn_str, NoTls).await.unwrap();
+        let (mut client, client_conn) = tokio_postgres::connect(&conn_str, NoTls).await.unwrap();
         tokio::spawn(client_conn);
 
         client
@@ -323,10 +312,7 @@ async fn test_pg_upgrade_acquire_failure_remains_rollbackable() {
             .expect("failed upgrade must leave the explicit transaction rollbackable");
 
         let main_count = client
-            .query_one(
-                "SELECT COUNT(*) FROM main.tests WHERE id = 302",
-                &[],
-            )
+            .query_one("SELECT COUNT(*) FROM main.tests WHERE id = 302", &[])
             .await
             .unwrap()
             .get::<_, i64>(0);
@@ -372,10 +358,7 @@ async fn test_pg_simple_query_error_rolls_back_implicit_transaction() {
 
         let affected = tokio::time::timeout(
             Duration::from_secs(5),
-            client.execute(
-                "INSERT INTO tests (id, text) VALUES (311, 'recovery')",
-                &[],
-            ),
+            client.execute("INSERT INTO tests (id, text) VALUES (311, 'recovery')", &[]),
         )
         .await
         .expect("writer remained blocked after implicit rollback")
@@ -400,17 +383,13 @@ async fn test_pg_constraint_error_aborts_explicit_transaction() {
     );
 
     {
-        let (mut client, client_conn) =
-            tokio_postgres::connect(&conn_str, NoTls).await.unwrap();
+        let (mut client, client_conn) = tokio_postgres::connect(&conn_str, NoTls).await.unwrap();
         tokio::spawn(client_conn);
 
         let tx = client.transaction().await.unwrap();
-        tx.execute(
-            "INSERT INTO tests (id, text) VALUES (320, 'first')",
-            &[],
-        )
-        .await
-        .unwrap();
+        tx.execute("INSERT INTO tests (id, text) VALUES (320, 'first')", &[])
+            .await
+            .unwrap();
 
         tx.execute(
             "INSERT INTO tests (id, text) VALUES (320, 'duplicate')",
@@ -448,10 +427,7 @@ async fn test_pg_constraint_error_aborts_explicit_transaction() {
 
         let affected = tokio::time::timeout(
             Duration::from_secs(5),
-            client.execute(
-                "INSERT INTO tests (id, text) VALUES (321, 'recovery')",
-                &[],
-            ),
+            client.execute("INSERT INTO tests (id, text) VALUES (321, 'recovery')", &[]),
         )
         .await
         .expect("writer remained blocked after explicit rollback")
@@ -476,8 +452,7 @@ async fn test_pg_canonical_upgrade_error_rolls_back_and_releases_writer() {
     );
 
     {
-        let (mut client, client_conn) =
-            tokio_postgres::connect(&conn_str, NoTls).await.unwrap();
+        let (mut client, client_conn) = tokio_postgres::connect(&conn_str, NoTls).await.unwrap();
         tokio::spawn(client_conn);
 
         client
@@ -538,10 +513,7 @@ async fn test_pg_canonical_upgrade_error_rolls_back_and_releases_writer() {
 
         let affected = tokio::time::timeout(
             Duration::from_secs(5),
-            client.execute(
-                "INSERT INTO tests (id, text) VALUES (331, 'recovery')",
-                &[],
-            ),
+            client.execute("INSERT INTO tests (id, text) VALUES (331, 'recovery')", &[]),
         )
         .await
         .expect("writer remained blocked after canonical rollback")
@@ -596,8 +568,7 @@ async fn test_pg_disconnect_rolls_back_and_releases_writer() {
             .expect("PG connection task panicked")
             .expect("PG connection closed with an error");
 
-        let (recovery, recovery_conn) =
-            tokio_postgres::connect(&conn_str, NoTls).await.unwrap();
+        let (recovery, recovery_conn) = tokio_postgres::connect(&conn_str, NoTls).await.unwrap();
         tokio::spawn(recovery_conn);
 
         let tracked_rows = recovery
@@ -606,10 +577,7 @@ async fn test_pg_disconnect_rolls_back_and_releases_writer() {
             .unwrap()
             .get::<_, i64>(0);
         let side_rows = recovery
-            .query_one(
-                "SELECT COUNT(*) FROM pg_disconnect_side WHERE id = 1",
-                &[],
-            )
+            .query_one("SELECT COUNT(*) FROM pg_disconnect_side WHERE id = 1", &[])
             .await
             .unwrap()
             .get::<_, i64>(0);
@@ -618,10 +586,7 @@ async fn test_pg_disconnect_rolls_back_and_releases_writer() {
 
         let affected = tokio::time::timeout(
             Duration::from_secs(5),
-            recovery.execute(
-                "INSERT INTO pg_disconnect_side (id) VALUES (2)",
-                &[],
-            ),
+            recovery.execute("INSERT INTO pg_disconnect_side (id) VALUES (2)", &[]),
         )
         .await
         .expect("writer remained blocked after PG disconnect")

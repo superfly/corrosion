@@ -1107,12 +1107,8 @@ mod tests {
                     "INSERT INTO tests (id, text) VALUES ('http-canonical-failure', 'first')"
                         .into(),
                 ),
-                Statement::Simple(
-                    "INSERT INTO http_canonical_side (id) VALUES (1)".into(),
-                ),
-                Statement::Simple(
-                    "INSERT INTO http_canonical_side (id) VALUES (1)".into(),
-                ),
+                Statement::Simple("INSERT INTO http_canonical_side (id) VALUES (1)".into()),
+                Statement::Simple("INSERT INTO http_canonical_side (id) VALUES (1)".into()),
             ]),
         )
         .await;
