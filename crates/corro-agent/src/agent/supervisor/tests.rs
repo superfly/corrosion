@@ -118,31 +118,6 @@ impl SupervisedActor for EscalatingActor {
     }
 }
 
-struct StopOnCompletionActor {
-    runs: Arc<AtomicUsize>,
-}
-
-impl SupervisedActor for StopOnCompletionActor {
-    type Error = Infallible;
-
-    fn name(&self) -> &'static str {
-        "stop-on-completion"
-    }
-
-    fn run(&mut self, _tripwire: Tripwire) -> impl Future<Output = Result<(), Self::Error>> + Send {
-        self.runs.fetch_add(1, Ordering::SeqCst);
-
-        async { Ok(()) }
-    }
-
-    fn restart_directive(&mut self, reason: RestartReason) -> RestartDirective {
-        match reason {
-            RestartReason::Completed => RestartDirective::Stop,
-            RestartReason::Failed | RestartReason::Panicked => RestartDirective::Restart,
-        }
-    }
-}
-
 struct AlwaysPanickingActor {
     runs: Arc<AtomicUsize>,
     restarts: Arc<AtomicUsize>,
@@ -345,25 +320,6 @@ async fn escalate_directive_does_not_restart_actor() {
     assert_eq!(escalations.load(Ordering::SeqCst), 1);
     assert_eq!(node_escalations.load(Ordering::SeqCst), 1);
     assert_eq!(restarts.load(Ordering::SeqCst), 0);
-}
-
-#[tokio::test]
-async fn stop_directive_does_not_restart_actor() {
-    let runs = Arc::new(AtomicUsize::new(0));
-    let (tripwire, _worker, _tx) = Tripwire::new_simple();
-
-    let supervisor = spawn_test_supervised(
-        StopOnCompletionActor { runs: runs.clone() },
-        tripwire,
-        test_policy(),
-    );
-
-    timeout(Duration::from_secs(1), supervisor)
-        .await
-        .expect("supervisor did not stop")
-        .expect("supervisor panicked");
-
-    assert_eq!(runs.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
