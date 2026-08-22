@@ -1050,17 +1050,30 @@ mod tests {
             .last();
         assert_eq!(booked_after, booked_before);
 
-        let (status_code, body) = api_v1_transactions(
-            Extension(agent.clone()),
-            axum::extract::Query(TimeoutParams { timeout: None }),
-            axum::Json(vec![Statement::Simple(
-                "INSERT INTO tests (id, text) VALUES ('http-speculative-recovery', 'ok')".into(),
-            )]),
+        let (status_code, body) = tokio::time::timeout(
+            Duration::from_secs(5),
+            api_v1_transactions(
+                Extension(agent.clone()),
+                axum::extract::Query(TimeoutParams { timeout: None }),
+                axum::Json(vec![Statement::Simple(
+                    "INSERT INTO tests (id, text) VALUES ('http-speculative-recovery', 'ok')"
+                        .into(),
+                )]),
+            ),
         )
-        .await;
+        .await
+        .expect("writer remained blocked after speculative rollback");
 
         assert_eq!(status_code, StatusCode::OK, "{body:?}");
         assert!(body.0.version.is_some());
+
+        let conn = agent.pool().read().await?;
+        let recovery_rows: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM tests WHERE id = 'http-speculative-recovery'",
+            (),
+            |row| row.get(0),
+        )?;
+        assert_eq!(recovery_rows, 1);
 
         Ok(())
     }
@@ -1130,17 +1143,29 @@ mod tests {
             .last();
         assert_eq!(booked_after, booked_before);
 
-        let (status_code, body) = api_v1_transactions(
-            Extension(agent.clone()),
-            axum::extract::Query(TimeoutParams { timeout: None }),
-            axum::Json(vec![Statement::Simple(
-                "INSERT INTO tests (id, text) VALUES ('http-canonical-recovery', 'ok')".into(),
-            )]),
+        let (status_code, body) = tokio::time::timeout(
+            Duration::from_secs(5),
+            api_v1_transactions(
+                Extension(agent.clone()),
+                axum::extract::Query(TimeoutParams { timeout: None }),
+                axum::Json(vec![Statement::Simple(
+                    "INSERT INTO tests (id, text) VALUES ('http-canonical-recovery', 'ok')".into(),
+                )]),
+            ),
         )
-        .await;
+        .await
+        .expect("writer remained blocked after canonical rollback");
 
         assert_eq!(status_code, StatusCode::OK, "{body:?}");
         assert!(body.0.version.is_some());
+
+        let conn = agent.pool().read().await?;
+        let recovery_rows: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM tests WHERE id = 'http-canonical-recovery'",
+            (),
+            |row| row.get(0),
+        )?;
+        assert_eq!(recovery_rows, 1);
 
         Ok(())
     }

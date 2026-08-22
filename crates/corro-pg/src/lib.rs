@@ -356,7 +356,6 @@ enum TxState {
     Started {
         kind: OpenTxKind,
         writing: bool,
-        sqlite_tx_active: bool,
         failed: bool,
         write_permit: Option<OwnedSemaphorePermit>,
         ts: Option<Timestamp>,
@@ -370,7 +369,6 @@ impl TxState {
         Self::Started {
             kind: OpenTxKind::Implicit,
             writing: false,
-            sqlite_tx_active: true,
             failed: false,
             write_permit: None,
             ts: None,
@@ -381,7 +379,6 @@ impl TxState {
         Self::Started {
             kind: OpenTxKind::Explicit,
             writing: false,
-            sqlite_tx_active: true,
             failed: false,
             write_permit: None,
             ts: None,
@@ -400,25 +397,6 @@ impl TxState {
                 ..
             }
         )
-    }
-
-    fn sqlite_tx_active(&self) -> bool {
-        matches!(
-            self,
-            TxState::Started {
-                sqlite_tx_active: true,
-                ..
-            }
-        )
-    }
-
-    fn set_sqlite_tx_active(&mut self, active: bool) {
-        if let TxState::Started {
-            sqlite_tx_active, ..
-        } = self
-        {
-            *sqlite_tx_active = active;
-        }
     }
 
     fn is_failed(&self) -> bool {
@@ -1868,6 +1846,7 @@ pub async fn start(
                                     let parsed_query = match parse_query(&query.query) {
                                         Ok(q) => q,
                                         Err(e) => {
+                                            session.tx_state.mark_failed();
                                             back_tx.blocking_send(
                                                 (
                                                     PgWireBackendMessage::ErrorResponse(
@@ -2245,21 +2224,6 @@ impl<'conn> Session<'conn> {
                     if !db_name.0.as_str().eq_ignore_ascii_case("main") {
                         return Ok(false);
                     }
-                } else {
-                    let shadowed: bool = self.conn.query_row(
-                        "SELECT EXISTS (
-                            SELECT 1
-                            FROM sqlite_temp_schema
-                            WHERE name = ?1 COLLATE NOCASE
-                              AND type IN ('table', 'view')
-                        )",
-                        [tbl_name.name.0.as_str()],
-                        |row| row.get(0),
-                    )?;
-
-                    if shadowed {
-                        return Ok(false);
-                    }
                 }
 
                 &tbl_name.name.0
@@ -2267,7 +2231,15 @@ impl<'conn> Session<'conn> {
             _ => return Ok(false),
         };
 
-        Ok(self.agent.schema().read().tables.contains_key(table))
+        if !self.agent.schema().read().tables.contains_key(table) {
+            return Ok(false);
+        }
+
+        self.conn.query_row(
+            "SELECT NOT EXISTS (SELECT 1 FROM sqlite_temp_schema LIMIT 1)",
+            (),
+            |row| row.get(0),
+        )
     }
 
     fn prepare_write(&mut self, cmd: &ParsedCmd) -> Result<(), QueryError> {
@@ -2298,9 +2270,7 @@ impl<'conn> Session<'conn> {
             self.conn.execute_batch("ROLLBACK")
         };
 
-        let active = !self.conn.is_autocommit();
-        self.tx_state.set_sqlite_tx_active(active);
-        if !active {
+        if self.conn.is_autocommit() {
             self.tx_state.release_write_permit();
         }
 
@@ -2334,7 +2304,6 @@ impl<'conn> Session<'conn> {
 
         let result = (|| -> rusqlite::Result<()> {
             self.conn.execute_batch("BEGIN IMMEDIATE")?;
-            self.tx_state.set_sqlite_tx_active(true);
 
             if let Some(ts) = ts {
                 self.set_ts_value(ts)?;
@@ -2345,7 +2314,7 @@ impl<'conn> Session<'conn> {
                     r#"
                     SELECT EXISTS (
                         SELECT 1
-                        FROM crsql_changes
+                        FROM main.crsql_changes
                         WHERE site_id = ?
                           AND db_version = ?
                     )
@@ -2374,13 +2343,25 @@ impl<'conn> Session<'conn> {
             return Err(err.into());
         }
 
-        self.tx_state.set_sqlite_tx_active(true);
         counter!("corro.acquired.write.permit.count", "protocol" => "pg").increment(1);
 
         Ok(())
     }
 
     fn handle_query(
+        &mut self,
+        cmd: &ParsedCmd,
+        back_tx: &Sender<BackendResponse>,
+        send_row_desc: bool,
+    ) -> Result<(), QueryError> {
+        let result = self.handle_query_inner(cmd, back_tx, send_row_desc);
+        if result.is_err() && !self.tx_state.is_ended() {
+            self.tx_state.mark_failed();
+        }
+        result
+    }
+
+    fn handle_query_inner(
         &mut self,
         cmd: &ParsedCmd,
         back_tx: &Sender<BackendResponse>,
@@ -2543,6 +2524,22 @@ impl<'conn> Session<'conn> {
 
     #[allow(clippy::too_many_arguments)]
     fn handle_execute(
+        &mut self,
+        prepped: &mut Statement<'conn>,
+        result_formats: &[FieldFormat],
+        cmd: &ParsedCmd,
+        max_rows: usize,
+        back_tx: &Sender<BackendResponse>,
+    ) -> Result<(), QueryError> {
+        let result = self.handle_execute_inner(prepped, result_formats, cmd, max_rows, back_tx);
+        if result.is_err() && !self.tx_state.is_ended() {
+            self.tx_state.mark_failed();
+        }
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn handle_execute_inner(
         &mut self,
         prepped: &mut Statement<'conn>,
         result_formats: &[FieldFormat],
@@ -2942,6 +2939,10 @@ fn send_ready(
     discard_until_sync: bool,
     back_tx: &Sender<BackendResponse>,
 ) -> Result<(), BoxError> {
+    if discard_until_sync && !session.tx_state.is_ended() {
+        session.tx_state.mark_failed();
+    }
+
     let ready_status = if session.tx_state.is_implicit() {
         if discard_until_sync || session.tx_state.is_failed() {
             warn!("receive Sync message w/ an error to send, rolling back implicit tx");

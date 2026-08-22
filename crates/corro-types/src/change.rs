@@ -218,7 +218,7 @@ impl PendingLocalChanges {
                 site_id,
                 cl,
                 ts
-            FROM crsql_changes
+            FROM main.crsql_changes
             WHERE site_id = ?
               AND db_version = ?
             ORDER BY seq
@@ -251,7 +251,7 @@ impl PendingLocalChanges {
 
         let mut stmt = conn.prepare_cached(
             r#"
-            INSERT INTO crsql_changes
+            INSERT INTO main.crsql_changes
                 ("table", pk, cid, val, col_version, db_version, site_id, cl, seq, ts)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
@@ -301,7 +301,7 @@ pub fn insert_local_changes(
 
     let version_info: (Option<CrsqlSeq>, Option<Timestamp>) = tx
         .prepare_cached(
-            "SELECT MAX(seq), MAX(ts) FROM crsql_changes WHERE site_id = ? AND db_version = ?;",
+            "SELECT MAX(seq), MAX(ts) FROM main.crsql_changes WHERE site_id = ? AND db_version = ?;",
         )
         .map_err(|source| ChangeError::Rusqlite {
             source,
