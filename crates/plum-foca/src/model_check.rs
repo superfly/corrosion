@@ -771,7 +771,9 @@ fn initial_eager_repair_graft_requires_faulted_receiver() {
     };
 
     assert!(!is_initial_eager_repair_graft(&packet(2)));
-    assert!(is_initial_eager_repair_graft(&packet(INITIAL_EAGER_RECEIVER)));
+    assert!(is_initial_eager_repair_graft(&packet(
+        INITIAL_EAGER_RECEIVER
+    )));
 }
 
 #[test]
