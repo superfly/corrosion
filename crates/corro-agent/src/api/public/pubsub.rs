@@ -1368,16 +1368,13 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_initial_subscription_survives_receiver_backpressure() -> eyre::Result<()> {
+    async fn test_initial_subscription_survives_broadcast_capacity_lag() -> eyre::Result<()> {
         _ = tracing_subscriber::fmt::try_init();
         let test = PubSubTest::with_n_agents(1).await?;
         let agent = &test.agents[0];
 
-        let data: Vec<Vec<SqliteValue>> = vec![
-            vec!["service-id-0".into(), "service-name-0".into()],
-            vec!["service-id-1".into(), "service-name-1".into()],
-            vec!["service-id-2".into(), "service-name-2".into()],
-        ];
+        let data: Vec<Vec<SqliteValue>> =
+            vec![vec!["service-id-0".into(), "service-name-0".into()]];
         agent.insert_test_data(&data).await?;
 
         let subs = agent.ta.agent.subs_manager();
@@ -1394,7 +1391,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(1);
         let mut bcast_write = agent.subs_bcast_cache.write().await;
 
-        upsert_sub(
+        let sub_id = upsert_sub(
             handle,
             maybe_created,
             subs,
@@ -1407,21 +1404,40 @@ mod tests {
         )
         .await?;
 
+        let sub_tx = bcast_write
+            .get(&sub_id)
+            .cloned()
+            .expect("missing subscription broadcaster");
+
         drop(bcast_write);
 
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        timeout(Duration::from_secs(5), async {
+            while rx.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("initial subscription did not start");
+
+        for i in 0..(SUB_BROADCAST_CHANNEL_CAPACITY as u64 * 2) {
+            sub_tx
+                .send((Bytes::new(), QueryEventMeta::Row(RowId(10_000 + i))))
+                .expect("subscription receiver dropped");
+
+            if i % 256 == 0 {
+                tokio::task::yield_now().await;
+            }
+        }
 
         let (_, meta) = timeout(Duration::from_secs(5), rx.recv())
             .await?
             .ok_or_else(|| eyre::eyre!("subscription closed before columns"))?;
         assert!(matches!(meta, QueryEventMeta::Columns));
 
-        for _ in &data {
-            let (_, meta) = timeout(Duration::from_secs(5), rx.recv())
-                .await?
-                .ok_or_else(|| eyre::eyre!("subscription closed before initial row"))?;
-            assert!(matches!(meta, QueryEventMeta::Row(_)));
-        }
+        let (_, meta) = timeout(Duration::from_secs(5), rx.recv())
+            .await?
+            .ok_or_else(|| eyre::eyre!("subscription closed before initial row"))?;
+        assert!(matches!(meta, QueryEventMeta::Row(_)));
 
         let (_, meta) = timeout(Duration::from_secs(5), rx.recv())
             .await?
