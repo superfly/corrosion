@@ -222,11 +222,9 @@ async fn test_pg_stale_tracked_schema_forces_canonical_path() {
         &[],
     ));
 
-    assert!(
-        tokio::time::timeout(Duration::from_millis(200), &mut write)
-            .await
-            .is_err()
-    );
+    assert!(tokio::time::timeout(Duration::from_millis(200), &mut write)
+        .await
+        .is_err());
 
     drop(permit);
 
@@ -299,7 +297,9 @@ async fn test_pg_schema_change_aborts_speculative_replay() {
     .unwrap();
 
     let err = tx.commit().await.unwrap_err();
-    let db_error = err.as_db_error().expect("commit error was not a database error");
+    let db_error = err
+        .as_db_error()
+        .expect("commit error was not a database error");
     assert!(
         db_error
             .message()
@@ -365,11 +365,9 @@ async fn test_pg_user_trigger_forces_canonical_path() {
         &[],
     ));
 
-    assert!(
-        tokio::time::timeout(Duration::from_millis(200), &mut write)
-            .await
-            .is_err()
-    );
+    assert!(tokio::time::timeout(Duration::from_millis(200), &mut write)
+        .await
+        .is_err());
 
     drop(permit);
 
@@ -420,10 +418,7 @@ async fn test_pg_foreign_key_forces_canonical_path() {
         .unwrap();
 
     client
-        .execute(
-            "INSERT INTO tests (id, text) VALUES (911, 'parent')",
-            &[],
-        )
+        .execute("INSERT INTO tests (id, text) VALUES (911, 'parent')", &[])
         .await
         .unwrap();
 
@@ -437,16 +432,11 @@ async fn test_pg_foreign_key_forces_canonical_path() {
 
     let permit = ta.agent.write_sema().acquire().await.unwrap();
     let tx = client.transaction().await.unwrap();
-    let mut write = Box::pin(tx.execute(
-        "UPDATE tests SET id = 912 WHERE id = 911",
-        &[],
-    ));
+    let mut write = Box::pin(tx.execute("UPDATE tests SET id = 912 WHERE id = 911", &[]));
 
-    assert!(
-        tokio::time::timeout(Duration::from_millis(200), &mut write)
-            .await
-            .is_err()
-    );
+    assert!(tokio::time::timeout(Duration::from_millis(200), &mut write)
+        .await
+        .is_err());
 
     drop(permit);
 

@@ -1001,6 +1001,7 @@ pub async fn api_v1_table_stats(
 
 #[cfg(test)]
 mod tests {
+    use corro_tests::TEST_SCHEMA;
     use corro_types::{
         api::RowId,
         base::CrsqlDbVersion,
@@ -1008,7 +1009,6 @@ mod tests {
         config::Config,
         schema::SqliteType,
     };
-    use corro_tests::TEST_SCHEMA;
     use futures::StreamExt;
     use tokio::sync::mpsc::error::TryRecvError;
     use tokio_util::codec::{Decoder, LinesCodec};
@@ -1131,8 +1131,9 @@ mod tests {
         assert!(body.0.version.is_none());
 
         let conn = agent.pool().read().await?;
-        let row: String =
-            conn.query_row("SELECT text FROM tests WHERE id = 981", (), |row| row.get(0))?;
+        let row: String = conn.query_row("SELECT text FROM tests WHERE id = 981", (), |row| {
+            row.get(0)
+        })?;
         assert_eq!(row, "canonical");
 
         Ok(())
@@ -1214,8 +1215,7 @@ mod tests {
 
         drop(writer);
 
-        let (status_code, body) =
-            tokio::time::timeout(Duration::from_secs(5), request).await??;
+        let (status_code, body) = tokio::time::timeout(Duration::from_secs(5), request).await??;
         assert_eq!(status_code, StatusCode::OK, "{body:?}");
 
         let conn = agent.pool().read().await?;
@@ -1479,11 +1479,10 @@ mod tests {
             (),
             |row| row.get(0),
         )?;
-        let audit_rows: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM http_schema_race_audit",
-            (),
-            |row| row.get(0),
-        )?;
+        let audit_rows: i64 =
+            conn.query_row("SELECT COUNT(*) FROM http_schema_race_audit", (), |row| {
+                row.get(0)
+            })?;
 
         assert_eq!(tracked_rows, 0);
         assert_eq!(audit_rows, 0);

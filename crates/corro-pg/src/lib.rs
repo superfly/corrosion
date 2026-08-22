@@ -2331,12 +2331,11 @@ impl<'conn> Session<'conn> {
             return Ok(());
         };
 
-        let actual =
-            database_schema_version(conn).map_err(|source| ChangeError::Rusqlite {
-                source,
-                actor_id: Some(self.agent.actor_id()),
-                version: None,
-            })?;
+        let actual = database_schema_version(conn).map_err(|source| ChangeError::Rusqlite {
+            source,
+            actor_id: Some(self.agent.actor_id()),
+            version: None,
+        })?;
 
         if actual != expected {
             return Err(ChangeError::SchemaChanged { expected, actual });
@@ -3018,8 +3017,7 @@ impl<'conn> Drop for Session<'conn> {
         if !self.tx_state.is_ended() {
             if let Err(e) = self.rollback_sqlite_tx() {
                 warn!("failed to rollback tx: {e}");
-                self.connection_drop_write_permit
-                    .hold(&mut self.tx_state);
+                self.connection_drop_write_permit.hold(&mut self.tx_state);
             } else {
                 debug!("rolled back tx");
                 let _permit = self.tx_state.end();
