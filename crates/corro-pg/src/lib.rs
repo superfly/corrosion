@@ -1450,11 +1450,25 @@ impl TxState {
         *self = Self::explicit()
     }
 
-    fn end(&mut self) -> Option<(OwnedSemaphorePermit, BookieWriteGuard)> {
-        let permits = match self {
+    fn take_write_context(&mut self) -> Option<(OwnedSemaphorePermit, BookieWriteGuard)> {
+        match self {
             TxState::Started { permits, .. } => permits.take(),
             TxState::Ended => None,
-        };
+        }
+    }
+
+    fn restore_write_context(
+        &mut self,
+        write_context: Option<(OwnedSemaphorePermit, BookieWriteGuard)>,
+    ) {
+        if let TxState::Started { permits, .. } = self {
+            debug_assert!(permits.is_none());
+            *permits = write_context;
+        }
+    }
+
+    fn end(&mut self) -> Option<(OwnedSemaphorePermit, BookieWriteGuard)> {
+        let permits = self.take_write_context();
         *self = TxState::Ended;
         permits
     }
@@ -3610,15 +3624,8 @@ pub async fn start(
                                     // automatically commit an implicit tx
                                     if session.tx_state.is_implicit() {
                                         trace!("committing IMPLICIT tx");
-                                        let permits = session.tx_state.end();
 
-                                        let commit_res = if let Some((_permit, bookie_write)) = permits {
-                                            session.handle_commit(bookie_write)
-                                        } else {
-                                            session.commit_db()
-                                        };
-
-                                        if let Err(e) = commit_res {
+                                        if let Err(e) = session.commit_tx() {
                                             back_tx.blocking_send(
                                                 (
                                                     PgWireBackendMessage::ErrorResponse(
@@ -3633,11 +3640,7 @@ pub async fn start(
                                                 )
                                                     .into(),
                                             )?;
-                                            send_ready(
-                                                &mut session,
-                                                discard_until_sync,
-                                                &back_tx,
-                                            )?;
+                                            send_ready(&mut session, true, &back_tx)?;
                                             continue;
                                         }
                                         trace!("committed IMPLICIT tx");
@@ -3951,13 +3954,7 @@ impl<'conn> Session<'conn> {
             self.tx_state.start_implicit();
         } else if self.tx_state.is_implicit() && cmd.is_begin() {
             trace!("committing IMPLICIT tx");
-            let permits = self.tx_state.end();
-
-            if let Some((_permit, bookie_write)) = permits {
-                self.handle_commit(bookie_write)?;
-            } else {
-                self.commit_db()?;
-            }
+            self.commit_tx()?;
             trace!("committed IMPLICIT tx");
         }
 
@@ -3970,16 +3967,10 @@ impl<'conn> Session<'conn> {
             self.tx_state.start_explicit();
             0
         } else if cmd.is_commit() {
-            let permits = self.tx_state.end();
-            if let Some((_permit, bookie_write)) = permits {
-                self.handle_commit(bookie_write)?;
-            } else {
-                self.commit_db()?;
-            }
+            self.commit_tx()?;
             0
         } else if cmd.is_rollback() {
-            let _permits = self.tx_state.end();
-            self.conn.execute_batch("ROLLBACK")?;
+            self.rollback_tx()?;
             0
         } else {
             let mut prepped = if cmd.is_pg() {
@@ -4121,15 +4112,9 @@ impl<'conn> Session<'conn> {
         let mut changes = 0usize;
 
         if cmd.is_commit() {
-            let permits = self.tx_state.end();
-            if let Some((_permit, bookie_write)) = permits {
-                self.handle_commit(bookie_write)?;
-            } else {
-                self.commit_db()?;
-            }
+            self.commit_tx()?;
         } else if cmd.is_rollback() {
-            let _permits = self.tx_state.end();
-            self.conn.execute_batch("ROLLBACK")?;
+            self.rollback_tx()?;
         } else if cmd.is_begin() {
             debug!("cmd is BEGIN");
         } else {
@@ -4310,12 +4295,7 @@ impl<'conn> Session<'conn> {
             }
 
             if opened_implicit_tx {
-                let permits = self.tx_state.end();
-                if let Some((_permit, bookie_write)) = permits {
-                    self.handle_commit(bookie_write)?;
-                } else {
-                    self.commit_db()?;
-                }
+                self.commit_tx()?;
             }
         }
 
@@ -4335,6 +4315,37 @@ impl<'conn> Session<'conn> {
             .map_err(|_| QueryError::BackendResponseSendFailed)?;
 
         Ok(())
+    }
+
+    fn commit_tx(&mut self) -> Result<(), ChangeError> {
+        let write_context = self.tx_state.take_write_context();
+        let result = match write_context.as_ref() {
+            Some((_permit, bookie_write)) => self.handle_commit(bookie_write),
+            None => self.commit_db(),
+        };
+
+        if result.is_ok() || self.conn.is_autocommit() {
+            let _write_context = self.tx_state.end();
+        } else {
+            self.tx_state.restore_write_context(write_context);
+            self.tx_state.fail_explicit();
+        }
+
+        result
+    }
+
+    fn rollback_tx(&mut self) -> rusqlite::Result<()> {
+        let result = if self.conn.is_autocommit() {
+            Ok(())
+        } else {
+            self.conn.execute_batch("ROLLBACK")
+        };
+
+        if self.conn.is_autocommit() {
+            let _write_context = self.tx_state.end();
+        }
+
+        result
     }
 
     fn validate_transaction_command(&self, cmd: &ParsedCmd) -> Result<(), QueryError> {
@@ -4361,7 +4372,7 @@ impl<'conn> Session<'conn> {
         Ok(())
     }
 
-    fn handle_commit(&self, bookie_write: BookieWriteGuard) -> Result<(), ChangeError> {
+    fn handle_commit(&self, bookie_write: &BookieWriteGuard) -> Result<(), ChangeError> {
         trace!("HANDLE COMMIT");
 
         let actor_id = self.agent.actor_id();
@@ -4410,12 +4421,12 @@ impl<'conn> Session<'conn> {
 impl<'conn> Drop for Session<'conn> {
     fn drop(&mut self) {
         if !self.tx_state.is_ended() {
-            let _permits = self.tx_state.end();
             if let Err(e) = self.conn.execute_batch("ROLLBACK") {
                 warn!("failed to rollback tx: {e}");
             } else {
                 debug!("rolled back tx");
             }
+            let _write_context = self.tx_state.end();
         }
     }
 }
@@ -4430,19 +4441,14 @@ fn send_ready(
     }
 
     let ready_status = if session.tx_state.is_implicit() {
-        let permits = session.tx_state.end(); // do this first, in case of failure
         if discard_until_sync {
             // an error occurred, rollback implicit tx!
             warn!("receive Sync message w/ an error to send, rolling back implicit tx");
-            session.conn.execute_batch("ROLLBACK")?;
+            session.rollback_tx()?;
         } else {
             // no error, commit implicit tx
             warn!("receive Sync message, committing implicit tx");
-            if let Some((_permit, bookie_write)) = permits {
-                session.handle_commit(bookie_write)?;
-            } else {
-                session.commit_db()?;
-            }
+            session.commit_tx()?;
         }
 
         TransactionStatus::Idle
