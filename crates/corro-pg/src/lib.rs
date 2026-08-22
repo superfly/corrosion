@@ -25,7 +25,10 @@ use compact_str::CompactString;
 use corro_types::{
     agent::{Agent, ChangeError},
     broadcast::{broadcast_changes, Timestamp},
-    change::{insert_local_changes, InsertChangesInfo, PendingLocalChanges},
+    change::{
+        database_has_foreign_keys, database_has_user_triggers, insert_local_changes,
+        InsertChangesInfo, PendingLocalChanges,
+    },
     config::PgConfig,
     persistent_gauge,
     schema::{parse_sql, Column, Schema, SchemaError, SqliteType, Table},
@@ -2225,6 +2228,10 @@ impl<'conn> Session<'conn> {
         };
 
         if !self.agent.schema().read().tables.contains_key(table) {
+            return Ok(false);
+        }
+
+        if database_has_user_triggers(self.conn)? || database_has_foreign_keys(self.conn)? {
             return Ok(false);
         }
 

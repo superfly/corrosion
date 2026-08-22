@@ -189,6 +189,153 @@ async fn test_pg_concurrent_writers() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn test_pg_user_trigger_forces_canonical_path() {
+    let (tripwire, _tripwire_worker, _tripwire_tx) = Tripwire::new_simple();
+    let (ta, server) = setup_pg_test_server(tripwire, None).await;
+
+    let conn_str = format!(
+        "host={} port={} user=testuser",
+        server.local_addr.ip(),
+        server.local_addr.port()
+    );
+
+    let (mut client, conn) = tokio_postgres::connect(&conn_str, NoTls).await.unwrap();
+    tokio::spawn(conn);
+
+    client
+        .batch_execute(
+            "CREATE TABLE pg_trigger_audit (
+                id INTEGER PRIMARY KEY,
+                seen TEXT NOT NULL
+            )",
+        )
+        .await
+        .unwrap();
+
+    client
+        .batch_execute(
+            "CREATE TRIGGER kitchensink_audit
+             AFTER INSERT ON kitchensink
+             BEGIN
+                 INSERT INTO pg_trigger_audit (id, seen)
+                 VALUES (NEW.id, NEW.other_ts || ':' || NEW.updated_at);
+             END",
+        )
+        .await
+        .unwrap();
+
+    let permit = ta.agent.write_sema().acquire().await.unwrap();
+    let tx = client.transaction().await.unwrap();
+    let mut write = Box::pin(tx.execute(
+        "INSERT INTO kitchensink (id, other_ts, updated_at)
+         VALUES (901, '2024-01-02T03:04:05', '2025-06-07T08:09:10')",
+        &[],
+    ));
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), &mut write)
+            .await
+            .is_err()
+    );
+
+    drop(permit);
+
+    let affected = tokio::time::timeout(Duration::from_secs(5), &mut write)
+        .await
+        .expect("canonical write remained blocked")
+        .unwrap();
+    assert_eq!(affected, 1);
+
+    drop(write);
+    tx.commit().await.unwrap();
+
+    let row = client
+        .query_one("SELECT COUNT(*), MIN(seen) FROM pg_trigger_audit", &[])
+        .await
+        .unwrap();
+
+    assert_eq!(row.get::<_, i64>(0), 1);
+    assert_eq!(
+        row.get::<_, String>(1),
+        "2024-01-02T03:04:05:2025-06-07T08:09:10"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_pg_foreign_key_forces_canonical_path() {
+    let (tripwire, _tripwire_worker, _tripwire_tx) = Tripwire::new_simple();
+    let (ta, server) = setup_pg_test_server(tripwire, None).await;
+
+    let conn_str = format!(
+        "host={} port={} user=testuser",
+        server.local_addr.ip(),
+        server.local_addr.port()
+    );
+
+    let (mut client, conn) = tokio_postgres::connect(&conn_str, NoTls).await.unwrap();
+    tokio::spawn(conn);
+
+    client
+        .batch_execute(
+            "CREATE TABLE pg_fk_child (
+                id INTEGER PRIMARY KEY,
+                parent_id INTEGER NOT NULL
+                    REFERENCES tests(id) ON UPDATE CASCADE
+            )",
+        )
+        .await
+        .unwrap();
+
+    client
+        .execute(
+            "INSERT INTO tests (id, text) VALUES (911, 'parent')",
+            &[],
+        )
+        .await
+        .unwrap();
+
+    client
+        .execute(
+            "INSERT INTO pg_fk_child (id, parent_id) VALUES (1, 911)",
+            &[],
+        )
+        .await
+        .unwrap();
+
+    let permit = ta.agent.write_sema().acquire().await.unwrap();
+    let tx = client.transaction().await.unwrap();
+    let mut write = Box::pin(tx.execute(
+        "UPDATE tests SET id = 912 WHERE id = 911",
+        &[],
+    ));
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), &mut write)
+            .await
+            .is_err()
+    );
+
+    drop(permit);
+
+    let affected = tokio::time::timeout(Duration::from_secs(5), &mut write)
+        .await
+        .expect("canonical write remained blocked")
+        .unwrap();
+    assert_eq!(affected, 1);
+
+    drop(write);
+    tx.commit().await.unwrap();
+
+    let parent_id = client
+        .query_one("SELECT parent_id FROM pg_fk_child WHERE id = 1", &[])
+        .await
+        .unwrap()
+        .get::<_, i64>(0);
+
+    assert_eq!(parent_id, 912);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_pg_temp_table_shadow_is_not_silently_rolled_back() {
     let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
     let (_ta, server) = setup_pg_test_server(tripwire, None).await;

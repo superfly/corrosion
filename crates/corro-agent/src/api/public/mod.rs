@@ -18,7 +18,10 @@ use corro_types::{
     },
     base::CrsqlDbVersion,
     broadcast::Timestamp,
-    change::{insert_local_changes, InsertChangesInfo, PendingLocalChanges, SqliteValue},
+    change::{
+        database_has_foreign_keys, database_has_user_triggers, insert_local_changes,
+        InsertChangesInfo, PendingLocalChanges, SqliteValue,
+    },
     persistent_gauge,
     schema::{apply_schema, parse_sql},
     sqlite::{CrConn, SqlitePoolError},
@@ -54,11 +57,26 @@ pub struct TimeoutParams {
     pub timeout: Option<u64>,
 }
 
-pub async fn make_broadcastable_changes<F, T>(
+enum SpeculativeChanges<T> {
+    Completed((T, Option<CrsqlDbVersion>, Duration)),
+    RequiresCanonical,
+}
+
+#[cfg(test)]
+impl<T> SpeculativeChanges<T> {
+    fn into_completed(self) -> (T, Option<CrsqlDbVersion>, Duration) {
+        match self {
+            Self::Completed(result) => result,
+            Self::RequiresCanonical => panic!("speculative transaction required canonical replay"),
+        }
+    }
+}
+
+async fn make_broadcastable_changes<F, T>(
     agent: &Agent,
     timeout: Option<u64>,
     f: F,
-) -> Result<(T, Option<CrsqlDbVersion>, Duration), ChangeError>
+) -> Result<SpeculativeChanges<T>, ChangeError>
 where
     F: FnOnce(&InterruptibleTransaction<CrConn>) -> Result<T, ChangeError>,
 {
@@ -76,13 +94,26 @@ where
             version: None,
         })?;
 
-    let (ret, pending) = block_in_place(move || {
+    let speculative = block_in_place(move || {
         conn.execute_batch("BEGIN CONCURRENT;")
             .map_err(|source| ChangeError::Rusqlite {
                 source,
                 actor_id: Some(actor_id),
                 version: None,
             })?;
+
+        let replay_safe = !database_has_user_triggers(&conn).unwrap_or(true)
+            && !database_has_foreign_keys(&conn).unwrap_or(true);
+
+        if !replay_safe {
+            conn.execute_batch("ROLLBACK;")
+                .map_err(|source| ChangeError::Rusqlite {
+                    source,
+                    actor_id: Some(actor_id),
+                    version: None,
+                })?;
+            return Ok(None);
+        }
 
         let tx = InterruptibleTransaction::new(conn, timeout, "local_changes");
 
@@ -125,14 +156,18 @@ where
                 version: None,
             })?;
 
-        Ok::<_, ChangeError>((ret, pending))
+        Ok::<_, ChangeError>(Some((ret, pending)))
     })?;
+
+    let Some((ret, pending)) = speculative else {
+        return Ok(SpeculativeChanges::RequiresCanonical);
+    };
 
     if pending.is_empty() {
         let elapsed = start.elapsed();
         histogram!("corro.agent.changes.processing.time.seconds", "source" => "local")
             .record(elapsed);
-        return Ok((ret, None, elapsed));
+        return Ok(SpeculativeChanges::Completed((ret, None, elapsed)));
     }
 
     let mut conn = agent.pool().write_priority().await?;
@@ -195,12 +230,16 @@ where
     histogram!("corro.agent.changes.processing.time.seconds", "source" => "local").record(elapsed);
 
     match insert_info {
-        None => Ok((ret, None, elapsed)),
+        None => Ok(SpeculativeChanges::Completed((ret, None, elapsed))),
         Some((db_version, last_seq, ts)) => {
             let agent = agent.clone();
             spawn_counted(async move { broadcast_changes(agent, db_version, last_seq, ts).await });
 
-            Ok((ret, Some(db_version), elapsed))
+            Ok(SpeculativeChanges::Completed((
+                ret,
+                Some(db_version),
+                elapsed,
+            )))
         }
     }
 }
@@ -427,10 +466,20 @@ pub async fn api_v1_transactions(
     let replayable = transaction_is_replayable(&agent, &statements);
 
     let res = if replayable {
-        make_broadcastable_changes(&agent, params.timeout, |tx| {
+        match make_broadcastable_changes(&agent, params.timeout, |tx| {
             execute_transaction_statements(tx, &statements)
         })
         .await
+        {
+            Ok(SpeculativeChanges::Completed(result)) => Ok(result),
+            Ok(SpeculativeChanges::RequiresCanonical) => {
+                make_canonical_broadcastable_changes(&agent, params.timeout, |tx| {
+                    execute_transaction_statements(tx, &statements)
+                })
+                .await
+            }
+            Err(err) => Err(err),
+        }
     } else {
         make_canonical_broadcastable_changes(&agent, params.timeout, |tx| {
             execute_transaction_statements(tx, &statements)
@@ -1006,6 +1055,99 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_api_user_trigger_forces_canonical_path() -> eyre::Result<()> {
+        let (_dir, agent) = setup_api_test_agent().await?;
+
+        let trigger_schema = "
+            CREATE TABLE http_trigger_target (
+                id INTEGER NOT NULL PRIMARY KEY,
+                first TEXT NOT NULL DEFAULT '',
+                second TEXT NOT NULL DEFAULT ''
+            );
+        ";
+
+        let (status_code, _) = api_v1_db_schema(
+            Extension(agent.clone()),
+            axum::Json(vec![TEST_SCHEMA.to_owned(), trigger_schema.to_owned()]),
+        )
+        .await;
+        assert_eq!(status_code, StatusCode::OK);
+
+        let (status_code, body) = api_v1_transactions(
+            Extension(agent.clone()),
+            axum::extract::Query(TimeoutParams { timeout: None }),
+            axum::Json(vec![
+                Statement::Simple(
+                    "CREATE TABLE http_trigger_audit (
+                        id INTEGER PRIMARY KEY,
+                        seen TEXT NOT NULL
+                    )"
+                    .into(),
+                ),
+                Statement::Simple(
+                    "CREATE TRIGGER http_trigger_target_audit
+                     AFTER INSERT ON http_trigger_target
+                     BEGIN
+                         INSERT INTO http_trigger_audit (id, seen)
+                         VALUES (NEW.id, NEW.first || ':' || NEW.second);
+                     END"
+                    .into(),
+                ),
+            ]),
+        )
+        .await;
+        assert_eq!(status_code, StatusCode::OK, "{body:?}");
+
+        {
+            let conn = agent.pool().read().await?;
+            assert!(database_has_user_triggers(&conn)?);
+        }
+
+        let statements = vec![Statement::Simple(
+            "INSERT INTO http_trigger_target (id, first, second)
+             VALUES (1, 'left', 'right')"
+                .into(),
+        )];
+
+        let writer = agent.pool().write_priority().await?;
+        let mut request = tokio::spawn({
+            let agent = agent.clone();
+            async move {
+                api_v1_transactions(
+                    Extension(agent),
+                    axum::extract::Query(TimeoutParams { timeout: None }),
+                    axum::Json(statements),
+                )
+                .await
+            }
+        });
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), &mut request)
+                .await
+                .is_err()
+        );
+
+        drop(writer);
+
+        let (status_code, body) =
+            tokio::time::timeout(Duration::from_secs(5), request).await??;
+        assert_eq!(status_code, StatusCode::OK, "{body:?}");
+
+        let conn = agent.pool().read().await?;
+        let (count, seen): (i64, String) = conn.query_row(
+            "SELECT COUNT(*), MIN(seen) FROM http_trigger_audit",
+            (),
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+
+        assert_eq!(count, 1);
+        assert_eq!(seen, "left:right");
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_api_speculative_failure_rolls_back_and_releases_writer() -> eyre::Result<()> {
         let (_dir, agent) = setup_api_test_agent().await?;
         let booked_before = agent
@@ -1229,7 +1371,7 @@ mod tests {
 
         release_tx.send(())?;
 
-        let (_, version, _) = speculative.await??;
+        let (_, version, _) = speculative.await??.into_completed();
         assert!(version.is_some());
 
         let conn = agent.pool().read().await?;
@@ -1322,8 +1464,8 @@ mod tests {
             })
         };
 
-        let first = first.await??;
-        let second = second.await??;
+        let first = first.await??.into_completed();
+        let second = second.await??.into_completed();
 
         assert!(first.0);
         assert!(second.0);

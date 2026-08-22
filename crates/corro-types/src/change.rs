@@ -189,6 +189,56 @@ pub struct InsertChangesInfo {
     pub snap: VersionsSnapshot,
 }
 
+pub fn database_has_user_triggers(conn: &Connection) -> rusqlite::Result<bool> {
+    conn.query_row(
+        r#"
+        SELECT EXISTS (
+            SELECT 1
+            FROM main.sqlite_schema
+            WHERE type = 'trigger'
+              AND NOT (
+                  name IN (
+                      tbl_name || '__crsql_itrig',
+                      tbl_name || '__crsql_utrig',
+                      tbl_name || '__crsql_dtrig'
+                  )
+                  OR (
+                      tbl_name = 'crsql_site_id'
+                      AND name IN (
+                          'crsql_site_id_insert_trig',
+                          'crsql_site_id_update_trig',
+                          'crsql_site_id_delete_trig'
+                      )
+                  )
+              )
+        )
+        "#,
+        (),
+        |row| row.get(0),
+    )
+}
+
+pub fn database_has_foreign_keys(conn: &Connection) -> rusqlite::Result<bool> {
+    let tables = {
+        let mut stmt = conn.prepare_cached(
+            "SELECT name FROM main.sqlite_schema WHERE type = 'table' AND name IS NOT NULL",
+        )?;
+        let rows = stmt.query_map((), |row| row.get::<_, String>(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+
+    let mut stmt =
+        conn.prepare_cached("SELECT EXISTS (SELECT 1 FROM pragma_foreign_key_list(?1))")?;
+
+    for table in tables {
+        if stmt.query_row([table], |row| row.get(0))? {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
 #[derive(Debug, Clone)]
 struct PendingLocalChange {
     change: Change,
