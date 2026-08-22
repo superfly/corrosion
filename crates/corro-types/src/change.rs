@@ -482,7 +482,7 @@ mod tests {
         conn.execute_batch(
             "
             CREATE TABLE tracked (
-                id INTEGER PRIMARY KEY,
+                id INTEGER NOT NULL PRIMARY KEY,
                 value TEXT NOT NULL DEFAULT ''
             );
             SELECT crsql_as_crr('tracked');
@@ -513,7 +513,7 @@ mod tests {
         conn.execute_batch(
             "
             CREATE TABLE tracked (
-                id INTEGER PRIMARY KEY,
+                id INTEGER NOT NULL PRIMARY KEY,
                 value TEXT NOT NULL DEFAULT ''
             );
             SELECT crsql_as_crr('tracked');

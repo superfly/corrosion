@@ -248,7 +248,7 @@ async fn test_pg_stale_tracked_schema_forces_canonical_path() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_pg_schema_change_aborts_speculative_replay() {
     let (tripwire, _tripwire_worker, _tripwire_tx) = Tripwire::new_simple();
-    let (_ta, server) = setup_pg_test_server(tripwire, None).await;
+    let (ta, server) = setup_pg_test_server(tripwire, None).await;
 
     let conn_str = format!(
         "host={} port={} user=testuser",
@@ -307,18 +307,22 @@ async fn test_pg_schema_change_aborts_speculative_replay() {
         "{db_error:?}"
     );
 
-    let row = client2
-        .query_one(
-            "SELECT
-                 (SELECT COUNT(*) FROM tests WHERE id = 951),
-                 (SELECT COUNT(*) FROM pg_schema_race_audit)",
-            &[],
+    let conn = ta.agent.pool().read().await.unwrap();
+    let tracked_rows: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM tests WHERE id = 951",
+            (),
+            |row| row.get(0),
         )
-        .await
+        .unwrap();
+    let audit_rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM pg_schema_race_audit", (), |row| {
+            row.get(0)
+        })
         .unwrap();
 
-    assert_eq!(row.get::<_, i64>(0), 0);
-    assert_eq!(row.get::<_, i64>(1), 0);
+    assert_eq!(tracked_rows, 0);
+    assert_eq!(audit_rows, 0);
 }
 
 #[tokio::test(flavor = "multi_thread")]
