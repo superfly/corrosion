@@ -7,6 +7,7 @@ mod vtab;
 use codec::VecFromSqlText;
 use eyre::WrapErr;
 use std::{
+    cell::RefCell,
     collections::{BTreeSet, HashMap, VecDeque},
     fmt,
     net::SocketAddr,
@@ -1348,6 +1349,27 @@ mod tests {
         // Table references should keep pg_catalog. prefix since SQLite supports schema.table
         assert!(converted.contains("pg_catalog.pg_class"));
     }
+    #[test]
+    fn connection_drop_context_holds_write_permit_until_owner_drops() {
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = semaphore.clone().try_acquire_owned().unwrap();
+        let bookie = corro_types::bookie::Bookie::new(HashMap::new());
+        let bookie_write = bookie.write_lock_blocking();
+        let mut tx_state = TxState::explicit();
+        tx_state.set_write_context(permit, bookie_write);
+
+        let connection_owner = ConnectionDropWriteContext::default();
+        let session_owner = connection_owner.clone();
+        session_owner.hold(&mut tx_state);
+        drop(session_owner);
+
+        assert!(tx_state.is_ended());
+        assert!(semaphore.clone().try_acquire_owned().is_err());
+
+        drop(connection_owner);
+
+        assert!(semaphore.try_acquire_owned().is_ok());
+    }
 }
 
 #[derive(Default)]
@@ -1471,6 +1493,20 @@ impl TxState {
         let permits = self.take_write_context();
         *self = TxState::Ended;
         permits
+    }
+}
+
+#[derive(Clone, Default)]
+struct ConnectionDropWriteContext(
+    Rc<RefCell<Option<(OwnedSemaphorePermit, BookieWriteGuard)>>>,
+);
+
+impl ConnectionDropWriteContext {
+    fn hold(&self, tx_state: &mut TxState) {
+        let write_context = tx_state.end();
+        let mut held = self.0.borrow_mut();
+        debug_assert!(held.is_none());
+        *held = write_context;
     }
 }
 
@@ -1893,6 +1929,8 @@ pub async fn start(
                 let res = tokio::task::spawn_blocking({
                     let back_tx = back_tx.clone();
                     move || {
+                        let connection_drop_write_context =
+                            ConnectionDropWriteContext::default();
                         let conn = if readonly {
                             agent.pool().client_dedicated_readonly().unwrap()
                         } else {
@@ -2693,6 +2731,7 @@ pub async fn start(
                             agent,
                             conn: &conn,
                             tx_state: TxState::default(),
+                            connection_drop_write_context: connection_drop_write_context.clone(),
                         };
 
                         let mut prepared: HashMap<CompactString, Prepared> = HashMap::new();
@@ -3910,6 +3949,7 @@ struct Session<'conn> {
     agent: Agent,
     conn: &'conn CrConn,
     tx_state: TxState,
+    connection_drop_write_context: ConnectionDropWriteContext,
 }
 
 impl<'conn> Session<'conn> {
@@ -4421,12 +4461,13 @@ impl<'conn> Session<'conn> {
 impl<'conn> Drop for Session<'conn> {
     fn drop(&mut self) {
         if !self.tx_state.is_ended() {
-            if let Err(e) = self.conn.execute_batch("ROLLBACK") {
+            if let Err(e) = self.rollback_tx() {
                 warn!("failed to rollback tx: {e}");
+                self.connection_drop_write_context
+                    .hold(&mut self.tx_state);
             } else {
                 debug!("rolled back tx");
             }
-            let _write_context = self.tx_state.end();
         }
     }
 }
