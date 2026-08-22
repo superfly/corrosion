@@ -5,7 +5,6 @@ use std::{
 };
 
 use metrics::counter;
-use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use rusqlite::types::{ToSql, ToSqlOutput, Value};
 use rusqlite::{
@@ -13,9 +12,8 @@ use rusqlite::{
 };
 use sqlite_pool::{Committable, SqliteConn};
 use std::rc::Rc;
-use tempfile::TempDir;
 use thread_local::ThreadLocal;
-use tracing::{error, info, trace, warn};
+use tracing::{error, info, warn};
 use tripwire::Tripwire;
 
 use crate::vtab::unnest::UnnestTab;
@@ -157,30 +155,6 @@ pub fn trace_heavy_queries(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
-const CRSQL_EXT_GENERIC_NAME: &str = "crsqlite";
-
-#[cfg(target_os = "macos")]
-pub const CRSQL_EXT_FILENAME: &str = "crsqlite.dylib";
-#[cfg(target_os = "linux")]
-pub const CRSQL_EXT_FILENAME: &str = "crsqlite.so";
-
-#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-pub const CRSQL_EXT: &[u8] = include_bytes!("../crsqlite-darwin-aarch64.dylib");
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-pub const CRSQL_EXT: &[u8] = include_bytes!("../crsqlite-linux-x86_64.so");
-#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
-pub const CRSQL_EXT: &[u8] = include_bytes!("../crsqlite-linux-aarch64.so");
-
-// TODO: support windows
-
-// need to keep this alive!
-static CRSQL_EXT_DIR: Lazy<TempDir> = Lazy::new(|| {
-    let dir = TempDir::new().expect("could not create temp dir!");
-    std::fs::write(dir.path().join(CRSQL_EXT_GENERIC_NAME), CRSQL_EXT)
-        .expect("could not write crsql ext file");
-    dir
-});
-
 pub fn rusqlite_to_crsqlite_write(conn: rusqlite::Connection) -> rusqlite::Result<CrConn> {
     let conn = rusqlite_to_crsqlite(conn)?;
     conn.execute_batch("PRAGMA cache_size = -32000;")?;
@@ -188,8 +162,7 @@ pub fn rusqlite_to_crsqlite_write(conn: rusqlite::Connection) -> rusqlite::Resul
     Ok(conn)
 }
 
-pub fn rusqlite_to_crsqlite(mut conn: rusqlite::Connection) -> rusqlite::Result<CrConn> {
-    init_cr_conn(&mut conn)?;
+pub fn rusqlite_to_crsqlite(conn: rusqlite::Connection) -> rusqlite::Result<CrConn> {
     setup_conn(&conn)?;
     sqlite_functions::add_to_connection(&conn)?;
 
@@ -202,8 +175,7 @@ pub fn rusqlite_to_crsqlite(mut conn: rusqlite::Connection) -> rusqlite::Result<
 pub struct CrConn(Connection);
 
 impl CrConn {
-    pub fn init(mut conn: Connection) -> Result<Self, rusqlite::Error> {
-        init_cr_conn(&mut conn)?;
+    pub fn init(conn: Connection) -> Result<Self, rusqlite::Error> {
         Ok(Self(conn))
     }
 
@@ -251,26 +223,6 @@ impl Committable for CrConn {
             "cannot create savepoint from connection",
         )))
     }
-}
-
-fn init_cr_conn(conn: &mut Connection) -> Result<(), rusqlite::Error> {
-    let ext_dir = &CRSQL_EXT_DIR;
-    trace!(
-        "loading crsqlite extension from path: {}",
-        ext_dir.path().display()
-    );
-    unsafe {
-        trace!("enabled loading extension");
-        /*conn.load_extension_enable()?;
-        conn.load_extension(
-            ext_dir.path().join(CRSQL_EXT_GENERIC_NAME),
-            Some("sqlite3_crsqlite_init"),
-        )?;
-        conn.load_extension_disable()?;*/
-    }
-    trace!("loaded crsqlite extension");
-
-    Ok(())
 }
 
 pub fn setup_conn(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -384,6 +336,54 @@ mod tests {
     use tokio::task::block_in_place;
 
     use super::*;
+
+    #[test]
+    fn begin_concurrent_allows_independent_writers() -> Result<(), Box<dyn std::error::Error>> {
+        let tmpdir = tempfile::tempdir()?;
+        let path = tmpdir.path().join("begin-concurrent.db");
+
+        let conn1 = rusqlite_to_crsqlite(Connection::open(&path)?)?;
+
+        let auto_vacuum: i64 = conn1.query_row("PRAGMA auto_vacuum", (), |row| row.get(0))?;
+        assert_eq!(auto_vacuum, 0);
+
+        conn1.execute_batch(
+            "
+            CREATE TABLE left_writes (
+                id INTEGER NOT NULL PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            CREATE TABLE right_writes (
+                id INTEGER NOT NULL PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            ",
+        )?;
+
+        let conn2 = rusqlite_to_crsqlite(Connection::open(&path)?)?;
+
+        conn1.execute_batch("BEGIN CONCURRENT;")?;
+
+        conn1.execute_batch("INSERT INTO left_writes (id, value) VALUES (1, 'left');")?;
+
+        conn2.execute_batch("BEGIN CONCURRENT;")?;
+
+        conn2.execute_batch("INSERT INTO right_writes (id, value) VALUES (1, 'right');")?;
+
+        conn1.execute_batch("COMMIT;")?;
+
+        conn2.execute_batch("COMMIT;")?;
+
+        let left_count: i64 =
+            conn1.query_row("SELECT COUNT(*) FROM left_writes", (), |row| row.get(0))?;
+        let right_count: i64 =
+            conn1.query_row("SELECT COUNT(*) FROM right_writes", (), |row| row.get(0))?;
+
+        assert_eq!(left_count, 1);
+        assert_eq!(right_count, 1);
+
+        Ok(())
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_writes() -> Result<(), Box<dyn std::error::Error>> {

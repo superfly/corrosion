@@ -1091,7 +1091,7 @@ mod tests {
 
         {
             let db_conn = Connection::open(db_path.clone())?;
-            db_conn.execute_batch("PRAGMA auto_vacuum = INCREMENTAL")?;
+            db_conn.execute_batch("PRAGMA auto_vacuum = INCREMENTAL; VACUUM;")?;
         }
 
         println!("temp db: {db_path:?}");

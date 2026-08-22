@@ -78,7 +78,7 @@ extern "C" fn best_index(vtab: *mut sqlite::vtab, index_info: *mut sqlite::index
                     "no package column specified. Got {:?} instead",
                     Columns::PACKAGE
                 ))
-                .map_or(core::ptr::null_mut(), |f| f.into_raw());
+                .map_or(core::ptr::null_mut(), sqlite::into_sqlite_owned_cstring);
             }
             return ResultCode::MISUSE as c_int;
         } else {
@@ -134,7 +134,7 @@ extern "C" fn filter(
     if args.len() < 1 {
         unsafe {
             (*(*cursor).pVtab).zErrMsg = CString::new("Zero args passed to filter")
-                .map_or(core::ptr::null_mut(), |f| f.into_raw());
+                .map_or(core::ptr::null_mut(), sqlite::into_sqlite_owned_cstring);
         }
         return ResultCode::MISUSE as c_int;
     }
@@ -210,7 +210,7 @@ extern "C" fn column(
                 ResultCode::OK as c_int
             } else {
                 (*(*cursor).pVtab).zErrMsg = CString::new("No columns to unpack!")
-                    .map_or(core::ptr::null_mut(), |f| f.into_raw());
+                    .map_or(core::ptr::null_mut(), sqlite::into_sqlite_owned_cstring);
                 ResultCode::ABORT as c_int
             }
         }
@@ -218,7 +218,7 @@ extern "C" fn column(
         unsafe {
             (*(*cursor).pVtab).zErrMsg =
                 CString::new(format!("Selected a column besides cell! {}", col_num))
-                    .map_or(core::ptr::null_mut(), |f| f.into_raw());
+                    .map_or(core::ptr::null_mut(), sqlite::into_sqlite_owned_cstring);
         }
         ResultCode::MISUSE as c_int
     }

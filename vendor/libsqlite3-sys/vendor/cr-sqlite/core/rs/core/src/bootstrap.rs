@@ -180,7 +180,7 @@ fn maybe_update_db_inner(
     if recorded_version < consts::CRSQLITE_VERSION_0_17_0 && !is_blank_slate {
         let cstring = CString::new(format!("Opening a db created with cr-sqlite version {} is not supported. Upcoming release 0.17.0 is a breaking change.", recorded_version))?;
         unsafe {
-            (*err_msg) = cstring.into_raw();
+            (*err_msg) = sqlite::into_sqlite_owned_cstring(cstring);
             return Err(ResultCode::ERROR);
         }
     }
