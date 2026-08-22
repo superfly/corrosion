@@ -1499,9 +1499,7 @@ impl TxState {
 }
 
 #[derive(Clone, Default)]
-struct ConnectionDropWriteContext(
-    Rc<RefCell<Option<(OwnedSemaphorePermit, BookieWriteGuard)>>>,
-);
+struct ConnectionDropWriteContext(Rc<RefCell<Option<(OwnedSemaphorePermit, BookieWriteGuard)>>>);
 
 impl ConnectionDropWriteContext {
     fn hold(&self, tx_state: &mut TxState) {
@@ -4465,8 +4463,7 @@ impl<'conn> Drop for Session<'conn> {
         if !self.tx_state.is_ended() {
             if let Err(e) = self.rollback_tx() {
                 warn!("failed to rollback tx: {e}");
-                self.connection_drop_write_context
-                    .hold(&mut self.tx_state);
+                self.connection_drop_write_context.hold(&mut self.tx_state);
             } else {
                 debug!("rolled back tx");
             }
