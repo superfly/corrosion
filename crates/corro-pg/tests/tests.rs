@@ -309,11 +309,9 @@ async fn test_pg_schema_change_aborts_speculative_replay() {
 
     let conn = ta.agent.pool().read().await.unwrap();
     let tracked_rows: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM tests WHERE id = 951",
-            (),
-            |row| row.get(0),
-        )
+        .query_row("SELECT COUNT(*) FROM tests WHERE id = 951", (), |row| {
+            row.get(0)
+        })
         .unwrap();
     let audit_rows: i64 = conn
         .query_row("SELECT COUNT(*) FROM pg_schema_race_audit", (), |row| {
