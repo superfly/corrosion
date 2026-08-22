@@ -557,7 +557,7 @@ async fn test_pg_canonical_upgrade_error_rolls_back_and_releases_writer() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_pg_disconnect_rolls_back_and_releases_writer() {
     let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
-    let (_ta, server) = setup_pg_test_server(tripwire, None).await;
+    let (ta, server) = setup_pg_test_server(tripwire, None).await;
 
     let conn_str = format!(
         "host={} port={} user=testuser",
@@ -586,6 +586,8 @@ async fn test_pg_disconnect_rolls_back_and_releases_writer() {
             )
             .await
             .unwrap();
+
+        assert_eq!(ta.agent.write_sema().available_permits(), 0);
 
         drop(client);
         tokio::time::timeout(Duration::from_secs(5), client_conn)

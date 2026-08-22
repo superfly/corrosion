@@ -1912,29 +1912,27 @@ pub async fn start(
                                         if failed {
                                             session.rollback_sqlite_tx()?;
                                             let _permit = session.tx_state.end();
-                                        } else {
-                                            if let Err(e) = session.commit_tx() {
-                                                back_tx.blocking_send(
-                                                    (
-                                                        PgWireBackendMessage::ErrorResponse(
-                                                            ErrorInfo::new(
-                                                                "ERROR".to_owned(),
-                                                                "XX000".to_owned(),
-                                                                e.to_string(),
-                                                            )
-                                                            .into(),
-                                                        ),
-                                                        true,
-                                                    )
+                                        } else if let Err(e) = session.commit_tx() {
+                                            back_tx.blocking_send(
+                                                (
+                                                    PgWireBackendMessage::ErrorResponse(
+                                                        ErrorInfo::new(
+                                                            "ERROR".to_owned(),
+                                                            "XX000".to_owned(),
+                                                            e.to_string(),
+                                                        )
                                                         .into(),
-                                                )?;
-                                                send_ready(
-                                                    &mut session,
-                                                    discard_until_sync,
-                                                    &back_tx,
-                                                )?;
-                                                continue;
-                                            }
+                                                    ),
+                                                    true,
+                                                )
+                                                    .into(),
+                                            )?;
+                                            send_ready(
+                                                &mut session,
+                                                discard_until_sync,
+                                                &back_tx,
+                                            )?;
+                                            continue;
                                         }
                                         trace!("committed IMPLICIT tx");
                                     }
