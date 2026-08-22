@@ -492,10 +492,11 @@ impl System {
                 matches!(
                     &packet.msg,
                     WireMsg::Graft {
+                        sender,
                         send: true,
                         requests,
-                        ..
-                    } if requests.iter().any(|(id, _)| *id == MESSAGE)
+                    } if *sender == INITIAL_EAGER_RECEIVER
+                        && requests.iter().any(|(id, _)| *id == MESSAGE)
                 )
             })
         {
