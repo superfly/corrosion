@@ -9,6 +9,7 @@ type NodeId = u8;
 
 const NODE_COUNT: usize = 3;
 const ORIGIN: NodeId = 0;
+const INITIAL_EAGER_RECEIVER: NodeId = 1;
 const MESSAGE: MsgId = MsgId(ORIGIN);
 
 static EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
@@ -256,13 +257,30 @@ struct NodeSnapshot {
     cache: Vec<(MsgId, TestPayload, Round)>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FaultScenario {
+    None,
+    AnySinglePacketLoss,
+    InitialEagerGossipLoss,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum FaultProgress {
+    Disabled,
+    Armed,
+    PacketDropped,
+    InitialGossipDropped,
+    GraftRequested,
+    Recovered,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct Snapshot {
     nodes: Vec<NodeSnapshot>,
     pending: Vec<Packet>,
     timers: Vec<TimerEvent>,
     delivered: [u8; NODE_COUNT],
-    drops_remaining: u8,
+    fault_progress: FaultProgress,
 }
 
 impl Snapshot {
@@ -270,6 +288,13 @@ impl Snapshot {
         self.pending.is_empty()
             && self.timers.is_empty()
             && self.nodes.iter().all(|node| node.lazy_queue.is_empty())
+    }
+
+    fn delivered_to_every_receiver(&self) -> bool {
+        self.delivered
+            .iter()
+            .enumerate()
+            .all(|(node, count)| node == ORIGIN as usize || *count == 1)
     }
 }
 
@@ -308,11 +333,11 @@ struct System {
     pending: Vec<Packet>,
     timers: Vec<TimerEvent>,
     delivered: [u8; NODE_COUNT],
-    drops_remaining: u8,
+    fault_progress: FaultProgress,
 }
 
 impl System {
-    fn new(drop_budget: u8) -> Self {
+    fn new(fault_scenario: FaultScenario) -> Self {
         let mut nodes = Vec::with_capacity(NODE_COUNT);
 
         for node in 0..NODE_COUNT as NodeId {
@@ -351,12 +376,35 @@ impl System {
             pending: Vec::new(),
             timers: Vec::new(),
             delivered: [0; NODE_COUNT],
-            drops_remaining: drop_budget,
+            fault_progress: match fault_scenario {
+                FaultScenario::None | FaultScenario::InitialEagerGossipLoss => {
+                    FaultProgress::Disabled
+                }
+                FaultScenario::AnySinglePacketLoss => FaultProgress::Armed,
+            },
         };
 
         let mut runtime = CaptureRuntime::default();
         system.nodes[ORIGIN as usize].broadcast(MESSAGE, TestPayload(MESSAGE), &mut runtime);
         system.drain(ORIGIN, runtime);
+
+        if fault_scenario == FaultScenario::InitialEagerGossipLoss {
+            let matching = system
+                .pending
+                .iter()
+                .filter(|packet| is_initial_eager_gossip(packet))
+                .count();
+            assert_eq!(matching, 1);
+
+            let pos = system
+                .pending
+                .iter()
+                .position(is_initial_eager_gossip)
+                .expect("initial eager Gossip is pending");
+            system.pending.remove(pos);
+            system.fault_progress = FaultProgress::InitialGossipDropped;
+        }
+
         system
     }
 
@@ -398,7 +446,7 @@ impl System {
                 true
             }
             Action::Drop(packet) => {
-                if self.drops_remaining == 0 {
+                if self.fault_progress != FaultProgress::Armed {
                     return false;
                 }
 
@@ -407,7 +455,7 @@ impl System {
                 };
 
                 self.pending.remove(pos);
-                self.drops_remaining -= 1;
+                self.fault_progress = FaultProgress::PacketDropped;
                 true
             }
             Action::Fire(event) => {
@@ -439,6 +487,21 @@ impl System {
     }
 
     fn drain(&mut self, node: NodeId, runtime: CaptureRuntime) {
+        if self.fault_progress == FaultProgress::InitialGossipDropped
+            && runtime.outbox.iter().any(|packet| {
+                matches!(
+                    &packet.msg,
+                    WireMsg::Graft {
+                        send: true,
+                        requests,
+                        ..
+                    } if requests.iter().any(|(id, _)| *id == MESSAGE)
+                )
+            })
+        {
+            self.fault_progress = FaultProgress::GraftRequested;
+        }
+
         self.pending.extend(runtime.outbox);
 
         self.timers.extend(
@@ -453,6 +516,16 @@ impl System {
             self.delivered[node as usize] += 1;
         }
 
+        if self.fault_progress == FaultProgress::GraftRequested
+            && self
+                .delivered
+                .iter()
+                .enumerate()
+                .all(|(node, count)| node == ORIGIN as usize || *count == 1)
+        {
+            self.fault_progress = FaultProgress::Recovered;
+        }
+
         self.pending.sort();
         self.timers.sort();
     }
@@ -463,7 +536,7 @@ impl System {
             pending: self.pending.clone(),
             timers: self.timers.clone(),
             delivered: self.delivered,
-            drops_remaining: self.drops_remaining,
+            fault_progress: self.fault_progress,
         }
     }
 }
@@ -526,8 +599,20 @@ fn model_config() -> Config {
     }
 }
 
-fn replay(trace: &[Action], drop_budget: u8) -> Option<System> {
-    let mut system = System::new(drop_budget);
+fn is_initial_eager_gossip(packet: &Packet) -> bool {
+    packet.to == INITIAL_EAGER_RECEIVER
+        && matches!(
+            &packet.msg,
+            WireMsg::Gossip {
+                sender,
+                payload,
+                ..
+            } if *sender == ORIGIN && payload.0 == MESSAGE
+        )
+}
+
+fn replay(trace: &[Action], fault_scenario: FaultScenario) -> Option<System> {
+    let mut system = System::new(fault_scenario);
 
     for action in trace {
         if !system.apply(action) {
@@ -539,7 +624,7 @@ fn replay(trace: &[Action], drop_budget: u8) -> Option<System> {
 }
 
 struct PlumtreeModel {
-    drop_budget: u8,
+    fault_scenario: FaultScenario,
 }
 
 impl Model for PlumtreeModel {
@@ -547,7 +632,7 @@ impl Model for PlumtreeModel {
     type Action = Action;
 
     fn init_states(&self) -> Vec<Self::State> {
-        let system = System::new(self.drop_budget);
+        let system = System::new(self.fault_scenario);
         vec![ModelState {
             trace: Vec::new(),
             snapshot: system.snapshot(),
@@ -559,7 +644,7 @@ impl Model for PlumtreeModel {
         pending.dedup();
         actions.extend(pending.iter().cloned().map(Action::Deliver));
 
-        if state.snapshot.drops_remaining > 0 {
+        if state.snapshot.fault_progress == FaultProgress::Armed {
             actions.extend(pending.into_iter().map(Action::Drop));
         }
 
@@ -575,7 +660,7 @@ impl Model for PlumtreeModel {
     }
 
     fn next_state(&self, state: &Self::State, action: Self::Action) -> Option<Self::State> {
-        let mut system = replay(&state.trace, self.drop_budget)?;
+        let mut system = replay(&state.trace, self.fault_scenario)?;
 
         if !system.apply(&action) {
             return None;
@@ -591,7 +676,7 @@ impl Model for PlumtreeModel {
     }
 
     fn properties(&self) -> Vec<Property<Self>> {
-        vec![
+        let mut properties = vec![
             Property::always(
                 "peer sets are disjoint",
                 |_: &PlumtreeModel, state: &ModelState| {
@@ -614,35 +699,57 @@ impl Model for PlumtreeModel {
                     state.snapshot.delivered[ORIGIN as usize] == 0
                 },
             ),
-            Property::always(
-                "quiescence delivers to every receiver without loss",
-                |model: &PlumtreeModel, state: &ModelState| {
-                    state.snapshot.drops_remaining < model.drop_budget
-                        || !state.snapshot.quiescent()
-                        || state
-                            .snapshot
-                            .delivered
-                            .iter()
-                            .enumerate()
-                            .all(|(node, count)| node == ORIGIN as usize || *count == 1)
-                },
-            ),
-            Property::sometimes(
-                "lazy repair requests payload",
-                |_: &PlumtreeModel, state: &ModelState| {
-                    state
-                        .snapshot
-                        .pending
-                        .iter()
-                        .any(|packet| matches!(&packet.msg, WireMsg::Graft { send: true, .. }))
-                },
-            ),
-        ]
+        ];
+
+        match self.fault_scenario {
+            FaultScenario::None => {
+                properties.push(Property::always(
+                    "lossless quiescence delivers to every receiver",
+                    |_: &PlumtreeModel, state: &ModelState| {
+                        !state.snapshot.quiescent()
+                            || state.snapshot.delivered_to_every_receiver()
+                    },
+                ));
+                properties.push(Property::sometimes(
+                    "lossless broadcast reaches delivered quiescence",
+                    |_: &PlumtreeModel, state: &ModelState| {
+                        state.snapshot.quiescent()
+                            && state.snapshot.delivered_to_every_receiver()
+                    },
+                ));
+            }
+            FaultScenario::AnySinglePacketLoss => {
+                properties.push(Property::sometimes(
+                    "single packet loss is explored",
+                    |_: &PlumtreeModel, state: &ModelState| {
+                        state.snapshot.fault_progress == FaultProgress::PacketDropped
+                    },
+                ));
+            }
+            FaultScenario::InitialEagerGossipLoss => {
+                properties.push(Property::always(
+                    "initial eager Gossip loss is repaired at quiescence",
+                    |_: &PlumtreeModel, state: &ModelState| {
+                        !state.snapshot.quiescent()
+                            || state.snapshot.fault_progress == FaultProgress::Recovered
+                    },
+                ));
+                properties.push(Property::sometimes(
+                    "initial eager Gossip loss reaches repaired quiescence",
+                    |_: &PlumtreeModel, state: &ModelState| {
+                        state.snapshot.quiescent()
+                            && state.snapshot.fault_progress == FaultProgress::Recovered
+                    },
+                ));
+            }
+        }
+
+        properties
     }
 }
 
-fn check_model(drop_budget: u8) {
-    let checker = PlumtreeModel { drop_budget }
+fn check_model(fault_scenario: FaultScenario) {
+    let checker = PlumtreeModel { fault_scenario }
         .checker()
         .threads(1)
         .spawn_dfs()
@@ -653,10 +760,15 @@ fn check_model(drop_budget: u8) {
 
 #[test]
 fn model_check_three_node_broadcast() {
-    check_model(0);
+    check_model(FaultScenario::None);
 }
 
 #[test]
-fn model_check_three_node_up_to_one_packet_loss() {
-    check_model(1);
+fn model_check_three_node_any_single_packet_loss_safety() {
+    check_model(FaultScenario::AnySinglePacketLoss);
+}
+
+#[test]
+fn model_check_three_node_initial_eager_gossip_loss_repair() {
+    check_model(FaultScenario::InitialEagerGossipLoss);
 }
