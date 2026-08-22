@@ -235,8 +235,9 @@ pub fn insert_db_version(
         if ordinal == 0 {
             // we manage our own db_version internally but only error if we get a bigger db_version
             // cause we can get our own rows from other nodes but the version should never be greater than our own.
-            let db_version = (*ext_data).dbVersion;
-            if insert_db_vrsn > db_version {
+            if insert_db_vrsn > (*ext_data).dbVersion
+                && insert_db_vrsn != (*ext_data).pendingDbVersion
+            {
                 return Err(ResultCode::ERROR);
             }
             return Ok(());

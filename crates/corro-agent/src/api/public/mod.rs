@@ -18,16 +18,18 @@ use corro_types::{
     },
     base::CrsqlDbVersion,
     broadcast::Timestamp,
-    change::{insert_local_changes, InsertChangesInfo, SqliteValue},
+    change::{insert_local_changes, InsertChangesInfo, PendingLocalChanges, SqliteValue},
     persistent_gauge,
     schema::{apply_schema, parse_sql},
-    sqlite::SqlitePoolError,
+    sqlite::{CrConn, SqlitePoolError},
 };
 use hyper::StatusCode;
 use metrics::{counter, histogram};
+use rusqlite::fallible_iterator::FallibleIterator;
 use rusqlite::{params_from_iter, ToSql, Transaction};
 use serde::Deserialize;
 use spawn::spawn_counted;
+use sqlite3_parser::ast::{Cmd, Stmt as SqliteStmt};
 use sqlite_pool::{Committable, InterruptibleTransaction};
 
 use tokio::{
@@ -58,24 +60,88 @@ pub async fn make_broadcastable_changes<F, T>(
     f: F,
 ) -> Result<(T, Option<CrsqlDbVersion>, Duration), ChangeError>
 where
-    F: FnOnce(&InterruptibleTransaction<Transaction>) -> Result<T, ChangeError>,
+    F: FnOnce(&InterruptibleTransaction<CrConn>) -> Result<T, ChangeError>,
 {
-    trace!("getting conn...");
-    let mut conn = agent.pool().write_priority().await?;
-    trace!("got conn");
-
     let actor_id = agent.actor_id();
-    // maybe we should do this earlier, but there can only ever be 1 write conn at a time,
-    // so it probably doesn't matter too much, except for reads of internal state
+    let start = Instant::now();
+    let ts = Timestamp::from(agent.clock().new_timestamp());
+    let timeout = timeout.map(Duration::from_secs);
+
+    let conn = agent
+        .pool()
+        .client_dedicated()
+        .map_err(|source| ChangeError::Rusqlite {
+            source,
+            actor_id: Some(actor_id),
+            version: None,
+        })?;
+
+    let (ret, pending) = block_in_place(move || {
+        conn.execute_batch("BEGIN CONCURRENT;")
+            .map_err(|source| ChangeError::Rusqlite {
+                source,
+                actor_id: Some(actor_id),
+                version: None,
+            })?;
+
+        let tx = InterruptibleTransaction::new(conn, timeout, "local_changes");
+
+        if let Err(source) = tx
+            .prepare_cached("SELECT crsql_set_ts(?)")
+            .and_then(|mut stmt| stmt.query_row([&ts], |row| row.get::<_, String>(0)))
+        {
+            let _ = tx.execute_batch("ROLLBACK;");
+            return Err(ChangeError::Rusqlite {
+                source,
+                actor_id: Some(actor_id),
+                version: None,
+            });
+        }
+
+        let ret = match f(&tx) {
+            Ok(ret) => ret,
+            Err(err) => {
+                let _ = tx.execute_batch("ROLLBACK;");
+                return Err(err);
+            }
+        };
+
+        let pending = match PendingLocalChanges::capture(&tx, actor_id) {
+            Ok(pending) => pending,
+            Err(source) => {
+                let _ = tx.execute_batch("ROLLBACK;");
+                return Err(ChangeError::Rusqlite {
+                    source,
+                    actor_id: Some(actor_id),
+                    version: None,
+                });
+            }
+        };
+
+        tx.execute_batch("ROLLBACK;")
+            .map_err(|source| ChangeError::Rusqlite {
+                source,
+                actor_id: Some(actor_id),
+                version: None,
+            })?;
+
+        Ok::<_, ChangeError>((ret, pending))
+    })?;
+
+    if pending.is_empty() {
+        let elapsed = start.elapsed();
+        histogram!("corro.agent.changes.processing.time.seconds", "source" => "local")
+            .record(elapsed);
+        return Ok((ret, None, elapsed));
+    }
+
+    let mut conn = agent.pool().write_priority().await?;
     let mut book_writer = agent
         .booked()
         .write::<&str, _>("make_broadcastable_changes(booked writer)", None)
         .await;
 
-    let start = Instant::now();
-    let ts = Timestamp::from(agent.clock().new_timestamp());
-
-    block_in_place(move || {
+    let insert_info = block_in_place(move || {
         let tx = conn
             .immediate_transaction()
             .map_err(|source| ChangeError::Rusqlite {
@@ -84,58 +150,184 @@ where
                 version: None,
             })?;
 
-        let timeout = timeout.map(Duration::from_secs);
-        let tx = InterruptibleTransaction::new(tx, timeout, "local_changes");
-
-        let _ = tx
-            .prepare_cached("SELECT crsql_set_ts(?)")
-            .map_err(|source| ChangeError::Rusqlite {
-                source,
-                actor_id: Some(actor_id),
-                version: None,
-            })?
-            .query_row([&ts], |row| row.get::<_, String>(0))
+        let reserved_version = pending
+            .replay(&tx)
             .map_err(|source| ChangeError::Rusqlite {
                 source,
                 actor_id: Some(actor_id),
                 version: None,
             })?;
 
-        // Execute whatever might mutate state data
-        let ret = f(&tx)?;
-
         let insert_info = insert_local_changes(agent, &tx, &mut book_writer)?;
+
+        if reserved_version.is_some() && insert_info.is_none() {
+            tx.rollback().map_err(|source| ChangeError::Rusqlite {
+                source,
+                actor_id: Some(actor_id),
+                version: reserved_version,
+            })?;
+            return Ok(None);
+        }
+
         tx.commit().map_err(|source| ChangeError::Rusqlite {
             source,
             actor_id: Some(actor_id),
             version: insert_info.as_ref().map(|info| info.db_version),
         })?;
 
-        let elapsed = start.elapsed();
-        histogram!("corro.agent.changes.processing.time.seconds", "source" => "local")
-            .record(start.elapsed());
-
-        match insert_info {
-            None => Ok((ret, None, elapsed)),
+        let committed = match insert_info {
+            None => None,
             Some(InsertChangesInfo {
                 db_version,
                 last_seq,
                 ts,
                 snap,
             }) => {
-                trace!("committed tx, db_version: {db_version}, last_seq: {last_seq:?}");
-
                 book_writer.commit_snapshot(snap);
-
-                let agent = agent.clone();
-
-                spawn_counted(
-                    async move { broadcast_changes(agent, db_version, last_seq, ts).await },
-                );
-
-                Ok::<_, ChangeError>((ret, Some(db_version), elapsed))
+                Some((db_version, last_seq, ts))
             }
+        };
+
+        Ok::<_, ChangeError>(committed)
+    })?;
+
+    let elapsed = start.elapsed();
+    histogram!("corro.agent.changes.processing.time.seconds", "source" => "local").record(elapsed);
+
+    match insert_info {
+        None => Ok((ret, None, elapsed)),
+        Some((db_version, last_seq, ts)) => {
+            let agent = agent.clone();
+            spawn_counted(async move { broadcast_changes(agent, db_version, last_seq, ts).await });
+
+            Ok((ret, Some(db_version), elapsed))
         }
+    }
+}
+
+async fn make_canonical_broadcastable_changes<F, T>(
+    agent: &Agent,
+    timeout: Option<u64>,
+    f: F,
+) -> Result<(T, Option<CrsqlDbVersion>, Duration), ChangeError>
+where
+    F: FnOnce(&InterruptibleTransaction<Transaction>) -> Result<T, ChangeError>,
+{
+    let actor_id = agent.actor_id();
+    let start = Instant::now();
+    let ts = Timestamp::from(agent.clock().new_timestamp());
+    let timeout = timeout.map(Duration::from_secs);
+
+    let mut conn = agent.pool().write_priority().await?;
+    let mut book_writer = agent
+        .booked()
+        .write::<&str, _>("make_canonical_broadcastable_changes(booked writer)", None)
+        .await;
+
+    let (ret, insert_info) = block_in_place(move || {
+        let tx = conn
+            .immediate_transaction()
+            .map_err(|source| ChangeError::Rusqlite {
+                source,
+                actor_id: Some(actor_id),
+                version: None,
+            })?;
+
+        let tx = InterruptibleTransaction::new(tx, timeout, "local_changes");
+
+        if let Err(source) = tx
+            .prepare_cached("SELECT crsql_set_ts(?)")
+            .and_then(|mut stmt| stmt.query_row([&ts], |row| row.get::<_, String>(0)))
+        {
+            let _ = tx.execute_batch("ROLLBACK;");
+            return Err(ChangeError::Rusqlite {
+                source,
+                actor_id: Some(actor_id),
+                version: None,
+            });
+        }
+
+        let ret = match f(&tx) {
+            Ok(ret) => ret,
+            Err(err) => {
+                let _ = tx.execute_batch("ROLLBACK;");
+                return Err(err);
+            }
+        };
+
+        let insert_info = match insert_local_changes(agent, &tx, &mut book_writer) {
+            Ok(insert_info) => insert_info,
+            Err(err) => {
+                let _ = tx.execute_batch("ROLLBACK;");
+                return Err(err);
+            }
+        };
+
+        tx.commit().map_err(|source| ChangeError::Rusqlite {
+            source,
+            actor_id: Some(actor_id),
+            version: insert_info.as_ref().map(|info| info.db_version),
+        })?;
+
+        let committed = insert_info.map(
+            |InsertChangesInfo {
+                 db_version,
+                 last_seq,
+                 ts,
+                 snap,
+             }| {
+                book_writer.commit_snapshot(snap);
+                (db_version, last_seq, ts)
+            },
+        );
+
+        Ok::<_, ChangeError>((ret, committed))
+    })?;
+
+    let elapsed = start.elapsed();
+    histogram!("corro.agent.changes.processing.time.seconds", "source" => "local").record(elapsed);
+
+    match insert_info {
+        None => Ok((ret, None, elapsed)),
+        Some((db_version, last_seq, ts)) => {
+            let agent = agent.clone();
+            spawn_counted(async move { broadcast_changes(agent, db_version, last_seq, ts).await });
+
+            Ok((ret, Some(db_version), elapsed))
+        }
+    }
+}
+
+fn transaction_is_replayable(agent: &Agent, statements: &[Statement]) -> bool {
+    let schema = agent.schema().read();
+
+    statements.iter().all(|statement| {
+        let sql = statement.query().trim().trim_end_matches(';').trim();
+        if sql.is_empty() {
+            return false;
+        }
+
+        let mut parser = sqlite3_parser::lexer::sql::Parser::new(sql.as_bytes());
+
+        let cmd = match parser.next() {
+            Ok(Some(cmd)) => cmd,
+            _ => return false,
+        };
+
+        if !matches!(parser.next(), Ok(None)) {
+            return false;
+        }
+
+        let table = match cmd {
+            Cmd::Stmt(
+                SqliteStmt::Insert { tbl_name, .. }
+                | SqliteStmt::Update { tbl_name, .. }
+                | SqliteStmt::Delete { tbl_name, .. },
+            ) if tbl_name.db_name.is_none() => tbl_name.name.0,
+            _ => return false,
+        };
+
+        schema.tables.contains_key(&table)
     })
 }
 
@@ -175,6 +367,39 @@ where
     }
 }
 
+fn execute_transaction_statements<T>(
+    tx: &InterruptibleTransaction<T>,
+    statements: &[Statement],
+) -> Result<Vec<ExecResult>, ChangeError>
+where
+    T: Deref<Target = rusqlite::Connection> + Committable,
+{
+    let mut total_rows_affected = 0;
+
+    statements
+        .iter()
+        .map(|stmt| {
+            let start = Instant::now();
+            let res = execute_statement(tx, stmt).map_err(|source| ChangeError::Rusqlite {
+                source,
+                actor_id: None,
+                version: None,
+            });
+
+            match res {
+                Ok(rows_affected) => {
+                    total_rows_affected += rows_affected;
+                    Ok(ExecResult::Execute {
+                        rows_affected,
+                        time: start.elapsed().as_secs_f64(),
+                    })
+                }
+                Err(err) => Err(err),
+            }
+        })
+        .collect()
+}
+
 #[tracing::instrument(skip_all)]
 pub async fn api_v1_transactions(
     // axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
@@ -199,35 +424,19 @@ pub async fn api_v1_transactions(
 
     counter!("corro.api.connection.count", "protocol" => "http").increment(1);
     assert_sometimes!(true, "Corrosion receives transactions through HTTP API");
-    let res = make_broadcastable_changes(&agent, params.timeout, move |tx| {
-        let mut total_rows_affected = 0;
+    let replayable = transaction_is_replayable(&agent, &statements);
 
-        let results = statements
-            .iter()
-            .map(|stmt| {
-                let start = Instant::now();
-                let res = execute_statement(tx, stmt).map_err(|e| ChangeError::Rusqlite {
-                    source: e,
-                    actor_id: None,
-                    version: None,
-                });
-
-                match res {
-                    Ok(rows_affected) => {
-                        total_rows_affected += rows_affected;
-                        Ok(ExecResult::Execute {
-                            rows_affected,
-                            time: start.elapsed().as_secs_f64(),
-                        })
-                    }
-                    Err(e) => Err(e),
-                }
-            })
-            .collect::<Result<Vec<ExecResult>, ChangeError>>();
-
-        results
-    })
-    .await;
+    let res = if replayable {
+        make_broadcastable_changes(&agent, params.timeout, |tx| {
+            execute_transaction_statements(tx, &statements)
+        })
+        .await
+    } else {
+        make_canonical_broadcastable_changes(&agent, params.timeout, |tx| {
+            execute_transaction_statements(tx, &statements)
+        })
+        .await
+    };
 
     let (results, version, elapsed) = match res {
         Ok(res) => res,
@@ -722,6 +931,417 @@ mod tests {
     use super::*;
 
     use crate::agent::setup;
+
+    async fn setup_api_test_agent() -> eyre::Result<(tempfile::TempDir, Agent)> {
+        let (tripwire, _tripwire_worker, _tripwire_tx) = Tripwire::new_simple();
+        let dir = tempfile::tempdir()?;
+
+        let (agent, _agent_options) = setup(
+            Config::builder()
+                .db_path(dir.path().join("corrosion.db").display().to_string())
+                .gossip_addr("127.0.0.1:0".parse()?)
+                .api_addr("127.0.0.1:0".parse()?)
+                .build()?,
+            tripwire,
+        )
+        .await?;
+
+        let (status_code, _) = api_v1_db_schema(
+            Extension(agent.clone()),
+            axum::Json(vec![corro_tests::TEST_SCHEMA.into()]),
+        )
+        .await;
+
+        assert_eq!(status_code, StatusCode::OK);
+
+        Ok((dir, agent))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_api_non_replayable_transaction_uses_canonical_path() -> eyre::Result<()> {
+        let (_dir, agent) = setup_api_test_agent().await?;
+
+        let (status_code, body) = api_v1_transactions(
+            Extension(agent.clone()),
+            axum::extract::Query(TimeoutParams { timeout: None }),
+            axum::Json(vec![
+                Statement::Simple(
+                    "INSERT INTO tests (id, text) VALUES ('canonical-http', 'preserved')".into(),
+                ),
+                Statement::Simple(
+                    "CREATE TABLE http_canonical_marker (id INTEGER PRIMARY KEY)".into(),
+                ),
+            ]),
+        )
+        .await;
+
+        assert_eq!(status_code, StatusCode::OK, "{body:?}");
+
+        let conn = agent.pool().read().await?;
+
+        let value: String = conn.query_row(
+            "SELECT text FROM tests WHERE id = 'canonical-http'",
+            (),
+            |row| row.get(0),
+        )?;
+
+        assert_eq!(value, "preserved");
+
+        let marker_exists: bool = conn.query_row(
+            "
+            SELECT EXISTS (
+                SELECT 1
+                FROM sqlite_schema
+                WHERE type = 'table'
+                  AND name = 'http_canonical_marker'
+            )
+            ",
+            (),
+            |row| row.get(0),
+        )?;
+
+        assert!(marker_exists);
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_api_speculative_failure_rolls_back_and_releases_writer() -> eyre::Result<()> {
+        let (_dir, agent) = setup_api_test_agent().await?;
+        let booked_before = agent
+            .booked()
+            .read::<&str, _>("test_api_speculative_failure", None)
+            .await
+            .last();
+
+        let (status_code, body) = api_v1_transactions(
+            Extension(agent.clone()),
+            axum::extract::Query(TimeoutParams { timeout: None }),
+            axum::Json(vec![
+                Statement::Simple(
+                    "INSERT INTO tests (id, text) VALUES ('http-speculative-failure', 'first')"
+                        .into(),
+                ),
+                Statement::Simple(
+                    "INSERT INTO tests (id, text) VALUES ('http-speculative-failure', 'duplicate')"
+                        .into(),
+                ),
+            ]),
+        )
+        .await;
+
+        assert_eq!(status_code, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(body.0.version.is_none());
+
+        {
+            let conn = agent.pool().read().await?;
+            let rows: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM tests WHERE id = 'http-speculative-failure'",
+                (),
+                |row| row.get(0),
+            )?;
+            assert_eq!(rows, 0);
+        }
+
+        let booked_after = agent
+            .booked()
+            .read::<&str, _>("test_api_speculative_failure", None)
+            .await
+            .last();
+        assert_eq!(booked_after, booked_before);
+
+        let (status_code, body) = tokio::time::timeout(
+            Duration::from_secs(5),
+            api_v1_transactions(
+                Extension(agent.clone()),
+                axum::extract::Query(TimeoutParams { timeout: None }),
+                axum::Json(vec![Statement::Simple(
+                    "INSERT INTO tests (id, text) VALUES ('http-speculative-recovery', 'ok')"
+                        .into(),
+                )]),
+            ),
+        )
+        .await
+        .expect("writer remained blocked after speculative rollback");
+
+        assert_eq!(status_code, StatusCode::OK, "{body:?}");
+        assert!(body.0.version.is_some());
+
+        let conn = agent.pool().read().await?;
+        let recovery_rows: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM tests WHERE id = 'http-speculative-recovery'",
+            (),
+            |row| row.get(0),
+        )?;
+        assert_eq!(recovery_rows, 1);
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_api_canonical_failure_rolls_back_and_releases_writer() -> eyre::Result<()> {
+        let (_dir, agent) = setup_api_test_agent().await?;
+
+        {
+            let conn = agent.pool().write_priority().await?;
+            block_in_place(|| {
+                conn.execute_batch(
+                    "CREATE TABLE http_canonical_side (
+                        id INTEGER PRIMARY KEY
+                    )",
+                )
+            })?;
+        }
+
+        let booked_before = agent
+            .booked()
+            .read::<&str, _>("test_api_canonical_failure", None)
+            .await
+            .last();
+
+        let (status_code, body) = api_v1_transactions(
+            Extension(agent.clone()),
+            axum::extract::Query(TimeoutParams { timeout: None }),
+            axum::Json(vec![
+                Statement::Simple(
+                    "INSERT INTO tests (id, text) VALUES ('http-canonical-failure', 'first')"
+                        .into(),
+                ),
+                Statement::Simple("INSERT INTO http_canonical_side (id) VALUES (1)".into()),
+                Statement::Simple("INSERT INTO http_canonical_side (id) VALUES (1)".into()),
+            ]),
+        )
+        .await;
+
+        assert_eq!(status_code, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(body.0.version.is_none());
+
+        {
+            let conn = agent.pool().read().await?;
+            let tracked_rows: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM tests WHERE id = 'http-canonical-failure'",
+                (),
+                |row| row.get(0),
+            )?;
+            let side_rows: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM http_canonical_side WHERE id = 1",
+                (),
+                |row| row.get(0),
+            )?;
+            assert_eq!(tracked_rows, 0);
+            assert_eq!(side_rows, 0);
+        }
+
+        let booked_after = agent
+            .booked()
+            .read::<&str, _>("test_api_canonical_failure", None)
+            .await
+            .last();
+        assert_eq!(booked_after, booked_before);
+
+        let (status_code, body) = tokio::time::timeout(
+            Duration::from_secs(5),
+            api_v1_transactions(
+                Extension(agent.clone()),
+                axum::extract::Query(TimeoutParams { timeout: None }),
+                axum::Json(vec![Statement::Simple(
+                    "INSERT INTO tests (id, text) VALUES ('http-canonical-recovery', 'ok')".into(),
+                )]),
+            ),
+        )
+        .await
+        .expect("writer remained blocked after canonical rollback");
+
+        assert_eq!(status_code, StatusCode::OK, "{body:?}");
+        assert!(body.0.version.is_some());
+
+        let conn = agent.pool().read().await?;
+        let recovery_rows: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM tests WHERE id = 'http-canonical-recovery'",
+            (),
+            |row| row.get(0),
+        )?;
+        assert_eq!(recovery_rows, 1);
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_api_speculative_write_does_not_block_normal_writer() -> eyre::Result<()> {
+        let (_dir, agent) = setup_api_test_agent().await?;
+
+        {
+            let conn = agent.pool().write_priority().await?;
+            block_in_place(|| {
+                conn.execute_batch(
+                    "
+                    CREATE TABLE issue503_writer_probe (
+                        id INTEGER PRIMARY KEY
+                    );
+                    ",
+                )
+            })?;
+        }
+
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+
+        let speculative = {
+            let agent = agent.clone();
+
+            tokio::spawn(async move {
+                make_broadcastable_changes(&agent, None, move |tx| {
+                    tx.execute(
+                        "INSERT INTO tests (id, text) VALUES ('speculative-open', 'client')",
+                        &[],
+                    )
+                    .map_err(|source| ChangeError::Rusqlite {
+                        source,
+                        actor_id: None,
+                        version: None,
+                    })?;
+
+                    let _ = entered_tx.send(());
+                    release_rx
+                        .recv_timeout(Duration::from_secs(5))
+                        .expect("speculative write was not released");
+
+                    Ok(())
+                })
+                .await
+            })
+        };
+
+        entered_rx.await?;
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut conn = agent.pool().write_normal().await?;
+
+            block_in_place(|| -> eyre::Result<()> {
+                let tx = conn.immediate_transaction()?;
+                tx.execute("INSERT INTO issue503_writer_probe (id) VALUES (1)", ())?;
+                tx.commit()?;
+                Ok(())
+            })
+        })
+        .await
+        .expect("normal writer was blocked by speculative client")?;
+
+        release_tx.send(())?;
+
+        let (_, version, _) = speculative.await??;
+        assert!(version.is_some());
+
+        let conn = agent.pool().read().await?;
+
+        let client_row: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM tests WHERE id = 'speculative-open'",
+            (),
+            |row| row.get(0),
+        )?;
+
+        let normal_row: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM issue503_writer_probe WHERE id = 1",
+            (),
+            |row| row.get(0),
+        )?;
+
+        assert_eq!(client_row, 1);
+        assert_eq!(normal_row, 1);
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_api_writes_execute_speculatively_in_parallel() -> eyre::Result<()> {
+        use std::sync::{Arc, Condvar, Mutex};
+        use std::time::Duration;
+
+        fn enter(gate: &(Mutex<usize>, Condvar)) -> bool {
+            let mut count = gate.0.lock().unwrap();
+            *count += 1;
+            gate.1.notify_all();
+
+            let (count, timeout) = gate
+                .1
+                .wait_timeout_while(count, Duration::from_secs(5), |count| *count < 2)
+                .unwrap();
+
+            *count >= 2 && !timeout.timed_out()
+        }
+
+        let (_dir, agent) = setup_api_test_agent().await?;
+
+        let gate = Arc::new((Mutex::new(0usize), Condvar::new()));
+
+        let first = {
+            let agent = agent.clone();
+            let gate = gate.clone();
+
+            tokio::spawn(async move {
+                make_broadcastable_changes(&agent, None, move |tx| {
+                    let concurrent = enter(&gate);
+
+                    tx.execute(
+                        "INSERT INTO tests (id, text) VALUES ('parallel-1', 'first')",
+                        &[],
+                    )
+                    .map_err(|source| ChangeError::Rusqlite {
+                        source,
+                        actor_id: None,
+                        version: None,
+                    })?;
+
+                    Ok(concurrent)
+                })
+                .await
+            })
+        };
+
+        let second = {
+            let agent = agent.clone();
+            let gate = gate.clone();
+
+            tokio::spawn(async move {
+                make_broadcastable_changes(&agent, None, move |tx| {
+                    let concurrent = enter(&gate);
+
+                    tx.execute(
+                        "INSERT INTO tests (id, text) VALUES ('parallel-2', 'second')",
+                        &[],
+                    )
+                    .map_err(|source| ChangeError::Rusqlite {
+                        source,
+                        actor_id: None,
+                        version: None,
+                    })?;
+
+                    Ok(concurrent)
+                })
+                .await
+            })
+        };
+
+        let first = first.await??;
+        let second = second.await??;
+
+        assert!(first.0);
+        assert!(second.0);
+        assert!(first.1.is_some());
+        assert!(second.1.is_some());
+        assert_ne!(first.1, second.1);
+
+        let conn = agent.pool().read().await?;
+        let rows: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM tests WHERE id IN ('parallel-1', 'parallel-2')",
+            (),
+            |row| row.get(0),
+        )?;
+
+        assert_eq!(rows, 2);
+
+        Ok(())
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn test_api_db_execute() -> eyre::Result<()> {

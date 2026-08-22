@@ -563,6 +563,9 @@ pub fn value_bytes(arg1: *mut value) -> c_int {
 pub fn value_blob<'a>(value: *mut value) -> &'a [u8] {
     unsafe {
         let n = value_bytes(value);
+        if n == 0 {
+            return &[];
+        }
         let b = invoke_sqlite!(value_blob, value);
         core::slice::from_raw_parts(b.cast::<u8>(), n as usize)
     }

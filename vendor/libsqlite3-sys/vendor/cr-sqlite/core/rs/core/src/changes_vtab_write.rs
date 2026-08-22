@@ -70,7 +70,7 @@ fn did_cid_win(
         Ok(rc) | Err(rc) => {
             reset_cached_stmt(col_vrsn_stmt.stmt)?;
             let err = CString::new("Bad return code when selecting local column version")?;
-            unsafe { *errmsg = err.into_raw() };
+            unsafe { *errmsg = sqlite::into_sqlite_owned_cstring(err) };
             return Err(rc);
         }
     }
@@ -115,7 +115,7 @@ fn did_cid_win(
                 "could not find row to merge with for tbl {}",
                 insert_tbl
             ))?;
-            unsafe { *errmsg = err.into_raw() };
+            unsafe { *errmsg = sqlite::into_sqlite_owned_cstring(err) };
             return Err(ResultCode::ERROR);
         }
     }
@@ -154,13 +154,13 @@ fn did_site_id_win(
                 "could not find site_id for previous change, cr-sqlite clock table might be corrupt for tbl {}",
                 insert_tbl
             ))?;
-            unsafe { *errmsg = err.into_raw() };
+            unsafe { *errmsg = sqlite::into_sqlite_owned_cstring(err) };
             return Err(ResultCode::ERROR);
         }
         Ok(rc) | Err(rc) => {
             reset_cached_stmt(col_site_id_stmt.stmt)?;
             let err = CString::new("Bad return code when selecting local column site_id")?;
-            unsafe { *errmsg = err.into_raw() };
+            unsafe { *errmsg = sqlite::into_sqlite_owned_cstring(err) };
             return Err(rc);
         }
     }
@@ -434,7 +434,7 @@ unsafe fn merge_insert(
     let rc = crsql_ensure_table_infos_are_up_to_date(db, (*tab).pExtData, errmsg);
     if rc != ResultCode::OK as i32 {
         let err = CString::new("Failed to update CRR table information")?;
-        *errmsg = err.into_raw();
+        *errmsg = sqlite::into_sqlite_owned_cstring(err);
         return Err(ResultCode::ERROR);
     }
 
@@ -442,7 +442,7 @@ unsafe fn merge_insert(
     let insert_tbl = args[2 + CrsqlChangesColumn::Tbl as usize];
     if insert_tbl.bytes() > crate::consts::MAX_TBL_NAME_LEN {
         let err = CString::new("crsql - table name exceeded max length")?;
-        *errmsg = err.into_raw();
+        *errmsg = sqlite::into_sqlite_owned_cstring(err);
         return Err(ResultCode::ERROR);
     }
 
@@ -451,7 +451,7 @@ unsafe fn merge_insert(
     let insert_col = args[2 + CrsqlChangesColumn::Cid as usize];
     if insert_col.bytes() > crate::consts::MAX_TBL_NAME_LEN {
         let err = CString::new("crsql - column name exceeded max length")?;
-        *errmsg = err.into_raw();
+        *errmsg = sqlite::into_sqlite_owned_cstring(err);
         return Err(ResultCode::ERROR);
     }
 
@@ -462,11 +462,16 @@ unsafe fn merge_insert(
     let insert_site_id = args[2 + CrsqlChangesColumn::SiteId as usize];
     let insert_cl = args[2 + CrsqlChangesColumn::Cl as usize].int64();
     let insert_seq = args[2 + CrsqlChangesColumn::Seq as usize].int64();
-    let insert_ts = args[2 + CrsqlChangesColumn::Ts as usize].text();
+    let insert_ts = args[2 + CrsqlChangesColumn::Ts as usize];
+    let insert_ts = if insert_ts.value_type() == sqlite::ColumnType::Null {
+        "0"
+    } else {
+        insert_ts.text()
+    };
 
     if insert_site_id.bytes() > crate::consts::SITE_ID_LEN {
         let err = CString::new("crsql - site id exceeded max length")?;
-        *errmsg = err.into_raw();
+        *errmsg = sqlite::into_sqlite_owned_cstring(err);
         return Err(ResultCode::ERROR);
     }
 
@@ -484,7 +489,7 @@ unsafe fn merge_insert(
             "crsql - could not find the schema information for table {}",
             insert_tbl
         ))?;
-        *errmsg = err.into_raw();
+        *errmsg = sqlite::into_sqlite_owned_cstring(err);
         return Err(ResultCode::ERROR);
     }
     // TODO: technically safe since we checked `is_none` but this should be more idiomatic
@@ -717,7 +722,7 @@ unsafe fn merge_insert(
                 "Unable to insert db version {} for site id {:?}",
                 insert_db_vrsn, insert_site_id
             ))?;
-            *errmsg = err.into_raw();
+            *errmsg = sqlite::into_sqlite_owned_cstring(err);
             return Err(rc);
         }
 

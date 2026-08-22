@@ -4,6 +4,13 @@
 #[cfg(feature = "bundled-sqlcipher-vendored-openssl")]
 extern crate openssl_sys;
 
+#[cfg(any(
+    feature = "bundled",
+    feature = "bundled-windows",
+    feature = "bundled-sqlcipher"
+))]
+extern crate crsql_bundle as _;
+
 pub use self::error::*;
 
 use core::mem;

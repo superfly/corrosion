@@ -14,8 +14,8 @@ exclude = ["**/*.sh"]
 
 [features]
 default = ["min_sqlite_version_3_34_1"]
-bundled = ["cc", "bundled_bindings"]
-bundled-windows = ["cc", "bundled_bindings"]
+bundled = ["cc", "bundled_bindings", "dep:crsql_bundle"]
+bundled-windows = ["cc", "bundled_bindings", "dep:crsql_bundle"]
 bundled-sqlcipher = ["bundled"]
 bundled-sqlcipher-vendored-openssl = [
     "bundled-sqlcipher",
@@ -41,6 +41,7 @@ wasm32-wasi-vfs = []
 
 [dependencies]
 openssl-sys = { version = "0.9.103", optional = true }
+crsql_bundle = { path = "vendor/cr-sqlite/core/rs/bundle", optional = true, features = ["static", "omit_load_extension", "host"] }
 
 [build-dependencies]
 bindgen = { version = "0.72", optional = true, default-features = false, features = [
