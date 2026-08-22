@@ -56,6 +56,13 @@ fn notifications_restart_directive(reason: RestartReason) -> RestartDirective {
     }
 }
 
+fn replay_sensitive_receiver_restart_directive(reason: RestartReason) -> RestartDirective {
+    match reason {
+        RestartReason::Completed | RestartReason::Panicked => RestartDirective::Escalate,
+        RestartReason::Failed => RestartDirective::Restart,
+    }
+}
+
 pub(in crate::agent) struct NotificationsActor {
     agent: Agent,
     receiver: CorroReceiver<OwnedNotification<CorroActor>>,
@@ -92,7 +99,7 @@ impl SupervisedActor for NotificationsActor {
     }
 }
 
-fn gossip_to_send_restart_directive(reason: RestartReason) -> RestartDirective {
+fn restartable_receiver_restart_directive(reason: RestartReason) -> RestartDirective {
     match reason {
         RestartReason::Completed => RestartDirective::Escalate,
         RestartReason::Failed | RestartReason::Panicked => RestartDirective::Restart,
@@ -134,7 +141,7 @@ impl SupervisedActor for GossipToSendActor {
     }
 
     fn restart_directive(&mut self, reason: RestartReason) -> RestartDirective {
-        gossip_to_send_restart_directive(reason)
+        restartable_receiver_restart_directive(reason)
     }
 }
 
@@ -151,16 +158,20 @@ impl SupervisedActor for handlers::ChangesActor {
     }
 
     fn restart_directive(&mut self, reason: RestartReason) -> RestartDirective {
-        match reason {
-            RestartReason::Completed => RestartDirective::Stop,
-            RestartReason::Failed => RestartDirective::Restart,
-            RestartReason::Panicked => RestartDirective::Escalate,
-        }
+        replay_sensitive_receiver_restart_directive(reason)
     }
 
     fn on_escalate(&mut self, reason: RestartReason) {
-        debug_assert_eq!(reason, RestartReason::Panicked);
-        self.mark_unhealthy("changes actor panicked");
+        debug_assert!(matches!(
+            reason,
+            RestartReason::Completed | RestartReason::Panicked
+        ));
+        let issue = match reason {
+            RestartReason::Completed => "changes actor exited unexpectedly",
+            RestartReason::Panicked => "changes actor panicked",
+            RestartReason::Failed => "changes actor failed",
+        };
+        self.mark_unhealthy(issue);
     }
 }
 
@@ -177,16 +188,20 @@ impl SupervisedActor for util::ApplyBufferedActor {
     }
 
     fn restart_directive(&mut self, reason: RestartReason) -> RestartDirective {
-        match reason {
-            RestartReason::Completed => RestartDirective::Stop,
-            RestartReason::Failed => RestartDirective::Restart,
-            RestartReason::Panicked => RestartDirective::Escalate,
-        }
+        replay_sensitive_receiver_restart_directive(reason)
     }
 
     fn on_escalate(&mut self, reason: RestartReason) {
-        debug_assert_eq!(reason, RestartReason::Panicked);
-        self.mark_unhealthy("apply-buffered actor panicked");
+        debug_assert!(matches!(
+            reason,
+            RestartReason::Completed | RestartReason::Panicked
+        ));
+        let issue = match reason {
+            RestartReason::Completed => "apply-buffered actor exited unexpectedly",
+            RestartReason::Panicked => "apply-buffered actor panicked",
+            RestartReason::Failed => "apply-buffered actor failed",
+        };
+        self.mark_unhealthy(issue);
     }
 }
 
@@ -203,10 +218,7 @@ impl SupervisedActor for util::ClearBufferedMetaActor {
     }
 
     fn restart_directive(&mut self, reason: RestartReason) -> RestartDirective {
-        match reason {
-            RestartReason::Completed => RestartDirective::Stop,
-            RestartReason::Failed | RestartReason::Panicked => RestartDirective::Restart,
-        }
+        restartable_receiver_restart_directive(reason)
     }
 }
 
@@ -235,10 +247,7 @@ impl SupervisedActor for crate::plumtree::PlumtreeActor {
     }
 
     fn restart_directive(&mut self, reason: RestartReason) -> RestartDirective {
-        match reason {
-            RestartReason::Completed => RestartDirective::Stop,
-            RestartReason::Failed | RestartReason::Panicked => RestartDirective::Restart,
-        }
+        restartable_receiver_restart_directive(reason)
     }
 }
 
@@ -256,10 +265,7 @@ impl SupervisedActor for crate::broadcast::GossipBroadcastActor {
     }
 
     fn restart_directive(&mut self, reason: RestartReason) -> RestartDirective {
-        match reason {
-            RestartReason::Completed => RestartDirective::Stop,
-            RestartReason::Failed | RestartReason::Panicked => RestartDirective::Restart,
-        }
+        restartable_receiver_restart_directive(reason)
     }
 }
 
@@ -329,17 +335,33 @@ mod tests {
     }
 
     #[test]
-    fn gossip_sender_escalates_on_channel_close() {
+    fn replay_sensitive_receivers_escalate_on_completion_and_panic() {
         assert_eq!(
-            gossip_to_send_restart_directive(RestartReason::Completed),
+            replay_sensitive_receiver_restart_directive(RestartReason::Completed),
             RestartDirective::Escalate
         );
         assert_eq!(
-            gossip_to_send_restart_directive(RestartReason::Failed),
+            replay_sensitive_receiver_restart_directive(RestartReason::Failed),
             RestartDirective::Restart
         );
         assert_eq!(
-            gossip_to_send_restart_directive(RestartReason::Panicked),
+            replay_sensitive_receiver_restart_directive(RestartReason::Panicked),
+            RestartDirective::Escalate
+        );
+    }
+
+    #[test]
+    fn restartable_receivers_escalate_on_channel_close() {
+        assert_eq!(
+            restartable_receiver_restart_directive(RestartReason::Completed),
+            RestartDirective::Escalate
+        );
+        assert_eq!(
+            restartable_receiver_restart_directive(RestartReason::Failed),
+            RestartDirective::Restart
+        );
+        assert_eq!(
+            restartable_receiver_restart_directive(RestartReason::Panicked),
             RestartDirective::Restart
         );
     }
