@@ -213,11 +213,7 @@ fn test_policy() -> RestartPolicy {
     )
 }
 
-fn spawn_test_supervised<A>(
-    actor: A,
-    tripwire: Tripwire,
-    policy: RestartPolicy,
-) -> JoinHandle<()>
+fn spawn_test_supervised<A>(actor: A, tripwire: Tripwire, policy: RestartPolicy) -> JoinHandle<()>
 where
     A: SupervisedActor,
 {
@@ -448,7 +444,6 @@ async fn shutdown_does_not_restart_or_escalate_actor() {
     assert_eq!(runs.load(Ordering::SeqCst), 1);
     assert_eq!(node_escalations.load(Ordering::SeqCst), 0);
 }
-
 
 #[tokio::test]
 async fn restart_limit_escalates_once() {
