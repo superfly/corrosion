@@ -205,6 +205,41 @@ impl SupervisedActor for StableResetActor {
     }
 }
 
+struct EscalateAfterShutdownActor {
+    runs: Arc<AtomicUsize>,
+    escalations: Arc<AtomicUsize>,
+}
+
+impl SupervisedActor for EscalateAfterShutdownActor {
+    type Error = Infallible;
+
+    fn name(&self) -> &'static str {
+        "escalate-after-shutdown"
+    }
+
+    fn run(&mut self, tripwire: Tripwire) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        let runs = self.runs.clone();
+
+        async move {
+            runs.fetch_add(1, Ordering::SeqCst);
+            tripwire.await;
+            Ok(())
+        }
+    }
+
+    fn restart_directive(&mut self, reason: RestartReason) -> RestartDirective {
+        match reason {
+            RestartReason::Completed => RestartDirective::Escalate,
+            RestartReason::Failed | RestartReason::Panicked => RestartDirective::Restart,
+        }
+    }
+
+    fn on_escalate(&mut self, reason: RestartReason) {
+        assert_eq!(reason, RestartReason::Completed);
+        self.escalations.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
 fn test_policy() -> RestartPolicy {
     RestartPolicy::new(
         Duration::from_millis(1),
@@ -420,16 +455,16 @@ async fn preserves_actor_state_across_restart() {
 #[tokio::test]
 async fn shutdown_does_not_restart_or_escalate_actor() {
     let runs = Arc::new(AtomicUsize::new(0));
+    let actor_escalations = Arc::new(AtomicUsize::new(0));
     let node_escalations = Arc::new(AtomicUsize::new(0));
     let (tripwire, worker, tx) = Tripwire::new_simple();
     let worker = tokio::spawn(worker);
 
     let node_escalations_for_handler = node_escalations.clone();
     let supervisor = spawn_supervised_with_escalation(
-        TestActor {
+        EscalateAfterShutdownActor {
             runs: runs.clone(),
-            first_run_panics: false,
-            first_run_exits: false,
+            escalations: actor_escalations.clone(),
         },
         tripwire,
         test_policy(),
@@ -442,6 +477,7 @@ async fn shutdown_does_not_restart_or_escalate_actor() {
     shutdown(tx, worker, supervisor).await;
 
     assert_eq!(runs.load(Ordering::SeqCst), 1);
+    assert_eq!(actor_escalations.load(Ordering::SeqCst), 0);
     assert_eq!(node_escalations.load(Ordering::SeqCst), 0);
 }
 
