@@ -33,7 +33,6 @@ impl RestartReason {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum RestartDirective {
     Restart,
-    Stop,
     Escalate,
 }
 
@@ -167,22 +166,6 @@ where
 
             match actor.restart_directive(reason) {
                 RestartDirective::Restart => {}
-
-                RestartDirective::Stop => {
-                    counter!(
-                        "corro.runtime.actor.stop.total",
-                        "actor" => name,
-                        "reason" => reason.as_str(),
-                    )
-                    .increment(1);
-
-                    warn!(
-                        actor = name,
-                        reason = reason.as_str(),
-                        "actor stopped without restart"
-                    );
-                    break;
-                }
 
                 RestartDirective::Escalate => {
                     actor.on_escalate(reason);
