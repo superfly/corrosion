@@ -189,6 +189,65 @@ async fn test_pg_concurrent_writers() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn test_pg_stale_tracked_schema_forces_canonical_path() {
+    let (tripwire, _tripwire_worker, _tripwire_tx) = Tripwire::new_simple();
+    let (ta, server) = setup_pg_test_server(tripwire, None).await;
+
+    let conn_str = format!(
+        "host={} port={} user=testuser",
+        server.local_addr.ip(),
+        server.local_addr.port()
+    );
+
+    let (mut client, conn) = tokio_postgres::connect(&conn_str, NoTls).await.unwrap();
+    tokio::spawn(conn);
+
+    client
+        .batch_execute(
+            "DROP TABLE tests;
+             CREATE TABLE tests (
+                 id INTEGER NOT NULL PRIMARY KEY,
+                 text TEXT NOT NULL DEFAULT ''
+             ) WITHOUT ROWID",
+        )
+        .await
+        .unwrap();
+
+    assert!(ta.agent.schema().read().tables.contains_key("tests"));
+
+    let permit = ta.agent.write_sema().acquire().await.unwrap();
+    let tx = client.transaction().await.unwrap();
+    let mut write = Box::pin(tx.execute(
+        "INSERT INTO tests (id, text) VALUES (961, 'canonical')",
+        &[],
+    ));
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), &mut write)
+            .await
+            .is_err()
+    );
+
+    drop(permit);
+
+    let affected = tokio::time::timeout(Duration::from_secs(5), &mut write)
+        .await
+        .expect("canonical write remained blocked")
+        .unwrap();
+    assert_eq!(affected, 1);
+
+    drop(write);
+    tx.commit().await.unwrap();
+
+    let row = client
+        .query_one("SELECT text FROM tests WHERE id = 961", &[])
+        .await
+        .unwrap();
+
+    assert_eq!(row.get::<_, String>(0), "canonical");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_pg_schema_change_aborts_speculative_replay() {
     let (tripwire, _tripwire_worker, _tripwire_tx) = Tripwire::new_simple();
     let (_ta, server) = setup_pg_test_server(tripwire, None).await;

@@ -193,6 +193,52 @@ pub fn database_schema_version(conn: &Connection) -> rusqlite::Result<i64> {
     conn.query_row("PRAGMA main.schema_version", (), |row| row.get(0))
 }
 
+pub fn database_table_is_crr(conn: &Connection, table: &str) -> rusqlite::Result<bool> {
+    conn.query_row(
+        r#"
+        SELECT
+            EXISTS (
+                SELECT 1
+                FROM main.sqlite_schema
+                WHERE type = 'table'
+                  AND name = ?1 COLLATE NOCASE
+            )
+            AND EXISTS (
+                SELECT 1
+                FROM main.sqlite_schema
+                WHERE type = 'table'
+                  AND name = (?1 || '__crsql_clock') COLLATE NOCASE
+            )
+            AND 3 = (
+                SELECT COUNT(*)
+                FROM main.sqlite_schema AS trg
+                WHERE trg.type = 'trigger'
+                  AND trg.tbl_name = ?1 COLLATE NOCASE
+                  AND instr(
+                      lower(coalesce(trg.sql, '')),
+                      'crsql_internal_sync_bit()'
+                  ) > 0
+                  AND (
+                      (
+                          trg.name = (?1 || '__crsql_itrig') COLLATE NOCASE
+                          AND instr(lower(trg.sql), 'crsql_after_insert(') > 0
+                      )
+                      OR (
+                          trg.name = (?1 || '__crsql_utrig') COLLATE NOCASE
+                          AND instr(lower(trg.sql), 'crsql_after_update(') > 0
+                      )
+                      OR (
+                          trg.name = (?1 || '__crsql_dtrig') COLLATE NOCASE
+                          AND instr(lower(trg.sql), 'crsql_after_delete(') > 0
+                      )
+                  )
+            )
+        "#,
+        [table],
+        |row| row.get(0),
+    )
+}
+
 pub fn database_has_user_triggers(conn: &Connection) -> rusqlite::Result<bool> {
     conn.query_row(
         r#"
@@ -428,6 +474,37 @@ pub fn insert_local_changes(
 mod tests {
     use super::*;
     use crate::base::dbsr;
+
+    #[test]
+    fn test_database_table_is_crr_uses_live_schema() -> Result<(), Box<dyn std::error::Error>> {
+        let conn = crate::sqlite::rusqlite_to_crsqlite(Connection::open_in_memory()?)?;
+
+        conn.execute_batch(
+            "
+            CREATE TABLE tracked (
+                id INTEGER PRIMARY KEY,
+                value TEXT NOT NULL DEFAULT ''
+            );
+            SELECT crsql_as_crr('tracked');
+            ",
+        )?;
+
+        assert!(database_table_is_crr(&conn, "tracked")?);
+
+        conn.execute_batch(
+            "
+            DROP TABLE tracked;
+            CREATE TABLE tracked (
+                id INTEGER PRIMARY KEY,
+                value TEXT NOT NULL DEFAULT ''
+            );
+            ",
+        )?;
+
+        assert!(!database_table_is_crr(&conn, "tracked")?);
+
+        Ok(())
+    }
 
     #[test]
     fn test_replay_side_effect_detection() -> Result<(), Box<dyn std::error::Error>> {

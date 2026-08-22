@@ -20,7 +20,8 @@ use corro_types::{
     broadcast::Timestamp,
     change::{
         database_has_foreign_keys, database_has_user_triggers, database_schema_version,
-        insert_local_changes, InsertChangesInfo, PendingLocalChanges, SqliteValue,
+        database_table_is_crr, insert_local_changes, InsertChangesInfo, PendingLocalChanges,
+        SqliteValue,
     },
     persistent_gauge,
     schema::{apply_schema, parse_sql},
@@ -75,6 +76,7 @@ impl<T> SpeculativeChanges<T> {
 async fn make_broadcastable_changes<F, T>(
     agent: &Agent,
     timeout: Option<u64>,
+    replayable_tables: BTreeSet<String>,
     f: F,
 ) -> Result<SpeculativeChanges<T>, ChangeError>
 where
@@ -109,7 +111,10 @@ where
                 version: None,
             })?;
 
-        let replay_safe = !database_has_user_triggers(&conn).unwrap_or(true)
+        let replay_safe = replayable_tables
+            .iter()
+            .all(|table| database_table_is_crr(&conn, table).unwrap_or(false))
+            && !database_has_user_triggers(&conn).unwrap_or(true)
             && !database_has_foreign_keys(&conn).unwrap_or(true);
 
         if !replay_safe {
@@ -358,24 +363,28 @@ where
     }
 }
 
-fn transaction_is_replayable(agent: &Agent, statements: &[Statement]) -> bool {
+fn replayable_transaction_tables(
+    agent: &Agent,
+    statements: &[Statement],
+) -> Option<BTreeSet<String>> {
     let schema = agent.schema().read();
+    let mut tables = BTreeSet::new();
 
-    statements.iter().all(|statement| {
+    for statement in statements {
         let sql = statement.query().trim().trim_end_matches(';').trim();
         if sql.is_empty() {
-            return false;
+            return None;
         }
 
         let mut parser = sqlite3_parser::lexer::sql::Parser::new(sql.as_bytes());
 
         let cmd = match parser.next() {
             Ok(Some(cmd)) => cmd,
-            _ => return false,
+            _ => return None,
         };
 
         if !matches!(parser.next(), Ok(None)) {
-            return false;
+            return None;
         }
 
         let table = match cmd {
@@ -384,11 +393,17 @@ fn transaction_is_replayable(agent: &Agent, statements: &[Statement]) -> bool {
                 | SqliteStmt::Update { tbl_name, .. }
                 | SqliteStmt::Delete { tbl_name, .. },
             ) if tbl_name.db_name.is_none() => tbl_name.name.0,
-            _ => return false,
+            _ => return None,
         };
 
-        schema.tables.contains_key(&table)
-    })
+        if !schema.tables.contains_key(&table) {
+            return None;
+        }
+
+        tables.insert(table);
+    }
+
+    Some(tables)
 }
 
 #[tracing::instrument(skip_all, err)]
@@ -484,10 +499,10 @@ pub async fn api_v1_transactions(
 
     counter!("corro.api.connection.count", "protocol" => "http").increment(1);
     assert_sometimes!(true, "Corrosion receives transactions through HTTP API");
-    let replayable = transaction_is_replayable(&agent, &statements);
+    let replayable_tables = replayable_transaction_tables(&agent, &statements);
 
-    let res = if replayable {
-        match make_broadcastable_changes(&agent, params.timeout, |tx| {
+    let res = if let Some(replayable_tables) = replayable_tables {
+        match make_broadcastable_changes(&agent, params.timeout, replayable_tables, |tx| {
             execute_transaction_statements(tx, &statements)
         })
         .await
@@ -1076,6 +1091,53 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_api_stale_tracked_schema_forces_canonical_path() -> eyre::Result<()> {
+        let (_dir, agent) = setup_api_test_agent().await?;
+
+        let (status_code, body) = api_v1_transactions(
+            Extension(agent.clone()),
+            axum::extract::Query(TimeoutParams { timeout: None }),
+            axum::Json(vec![
+                Statement::Simple("DROP TABLE tests".into()),
+                Statement::Simple(
+                    "CREATE TABLE tests (
+                        id INTEGER NOT NULL PRIMARY KEY,
+                        text TEXT NOT NULL DEFAULT ''
+                    ) WITHOUT ROWID"
+                        .into(),
+                ),
+            ]),
+        )
+        .await;
+        assert_eq!(status_code, StatusCode::OK, "{body:?}");
+
+        assert!(agent.schema().read().tables.contains_key("tests"));
+        {
+            let conn = agent.pool().read().await?;
+            assert!(!database_table_is_crr(&conn, "tests")?);
+        }
+
+        let (status_code, body) = api_v1_transactions(
+            Extension(agent.clone()),
+            axum::extract::Query(TimeoutParams { timeout: None }),
+            axum::Json(vec![Statement::Simple(
+                "INSERT INTO tests (id, text) VALUES (981, 'canonical')".into(),
+            )]),
+        )
+        .await;
+
+        assert_eq!(status_code, StatusCode::OK, "{body:?}");
+        assert!(body.0.version.is_none());
+
+        let conn = agent.pool().read().await?;
+        let row: String =
+            conn.query_row("SELECT text FROM tests WHERE id = 981", (), |row| row.get(0))?;
+        assert_eq!(row, "canonical");
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_api_user_trigger_forces_canonical_path() -> eyre::Result<()> {
         let (_dir, agent) = setup_api_test_agent().await?;
 
@@ -1354,7 +1416,11 @@ mod tests {
             let agent = agent.clone();
 
             tokio::spawn(async move {
-                make_broadcastable_changes(&agent, None, move |tx| {
+                make_broadcastable_changes(
+                    &agent,
+                    None,
+                    BTreeSet::from(["tests".to_owned()]),
+                    move |tx| {
                     tx.execute(
                         "INSERT INTO tests (id, text) VALUES ('schema-race', 'old-schema')",
                         &[],
@@ -1446,7 +1512,11 @@ mod tests {
             let agent = agent.clone();
 
             tokio::spawn(async move {
-                make_broadcastable_changes(&agent, None, move |tx| {
+                make_broadcastable_changes(
+                    &agent,
+                    None,
+                    BTreeSet::from(["tests".to_owned()]),
+                    move |tx| {
                     tx.execute(
                         "INSERT INTO tests (id, text) VALUES ('speculative-open', 'client')",
                         &[],
@@ -1535,7 +1605,11 @@ mod tests {
             let gate = gate.clone();
 
             tokio::spawn(async move {
-                make_broadcastable_changes(&agent, None, move |tx| {
+                make_broadcastable_changes(
+                    &agent,
+                    None,
+                    BTreeSet::from(["tests".to_owned()]),
+                    move |tx| {
                     let concurrent = enter(&gate);
 
                     tx.execute(
@@ -1559,7 +1633,11 @@ mod tests {
             let gate = gate.clone();
 
             tokio::spawn(async move {
-                make_broadcastable_changes(&agent, None, move |tx| {
+                make_broadcastable_changes(
+                    &agent,
+                    None,
+                    BTreeSet::from(["tests".to_owned()]),
+                    move |tx| {
                     let concurrent = enter(&gate);
 
                     tx.execute(

@@ -28,7 +28,7 @@ use corro_types::{
     broadcast::{broadcast_changes, Timestamp},
     change::{
         database_has_foreign_keys, database_has_user_triggers, database_schema_version,
-        insert_local_changes, InsertChangesInfo, PendingLocalChanges,
+        database_table_is_crr, insert_local_changes, InsertChangesInfo, PendingLocalChanges,
     },
     config::PgConfig,
     persistent_gauge,
@@ -2286,6 +2286,10 @@ impl<'conn> Session<'conn> {
         };
 
         if !self.agent.schema().read().tables.contains_key(table) {
+            return Ok(false);
+        }
+
+        if !database_table_is_crr(self.conn, table)? {
             return Ok(false);
         }
 
