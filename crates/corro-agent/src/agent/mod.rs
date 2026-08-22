@@ -12,6 +12,7 @@ mod metrics;
 mod reaper;
 mod run_root;
 mod setup;
+mod supervisor;
 mod uni;
 pub mod util;
 

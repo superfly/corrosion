@@ -476,127 +476,208 @@ pub async fn sync_loop(agent: Agent, bookie: Bookie, transport: Transport, mut t
     }
 }
 
-pub async fn apply_fully_buffered_changes_loop(
+pub(super) struct ApplyBufferedActor {
     agent: Agent,
     bookie: Bookie,
-    mut rx_apply: CorroReceiver<ApplyTrigger>,
-    mut tripwire: Tripwire,
-) {
-    info!("Starting apply_fully_buffered_changes loop");
-    let sql_tx_timeout_secs = Duration::from_secs(agent.config().perf.sql_tx_timeout as u64);
-    // we can burst timeout up to an additional 2 min
-    let max_timeout_increase: u64 = 6;
-    let step_timeout_secs: u64 = 20;
+    rx_apply: CorroReceiver<ApplyTrigger>,
+    retry_interval: tokio::time::Interval,
+    limit_retries: ThrottleMap<(ActorId, CrsqlDbVersion)>,
+    scan_enabled: bool,
+    sql_tx_timeout: Duration,
+    max_timeout_increase: u64,
+    step_timeout_secs: u64,
+}
 
-    let throttle_max = agent.config().perf.partial_retry_backoff;
-    let scan_enabled = throttle_max > 0;
-    let throttle_min = Duration::from_secs(5 * 60);
+impl ApplyBufferedActor {
+    pub(super) fn new(agent: Agent, bookie: Bookie, rx_apply: CorroReceiver<ApplyTrigger>) -> Self {
+        let throttle_max = agent.config().perf.partial_retry_backoff;
+        let scan_enabled = throttle_max > 0;
+        let throttle_min = Duration::from_secs(5 * 60);
 
-    let mut retry_interval = tokio::time::interval(Duration::from_secs(5 * 60));
+        let mut retry_interval = tokio::time::interval(Duration::from_secs(5 * 60));
 
-    // map to throttle retries for failed versions that took too long to apply
-    let mut limit_retries =
-        ThrottleMap::new(throttle_min, Duration::from_secs(throttle_max as u64));
+        // Tokio intervals tick immediately once. The old loop consumed that
+        // first tick before entering its select. Resetting here preserves that
+        // behavior while keeping the interval alive across actor restarts.
+        retry_interval.reset();
 
-    retry_interval.tick().await;
-    if !scan_enabled {
-        info!("periodic fully-buffered partial scan disabled (partial_retry_backoff = 0)");
+        if !scan_enabled {
+            info!(
+                "periodic fully-buffered partial scan disabled \
+                 (partial_retry_backoff = 0)"
+            );
+        }
+
+        Self {
+            sql_tx_timeout: Duration::from_secs(agent.config().perf.sql_tx_timeout as u64),
+            limit_retries: ThrottleMap::new(throttle_min, Duration::from_secs(throttle_max as u64)),
+            agent,
+            bookie,
+            rx_apply,
+            retry_interval,
+            scan_enabled,
+            max_timeout_increase: 6,
+            step_timeout_secs: 20,
+        }
     }
 
-    loop {
-        let partial_versions = tokio::select! {
-            biased;
-            _ = &mut tripwire => break,
-            maybe_trigger = rx_apply.recv() => match maybe_trigger {
-                Some(ApplyTrigger::Version(actor_id, version)) => {
-                    vec![(actor_id, version)]
-                }
-                Some(ApplyTrigger::SchemaChanged) => {
-                    match find_fully_buffered_partials(&agent, None).await {
-                        Ok(partials) if partials.is_empty() => continue,
-                        Ok(partials) => {
-                            for partial in &partials {
-                                limit_retries.unblock(partial);
+    pub(super) fn mark_unhealthy(&self, reason: &str) {
+        self.agent.mark_unhealthy(reason);
+    }
+
+    pub(super) async fn run(&mut self, mut tripwire: Tripwire) {
+        info!("Starting apply_fully_buffered_changes loop");
+
+        let agent = self.agent.clone();
+        let bookie = self.bookie.clone();
+        let rx_apply = &mut self.rx_apply;
+        let retry_interval = &mut self.retry_interval;
+        let limit_retries = &mut self.limit_retries;
+
+        let scan_enabled = self.scan_enabled;
+        let sql_tx_timeout = self.sql_tx_timeout;
+        let max_timeout_increase = self.max_timeout_increase;
+        let step_timeout_secs = self.step_timeout_secs;
+
+        loop {
+            let partial_versions = tokio::select! {
+                biased;
+
+                _ = &mut tripwire => break,
+
+                maybe_trigger = rx_apply.recv() => match maybe_trigger {
+                    Some(ApplyTrigger::Version(actor_id, version)) => {
+                        vec![(actor_id, version)]
+                    }
+                    Some(ApplyTrigger::SchemaChanged) => {
+                        match find_fully_buffered_partials(&agent, None).await {
+                            Ok(partials) if partials.is_empty() => continue,
+                            Ok(partials) => {
+                                for partial in &partials {
+                                    limit_retries.unblock(partial);
+                                }
+                                partials
                             }
-                            partials
+                            Err(e) => {
+                                warn!(
+                                    "could not query for fully buffered partials: {e}"
+                                );
+                                continue;
+                            }
                         }
+                    }
+                    None => break,
+                },
+
+                _ = retry_interval.tick(), if scan_enabled => {
+                    match find_fully_buffered_partials(&agent, Some(1)).await {
+                        Ok(partials) if partials.is_empty() => continue,
+                        Ok(partials) => partials,
                         Err(e) => {
-                            warn!("could not query for fully buffered partials: {e}");
+                            warn!(
+                                "could not query for fully buffered partials: {e}"
+                            );
                             continue;
                         }
                     }
-                }
-                None => break,
-            },
+                },
+            };
 
-            _ = retry_interval.tick(), if scan_enabled => {
-                match find_fully_buffered_partials(&agent, Some(1)).await {
-                    Ok(partials) if partials.is_empty() => continue,
-                    Ok(partials) => partials,
-                    Err(e) => {
-                        warn!("could not query for fully buffered partials: {e}");
-                        continue;
-                    },
-                }
-            },
-        };
+            for partial_version in partial_versions {
+                if let Some(blocked_until) = limit_retries.is_throttled(&partial_version) {
+                    let next_retry = blocked_until.duration_since(Instant::now()).as_secs();
 
-        for partial_version in partial_versions {
-            if let Some(blocked_until) = limit_retries.is_throttled(&partial_version) {
-                let next_retry = blocked_until.duration_since(Instant::now()).as_secs();
-                warn!(
-                    ?partial_version,
-                    "previous attempt to apply buffered changes took too long, will retry in {next_retry} seconds"
+                    warn!(
+                        ?partial_version,
+                        "previous attempt to apply buffered changes took too long, \
+                         will retry in {next_retry} seconds"
+                    );
+
+                    continue;
+                }
+
+                let (actor_id, version) = partial_version;
+
+                let throttle_count = limit_retries
+                    .throttle_count(&(actor_id, version))
+                    .min(max_timeout_increase);
+
+                let tx_timeout =
+                    sql_tx_timeout + Duration::from_secs(step_timeout_secs * throttle_count);
+
+                debug!(
+                    %actor_id,
+                    %version,
+                    ?tx_timeout,
+                    "picked up background apply of buffered changes"
                 );
-                continue;
-            }
 
-            let (actor_id, version) = partial_version;
-            let throttle_count = limit_retries
-                .throttle_count(&(actor_id, version))
-                .min(max_timeout_increase);
-            let tx_timeout =
-                sql_tx_timeout_secs + Duration::from_secs(step_timeout_secs * throttle_count);
+                let start = Instant::now();
 
-            debug!(%actor_id, %version, ?tx_timeout, "picked up background apply of buffered changes");
-            let start = Instant::now();
-            let res =
-                process_fully_buffered_changes(&agent, &bookie, actor_id, version, tx_timeout)
-                    .await;
-            let elapsed = start.elapsed();
+                let res =
+                    process_fully_buffered_changes(&agent, &bookie, actor_id, version, tx_timeout)
+                        .await;
 
-            match res {
-                Ok(false) => {
-                    warn!(%actor_id, %version, "did not apply buffered changes");
-                    limit_retries.remove(&(actor_id, version));
-                }
-                Ok(true) => {
-                    debug!(%actor_id, %version, "succesfully applied buffered changes");
-                    histogram!("corro.agent.changes.processing.time.seconds", "source" => "buffered")
-                        .record(elapsed.as_secs_f64());
-                    limit_retries.remove(&(actor_id, version));
-                }
-                Err(e) => {
-                    let is_interrupt_error = e.is_interrupt_error();
-                    error!(%actor_id, %version, "could not apply fully buffered changes with timeout {tx_timeout:?}: {e}");
+                let elapsed = start.elapsed();
 
-                    if let Some(issue) = e.fatal_db_issue() {
-                        error!("fatal DB issue detected: {issue}");
-                        agent.mark_unhealthy(issue);
+                match res {
+                    Ok(false) => {
+                        warn!(
+                            %actor_id,
+                            %version,
+                            "did not apply buffered changes"
+                        );
+
+                        limit_retries.remove(&(actor_id, version));
                     }
 
-                    let details = json!({"error": e.to_string()});
-                    assert_unreachable!("could not apply fully buffered changes", &details);
+                    Ok(true) => {
+                        debug!(
+                            %actor_id,
+                            %version,
+                            "succesfully applied buffered changes"
+                        );
 
-                    if is_interrupt_error {
-                        limit_retries.throttle((actor_id, version));
+                        histogram!(
+                            "corro.agent.changes.processing.time.seconds",
+                            "source" => "buffered"
+                        )
+                        .record(elapsed.as_secs_f64());
+
+                        limit_retries.remove(&(actor_id, version));
+                    }
+
+                    Err(e) => {
+                        let is_interrupt_error = e.is_interrupt_error();
+
+                        error!(
+                            %actor_id,
+                            %version,
+                            "could not apply fully buffered changes with timeout \
+                             {tx_timeout:?}: {e}"
+                        );
+
+                        if let Some(issue) = e.fatal_db_issue() {
+                            error!("fatal DB issue detected: {issue}");
+                            agent.mark_unhealthy(issue);
+                        }
+
+                        let details = json!({
+                            "error": e.to_string()
+                        });
+
+                        assert_unreachable!("could not apply fully buffered changes", &details);
+
+                        if is_interrupt_error {
+                            limit_retries.throttle((actor_id, version));
+                        }
                     }
                 }
             }
         }
-    }
 
-    info!("fully_buffered_changes_loop ended");
+        info!("fully_buffered_changes_loop ended");
+    }
 }
 
 async fn find_fully_buffered_partials(
@@ -627,50 +708,60 @@ async fn find_fully_buffered_partials(
 /// Clean up `__corro_buffered_changes` rows for versions that have been fully applied.
 /// `__corro_seq_bookkeeping` is managed through the bookie via `insert_partials_db`/`insert_db`.
 ///
-pub async fn clear_buffered_meta_loop(
+pub(super) struct ClearBufferedMetaActor {
     agent: Agent,
-    mut rx_partials: CorroReceiver<(ActorId, CrsqlDbVersionRange)>,
-    mut tripwire: Tripwire,
-) {
-    let tx_timeout: Duration = Duration::from_secs(agent.config().perf.sql_tx_timeout as u64);
-    // check for orphaned buffered changes every 5 minutes
-    let mut retry_interval = tokio::time::interval(Duration::from_secs(5 * 60));
-    retry_interval.tick().await;
+    rx_partials: CorroReceiver<(ActorId, CrsqlDbVersionRange)>,
+    tx_timeout: Duration,
+    retry_interval: tokio::time::Interval,
+    jobs: tokio::task::JoinSet<eyre::Result<()>>,
+}
 
-    loop {
-        let (actor_id, versions) = tokio::select! {
-            biased;
-            _ = &mut tripwire => break,
-            maybe_partials = rx_partials.recv() => match maybe_partials {
-                Some(partials) => partials,
-                None => break,
-            },
-            _ = retry_interval.tick() => {
-                match find_orphaned_buffered_changes(&agent).await {
-                    Ok(Some((actor_id, version))) => (actor_id, CrsqlDbVersionRange::single(version)),
-                    Ok(None) => continue,
-                    Err(e) => {
-                        warn!("could not query for orphaned buffered changes: {e}");
-                        continue;
-                    }
-                }
-            }
-        };
+impl ClearBufferedMetaActor {
+    pub(super) fn new(
+        agent: Agent,
+        rx_partials: CorroReceiver<(ActorId, CrsqlDbVersionRange)>,
+    ) -> Self {
+        let mut retry_interval = tokio::time::interval(Duration::from_secs(5 * 60));
+        retry_interval.reset();
 
-        if let Some(booked) = agent.bookie().get(&actor_id) {
+        Self {
+            tx_timeout: Duration::from_secs(agent.config().perf.sql_tx_timeout as u64),
+            agent,
+            rx_partials,
+            retry_interval,
+            jobs: tokio::task::JoinSet::new(),
+        }
+    }
+
+    fn spawn_cleanup(
+        &mut self,
+        actor_id: ActorId,
+        versions: CrsqlDbVersionRange,
+        tripwire: Tripwire,
+    ) {
+        if let Some(booked) = self.agent.bookie().get(&actor_id) {
             let booked_read = booked.read();
+
             for version in versions {
                 if booked_read.get_partial(&version).is_some() {
-                    warn!(%actor_id, %version, "clear_buffered_meta: received partial version that's still in bookie, skipping");
+                    warn!(
+                        %actor_id,
+                        %version,
+                        "clear_buffered_meta: received partial version \
+                         that's still in bookie, skipping"
+                    );
                     continue;
                 }
             }
         }
 
-        let pool = agent.pool().clone();
-        let self_actor_id = agent.actor_id();
-        let mut task_tripwire = tripwire.clone();
-        spawn_counted(async move {
+        let pool = self.agent.pool().clone();
+        let self_actor_id = self.agent.actor_id();
+        let tx_timeout = self.tx_timeout;
+
+        self.jobs.spawn(async move {
+            let mut task_tripwire = tripwire;
+
             loop {
                 let res = {
                     let mut conn = pool.write_low().await?;
@@ -683,8 +774,22 @@ pub async fn clear_buffered_meta_loop(
                         );
 
                         let buf_count = tx
-                            .prepare_cached("DELETE FROM __corro_buffered_changes WHERE (site_id, db_version, seq) IN (SELECT site_id, db_version, seq FROM __corro_buffered_changes WHERE site_id = ? AND db_version >= ? AND db_version <= ? LIMIT ?)")?
-                            .execute(params![actor_id, versions.start(), versions.end(), TO_CLEAR_COUNT])?;
+                            .prepare_cached(
+                                "DELETE FROM __corro_buffered_changes \
+                                 WHERE (site_id, db_version, seq) IN \
+                                 (SELECT site_id, db_version, seq \
+                                  FROM __corro_buffered_changes \
+                                  WHERE site_id = ? \
+                                    AND db_version >= ? \
+                                    AND db_version <= ? \
+                                  LIMIT ?)",
+                            )?
+                            .execute(params![
+                                actor_id,
+                                versions.start(),
+                                versions.end(),
+                                TO_CLEAR_COUNT
+                            ])?;
 
                         tx.commit()?;
 
@@ -696,27 +801,101 @@ pub async fn clear_buffered_meta_loop(
                     Ok(buf_count) => {
                         if buf_count > 0 {
                             assert_sometimes!(true, "Corrosion clears buffered meta");
-                            info!(%actor_id, %self_actor_id, "cleared {buf_count} buffered change rows for versions {versions:?}");
+
+                            info!(
+                                %actor_id,
+                                %self_actor_id,
+                                "cleared {buf_count} buffered change rows \
+                                 for versions {versions:?}"
+                            );
                         }
+
                         if buf_count < TO_CLEAR_COUNT {
                             break;
                         }
                     }
+
                     Err(e) => {
-                        error!(%actor_id, "could not clear buffered meta for versions {versions:?}: {e}");
+                        error!(
+                            %actor_id,
+                            "could not clear buffered meta for versions \
+                             {versions:?}: {e}"
+                        );
                     }
                 }
 
                 tokio::select! {
-                    _ = &mut task_tripwire => {
-                        break;
-                    }
+                    _ = &mut task_tripwire => break,
                     _ = tokio::time::sleep(Duration::from_secs(2)) => {}
                 }
             }
 
-            Ok::<_, eyre::Report>(())
+            Ok(())
         });
+    }
+
+    fn handle_job_result(result: Result<eyre::Result<()>, tokio::task::JoinError>) {
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                error!("buffered metadata cleanup task failed: {e}");
+            }
+            Err(e) => {
+                error!("buffered metadata cleanup task panicked: {e}");
+            }
+        }
+    }
+
+    pub(super) async fn run(&mut self, mut tripwire: Tripwire) {
+        loop {
+            tokio::select! {
+                biased;
+
+                _ = &mut tripwire => {
+                    break;
+                }
+
+                result = self.jobs.join_next(), if !self.jobs.is_empty() => {
+                    if let Some(result) = result {
+                        Self::handle_job_result(result);
+                    }
+                }
+
+                maybe_partials = self.rx_partials.recv() => {
+                    let Some((actor_id, versions)) = maybe_partials else {
+                        break;
+                    };
+
+                    self.spawn_cleanup(
+                        actor_id,
+                        versions,
+                        tripwire.clone(),
+                    );
+                }
+
+                _ = self.retry_interval.tick() => {
+                    match find_orphaned_buffered_changes(&self.agent).await {
+                        Ok(Some((actor_id, version))) => {
+                            self.spawn_cleanup(
+                                actor_id,
+                                CrsqlDbVersionRange::single(version),
+                                tripwire.clone(),
+                            );
+                        }
+
+                        Ok(None) => {}
+
+                        Err(e) => {
+                            warn!(
+                                "could not query for orphaned buffered changes: {e}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        self.jobs.shutdown().await;
     }
 }
 
