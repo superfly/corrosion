@@ -1294,7 +1294,8 @@ fn strip_pg_ast_expr(outer_expr: &mut sqlparser::ast::Expr) {
 
 #[cfg(test)]
 mod tests {
-    use super::pg_stmt_to_sqlite_sql;
+    use super::{pg_stmt_to_sqlite_sql, ConnectionDropWriteContext, TxState};
+    use std::{collections::HashMap, sync::Arc};
 
     #[test]
     fn check_normal_pg_dialect_array_subscript() {
@@ -1349,6 +1350,7 @@ mod tests {
         // Table references should keep pg_catalog. prefix since SQLite supports schema.table
         assert!(converted.contains("pg_catalog.pg_class"));
     }
+
     #[test]
     fn connection_drop_context_holds_write_permit_until_owner_drops() {
         let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
