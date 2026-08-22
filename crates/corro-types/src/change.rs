@@ -194,21 +194,46 @@ pub fn database_has_user_triggers(conn: &Connection) -> rusqlite::Result<bool> {
         r#"
         SELECT EXISTS (
             SELECT 1
-            FROM main.sqlite_schema
-            WHERE type = 'trigger'
+            FROM main.sqlite_schema AS trg
+            WHERE trg.type = 'trigger'
               AND NOT (
-                  name IN (
-                      tbl_name || '__crsql_itrig',
-                      tbl_name || '__crsql_utrig',
-                      tbl_name || '__crsql_dtrig'
+                  (
+                      EXISTS (
+                          SELECT 1
+                          FROM main.sqlite_schema AS clock
+                          WHERE clock.type = 'table'
+                            AND clock.name = trg.tbl_name || '__crsql_clock'
+                      )
+                      AND instr(
+                          lower(coalesce(trg.sql, '')),
+                          'crsql_internal_sync_bit()'
+                      ) > 0
+                      AND (
+                          (
+                              trg.name = trg.tbl_name || '__crsql_itrig'
+                              AND instr(lower(trg.sql), 'crsql_after_insert(') > 0
+                          )
+                          OR (
+                              trg.name = trg.tbl_name || '__crsql_utrig'
+                              AND instr(lower(trg.sql), 'crsql_after_update(') > 0
+                          )
+                          OR (
+                              trg.name = trg.tbl_name || '__crsql_dtrig'
+                              AND instr(lower(trg.sql), 'crsql_after_delete(') > 0
+                          )
+                      )
                   )
                   OR (
-                      tbl_name = 'crsql_site_id'
-                      AND name IN (
+                      trg.tbl_name = 'crsql_site_id'
+                      AND trg.name IN (
                           'crsql_site_id_insert_trig',
                           'crsql_site_id_update_trig',
                           'crsql_site_id_delete_trig'
                       )
+                      AND instr(
+                          lower(coalesce(trg.sql, '')),
+                          'crsql_update_site_id('
+                      ) > 0
                   )
               )
         )
@@ -219,24 +244,18 @@ pub fn database_has_user_triggers(conn: &Connection) -> rusqlite::Result<bool> {
 }
 
 pub fn database_has_foreign_keys(conn: &Connection) -> rusqlite::Result<bool> {
-    let tables = {
-        let mut stmt = conn.prepare_cached(
-            "SELECT name FROM main.sqlite_schema WHERE type = 'table' AND name IS NOT NULL",
-        )?;
-        let rows = stmt.query_map((), |row| row.get::<_, String>(0))?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()?
-    };
-
-    let mut stmt =
-        conn.prepare_cached("SELECT EXISTS (SELECT 1 FROM pragma_foreign_key_list(?1))")?;
-
-    for table in tables {
-        if stmt.query_row([table], |row| row.get(0))? {
-            return Ok(true);
-        }
-    }
-
-    Ok(false)
+    conn.query_row(
+        r#"
+        SELECT EXISTS (
+            SELECT 1
+            FROM main.sqlite_schema
+            WHERE type = 'table'
+              AND instr(lower(coalesce(sql, '')), 'references') > 0
+        )
+        "#,
+        (),
+        |row| row.get(0),
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -405,6 +424,53 @@ pub fn insert_local_changes(
 mod tests {
     use super::*;
     use crate::base::dbsr;
+
+    #[test]
+    fn test_replay_side_effect_detection() -> Result<(), Box<dyn std::error::Error>> {
+        let conn = crate::sqlite::rusqlite_to_crsqlite(Connection::open_in_memory()?)?;
+
+        conn.execute_batch(
+            "
+            CREATE TABLE tracked (
+                id INTEGER PRIMARY KEY,
+                value TEXT NOT NULL DEFAULT ''
+            );
+            SELECT crsql_as_crr('tracked');
+            ",
+        )?;
+
+        assert!(!database_has_user_triggers(&conn)?);
+        assert!(!database_has_foreign_keys(&conn)?);
+
+        conn.execute_batch(
+            "
+            CREATE TABLE exact_name_shadow (id INTEGER PRIMARY KEY);
+            CREATE TRIGGER exact_name_shadow__crsql_itrig
+            AFTER INSERT ON exact_name_shadow
+            BEGIN
+                SELECT 1;
+            END;
+            ",
+        )?;
+
+        assert!(database_has_user_triggers(&conn)?);
+
+        conn.execute_batch(
+            "
+            DROP TRIGGER exact_name_shadow__crsql_itrig;
+            CREATE TABLE fk_parent (id INTEGER PRIMARY KEY);
+            CREATE TABLE fk_child (
+                id INTEGER PRIMARY KEY,
+                parent_id INTEGER REFERENCES fk_parent(id)
+            );
+            ",
+        )?;
+
+        assert!(!database_has_user_triggers(&conn)?);
+        assert!(database_has_foreign_keys(&conn)?);
+
+        Ok(())
+    }
 
     #[test]
     fn test_pending_local_changes_capture_and_replay() -> Result<(), Box<dyn std::error::Error>> {
