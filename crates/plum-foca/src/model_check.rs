@@ -488,17 +488,7 @@ impl System {
 
     fn drain(&mut self, node: NodeId, runtime: CaptureRuntime) {
         if self.fault_progress == FaultProgress::InitialGossipDropped
-            && runtime.outbox.iter().any(|packet| {
-                matches!(
-                    &packet.msg,
-                    WireMsg::Graft {
-                        sender,
-                        send: true,
-                        requests,
-                    } if *sender == INITIAL_EAGER_RECEIVER
-                        && requests.iter().any(|(id, _)| *id == MESSAGE)
-                )
-            })
+            && runtime.outbox.iter().any(is_initial_eager_repair_graft)
         {
             self.fault_progress = FaultProgress::GraftRequested;
         }
@@ -610,6 +600,18 @@ fn is_initial_eager_gossip(packet: &Packet) -> bool {
                 ..
             } if *sender == ORIGIN && payload.0 == MESSAGE
         )
+}
+
+fn is_initial_eager_repair_graft(packet: &Packet) -> bool {
+    matches!(
+        &packet.msg,
+        WireMsg::Graft {
+            sender,
+            send: true,
+            requests,
+        } if *sender == INITIAL_EAGER_RECEIVER
+            && requests.iter().any(|(id, _)| *id == MESSAGE)
+    )
 }
 
 fn replay(trace: &[Action], fault_scenario: FaultScenario) -> Option<System> {
@@ -755,6 +757,23 @@ fn check_model(fault_scenario: FaultScenario) {
         .join();
 
     checker.assert_properties();
+}
+
+#[test]
+fn initial_eager_repair_graft_requires_faulted_receiver() {
+    let packet = |sender| Packet {
+        to: ORIGIN,
+        msg: WireMsg::Graft {
+            sender,
+            send: true,
+            requests: vec![(MESSAGE, 0)],
+        },
+    };
+
+    assert!(!is_initial_eager_repair_graft(&packet(2)));
+    assert!(is_initial_eager_repair_graft(&packet(
+        INITIAL_EAGER_RECEIVER
+    )));
 }
 
 #[test]
