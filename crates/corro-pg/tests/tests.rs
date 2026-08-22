@@ -555,6 +555,84 @@ async fn test_pg_canonical_upgrade_error_rolls_back_and_releases_writer() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn test_pg_disconnect_rolls_back_and_releases_writer() {
+    let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
+    let (_ta, server) = setup_pg_test_server(tripwire, None).await;
+
+    let conn_str = format!(
+        "host={} port={} user=testuser",
+        server.local_addr.ip(),
+        server.local_addr.port()
+    );
+
+    {
+        let (client, client_conn) = tokio_postgres::connect(&conn_str, NoTls).await.unwrap();
+        let client_conn = tokio::spawn(client_conn);
+
+        client
+            .batch_execute(
+                "CREATE TABLE pg_disconnect_side (
+                    id BIGINT PRIMARY KEY NOT NULL
+                )",
+            )
+            .await
+            .unwrap();
+
+        client
+            .batch_execute(
+                "BEGIN;
+                 INSERT INTO tests (id, text) VALUES (340, 'disconnect');
+                 INSERT INTO pg_disconnect_side (id) VALUES (1);",
+            )
+            .await
+            .unwrap();
+
+        drop(client);
+        tokio::time::timeout(Duration::from_secs(5), client_conn)
+            .await
+            .expect("server did not close the disconnected PG session")
+            .expect("PG connection task panicked")
+            .expect("PG connection closed with an error");
+
+        let (recovery, recovery_conn) =
+            tokio_postgres::connect(&conn_str, NoTls).await.unwrap();
+        tokio::spawn(recovery_conn);
+
+        let tracked_rows = recovery
+            .query_one("SELECT COUNT(*) FROM tests WHERE id = 340", &[])
+            .await
+            .unwrap()
+            .get::<_, i64>(0);
+        let side_rows = recovery
+            .query_one(
+                "SELECT COUNT(*) FROM pg_disconnect_side WHERE id = 1",
+                &[],
+            )
+            .await
+            .unwrap()
+            .get::<_, i64>(0);
+        assert_eq!(tracked_rows, 0);
+        assert_eq!(side_rows, 0);
+
+        let affected = tokio::time::timeout(
+            Duration::from_secs(5),
+            recovery.execute(
+                "INSERT INTO pg_disconnect_side (id) VALUES (2)",
+                &[],
+            ),
+        )
+        .await
+        .expect("writer remained blocked after PG disconnect")
+        .unwrap();
+        assert_eq!(affected, 1);
+    }
+
+    tripwire_tx.send(()).await.ok();
+    tripwire_worker.await;
+    wait_for_all_pending_handles().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_pg() {
     let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
 

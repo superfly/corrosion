@@ -1323,6 +1323,7 @@ pub async fn start(
                                                             )
                                                                 .into(),
                                                         )?;
+                                                        discard_until_sync = true;
                                                         continue 'outer;
                                                     }
                                                 };
@@ -1836,12 +1837,6 @@ pub async fn start(
                                         })?;
 
                                         discard_until_sync = true;
-
-                                        send_ready(
-                                            &mut session,
-                                            discard_until_sync,
-                                            &back_tx,
-                                        )?;
                                         continue;
                                     }
                                 }
@@ -1918,10 +1913,7 @@ pub async fn start(
                                             session.rollback_sqlite_tx()?;
                                             let _permit = session.tx_state.end();
                                         } else {
-                                            let permit = session.tx_state.end();
-                                            if let Err(e) =
-                                                session.handle_commit(permit.is_some())
-                                            {
+                                            if let Err(e) = session.commit_tx() {
                                                 back_tx.blocking_send(
                                                     (
                                                         PgWireBackendMessage::ErrorResponse(
@@ -2407,9 +2399,7 @@ impl<'conn> Session<'conn> {
             self.tx_state.start_implicit();
         } else if self.tx_state.is_implicit() && cmd.is_begin() {
             trace!("committing IMPLICIT tx");
-            let permit = self.tx_state.end();
-
-            self.handle_commit(permit.is_some())?;
+            self.commit_tx()?;
             trace!("committed IMPLICIT tx");
         }
 
@@ -2426,8 +2416,7 @@ impl<'conn> Session<'conn> {
                 self.rollback_sqlite_tx()?;
                 let _permit = self.tx_state.end();
             } else {
-                let permit = self.tx_state.end();
-                self.handle_commit(permit.is_some())?;
+                self.commit_tx()?;
             }
             0
         } else if cmd.is_rollback() {
@@ -2591,8 +2580,7 @@ impl<'conn> Session<'conn> {
                 self.rollback_sqlite_tx()?;
                 let _permit = self.tx_state.end();
             } else {
-                let permit = self.tx_state.end();
-                self.handle_commit(permit.is_some())?;
+                self.commit_tx()?;
             }
         } else if cmd.is_rollback() {
             self.rollback_sqlite_tx()?;
@@ -2745,8 +2733,7 @@ impl<'conn> Session<'conn> {
             }
 
             if opened_implicit_tx {
-                let permit = self.tx_state.end();
-                self.handle_commit(permit.is_some())?;
+                self.commit_tx()?;
             }
         }
 
@@ -2766,6 +2753,18 @@ impl<'conn> Session<'conn> {
             .map_err(|_| QueryError::BackendResponseSendFailed)?;
 
         Ok(())
+    }
+
+    fn commit_tx(&mut self) -> Result<(), ChangeError> {
+        let result = self.handle_commit(self.tx_state.is_canonical());
+
+        if result.is_ok() || self.conn.is_autocommit() {
+            let _permit = self.tx_state.end();
+        } else {
+            self.tx_state.mark_failed();
+        }
+
+        result
     }
 
     fn handle_commit(&self, canonical: bool) -> Result<(), ChangeError> {
@@ -2953,8 +2952,7 @@ fn send_ready(
             let _permit = session.tx_state.end();
         } else {
             warn!("receive Sync message, committing implicit tx");
-            let permit = session.tx_state.end();
-            session.handle_commit(permit.is_some())?;
+            session.commit_tx()?;
         }
 
         TransactionStatus::Idle
