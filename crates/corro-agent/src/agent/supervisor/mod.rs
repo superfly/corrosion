@@ -1,3 +1,4 @@
+use corro_types::agent::Agent;
 use futures::FutureExt;
 use metrics::counter;
 use spawn::spawn_counted;
@@ -41,6 +42,7 @@ pub(super) struct RestartPolicy {
     initial_backoff: Duration,
     max_backoff: Duration,
     reset_after: Duration,
+    max_restarts: u32,
 }
 
 impl RestartPolicy {
@@ -58,7 +60,15 @@ impl RestartPolicy {
             initial_backoff,
             max_backoff,
             reset_after,
+            max_restarts: 10,
         }
+    }
+
+    #[cfg(test)]
+    fn with_max_restarts(mut self, max_restarts: u32) -> Self {
+        assert!(max_restarts > 0, "maximum restart count must be positive");
+        self.max_restarts = max_restarts;
+        self
     }
 }
 
@@ -89,17 +99,36 @@ pub(super) trait SupervisedActor: Send + 'static {
 }
 
 pub(super) fn spawn_supervised<A>(
-    mut actor: A,
+    agent: &Agent,
+    actor: A,
     tripwire: Tripwire,
     policy: RestartPolicy,
 ) -> JoinHandle<()>
 where
     A: SupervisedActor,
 {
+    let agent = agent.clone();
+
+    spawn_supervised_with_escalation(actor, tripwire, policy, move |reason| {
+        agent.mark_unhealthy(reason);
+    })
+}
+
+fn spawn_supervised_with_escalation<A, F>(
+    mut actor: A,
+    tripwire: Tripwire,
+    policy: RestartPolicy,
+    escalate: F,
+) -> JoinHandle<()>
+where
+    A: SupervisedActor,
+    F: Fn(&str) + Send + 'static,
+{
     let name = actor.name();
 
     spawn_counted(async move {
         let mut restart_backoff = policy.initial_backoff;
+        let mut restart_count = 0;
 
         loop {
             if tripwire.is_shutting_down() {
@@ -157,6 +186,7 @@ where
 
                 RestartDirective::Escalate => {
                     actor.on_escalate(reason);
+                    escalate(&format!("{name} actor {}", reason.as_str()));
 
                     counter!(
                         "corro.runtime.actor.escalate.total",
@@ -174,7 +204,37 @@ where
                 }
             }
 
+            let run_duration = started_at.elapsed();
+
+            if run_duration >= policy.reset_after {
+                restart_count = 0;
+            }
+
+            if restart_count >= policy.max_restarts {
+                actor.on_escalate(reason);
+                escalate(&format!(
+                    "{name} actor exceeded restart limit after {}",
+                    reason.as_str()
+                ));
+
+                counter!(
+                    "corro.runtime.actor.escalate.total",
+                    "actor" => name,
+                    "reason" => "restart-limit",
+                )
+                .increment(1);
+
+                error!(
+                    actor = name,
+                    reason = reason.as_str(),
+                    max_restarts = policy.max_restarts,
+                    "actor exceeded restart limit"
+                );
+                break;
+            }
+
             actor.on_restart(reason);
+            restart_count += 1;
 
             counter!(
                 "corro.runtime.actor.restart.total",
@@ -184,7 +244,7 @@ where
             .increment(1);
 
             let (restart_delay, next_backoff) =
-                restart_schedule(restart_backoff, policy, started_at.elapsed());
+                restart_schedule(restart_backoff, policy, run_duration);
 
             warn!(
                 actor = name,

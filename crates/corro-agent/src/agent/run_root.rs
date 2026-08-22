@@ -113,6 +113,7 @@ async fn run(
 
     match agent.broadcast_method() {
         BroadcastMethod::Gossip => spawn_supervised(
+            &agent,
             GossipBroadcastActor::new(
                 agent.clone(),
                 rx_bcast,
@@ -124,6 +125,7 @@ async fn run(
             RestartPolicy::default(),
         ),
         BroadcastMethod::Plumtree => spawn_supervised(
+            &agent,
             crate::plumtree::PlumtreeActor::new(
                 agent.clone(),
                 transport.clone(),
@@ -155,35 +157,41 @@ async fn run(
     handles.append(&mut http_handles);
 
     spawn_supervised(
+        &agent,
         util::ClearBufferedMetaActor::new(agent.clone(), rx_clear_buf),
         tripwire.clone(),
         RestartPolicy::default(),
     );
 
     spawn_supervised(
+        &agent,
         AgentMetricsActor::new(agent.clone(), transport.clone()),
         tripwire.clone(),
         RestartPolicy::default(),
     );
 
     spawn_supervised(
+        &agent,
         QueryMetricsActor::new(),
         tripwire.clone(),
         RestartPolicy::default(),
     );
 
     spawn_supervised(
+        &agent,
         GossipToSendActor::new(transport.clone(), to_send_rx),
         tripwire.clone(),
         RestartPolicy::default(),
     );
     spawn_supervised(
+        &agent,
         NotificationsActor::new(agent.clone(), notifications_rx),
         tripwire.clone(),
         RestartPolicy::default(),
     );
 
     spawn_supervised(
+        &agent,
         handlers::DbMaintenanceActor::new(&agent),
         tripwire.clone(),
         RestartPolicy::default(),
@@ -219,12 +227,14 @@ async fn run(
     info!("Checked bookie partials in {:?}", start.elapsed());
 
     spawn_supervised(
+        &agent,
         SyncActor::new(agent.clone(), bookie.clone(), transport.clone()),
         tripwire.clone(),
         RestartPolicy::default(),
     );
 
     spawn_supervised(
+        &agent,
         util::ApplyBufferedActor::new(agent.clone(), bookie.clone(), rx_apply),
         tripwire.clone(),
         RestartPolicy::default(),
@@ -241,6 +251,7 @@ async fn run(
     handlers::spawn_gossipserver_handler(&agent, &bookie, &tripwire, gossip_server_endpoint);
 
     let changes_handle = spawn_supervised(
+        &agent,
         handlers::ChangesActor::new(agent.clone(), bookie.clone(), rx_changes),
         tripwire.clone(),
         RestartPolicy::default(),

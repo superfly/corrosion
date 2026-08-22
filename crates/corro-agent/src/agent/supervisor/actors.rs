@@ -48,6 +48,14 @@ impl SupervisedActor for SyncActor {
     }
 }
 
+fn notifications_restart_directive(reason: RestartReason) -> RestartDirective {
+    match reason {
+        RestartReason::Completed | RestartReason::Failed | RestartReason::Panicked => {
+            RestartDirective::Escalate
+        }
+    }
+}
+
 pub(in crate::agent) struct NotificationsActor {
     agent: Agent,
     receiver: CorroReceiver<OwnedNotification<CorroActor>>,
@@ -80,10 +88,14 @@ impl SupervisedActor for NotificationsActor {
     }
 
     fn restart_directive(&mut self, reason: RestartReason) -> RestartDirective {
-        match reason {
-            RestartReason::Completed => RestartDirective::Stop,
-            RestartReason::Failed | RestartReason::Panicked => RestartDirective::Restart,
-        }
+        notifications_restart_directive(reason)
+    }
+}
+
+fn gossip_to_send_restart_directive(reason: RestartReason) -> RestartDirective {
+    match reason {
+        RestartReason::Completed => RestartDirective::Escalate,
+        RestartReason::Failed | RestartReason::Panicked => RestartDirective::Restart,
     }
 }
 
@@ -122,10 +134,7 @@ impl SupervisedActor for GossipToSendActor {
     }
 
     fn restart_directive(&mut self, reason: RestartReason) -> RestartDirective {
-        match reason {
-            RestartReason::Completed => RestartDirective::Stop,
-            RestartReason::Failed | RestartReason::Panicked => RestartDirective::Restart,
-        }
+        gossip_to_send_restart_directive(reason)
     }
 }
 
@@ -298,5 +307,40 @@ impl SupervisedActor for QueryMetricsActor {
     async fn run(&mut self, tripwire: Tripwire) -> Result<(), Self::Error> {
         corro_types::sqlite::query_metrics_loop(tripwire).await;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn notifications_escalate_on_every_non_shutdown_exit() {
+        for reason in [
+            RestartReason::Completed,
+            RestartReason::Failed,
+            RestartReason::Panicked,
+        ] {
+            assert_eq!(
+                notifications_restart_directive(reason),
+                RestartDirective::Escalate
+            );
+        }
+    }
+
+    #[test]
+    fn gossip_sender_escalates_on_channel_close() {
+        assert_eq!(
+            gossip_to_send_restart_directive(RestartReason::Completed),
+            RestartDirective::Escalate
+        );
+        assert_eq!(
+            gossip_to_send_restart_directive(RestartReason::Failed),
+            RestartDirective::Restart
+        );
+        assert_eq!(
+            gossip_to_send_restart_directive(RestartReason::Panicked),
+            RestartDirective::Restart
+        );
     }
 }

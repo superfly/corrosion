@@ -143,12 +143,85 @@ impl SupervisedActor for StopOnCompletionActor {
     }
 }
 
+struct AlwaysPanickingActor {
+    runs: Arc<AtomicUsize>,
+    restarts: Arc<AtomicUsize>,
+    escalations: Arc<AtomicUsize>,
+}
+
+impl SupervisedActor for AlwaysPanickingActor {
+    type Error = Infallible;
+
+    fn name(&self) -> &'static str {
+        "always-panicking"
+    }
+
+    fn run(&mut self, _tripwire: Tripwire) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        let runs = self.runs.clone();
+
+        async move {
+            runs.fetch_add(1, Ordering::SeqCst);
+            panic!("always-panicking actor panic");
+        }
+    }
+
+    fn on_restart(&mut self, reason: RestartReason) {
+        assert_eq!(reason, RestartReason::Panicked);
+        self.restarts.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn on_escalate(&mut self, reason: RestartReason) {
+        assert_eq!(reason, RestartReason::Panicked);
+        self.escalations.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+struct StableResetActor {
+    runs: Arc<AtomicUsize>,
+}
+
+impl SupervisedActor for StableResetActor {
+    type Error = Infallible;
+
+    fn name(&self) -> &'static str {
+        "stable-reset"
+    }
+
+    fn run(&mut self, tripwire: Tripwire) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        let runs = self.runs.clone();
+
+        async move {
+            match runs.fetch_add(1, Ordering::SeqCst) {
+                0 => panic!("first short run"),
+                1 => {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    panic!("stable run ended");
+                }
+                _ => tripwire.await,
+            }
+
+            Ok(())
+        }
+    }
+}
+
 fn test_policy() -> RestartPolicy {
     RestartPolicy::new(
         Duration::from_millis(1),
         Duration::from_millis(10),
         Duration::from_secs(1),
     )
+}
+
+fn spawn_test_supervised<A>(
+    actor: A,
+    tripwire: Tripwire,
+    policy: RestartPolicy,
+) -> JoinHandle<()>
+where
+    A: SupervisedActor,
+{
+    spawn_supervised_with_escalation(actor, tripwire, policy, |_| {})
 }
 
 async fn wait_for_runs(runs: &AtomicUsize, expected: usize) {
@@ -215,9 +288,11 @@ async fn escalate_directive_does_not_restart_actor() {
     let runs = Arc::new(AtomicUsize::new(0));
     let escalations = Arc::new(AtomicUsize::new(0));
     let restarts = Arc::new(AtomicUsize::new(0));
+    let node_escalations = Arc::new(AtomicUsize::new(0));
     let (tripwire, _worker, _tx) = Tripwire::new_simple();
 
-    let supervisor = spawn_supervised(
+    let node_escalations_for_handler = node_escalations.clone();
+    let supervisor = spawn_supervised_with_escalation(
         EscalatingActor {
             runs: runs.clone(),
             escalations: escalations.clone(),
@@ -225,6 +300,9 @@ async fn escalate_directive_does_not_restart_actor() {
         },
         tripwire,
         test_policy(),
+        move |_| {
+            node_escalations_for_handler.fetch_add(1, Ordering::SeqCst);
+        },
     );
 
     timeout(Duration::from_secs(1), supervisor)
@@ -234,6 +312,7 @@ async fn escalate_directive_does_not_restart_actor() {
 
     assert_eq!(runs.load(Ordering::SeqCst), 1);
     assert_eq!(escalations.load(Ordering::SeqCst), 1);
+    assert_eq!(node_escalations.load(Ordering::SeqCst), 1);
     assert_eq!(restarts.load(Ordering::SeqCst), 0);
 }
 
@@ -242,7 +321,7 @@ async fn stop_directive_does_not_restart_actor() {
     let runs = Arc::new(AtomicUsize::new(0));
     let (tripwire, _worker, _tx) = Tripwire::new_simple();
 
-    let supervisor = spawn_supervised(
+    let supervisor = spawn_test_supervised(
         StopOnCompletionActor { runs: runs.clone() },
         tripwire,
         test_policy(),
@@ -262,7 +341,7 @@ async fn restarts_actor_after_unexpected_exit() {
     let (tripwire, worker, tx) = Tripwire::new_simple();
     let worker = tokio::spawn(worker);
 
-    let supervisor = spawn_supervised(
+    let supervisor = spawn_test_supervised(
         TestActor {
             runs: runs.clone(),
             first_run_panics: false,
@@ -284,7 +363,7 @@ async fn restarts_actor_after_panic() {
     let (tripwire, worker, tx) = Tripwire::new_simple();
     let worker = tokio::spawn(worker);
 
-    let supervisor = spawn_supervised(
+    let supervisor = spawn_test_supervised(
         TestActor {
             runs: runs.clone(),
             first_run_panics: true,
@@ -318,7 +397,7 @@ async fn preserves_actor_state_across_restart() {
     let (tripwire, worker, tx) = Tripwire::new_simple();
     let worker = tokio::spawn(worker);
 
-    let supervisor = spawn_supervised(
+    let supervisor = spawn_test_supervised(
         StatefulTestActor {
             runs: runs.clone(),
             delivered: delivered.clone(),
@@ -343,12 +422,14 @@ async fn preserves_actor_state_across_restart() {
 }
 
 #[tokio::test]
-async fn shutdown_does_not_restart_actor() {
+async fn shutdown_does_not_restart_or_escalate_actor() {
     let runs = Arc::new(AtomicUsize::new(0));
+    let node_escalations = Arc::new(AtomicUsize::new(0));
     let (tripwire, worker, tx) = Tripwire::new_simple();
     let worker = tokio::spawn(worker);
 
-    let supervisor = spawn_supervised(
+    let node_escalations_for_handler = node_escalations.clone();
+    let supervisor = spawn_supervised_with_escalation(
         TestActor {
             runs: runs.clone(),
             first_run_panics: false,
@@ -356,10 +437,79 @@ async fn shutdown_does_not_restart_actor() {
         },
         tripwire,
         test_policy(),
+        move |_| {
+            node_escalations_for_handler.fetch_add(1, Ordering::SeqCst);
+        },
     );
 
     wait_for_runs(&runs, 1).await;
     shutdown(tx, worker, supervisor).await;
 
     assert_eq!(runs.load(Ordering::SeqCst), 1);
+    assert_eq!(node_escalations.load(Ordering::SeqCst), 0);
+}
+
+
+#[tokio::test]
+async fn restart_limit_escalates_once() {
+    let runs = Arc::new(AtomicUsize::new(0));
+    let restarts = Arc::new(AtomicUsize::new(0));
+    let actor_escalations = Arc::new(AtomicUsize::new(0));
+    let node_escalations = Arc::new(AtomicUsize::new(0));
+    let (tripwire, _worker, _tx) = Tripwire::new_simple();
+
+    let node_escalations_for_handler = node_escalations.clone();
+    let supervisor = spawn_supervised_with_escalation(
+        AlwaysPanickingActor {
+            runs: runs.clone(),
+            restarts: restarts.clone(),
+            escalations: actor_escalations.clone(),
+        },
+        tripwire,
+        test_policy().with_max_restarts(2),
+        move |_| {
+            node_escalations_for_handler.fetch_add(1, Ordering::SeqCst);
+        },
+    );
+
+    timeout(Duration::from_secs(1), supervisor)
+        .await
+        .expect("supervisor did not stop at restart limit")
+        .expect("supervisor panicked");
+
+    assert_eq!(runs.load(Ordering::SeqCst), 3);
+    assert_eq!(restarts.load(Ordering::SeqCst), 2);
+    assert_eq!(actor_escalations.load(Ordering::SeqCst), 1);
+    assert_eq!(node_escalations.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn stable_run_resets_restart_limit() {
+    let runs = Arc::new(AtomicUsize::new(0));
+    let node_escalations = Arc::new(AtomicUsize::new(0));
+    let (tripwire, worker, tx) = Tripwire::new_simple();
+    let worker = tokio::spawn(worker);
+
+    let policy = RestartPolicy::new(
+        Duration::from_millis(1),
+        Duration::from_millis(10),
+        Duration::from_millis(10),
+    )
+    .with_max_restarts(1);
+
+    let node_escalations_for_handler = node_escalations.clone();
+    let supervisor = spawn_supervised_with_escalation(
+        StableResetActor { runs: runs.clone() },
+        tripwire,
+        policy,
+        move |_| {
+            node_escalations_for_handler.fetch_add(1, Ordering::SeqCst);
+        },
+    );
+
+    wait_for_runs(&runs, 3).await;
+    shutdown(tx, worker, supervisor).await;
+
+    assert_eq!(runs.load(Ordering::SeqCst), 3);
+    assert_eq!(node_escalations.load(Ordering::SeqCst), 0);
 }
