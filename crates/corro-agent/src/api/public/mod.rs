@@ -1008,6 +1008,7 @@ mod tests {
         config::Config,
         schema::SqliteType,
     };
+    use corro_tests::TEST_SCHEMA;
     use futures::StreamExt;
     use tokio::sync::mpsc::error::TryRecvError;
     use tokio_util::codec::{Decoder, LinesCodec};
@@ -1464,7 +1465,7 @@ mod tests {
             })
         })
         .await
-        .expect("schema change was blocked by speculative transaction")??;
+        .expect("schema change was blocked by speculative transaction")?;
 
         release_tx.send(())?;
 
