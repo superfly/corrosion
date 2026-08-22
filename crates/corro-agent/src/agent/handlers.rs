@@ -1046,6 +1046,14 @@ impl HandleChangesState {
     }
 }
 
+impl Drop for HandleChangesState {
+    fn drop(&mut self) {
+        if let Some(task) = self.processing_task.take() {
+            task.abort();
+        }
+    }
+}
+
 /// Bundle incoming changes to optimise transaction sizes with SQLite
 ///
 /// *Performance tradeoff*: introduce latency (with a max timeout) to
