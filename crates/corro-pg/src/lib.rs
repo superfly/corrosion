@@ -7,6 +7,7 @@ mod vtab;
 use codec::VecFromSqlText;
 use eyre::WrapErr;
 use std::{
+    cell::RefCell,
     collections::{BTreeSet, HashMap, VecDeque},
     fmt,
     net::SocketAddr,
@@ -486,6 +487,44 @@ impl TxState {
     }
 }
 
+#[derive(Clone, Default)]
+struct ConnectionDropWritePermit(Rc<RefCell<Option<OwnedSemaphorePermit>>>);
+
+impl ConnectionDropWritePermit {
+    fn hold(&self, tx_state: &mut TxState) {
+        let permit = tx_state.end();
+        let mut held = self.0.borrow_mut();
+        debug_assert!(held.is_none());
+        *held = permit;
+    }
+}
+
+#[cfg(test)]
+mod connection_drop_tests {
+    use super::{ConnectionDropWritePermit, TxState};
+    use std::sync::Arc;
+
+    #[test]
+    fn write_permit_is_held_until_connection_owner_drops() {
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = semaphore.clone().try_acquire_owned().unwrap();
+        let mut tx_state = TxState::explicit();
+        tx_state.set_write_permit(permit);
+
+        let connection_owner = ConnectionDropWritePermit::default();
+        let session_owner = connection_owner.clone();
+        session_owner.hold(&mut tx_state);
+        drop(session_owner);
+
+        assert!(tx_state.is_ended());
+        assert!(semaphore.clone().try_acquire_owned().is_err());
+
+        drop(connection_owner);
+
+        assert!(semaphore.try_acquire_owned().is_ok());
+    }
+}
+
 #[derive(Debug)]
 enum OpenTxKind {
     Implicit,
@@ -903,6 +942,7 @@ pub async fn start(
                 let res = tokio::task::spawn_blocking({
                     let back_tx = back_tx.clone();
                     move || {
+                        let connection_drop_write_permit = ConnectionDropWritePermit::default();
                         let conn = if readonly {
                             agent.pool().client_dedicated_readonly().unwrap()
                         } else {
@@ -993,6 +1033,7 @@ pub async fn start(
                             agent,
                             conn: &conn,
                             tx_state: TxState::default(),
+                            connection_drop_write_permit: connection_drop_write_permit.clone(),
                         };
 
                         let mut prepared: HashMap<CompactString, Prepared> = HashMap::new();
@@ -2206,6 +2247,7 @@ struct Session<'conn> {
     agent: Agent,
     conn: &'conn CrConn,
     tx_state: TxState,
+    connection_drop_write_permit: ConnectionDropWritePermit,
 }
 
 impl<'conn> Session<'conn> {
@@ -2933,10 +2975,12 @@ impl<'conn> Drop for Session<'conn> {
         if !self.tx_state.is_ended() {
             if let Err(e) = self.rollback_sqlite_tx() {
                 warn!("failed to rollback tx: {e}");
+                self.connection_drop_write_permit
+                    .hold(&mut self.tx_state);
             } else {
                 debug!("rolled back tx");
+                let _permit = self.tx_state.end();
             }
-            let _permit = self.tx_state.end();
         }
     }
 }
