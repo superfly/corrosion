@@ -706,15 +706,13 @@ impl Model for PlumtreeModel {
                 properties.push(Property::always(
                     "lossless quiescence delivers to every receiver",
                     |_: &PlumtreeModel, state: &ModelState| {
-                        !state.snapshot.quiescent()
-                            || state.snapshot.delivered_to_every_receiver()
+                        !state.snapshot.quiescent() || state.snapshot.delivered_to_every_receiver()
                     },
                 ));
                 properties.push(Property::sometimes(
                     "lossless broadcast reaches delivered quiescence",
                     |_: &PlumtreeModel, state: &ModelState| {
-                        state.snapshot.quiescent()
-                            && state.snapshot.delivered_to_every_receiver()
+                        state.snapshot.quiescent() && state.snapshot.delivered_to_every_receiver()
                     },
                 ));
             }
