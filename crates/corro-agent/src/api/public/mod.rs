@@ -1422,23 +1422,24 @@ mod tests {
                     None,
                     BTreeSet::from(["tests".to_owned()]),
                     move |tx| {
-                    tx.execute(
-                        "INSERT INTO tests (id, text) VALUES ('schema-race', 'old-schema')",
-                        &[],
-                    )
-                    .map_err(|source| ChangeError::Rusqlite {
-                        source,
-                        actor_id: None,
-                        version: None,
-                    })?;
+                        tx.execute(
+                            "INSERT INTO tests (id, text) VALUES ('schema-race', 'old-schema')",
+                            &[],
+                        )
+                        .map_err(|source| ChangeError::Rusqlite {
+                            source,
+                            actor_id: None,
+                            version: None,
+                        })?;
 
-                    let _ = entered_tx.send(());
-                    release_rx
-                        .recv_timeout(Duration::from_secs(5))
-                        .expect("speculative write was not released");
+                        let _ = entered_tx.send(());
+                        release_rx
+                            .recv_timeout(Duration::from_secs(5))
+                            .expect("speculative write was not released");
 
-                    Ok(())
-                })
+                        Ok(())
+                    },
+                )
                 .await
             })
         };
@@ -1478,10 +1479,11 @@ mod tests {
             (),
             |row| row.get(0),
         )?;
-        let audit_rows: i64 =
-            conn.query_row("SELECT COUNT(*) FROM http_schema_race_audit", (), |row| {
-                row.get(0)
-            })?;
+        let audit_rows: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM http_schema_race_audit",
+            (),
+            |row| row.get(0),
+        )?;
 
         assert_eq!(tracked_rows, 0);
         assert_eq!(audit_rows, 0);
@@ -1518,23 +1520,24 @@ mod tests {
                     None,
                     BTreeSet::from(["tests".to_owned()]),
                     move |tx| {
-                    tx.execute(
-                        "INSERT INTO tests (id, text) VALUES ('speculative-open', 'client')",
-                        &[],
-                    )
-                    .map_err(|source| ChangeError::Rusqlite {
-                        source,
-                        actor_id: None,
-                        version: None,
-                    })?;
+                        tx.execute(
+                            "INSERT INTO tests (id, text) VALUES ('speculative-open', 'client')",
+                            &[],
+                        )
+                        .map_err(|source| ChangeError::Rusqlite {
+                            source,
+                            actor_id: None,
+                            version: None,
+                        })?;
 
-                    let _ = entered_tx.send(());
-                    release_rx
-                        .recv_timeout(Duration::from_secs(5))
-                        .expect("speculative write was not released");
+                        let _ = entered_tx.send(());
+                        release_rx
+                            .recv_timeout(Duration::from_secs(5))
+                            .expect("speculative write was not released");
 
-                    Ok(())
-                })
+                        Ok(())
+                    },
+                )
                 .await
             })
         };
@@ -1611,20 +1614,21 @@ mod tests {
                     None,
                     BTreeSet::from(["tests".to_owned()]),
                     move |tx| {
-                    let concurrent = enter(&gate);
+                        let concurrent = enter(&gate);
 
-                    tx.execute(
-                        "INSERT INTO tests (id, text) VALUES ('parallel-1', 'first')",
-                        &[],
-                    )
-                    .map_err(|source| ChangeError::Rusqlite {
-                        source,
-                        actor_id: None,
-                        version: None,
-                    })?;
+                        tx.execute(
+                            "INSERT INTO tests (id, text) VALUES ('parallel-1', 'first')",
+                            &[],
+                        )
+                        .map_err(|source| ChangeError::Rusqlite {
+                            source,
+                            actor_id: None,
+                            version: None,
+                        })?;
 
-                    Ok(concurrent)
-                })
+                        Ok(concurrent)
+                    },
+                )
                 .await
             })
         };
@@ -1639,20 +1643,21 @@ mod tests {
                     None,
                     BTreeSet::from(["tests".to_owned()]),
                     move |tx| {
-                    let concurrent = enter(&gate);
+                        let concurrent = enter(&gate);
 
-                    tx.execute(
-                        "INSERT INTO tests (id, text) VALUES ('parallel-2', 'second')",
-                        &[],
-                    )
-                    .map_err(|source| ChangeError::Rusqlite {
-                        source,
-                        actor_id: None,
-                        version: None,
-                    })?;
+                        tx.execute(
+                            "INSERT INTO tests (id, text) VALUES ('parallel-2', 'second')",
+                            &[],
+                        )
+                        .map_err(|source| ChangeError::Rusqlite {
+                            source,
+                            actor_id: None,
+                            version: None,
+                        })?;
 
-                    Ok(concurrent)
-                })
+                        Ok(concurrent)
+                    },
+                )
                 .await
             })
         };
