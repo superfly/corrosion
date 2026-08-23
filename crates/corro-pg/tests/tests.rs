@@ -644,7 +644,7 @@ async fn test_pg_simple_query_error_rolls_back_implicit_transaction() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_pg_constraint_error_aborts_explicit_transaction() {
+async fn test_pg_transaction_errors_require_rollback() {
     let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
     let (ta, server) = setup_pg_test_server(tripwire, None).await;
 
@@ -670,10 +670,21 @@ async fn test_pg_constraint_error_aborts_explicit_transaction() {
         .await
         .expect_err("the duplicate statement must fail");
 
+        let rejected_commit = tx
+            .execute("COMMIT", &[])
+            .await
+            .expect_err("commit must not recover a failed transaction");
+        assert_eq!(
+            rejected_commit
+                .as_db_error()
+                .map(|error| error.code().code()),
+            Some("25P02")
+        );
+
         let aborted = tx
             .query_one("SELECT 1", &[])
             .await
-            .expect_err("constraint failure must abort the explicit transaction");
+            .expect_err("rejected commit must leave the transaction failed");
         assert_eq!(
             aborted.as_db_error().map(|error| error.code().code()),
             Some("25P02")
@@ -687,6 +698,83 @@ async fn test_pg_constraint_error_aborts_explicit_transaction() {
             .unwrap()
             .get::<_, i64>(0);
         assert_eq!(rows, 0);
+
+        client.batch_execute("BEGIN").await.unwrap();
+        client
+            .batch_execute("INSERT INTO tests (id, text) VALUES (322, 'first')")
+            .await
+            .unwrap();
+        client
+            .batch_execute("INSERT INTO tests (id, text) VALUES (322, 'duplicate')")
+            .await
+            .expect_err("the duplicate statement must fail");
+
+        let rejected_commit = client
+            .batch_execute("COMMIT")
+            .await
+            .expect_err("commit must not recover a failed transaction");
+        assert_eq!(
+            rejected_commit
+                .as_db_error()
+                .map(|error| error.code().code()),
+            Some("25P02")
+        );
+
+        let aborted = client
+            .batch_execute("SELECT 1")
+            .await
+            .expect_err("rejected commit must leave the transaction failed");
+        assert_eq!(
+            aborted.as_db_error().map(|error| error.code().code()),
+            Some("25P02")
+        );
+
+        client.batch_execute("ROLLBACK").await.unwrap();
+
+        let rows = client
+            .query_one("SELECT COUNT(*) FROM tests WHERE id = 322", &[])
+            .await
+            .unwrap()
+            .get::<_, i64>(0);
+        assert_eq!(rows, 0);
+
+        client.batch_execute("BEGIN").await.unwrap();
+        let active = client
+            .batch_execute("BEGIN")
+            .await
+            .expect_err("nested begin must fail");
+        assert_eq!(
+            active.as_db_error().map(|error| error.code().code()),
+            Some("25001")
+        );
+        let aborted = client
+            .batch_execute("SELECT 1")
+            .await
+            .expect_err("nested begin must abort the transaction");
+        assert_eq!(
+            aborted.as_db_error().map(|error| error.code().code()),
+            Some("25P02")
+        );
+        client.batch_execute("ROLLBACK").await.unwrap();
+
+        client.execute("BEGIN", &[]).await.unwrap();
+        let active = client
+            .execute("BEGIN", &[])
+            .await
+            .expect_err("nested begin must fail");
+        assert_eq!(
+            active.as_db_error().map(|error| error.code().code()),
+            Some("25001")
+        );
+        let aborted = client
+            .query_one("SELECT 1", &[])
+            .await
+            .expect_err("nested begin must abort the transaction");
+        assert_eq!(
+            aborted.as_db_error().map(|error| error.code().code()),
+            Some("25P02")
+        );
+        client.execute("ROLLBACK", &[]).await.unwrap();
 
         let permit = tokio::time::timeout(
             Duration::from_secs(5),

@@ -2449,9 +2449,7 @@ impl<'conn> Session<'conn> {
         back_tx: &Sender<BackendResponse>,
         send_row_desc: bool,
     ) -> Result<(), QueryError> {
-        if self.tx_state.is_failed() && !cmd.is_commit() && !cmd.is_rollback() {
-            return Err(QueryError::TransactionAborted);
-        }
+        self.validate_transaction_command(cmd)?;
 
         if cmd.is_show() {
             back_tx
@@ -2499,12 +2497,7 @@ impl<'conn> Session<'conn> {
             self.tx_state.start_explicit();
             0
         } else if cmd.is_commit() {
-            if self.tx_state.is_failed() {
-                self.rollback_sqlite_tx()?;
-                let _permit = self.tx_state.end();
-            } else {
-                self.commit_tx()?;
-            }
+            self.commit_tx()?;
             0
         } else if cmd.is_rollback() {
             self.rollback_sqlite_tx()?;
@@ -2626,9 +2619,7 @@ impl<'conn> Session<'conn> {
         max_rows: usize,
         back_tx: &Sender<BackendResponse>,
     ) -> Result<(), QueryError> {
-        if self.tx_state.is_failed() && !cmd.is_commit() && !cmd.is_rollback() {
-            return Err(QueryError::TransactionAborted);
-        }
+        self.validate_transaction_command(cmd)?;
 
         // TODO: maybe we don't need to recompute this...
         let fields = field_types(prepped, cmd, FieldFormats::Each(result_formats))?;
@@ -2663,12 +2654,7 @@ impl<'conn> Session<'conn> {
         let mut changes = 0usize;
 
         if cmd.is_commit() {
-            if self.tx_state.is_failed() {
-                self.rollback_sqlite_tx()?;
-                let _permit = self.tx_state.end();
-            } else {
-                self.commit_tx()?;
-            }
+            self.commit_tx()?;
         } else if cmd.is_rollback() {
             self.rollback_sqlite_tx()?;
             let _permit = self.tx_state.end();
@@ -2838,6 +2824,18 @@ impl<'conn> Session<'conn> {
                     .into(),
             )
             .map_err(|_| QueryError::BackendResponseSendFailed)?;
+
+        Ok(())
+    }
+
+    fn validate_transaction_command(&self, cmd: &ParsedCmd) -> Result<(), QueryError> {
+        if self.tx_state.is_failed() && !cmd.is_rollback() {
+            return Err(QueryError::TransactionAborted);
+        }
+
+        if self.tx_state.is_explicit() && cmd.is_begin() {
+            return Err(QueryError::ActiveTransaction);
+        }
 
         Ok(())
     }
@@ -3087,6 +3085,8 @@ enum QueryError {
     Change(#[from] ChangeError),
     #[error("current transaction is aborted, commands ignored until end of transaction block")]
     TransactionAborted,
+    #[error("there is already a transaction in progress")]
+    ActiveTransaction,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -3126,9 +3126,18 @@ impl TryFrom<QueryError> for PgWireBackendMessage {
             QueryError::Change(e) => {
                 ErrorInfo::new("ERROR".to_owned(), "XX000".to_owned(), e.to_string()).into()
             }
-            e @ QueryError::TransactionAborted => {
-                ErrorInfo::new("ERROR".to_owned(), "25P02".to_owned(), e.to_string()).into()
-            }
+            e @ QueryError::TransactionAborted => ErrorInfo::new(
+                "ERROR".to_owned(),
+                SqlState::IN_FAILED_SQL_TRANSACTION.code().into(),
+                e.to_string(),
+            )
+            .into(),
+            e @ QueryError::ActiveTransaction => ErrorInfo::new(
+                "ERROR".to_owned(),
+                SqlState::ACTIVE_SQL_TRANSACTION.code().into(),
+                e.to_string(),
+            )
+            .into(),
         }))
     }
 }
