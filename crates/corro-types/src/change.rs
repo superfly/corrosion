@@ -4,13 +4,14 @@ use antithesis_sdk::assert_always;
 pub use corro_api_types::SqliteValue;
 use corro_api_types::{ColumnName, TableName};
 use corro_base_types::{CrsqlDbVersion, CrsqlSeqRange};
-use rusqlite::{Connection, Row};
+use rusqlite::{params, Connection, Row};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use speedy::{Readable, Writable};
 use tracing::{debug, trace, warn};
 
 use crate::{
+    actor::ActorId,
     agent::{Agent, BookedVersions, ChangeError, VersionsSnapshot},
     base::CrsqlSeq,
     broadcast::{ChangesetPerTable, Timestamp},
@@ -188,6 +189,214 @@ pub struct InsertChangesInfo {
     pub snap: VersionsSnapshot,
 }
 
+pub fn database_schema_version(conn: &Connection) -> rusqlite::Result<i64> {
+    conn.query_row("PRAGMA main.schema_version", (), |row| row.get(0))
+}
+
+pub fn database_table_is_crr(conn: &Connection, table: &str) -> rusqlite::Result<bool> {
+    conn.query_row(
+        r#"
+        SELECT
+            EXISTS (
+                SELECT 1
+                FROM main.sqlite_schema
+                WHERE type = 'table'
+                  AND name = ?1 COLLATE NOCASE
+            )
+            AND EXISTS (
+                SELECT 1
+                FROM main.sqlite_schema
+                WHERE type = 'table'
+                  AND name = (?1 || '__crsql_clock') COLLATE NOCASE
+            )
+            AND 3 = (
+                SELECT COUNT(*)
+                FROM main.sqlite_schema AS trg
+                WHERE trg.type = 'trigger'
+                  AND trg.tbl_name = ?1 COLLATE NOCASE
+                  AND instr(
+                      lower(coalesce(trg.sql, '')),
+                      'crsql_internal_sync_bit()'
+                  ) > 0
+                  AND (
+                      (
+                          trg.name = (?1 || '__crsql_itrig') COLLATE NOCASE
+                          AND instr(lower(trg.sql), 'crsql_after_insert(') > 0
+                      )
+                      OR (
+                          trg.name = (?1 || '__crsql_utrig') COLLATE NOCASE
+                          AND instr(lower(trg.sql), 'crsql_after_update(') > 0
+                      )
+                      OR (
+                          trg.name = (?1 || '__crsql_dtrig') COLLATE NOCASE
+                          AND instr(lower(trg.sql), 'crsql_after_delete(') > 0
+                      )
+                  )
+            )
+        "#,
+        [table],
+        |row| row.get(0),
+    )
+}
+
+pub fn database_has_user_triggers(conn: &Connection) -> rusqlite::Result<bool> {
+    conn.query_row(
+        r#"
+        SELECT EXISTS (
+            SELECT 1
+            FROM main.sqlite_schema AS trg
+            WHERE trg.type = 'trigger'
+              AND NOT (
+                  (
+                      EXISTS (
+                          SELECT 1
+                          FROM main.sqlite_schema AS clock
+                          WHERE clock.type = 'table'
+                            AND clock.name = trg.tbl_name || '__crsql_clock'
+                      )
+                      AND instr(
+                          lower(coalesce(trg.sql, '')),
+                          'crsql_internal_sync_bit()'
+                      ) > 0
+                      AND (
+                          (
+                              trg.name = trg.tbl_name || '__crsql_itrig'
+                              AND instr(lower(trg.sql), 'crsql_after_insert(') > 0
+                          )
+                          OR (
+                              trg.name = trg.tbl_name || '__crsql_utrig'
+                              AND instr(lower(trg.sql), 'crsql_after_update(') > 0
+                          )
+                          OR (
+                              trg.name = trg.tbl_name || '__crsql_dtrig'
+                              AND instr(lower(trg.sql), 'crsql_after_delete(') > 0
+                          )
+                      )
+                  )
+                  OR (
+                      trg.tbl_name = 'crsql_site_id'
+                      AND trg.name IN (
+                          'crsql_site_id_insert_trig',
+                          'crsql_site_id_update_trig',
+                          'crsql_site_id_delete_trig'
+                      )
+                      AND instr(
+                          lower(coalesce(trg.sql, '')),
+                          'crsql_update_site_id('
+                      ) > 0
+                  )
+              )
+        )
+        "#,
+        (),
+        |row| row.get(0),
+    )
+}
+
+pub fn database_has_foreign_keys(conn: &Connection) -> rusqlite::Result<bool> {
+    conn.query_row(
+        r#"
+        SELECT EXISTS (
+            SELECT 1
+            FROM main.sqlite_schema
+            WHERE type = 'table'
+              AND instr(lower(coalesce(sql, '')), 'references') > 0
+        )
+        "#,
+        (),
+        |row| row.get(0),
+    )
+}
+
+#[derive(Debug, Clone)]
+struct PendingLocalChange {
+    change: Change,
+    ts: Option<String>,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct PendingLocalChanges {
+    changes: Vec<PendingLocalChange>,
+}
+
+impl PendingLocalChanges {
+    pub fn capture(conn: &Connection, actor_id: ActorId) -> rusqlite::Result<Self> {
+        let db_version: CrsqlDbVersion =
+            conn.query_row("SELECT crsql_peek_next_db_version()", (), |row| row.get(0))?;
+
+        let mut stmt = conn.prepare_cached(
+            r#"
+            SELECT
+                "table",
+                pk,
+                cid,
+                val,
+                col_version,
+                db_version,
+                seq,
+                site_id,
+                cl,
+                ts
+            FROM main.crsql_changes
+            WHERE site_id = ?
+              AND db_version = ?
+            ORDER BY seq
+            "#,
+        )?;
+
+        let changes = stmt
+            .query_map((actor_id, db_version), |row| {
+                Ok(PendingLocalChange {
+                    change: row_to_change(row)?,
+                    ts: row.get(9)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        Ok(Self { changes })
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.changes.is_empty()
+    }
+
+    pub fn replay(&self, conn: &Connection) -> rusqlite::Result<Option<CrsqlDbVersion>> {
+        if self.changes.is_empty() {
+            return Ok(None);
+        }
+
+        let db_version: CrsqlDbVersion =
+            conn.query_row("SELECT crsql_next_db_version()", (), |row| row.get(0))?;
+
+        let mut stmt = conn.prepare_cached(
+            r#"
+            INSERT INTO main.crsql_changes
+                ("table", pk, cid, val, col_version, db_version, site_id, cl, seq, ts)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )?;
+
+        for pending in &self.changes {
+            let change = &pending.change;
+
+            stmt.execute(params![
+                &change.table,
+                &change.pk,
+                &change.cid,
+                &change.val,
+                change.col_version,
+                db_version,
+                &change.site_id,
+                change.cl,
+                change.seq,
+                &pending.ts,
+            ])?;
+        }
+
+        Ok(Some(db_version))
+    }
+}
+
 pub fn insert_local_changes(
     agent: &Agent,
     tx: &Connection,
@@ -211,7 +420,7 @@ pub fn insert_local_changes(
 
     let version_info: (Option<CrsqlSeq>, Option<Timestamp>) = tx
         .prepare_cached(
-            "SELECT MAX(seq), MAX(ts) FROM crsql_changes WHERE site_id = ? AND db_version = ?;",
+            "SELECT MAX(seq), MAX(ts) FROM main.crsql_changes WHERE site_id = ? AND db_version = ?;",
         )
         .map_err(|source| ChangeError::Rusqlite {
             source,
@@ -265,6 +474,141 @@ pub fn insert_local_changes(
 mod tests {
     use super::*;
     use crate::base::dbsr;
+
+    #[test]
+    fn test_database_table_is_crr_uses_live_schema() -> Result<(), Box<dyn std::error::Error>> {
+        let conn = crate::sqlite::rusqlite_to_crsqlite(Connection::open_in_memory()?)?;
+
+        conn.execute_batch(
+            "
+            CREATE TABLE tracked (
+                id INTEGER NOT NULL PRIMARY KEY,
+                value TEXT NOT NULL DEFAULT ''
+            );
+            SELECT crsql_as_crr('tracked');
+            ",
+        )?;
+
+        assert!(database_table_is_crr(&conn, "tracked")?);
+
+        conn.execute_batch(
+            "
+            DROP TABLE tracked;
+            CREATE TABLE tracked (
+                id INTEGER PRIMARY KEY,
+                value TEXT NOT NULL DEFAULT ''
+            );
+            ",
+        )?;
+
+        assert!(!database_table_is_crr(&conn, "tracked")?);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_replay_side_effect_detection() -> Result<(), Box<dyn std::error::Error>> {
+        let conn = crate::sqlite::rusqlite_to_crsqlite(Connection::open_in_memory()?)?;
+
+        conn.execute_batch(
+            "
+            CREATE TABLE tracked (
+                id INTEGER NOT NULL PRIMARY KEY,
+                value TEXT NOT NULL DEFAULT ''
+            );
+            SELECT crsql_as_crr('tracked');
+            ",
+        )?;
+
+        assert!(!database_has_user_triggers(&conn)?);
+        assert!(!database_has_foreign_keys(&conn)?);
+
+        conn.execute_batch(
+            "
+            CREATE TABLE exact_name_shadow (id INTEGER PRIMARY KEY);
+            CREATE TRIGGER exact_name_shadow__crsql_itrig
+            AFTER INSERT ON exact_name_shadow
+            BEGIN
+                SELECT 1;
+            END;
+            ",
+        )?;
+
+        assert!(database_has_user_triggers(&conn)?);
+
+        conn.execute_batch(
+            "
+            DROP TRIGGER exact_name_shadow__crsql_itrig;
+            CREATE TABLE fk_parent (id INTEGER PRIMARY KEY);
+            CREATE TABLE fk_child (
+                id INTEGER PRIMARY KEY,
+                parent_id INTEGER REFERENCES fk_parent(id)
+            );
+            ",
+        )?;
+
+        assert!(!database_has_user_triggers(&conn)?);
+        assert!(database_has_foreign_keys(&conn)?);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_pending_local_changes_capture_and_replay() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("pending-local-changes.db");
+
+        let speculative = crate::sqlite::rusqlite_to_crsqlite(Connection::open(&path)?)?;
+
+        speculative.execute_batch(
+            "
+            CREATE TABLE foo (
+                id INTEGER NOT NULL PRIMARY KEY,
+                value TEXT NOT NULL DEFAULT ''
+            );
+            SELECT crsql_as_crr('foo');
+            BEGIN CONCURRENT;
+            ",
+        )?;
+
+        let actor_id: ActorId =
+            speculative.query_row("SELECT crsql_site_id()", (), |row| row.get(0))?;
+
+        let _: String =
+            speculative.query_row("SELECT crsql_set_ts('401')", (), |row| row.get(0))?;
+
+        speculative.execute("INSERT INTO foo (id, value) VALUES (1, 'speculative')", ())?;
+
+        let pending = PendingLocalChanges::capture(&speculative, actor_id)?;
+        assert!(!pending.is_empty());
+
+        speculative.execute_batch("ROLLBACK;")?;
+
+        let canonical = crate::sqlite::rusqlite_to_crsqlite(Connection::open(&path)?)?;
+
+        canonical.execute_batch("BEGIN IMMEDIATE;")?;
+
+        let db_version = pending
+            .replay(&canonical)?
+            .expect("expected a reserved db version");
+
+        let rows: i64 = canonical.query_row(
+            "SELECT COUNT(*) FROM crsql_changes WHERE site_id = ? AND db_version = ?",
+            (actor_id, db_version),
+            |row| row.get(0),
+        )?;
+
+        assert_eq!(rows, 1);
+
+        canonical.execute_batch("COMMIT;")?;
+
+        let value: String =
+            canonical.query_row("SELECT value FROM foo WHERE id = 1", (), |row| row.get(0))?;
+
+        assert_eq!(value, "speculative");
+
+        Ok(())
+    }
 
     #[test]
     fn test_change_chunker() {

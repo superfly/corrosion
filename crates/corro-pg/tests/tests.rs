@@ -74,6 +74,892 @@ async fn setup_pg_test_server(
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn test_pg_mixed_transaction_upgrades_to_canonical() {
+    let (tripwire, _tripwire_worker, _tripwire_tx) = Tripwire::new_simple();
+    let (_ta, server) = setup_pg_test_server(tripwire, None).await;
+
+    let conn_str = format!(
+        "host={} port={} user=testuser",
+        server.local_addr.ip(),
+        server.local_addr.port()
+    );
+
+    let (mut client, conn) = tokio_postgres::connect(&conn_str, NoTls).await.unwrap();
+    tokio::spawn(conn);
+
+    let tx = client.transaction().await.unwrap();
+
+    let affected = tx
+        .execute(
+            "INSERT INTO tests VALUES ($1, $2)",
+            &[&201i64, &"before-upgrade"],
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(affected, 1);
+
+    tx.batch_execute(
+        "CREATE TABLE pg_upgrade_marker (
+            id INTEGER PRIMARY KEY
+        )",
+    )
+    .await
+    .unwrap();
+
+    tx.commit().await.unwrap();
+
+    let row = client
+        .query_one("SELECT text FROM tests WHERE id = 201", &[])
+        .await
+        .unwrap();
+
+    assert_eq!(row.get::<_, String>(0), "before-upgrade");
+
+    let row = client
+        .query_one(
+            "SELECT COUNT(*) FROM sqlite_schema \
+             WHERE type = 'table' AND name = 'pg_upgrade_marker'",
+            &[],
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(row.get::<_, i64>(0), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_pg_concurrent_writers() {
+    let (tripwire, _tripwire_worker, _tripwire_tx) = Tripwire::new_simple();
+    let (ta, server) = setup_pg_test_server(tripwire, None).await;
+
+    let sema = ta.agent.write_sema().clone();
+    let conn_str = format!(
+        "host={} port={} user=testuser",
+        server.local_addr.ip(),
+        server.local_addr.port()
+    );
+
+    let (mut client1, conn1) = tokio_postgres::connect(&conn_str, NoTls).await.unwrap();
+    let (mut client2, conn2) = tokio_postgres::connect(&conn_str, NoTls).await.unwrap();
+
+    tokio::spawn(conn1);
+    tokio::spawn(conn2);
+
+    let tx1 = client1.transaction().await.unwrap();
+    let tx2 = client2.transaction().await.unwrap();
+
+    let permit = sema.acquire().await.unwrap();
+
+    let (write1, write2) = tokio::join!(
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            tx1.execute(
+                "INSERT INTO tests VALUES ($1, $2)",
+                &[&101i64, &"writer-one"],
+            ),
+        ),
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            tx2.execute(
+                "INSERT INTO tests VALUES ($1, $2)",
+                &[&102i64, &"writer-two"],
+            ),
+        ),
+    );
+
+    assert_eq!(write1.expect("first speculative write blocked").unwrap(), 1);
+    assert_eq!(
+        write2.expect("second speculative write blocked").unwrap(),
+        1
+    );
+
+    drop(permit);
+
+    let (commit1, commit2) = tokio::join!(tx1.commit(), tx2.commit());
+    commit1.unwrap();
+    commit2.unwrap();
+
+    let row = client1
+        .query_one("SELECT COUNT(*) FROM tests WHERE id IN (101, 102)", &[])
+        .await
+        .unwrap();
+
+    assert_eq!(row.get::<_, i64>(0), 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_pg_stale_tracked_schema_forces_canonical_path() {
+    let (tripwire, _tripwire_worker, _tripwire_tx) = Tripwire::new_simple();
+    let (ta, server) = setup_pg_test_server(tripwire, None).await;
+
+    let conn_str = format!(
+        "host={} port={} user=testuser",
+        server.local_addr.ip(),
+        server.local_addr.port()
+    );
+
+    let (mut client, conn) = tokio_postgres::connect(&conn_str, NoTls).await.unwrap();
+    tokio::spawn(conn);
+
+    client
+        .batch_execute(
+            "DROP TABLE tests;
+             CREATE TABLE tests (
+                 id INTEGER NOT NULL PRIMARY KEY,
+                 text TEXT NOT NULL DEFAULT ''
+             ) WITHOUT ROWID",
+        )
+        .await
+        .unwrap();
+
+    assert!(ta.agent.schema().read().tables.contains_key("tests"));
+
+    let permit = ta.agent.write_sema().acquire().await.unwrap();
+    let tx = client.transaction().await.unwrap();
+    let mut write = Box::pin(tx.execute(
+        "INSERT INTO tests (id, text) VALUES (961, 'canonical')",
+        &[],
+    ));
+
+    assert!(tokio::time::timeout(Duration::from_millis(200), &mut write)
+        .await
+        .is_err());
+
+    drop(permit);
+
+    let affected = tokio::time::timeout(Duration::from_secs(5), &mut write)
+        .await
+        .expect("canonical write remained blocked")
+        .unwrap();
+    assert_eq!(affected, 1);
+
+    drop(write);
+    tx.commit().await.unwrap();
+
+    let row = client
+        .query_one("SELECT text FROM tests WHERE id = 961", &[])
+        .await
+        .unwrap();
+
+    assert_eq!(row.get::<_, String>(0), "canonical");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_pg_schema_change_aborts_speculative_replay() {
+    let (tripwire, _tripwire_worker, _tripwire_tx) = Tripwire::new_simple();
+    let (ta, server) = setup_pg_test_server(tripwire, None).await;
+
+    let conn_str = format!(
+        "host={} port={} user=testuser",
+        server.local_addr.ip(),
+        server.local_addr.port()
+    );
+
+    let (mut client1, conn1) = tokio_postgres::connect(&conn_str, NoTls).await.unwrap();
+    let (client2, conn2) = tokio_postgres::connect(&conn_str, NoTls).await.unwrap();
+    tokio::spawn(conn1);
+    tokio::spawn(conn2);
+
+    client2
+        .batch_execute(
+            "CREATE TABLE pg_schema_race_audit (
+                id INTEGER PRIMARY KEY,
+                seen TEXT NOT NULL
+            )",
+        )
+        .await
+        .unwrap();
+
+    let tx = client1.transaction().await.unwrap();
+    let affected = tx
+        .execute(
+            "INSERT INTO tests (id, text) VALUES (951, 'old-schema')",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(affected, 1);
+
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        client2.batch_execute(
+            "CREATE TRIGGER tests_schema_race_audit
+             AFTER INSERT ON tests
+             BEGIN
+                 INSERT INTO pg_schema_race_audit (id, seen)
+                 VALUES (NEW.id, NEW.text);
+             END",
+        ),
+    )
+    .await
+    .expect("schema change was blocked by speculative transaction")
+    .unwrap();
+
+    let err = tx.commit().await.unwrap_err();
+    let db_error = err
+        .as_db_error()
+        .expect("commit error was not a database error");
+    assert!(
+        db_error
+            .message()
+            .contains("database schema changed during speculative transaction"),
+        "{db_error:?}"
+    );
+
+    let conn = ta.agent.pool().read().await.unwrap();
+    let tracked_rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM tests WHERE id = 951", (), |row| {
+            row.get(0)
+        })
+        .unwrap();
+    let audit_rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM pg_schema_race_audit", (), |row| {
+            row.get(0)
+        })
+        .unwrap();
+
+    assert_eq!(tracked_rows, 0);
+    assert_eq!(audit_rows, 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_pg_user_trigger_forces_canonical_path() {
+    let (tripwire, _tripwire_worker, _tripwire_tx) = Tripwire::new_simple();
+    let (ta, server) = setup_pg_test_server(tripwire, None).await;
+
+    let conn_str = format!(
+        "host={} port={} user=testuser",
+        server.local_addr.ip(),
+        server.local_addr.port()
+    );
+
+    let (mut client, conn) = tokio_postgres::connect(&conn_str, NoTls).await.unwrap();
+    tokio::spawn(conn);
+
+    client
+        .batch_execute(
+            "CREATE TABLE pg_trigger_audit (
+                id INTEGER PRIMARY KEY,
+                seen TEXT NOT NULL
+            )",
+        )
+        .await
+        .unwrap();
+
+    client
+        .batch_execute(
+            "CREATE TRIGGER kitchensink_audit
+             AFTER INSERT ON kitchensink
+             BEGIN
+                 INSERT INTO pg_trigger_audit (id, seen)
+                 VALUES (NEW.id, NEW.other_ts || ':' || NEW.updated_at);
+             END",
+        )
+        .await
+        .unwrap();
+
+    let permit = ta.agent.write_sema().acquire().await.unwrap();
+    let tx = client.transaction().await.unwrap();
+    let mut write = Box::pin(tx.execute(
+        "INSERT INTO kitchensink (id, other_ts, updated_at)
+         VALUES (901, '2024-01-02T03:04:05', '2025-06-07T08:09:10')",
+        &[],
+    ));
+
+    assert!(tokio::time::timeout(Duration::from_millis(200), &mut write)
+        .await
+        .is_err());
+
+    drop(permit);
+
+    let affected = tokio::time::timeout(Duration::from_secs(5), &mut write)
+        .await
+        .expect("canonical write remained blocked")
+        .unwrap();
+    assert_eq!(affected, 1);
+
+    drop(write);
+    tx.commit().await.unwrap();
+
+    let row = client
+        .query_one("SELECT COUNT(*), MIN(seen) FROM pg_trigger_audit", &[])
+        .await
+        .unwrap();
+
+    assert_eq!(row.get::<_, i64>(0), 1);
+    assert_eq!(
+        row.get::<_, String>(1),
+        "2024-01-02T03:04:05:2025-06-07T08:09:10"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_pg_foreign_key_forces_canonical_path() {
+    let (tripwire, _tripwire_worker, _tripwire_tx) = Tripwire::new_simple();
+    let (ta, server) = setup_pg_test_server(tripwire, None).await;
+
+    let conn_str = format!(
+        "host={} port={} user=testuser",
+        server.local_addr.ip(),
+        server.local_addr.port()
+    );
+
+    let (mut client, conn) = tokio_postgres::connect(&conn_str, NoTls).await.unwrap();
+    tokio::spawn(conn);
+
+    client
+        .batch_execute(
+            "CREATE TABLE pg_fk_child (
+                id INTEGER PRIMARY KEY,
+                parent_id INTEGER NOT NULL
+                    REFERENCES tests(id) ON UPDATE CASCADE
+            )",
+        )
+        .await
+        .unwrap();
+
+    client
+        .execute("INSERT INTO tests (id, text) VALUES (911, 'parent')", &[])
+        .await
+        .unwrap();
+
+    client
+        .execute(
+            "INSERT INTO pg_fk_child (id, parent_id) VALUES (1, 911)",
+            &[],
+        )
+        .await
+        .unwrap();
+
+    let permit = ta.agent.write_sema().acquire().await.unwrap();
+    let tx = client.transaction().await.unwrap();
+    let mut write = Box::pin(tx.execute("UPDATE tests SET id = 912 WHERE id = 911", &[]));
+
+    assert!(tokio::time::timeout(Duration::from_millis(200), &mut write)
+        .await
+        .is_err());
+
+    drop(permit);
+
+    let affected = tokio::time::timeout(Duration::from_secs(5), &mut write)
+        .await
+        .expect("canonical write remained blocked")
+        .unwrap();
+    assert_eq!(affected, 1);
+
+    drop(write);
+    tx.commit().await.unwrap();
+
+    let parent_id = client
+        .query_one("SELECT parent_id FROM pg_fk_child WHERE id = 1", &[])
+        .await
+        .unwrap()
+        .get::<_, i64>(0);
+
+    assert_eq!(parent_id, 912);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_pg_temp_table_shadow_is_not_silently_rolled_back() {
+    let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
+    let (_ta, server) = setup_pg_test_server(tripwire, None).await;
+
+    let conn_str = format!(
+        "host={} port={} user=testuser",
+        server.local_addr.ip(),
+        server.local_addr.port()
+    );
+
+    {
+        let (mut client, client_conn) = tokio_postgres::connect(&conn_str, NoTls).await.unwrap();
+        tokio::spawn(client_conn);
+
+        client
+            .batch_execute(
+                "CREATE TEMP TABLE tests (
+                    id BIGINT PRIMARY KEY NOT NULL,
+                    text TEXT NOT NULL
+                )",
+            )
+            .await
+            .unwrap();
+
+        let tx = client.transaction().await.unwrap();
+        let affected = tx
+            .execute(
+                "INSERT INTO tests (id, text) VALUES (301, 'temp-shadow')",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(affected, 1);
+        tx.commit().await.unwrap();
+
+        let temp_count = client
+            .query_one("SELECT COUNT(*) FROM temp.tests WHERE id = 301", &[])
+            .await
+            .unwrap()
+            .get::<_, i64>(0);
+        assert_eq!(temp_count, 1);
+
+        let main_count = client
+            .query_one("SELECT COUNT(*) FROM main.tests WHERE id = 301", &[])
+            .await
+            .unwrap()
+            .get::<_, i64>(0);
+        assert_eq!(main_count, 0);
+
+        let affected = client
+            .execute(
+                "INSERT INTO main.tests (id, text) VALUES (303, 'qualified-main')",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(affected, 1);
+
+        let qualified_main_count = client
+            .query_one("SELECT COUNT(*) FROM main.tests WHERE id = 303", &[])
+            .await
+            .unwrap()
+            .get::<_, i64>(0);
+        assert_eq!(qualified_main_count, 1);
+    }
+
+    tripwire_tx.send(()).await.ok();
+    tripwire_worker.await;
+    wait_for_all_pending_handles().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_pg_upgrade_acquire_failure_remains_rollbackable() {
+    let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
+    let (ta, server) = setup_pg_test_server(tripwire, None).await;
+
+    let conn_str = format!(
+        "host={} port={} user=testuser",
+        server.local_addr.ip(),
+        server.local_addr.port()
+    );
+
+    {
+        let (mut client, client_conn) = tokio_postgres::connect(&conn_str, NoTls).await.unwrap();
+        tokio::spawn(client_conn);
+
+        client
+            .batch_execute(
+                "CREATE TABLE upgrade_target (
+                    id BIGINT PRIMARY KEY NOT NULL
+                )",
+            )
+            .await
+            .unwrap();
+
+        let tx = client.transaction().await.unwrap();
+        tx.execute(
+            "INSERT INTO main.tests (id, text) VALUES (302, 'rolled-back')",
+            &[],
+        )
+        .await
+        .unwrap();
+
+        ta.agent.write_sema().close();
+
+        tx.execute("INSERT INTO upgrade_target (id) VALUES (1)", &[])
+            .await
+            .expect_err("canonical upgrade must fail after the write semaphore closes");
+
+        let aborted = tx
+            .query_one("SELECT 1", &[])
+            .await
+            .expect_err("failed upgrade must abort the explicit transaction");
+        assert_eq!(
+            aborted.as_db_error().map(|error| error.code().code()),
+            Some("25P02")
+        );
+
+        tx.rollback()
+            .await
+            .expect("failed upgrade must leave the explicit transaction rollbackable");
+
+        let main_count = client
+            .query_one("SELECT COUNT(*) FROM main.tests WHERE id = 302", &[])
+            .await
+            .unwrap()
+            .get::<_, i64>(0);
+        assert_eq!(main_count, 0);
+
+        client.simple_query("SELECT 1").await.unwrap();
+    }
+
+    tripwire_tx.send(()).await.ok();
+    tripwire_worker.await;
+    wait_for_all_pending_handles().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_pg_simple_query_error_rolls_back_implicit_transaction() {
+    let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
+    let (_ta, server) = setup_pg_test_server(tripwire, None).await;
+
+    let conn_str = format!(
+        "host={} port={} user=testuser",
+        server.local_addr.ip(),
+        server.local_addr.port()
+    );
+
+    {
+        let (client, client_conn) = tokio_postgres::connect(&conn_str, NoTls).await.unwrap();
+        tokio::spawn(client_conn);
+
+        client
+            .batch_execute(
+                "INSERT INTO tests (id, text) VALUES (310, 'first');
+                 INSERT INTO tests (id, text) VALUES (310, 'duplicate');",
+            )
+            .await
+            .expect_err("the duplicate statement must fail");
+
+        let rows = client
+            .query_one("SELECT COUNT(*) FROM tests WHERE id = 310", &[])
+            .await
+            .unwrap()
+            .get::<_, i64>(0);
+        assert_eq!(rows, 0);
+
+        let affected = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.execute("INSERT INTO tests (id, text) VALUES (311, 'recovery')", &[]),
+        )
+        .await
+        .expect("writer remained blocked after implicit rollback")
+        .unwrap();
+        assert_eq!(affected, 1);
+    }
+
+    tripwire_tx.send(()).await.ok();
+    tripwire_worker.await;
+    wait_for_all_pending_handles().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_pg_transaction_errors_require_rollback() {
+    let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
+    let (ta, server) = setup_pg_test_server(tripwire, None).await;
+
+    let conn_str = format!(
+        "host={} port={} user=testuser",
+        server.local_addr.ip(),
+        server.local_addr.port()
+    );
+
+    {
+        let (mut client, client_conn) = tokio_postgres::connect(&conn_str, NoTls).await.unwrap();
+        tokio::spawn(client_conn);
+
+        let tx = client.transaction().await.unwrap();
+        tx.execute("INSERT INTO tests (id, text) VALUES (320, 'first')", &[])
+            .await
+            .unwrap();
+
+        tx.execute(
+            "INSERT INTO tests (id, text) VALUES (320, 'duplicate')",
+            &[],
+        )
+        .await
+        .expect_err("the duplicate statement must fail");
+
+        let rejected_commit = tx
+            .execute("COMMIT", &[])
+            .await
+            .expect_err("commit must not recover a failed transaction");
+        assert_eq!(
+            rejected_commit
+                .as_db_error()
+                .map(|error| error.code().code()),
+            Some("25P02")
+        );
+
+        let aborted = tx
+            .query_one("SELECT 1", &[])
+            .await
+            .expect_err("rejected commit must leave the transaction failed");
+        assert_eq!(
+            aborted.as_db_error().map(|error| error.code().code()),
+            Some("25P02")
+        );
+
+        tx.rollback().await.unwrap();
+
+        let rows = client
+            .query_one("SELECT COUNT(*) FROM tests WHERE id = 320", &[])
+            .await
+            .unwrap()
+            .get::<_, i64>(0);
+        assert_eq!(rows, 0);
+
+        client.batch_execute("BEGIN").await.unwrap();
+        client
+            .batch_execute("INSERT INTO tests (id, text) VALUES (322, 'first')")
+            .await
+            .unwrap();
+        client
+            .batch_execute("INSERT INTO tests (id, text) VALUES (322, 'duplicate')")
+            .await
+            .expect_err("the duplicate statement must fail");
+
+        let rejected_commit = client
+            .batch_execute("COMMIT")
+            .await
+            .expect_err("commit must not recover a failed transaction");
+        assert_eq!(
+            rejected_commit
+                .as_db_error()
+                .map(|error| error.code().code()),
+            Some("25P02")
+        );
+
+        let aborted = client
+            .batch_execute("SELECT 1")
+            .await
+            .expect_err("rejected commit must leave the transaction failed");
+        assert_eq!(
+            aborted.as_db_error().map(|error| error.code().code()),
+            Some("25P02")
+        );
+
+        client.batch_execute("ROLLBACK").await.unwrap();
+
+        let rows = client
+            .query_one("SELECT COUNT(*) FROM tests WHERE id = 322", &[])
+            .await
+            .unwrap()
+            .get::<_, i64>(0);
+        assert_eq!(rows, 0);
+
+        client.batch_execute("BEGIN").await.unwrap();
+        let active = client
+            .batch_execute("BEGIN")
+            .await
+            .expect_err("nested begin must fail");
+        assert_eq!(
+            active.as_db_error().map(|error| error.code().code()),
+            Some("25001")
+        );
+        let aborted = client
+            .batch_execute("SELECT 1")
+            .await
+            .expect_err("nested begin must abort the transaction");
+        assert_eq!(
+            aborted.as_db_error().map(|error| error.code().code()),
+            Some("25P02")
+        );
+        client.batch_execute("ROLLBACK").await.unwrap();
+
+        client.execute("BEGIN", &[]).await.unwrap();
+        let active = client
+            .execute("BEGIN", &[])
+            .await
+            .expect_err("nested begin must fail");
+        assert_eq!(
+            active.as_db_error().map(|error| error.code().code()),
+            Some("25001")
+        );
+        let aborted = client
+            .query_one("SELECT 1", &[])
+            .await
+            .expect_err("nested begin must abort the transaction");
+        assert_eq!(
+            aborted.as_db_error().map(|error| error.code().code()),
+            Some("25P02")
+        );
+        client.execute("ROLLBACK", &[]).await.unwrap();
+
+        let permit = tokio::time::timeout(
+            Duration::from_secs(5),
+            ta.agent.write_sema().clone().acquire_owned(),
+        )
+        .await
+        .expect("write permit remained blocked after explicit rollback")
+        .unwrap();
+        drop(permit);
+
+        let affected = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.execute("INSERT INTO tests (id, text) VALUES (321, 'recovery')", &[]),
+        )
+        .await
+        .expect("writer remained blocked after explicit rollback")
+        .unwrap();
+        assert_eq!(affected, 1);
+    }
+
+    tripwire_tx.send(()).await.ok();
+    tripwire_worker.await;
+    wait_for_all_pending_handles().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_pg_canonical_upgrade_error_rolls_back_and_releases_writer() {
+    let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
+    let (ta, server) = setup_pg_test_server(tripwire, None).await;
+
+    let conn_str = format!(
+        "host={} port={} user=testuser",
+        server.local_addr.ip(),
+        server.local_addr.port()
+    );
+
+    {
+        let (mut client, client_conn) = tokio_postgres::connect(&conn_str, NoTls).await.unwrap();
+        tokio::spawn(client_conn);
+
+        client
+            .batch_execute(
+                "CREATE TABLE pg_canonical_side (
+                    id BIGINT PRIMARY KEY NOT NULL
+                )",
+            )
+            .await
+            .unwrap();
+
+        let tx = client.transaction().await.unwrap();
+        tx.execute(
+            "INSERT INTO tests (id, text) VALUES (330, 'before-upgrade')",
+            &[],
+        )
+        .await
+        .unwrap();
+        tx.execute("INSERT INTO pg_canonical_side (id) VALUES (1)", &[])
+            .await
+            .unwrap();
+        tx.execute("INSERT INTO pg_canonical_side (id) VALUES (1)", &[])
+            .await
+            .expect_err("the duplicate canonical statement must fail");
+
+        let aborted = tx
+            .query_one("SELECT 1", &[])
+            .await
+            .expect_err("canonical failure must abort the explicit transaction");
+        assert_eq!(
+            aborted.as_db_error().map(|error| error.code().code()),
+            Some("25P02")
+        );
+
+        tx.rollback().await.unwrap();
+
+        let tracked_rows = client
+            .query_one("SELECT COUNT(*) FROM tests WHERE id = 330", &[])
+            .await
+            .unwrap()
+            .get::<_, i64>(0);
+        let side_rows = client
+            .query_one("SELECT COUNT(*) FROM pg_canonical_side WHERE id = 1", &[])
+            .await
+            .unwrap()
+            .get::<_, i64>(0);
+        assert_eq!(tracked_rows, 0);
+        assert_eq!(side_rows, 0);
+
+        let permit = tokio::time::timeout(
+            Duration::from_secs(5),
+            ta.agent.write_sema().clone().acquire_owned(),
+        )
+        .await
+        .expect("write permit remained blocked after canonical rollback")
+        .unwrap();
+        drop(permit);
+
+        let affected = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.execute("INSERT INTO tests (id, text) VALUES (331, 'recovery')", &[]),
+        )
+        .await
+        .expect("writer remained blocked after canonical rollback")
+        .unwrap();
+        assert_eq!(affected, 1);
+    }
+
+    tripwire_tx.send(()).await.ok();
+    tripwire_worker.await;
+    wait_for_all_pending_handles().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_pg_disconnect_rolls_back_and_releases_writer() {
+    let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
+    let (ta, server) = setup_pg_test_server(tripwire, None).await;
+
+    let conn_str = format!(
+        "host={} port={} user=testuser",
+        server.local_addr.ip(),
+        server.local_addr.port()
+    );
+
+    {
+        let (client, client_conn) = tokio_postgres::connect(&conn_str, NoTls).await.unwrap();
+        let client_conn = tokio::spawn(client_conn);
+
+        client
+            .batch_execute(
+                "CREATE TABLE pg_disconnect_side (
+                    id BIGINT PRIMARY KEY NOT NULL
+                )",
+            )
+            .await
+            .unwrap();
+
+        client
+            .batch_execute(
+                "BEGIN;
+                 INSERT INTO tests (id, text) VALUES (340, 'disconnect');
+                 INSERT INTO pg_disconnect_side (id) VALUES (1);",
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(ta.agent.write_sema().available_permits(), 0);
+
+        drop(client);
+        tokio::time::timeout(Duration::from_secs(5), client_conn)
+            .await
+            .expect("server did not close the disconnected PG session")
+            .expect("PG connection task panicked")
+            .expect("PG connection closed with an error");
+
+        let (recovery, recovery_conn) = tokio_postgres::connect(&conn_str, NoTls).await.unwrap();
+        tokio::spawn(recovery_conn);
+
+        let tracked_rows = recovery
+            .query_one("SELECT COUNT(*) FROM tests WHERE id = 340", &[])
+            .await
+            .unwrap()
+            .get::<_, i64>(0);
+        let side_rows = recovery
+            .query_one("SELECT COUNT(*) FROM pg_disconnect_side WHERE id = 1", &[])
+            .await
+            .unwrap()
+            .get::<_, i64>(0);
+        assert_eq!(tracked_rows, 0);
+        assert_eq!(side_rows, 0);
+
+        let affected = tokio::time::timeout(
+            Duration::from_secs(5),
+            recovery.execute("INSERT INTO pg_disconnect_side (id) VALUES (2)", &[]),
+        )
+        .await
+        .expect("writer remained blocked after PG disconnect")
+        .unwrap();
+        assert_eq!(affected, 1);
+    }
+
+    tripwire_tx.send(()).await.ok();
+    tripwire_worker.await;
+    wait_for_all_pending_handles().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_pg() {
     let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
 

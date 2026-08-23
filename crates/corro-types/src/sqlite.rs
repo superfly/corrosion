@@ -5,7 +5,6 @@ use std::{
 };
 
 use metrics::counter;
-use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use rusqlite::types::{ToSql, ToSqlOutput, Value};
 use rusqlite::{
@@ -13,9 +12,8 @@ use rusqlite::{
 };
 use sqlite_pool::{Committable, SqliteConn};
 use std::rc::Rc;
-use tempfile::TempDir;
 use thread_local::ThreadLocal;
-use tracing::{error, info, trace, warn};
+use tracing::{error, info, warn};
 use tripwire::Tripwire;
 
 use crate::vtab::unnest::UnnestTab;
@@ -157,30 +155,6 @@ pub fn trace_heavy_queries(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
-const CRSQL_EXT_GENERIC_NAME: &str = "crsqlite";
-
-#[cfg(target_os = "macos")]
-pub const CRSQL_EXT_FILENAME: &str = "crsqlite.dylib";
-#[cfg(target_os = "linux")]
-pub const CRSQL_EXT_FILENAME: &str = "crsqlite.so";
-
-#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-pub const CRSQL_EXT: &[u8] = include_bytes!("../crsqlite-darwin-aarch64.dylib");
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-pub const CRSQL_EXT: &[u8] = include_bytes!("../crsqlite-linux-x86_64.so");
-#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
-pub const CRSQL_EXT: &[u8] = include_bytes!("../crsqlite-linux-aarch64.so");
-
-// TODO: support windows
-
-// need to keep this alive!
-static CRSQL_EXT_DIR: Lazy<TempDir> = Lazy::new(|| {
-    let dir = TempDir::new().expect("could not create temp dir!");
-    std::fs::write(dir.path().join(CRSQL_EXT_GENERIC_NAME), CRSQL_EXT)
-        .expect("could not write crsql ext file");
-    dir
-});
-
 pub fn rusqlite_to_crsqlite_write(conn: rusqlite::Connection) -> rusqlite::Result<CrConn> {
     let conn = rusqlite_to_crsqlite(conn)?;
     conn.execute_batch("PRAGMA cache_size = -32000;")?;
@@ -188,8 +162,7 @@ pub fn rusqlite_to_crsqlite_write(conn: rusqlite::Connection) -> rusqlite::Resul
     Ok(conn)
 }
 
-pub fn rusqlite_to_crsqlite(mut conn: rusqlite::Connection) -> rusqlite::Result<CrConn> {
-    init_cr_conn(&mut conn)?;
+pub fn rusqlite_to_crsqlite(conn: rusqlite::Connection) -> rusqlite::Result<CrConn> {
     setup_conn(&conn)?;
     sqlite_functions::add_to_connection(&conn)?;
 
@@ -202,8 +175,7 @@ pub fn rusqlite_to_crsqlite(mut conn: rusqlite::Connection) -> rusqlite::Result<
 pub struct CrConn(Connection);
 
 impl CrConn {
-    pub fn init(mut conn: Connection) -> Result<Self, rusqlite::Error> {
-        init_cr_conn(&mut conn)?;
+    pub fn init(conn: Connection) -> Result<Self, rusqlite::Error> {
         Ok(Self(conn))
     }
 
@@ -251,26 +223,6 @@ impl Committable for CrConn {
             "cannot create savepoint from connection",
         )))
     }
-}
-
-fn init_cr_conn(conn: &mut Connection) -> Result<(), rusqlite::Error> {
-    let ext_dir = &CRSQL_EXT_DIR;
-    trace!(
-        "loading crsqlite extension from path: {}",
-        ext_dir.path().display()
-    );
-    unsafe {
-        trace!("enabled loading extension");
-        /*conn.load_extension_enable()?;
-        conn.load_extension(
-            ext_dir.path().join(CRSQL_EXT_GENERIC_NAME),
-            Some("sqlite3_crsqlite_init"),
-        )?;
-        conn.load_extension_disable()?;*/
-    }
-    trace!("loaded crsqlite extension");
-
-    Ok(())
 }
 
 pub fn setup_conn(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -384,6 +336,270 @@ mod tests {
     use tokio::task::block_in_place;
 
     use super::*;
+
+    #[test]
+    fn begin_concurrent_allows_independent_writers() -> Result<(), Box<dyn std::error::Error>> {
+        let tmpdir = tempfile::tempdir()?;
+        let path = tmpdir.path().join("begin-concurrent.db");
+
+        let conn1 = rusqlite_to_crsqlite(Connection::open(&path)?)?;
+
+        let auto_vacuum: i64 = conn1.query_row("PRAGMA auto_vacuum", (), |row| row.get(0))?;
+        assert_eq!(auto_vacuum, 0);
+
+        conn1.execute_batch(
+            "
+            CREATE TABLE left_writes (
+                id INTEGER NOT NULL PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            CREATE TABLE right_writes (
+                id INTEGER NOT NULL PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            ",
+        )?;
+
+        let conn2 = rusqlite_to_crsqlite(Connection::open(&path)?)?;
+
+        conn1.execute_batch("BEGIN CONCURRENT;")?;
+
+        conn1.execute_batch("INSERT INTO left_writes (id, value) VALUES (1, 'left');")?;
+
+        conn2.execute_batch("BEGIN CONCURRENT;")?;
+
+        conn2.execute_batch("INSERT INTO right_writes (id, value) VALUES (1, 'right');")?;
+
+        conn1.execute_batch("COMMIT;")?;
+
+        conn2.execute_batch("COMMIT;")?;
+
+        let left_count: i64 =
+            conn1.query_row("SELECT COUNT(*) FROM left_writes", (), |row| row.get(0))?;
+        let right_count: i64 =
+            conn1.query_row("SELECT COUNT(*) FROM right_writes", (), |row| row.get(0))?;
+
+        assert_eq!(left_count, 1);
+        assert_eq!(right_count, 1);
+
+        Ok(())
+    }
+
+    #[test]
+    fn losing_speculative_replay_rolls_back_reserved_version(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        fn replay(
+            conn: &Connection,
+            pending: &crate::change::PendingLocalChanges,
+            actor_id: crate::actor::ActorId,
+        ) -> rusqlite::Result<Option<crate::base::CrsqlDbVersion>> {
+            conn.execute_batch("BEGIN IMMEDIATE;")?;
+
+            let Some(version) = pending.replay(conn)? else {
+                conn.execute_batch("ROLLBACK;")?;
+                return Ok(None);
+            };
+
+            let produced: bool = conn.query_row(
+                "
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM crsql_changes
+                    WHERE site_id = ?
+                      AND db_version = ?
+                )
+                ",
+                (actor_id, version),
+                |row| row.get(0),
+            )?;
+
+            if produced {
+                conn.execute_batch("COMMIT;")?;
+                Ok(Some(version))
+            } else {
+                conn.execute_batch("ROLLBACK;")?;
+                Ok(None)
+            }
+        }
+
+        let tmpdir = tempfile::tempdir()?;
+        let path = tmpdir.path().join("conflicting-speculative-replay.db");
+
+        let writer1 = rusqlite_to_crsqlite(Connection::open(&path)?)?;
+
+        writer1.execute_batch(
+            "
+            CREATE TABLE foo (
+                id INTEGER NOT NULL PRIMARY KEY,
+                value TEXT NOT NULL DEFAULT ''
+            );
+            SELECT crsql_as_crr('foo');
+            INSERT INTO foo (id, value) VALUES (1, 'base');
+            ",
+        )?;
+
+        let writer2 = rusqlite_to_crsqlite(Connection::open(&path)?)?;
+        let actor_id: crate::actor::ActorId =
+            writer1.query_row("SELECT crsql_site_id()", (), |row| row.get(0))?;
+
+        writer1.execute_batch("BEGIN CONCURRENT;")?;
+        writer2.execute_batch("BEGIN CONCURRENT;")?;
+
+        let _: String = writer1.query_row("SELECT crsql_set_ts('201')", (), |row| row.get(0))?;
+        let _: String = writer2.query_row("SELECT crsql_set_ts('202')", (), |row| row.get(0))?;
+
+        writer1.execute("UPDATE foo SET value = 'zulu' WHERE id = 1", ())?;
+        writer2.execute("UPDATE foo SET value = 'alpha' WHERE id = 1", ())?;
+
+        let pending1 = crate::change::PendingLocalChanges::capture(&writer1, actor_id)?;
+        let pending2 = crate::change::PendingLocalChanges::capture(&writer2, actor_id)?;
+
+        writer1.execute_batch("ROLLBACK;")?;
+        writer2.execute_batch("ROLLBACK;")?;
+
+        let canonical = rusqlite_to_crsqlite(Connection::open(&path)?)?;
+
+        assert_eq!(
+            replay(&canonical, &pending1, actor_id)?,
+            Some(crate::base::CrsqlDbVersion(2))
+        );
+
+        let value: String =
+            canonical.query_row("SELECT value FROM foo WHERE id = 1", (), |row| row.get(0))?;
+        assert_eq!(value, "zulu");
+
+        assert_eq!(replay(&canonical, &pending2, actor_id)?, None);
+
+        let version: i64 =
+            canonical.query_row("SELECT crsql_db_version()", (), |row| row.get(0))?;
+        assert_eq!(version, 2);
+
+        canonical.execute_batch("BEGIN IMMEDIATE;")?;
+        let _: String = canonical.query_row("SELECT crsql_set_ts('203')", (), |row| row.get(0))?;
+        canonical.execute("UPDATE foo SET value = 'zzzz' WHERE id = 1", ())?;
+        canonical.execute_batch("COMMIT;")?;
+
+        let version: i64 =
+            canonical.query_row("SELECT crsql_db_version()", (), |row| row.get(0))?;
+        assert_eq!(version, 3);
+
+        Ok(())
+    }
+
+    #[test]
+    fn unreserved_future_local_version_is_rejected() -> Result<(), Box<dyn std::error::Error>> {
+        let tmpdir = tempfile::tempdir()?;
+        let path = tmpdir.path().join("unreserved-self-replay.db");
+
+        let speculative = rusqlite_to_crsqlite(Connection::open(&path)?)?;
+
+        speculative.execute_batch(
+            "
+            CREATE TABLE foo (
+                id INTEGER NOT NULL PRIMARY KEY,
+                value TEXT NOT NULL DEFAULT ''
+            );
+            SELECT crsql_as_crr('foo');
+            ",
+        )?;
+
+        let site_id: Vec<u8> =
+            speculative.query_row("SELECT crsql_site_id()", (), |row| row.get(0))?;
+
+        speculative.execute_batch("BEGIN CONCURRENT;")?;
+
+        let _: String =
+            speculative.query_row("SELECT crsql_set_ts('301')", (), |row| row.get(0))?;
+
+        speculative.execute("INSERT INTO foo (id, value) VALUES (1, 'speculative')", ())?;
+
+        let speculative_version: i64 =
+            speculative.query_row("SELECT crsql_peek_next_db_version()", (), |row| row.get(0))?;
+
+        let change = speculative.query_row(
+            r#"
+            SELECT
+                "table",
+                pk,
+                cid,
+                val,
+                col_version,
+                db_version,
+                site_id,
+                cl,
+                seq,
+                ts
+            FROM crsql_changes
+            WHERE site_id = ?
+              AND db_version = ?
+            ORDER BY seq ASC
+            LIMIT 1
+            "#,
+            (&site_id, speculative_version),
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Value>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, Vec<u8>>(6)?,
+                    row.get::<_, i64>(7)?,
+                    row.get::<_, i64>(8)?,
+                    row.get::<_, String>(9)?,
+                ))
+            },
+        )?;
+
+        speculative.execute_batch("ROLLBACK;")?;
+
+        let canonical = rusqlite_to_crsqlite(Connection::open(&path)?)?;
+
+        let before_version: i64 =
+            canonical.query_row("SELECT crsql_db_version()", (), |row| row.get(0))?;
+        assert_eq!(before_version, 0);
+
+        let (table, pk, cid, val, col_version, captured_version, captured_site_id, cl, seq, ts) =
+            change;
+
+        assert_eq!(captured_version, speculative_version);
+
+        let replay = canonical.execute(
+            r#"
+            INSERT INTO crsql_changes
+                ("table", pk, cid, val, col_version, db_version, site_id, cl, seq, ts)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+            params![
+                table,
+                pk,
+                cid,
+                val,
+                col_version,
+                speculative_version,
+                captured_site_id,
+                cl,
+                seq,
+                ts,
+            ],
+        );
+
+        assert!(
+            replay.is_err(),
+            "future local-site version must not be accepted without a pending reservation"
+        );
+
+        let after_version: i64 =
+            canonical.query_row("SELECT crsql_db_version()", (), |row| row.get(0))?;
+        assert_eq!(after_version, 0);
+
+        let row_count: i64 =
+            canonical.query_row("SELECT COUNT(*) FROM foo", (), |row| row.get(0))?;
+        assert_eq!(row_count, 0);
+
+        Ok(())
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_writes() -> Result<(), Box<dyn std::error::Error>> {
