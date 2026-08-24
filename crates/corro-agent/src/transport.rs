@@ -32,7 +32,7 @@ struct TransportInner {
     rtt_tx: mpsc::Sender<(SocketAddr, Duration)>,
     path_snapshots: StdMutex<HashMap<SocketAddr, PathSnapshot>>,
     /// Last ACK count / `path.min_rtt` observed per peer by [`Transport::sample_rtts`].
-    rtt_marks: StdMutex<HashMap<SocketAddr, RttMark>>,
+    rtt_marks: StdMutex<HashMap<SocketAddr, Duration>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -328,9 +328,9 @@ impl Transport {
                 }
             };
 
-            let measured = marks.get(&addr).is_none_or(|prev| {
-                prev.min_rtt.as_millis() != mark.min_rtt.as_millis()
-            });
+            let measured = marks
+                .get(&addr)
+                .is_none_or(|prev| prev.min_rtt.as_millis() != mark.min_rtt.as_millis());
 
             if !measured {
                 counter!("corro.transport.rtt.samples", "result" => "skipped").increment(1);

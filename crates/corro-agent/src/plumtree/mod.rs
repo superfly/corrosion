@@ -22,7 +22,7 @@ use corro_types::{
     compress::ZstdDicts,
 };
 use governor::{Quota, RateLimiter};
-use indexmap::IndexMap;
+use indexmap::{IndexMap, IndexSet};
 use metrics::{counter, gauge, histogram};
 use plum_foca::{Payload, PlumtreeState, Round, RttInfo, SeenStore, Timer};
 use rangemap::RangeInclusiveSet;
@@ -666,14 +666,15 @@ async fn send_messages_loop(
 
     let mut local_queue: VecDeque<PendingPlumtreeSend> = VecDeque::new();
     let mut remote_queue: VecDeque<PendingPlumtreeSend> = VecDeque::new();
-    let mut gossip_batch = PendingPlumtreeSend {
-        peers: Vec::new(),
-        payload: BytesMut::new(),
-        shed_key: ShedKey(Round::MAX, ShedKind::Gossip),
-    };
+
+    let mut gossip_batch_peers: IndexSet<ActorId> = IndexSet::new();
+    let mut gossip_batch_payload = BytesMut::new();
+    let mut batch_shed_key = ShedKey(Round::MAX, ShedKind::Gossip);
     let mut gossip_batch_interval = interval(GOSSIP_BATCH_INTERVAL);
+
     let mut metrics_interval = interval(Duration::from_secs(10));
     metrics_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
     let mut join_set = JoinSet::new();
     let mut limited_log_count = 0;
     let mut drop_log_count = 0;
@@ -696,12 +697,12 @@ async fn send_messages_loop(
                 continue;
             },
             _ = gossip_batch_interval.tick(), if batch_gossip => {
-                if !gossip_batch.payload.is_empty() {
-                    remote_queue.push_back(PendingPlumtreeSend {
-                        peers: std::mem::take(&mut gossip_batch.peers),
-                        payload: std::mem::take(&mut gossip_batch.payload),
+                if !gossip_batch_payload.is_empty() {
+                    remote_queue.push_front(PendingPlumtreeSend {
+                        peers: gossip_batch_peers.drain(..).collect(),
+                        payload: std::mem::take(&mut gossip_batch_payload),
                         shed_key: std::mem::replace(
-                            &mut gossip_batch.shed_key,
+                            &mut batch_shed_key,
                             ShedKey(Round::MAX, ShedKind::Gossip),
                         ),
                     });
@@ -730,17 +731,16 @@ async fn send_messages_loop(
             };
 
         if batch_gossip && batchable {
-            // gossip is sent to latest eager peers
-            gossip_batch.peers = peers;
-            gossip_batch.payload.extend_from_slice(&payload);
+            gossip_batch_peers.extend(peers);
+            gossip_batch_payload.extend_from_slice(&payload);
             // A batch is only as sheddable as its most valuable member.
-            gossip_batch.shed_key = gossip_batch.shed_key.min(shed_key);
-            if gossip_batch.payload.len() >= GOSSIP_BATCH_CUTOFF {
-                remote_queue.push_back(PendingPlumtreeSend {
-                    peers: std::mem::take(&mut gossip_batch.peers),
-                    payload: std::mem::take(&mut gossip_batch.payload),
+            batch_shed_key = batch_shed_key.min(shed_key);
+            if gossip_batch_payload.len() >= GOSSIP_BATCH_CUTOFF {
+                remote_queue.push_front(PendingPlumtreeSend {
+                    peers: gossip_batch_peers.drain(..).collect(),
+                    payload: std::mem::take(&mut gossip_batch_payload),
                     shed_key: std::mem::replace(
-                        &mut gossip_batch.shed_key,
+                        &mut batch_shed_key,
                         ShedKey(Round::MAX, ShedKind::Gossip),
                     ),
                 });
@@ -752,9 +752,9 @@ async fn send_messages_loop(
                 shed_key,
             };
             if is_local {
-                local_queue.push_back(pending);
+                local_queue.push_front(pending);
             } else {
-                remote_queue.push_back(pending);
+                remote_queue.push_front(pending);
             }
         }
 
@@ -894,11 +894,7 @@ fn drain_plumtree_queue(
     }
 }
 
-/// How many of the oldest queued entries `shed_plumtree_send` inspects when
-/// choosing a victim. Bounds the cost of shedding under overload.
-const SHED_SCAN_WINDOW: usize = 512;
-
-/// Drop items from queue, we drop from priority queue (based on ShedKey) first,
+/// Drop items from queue, we drop from remote queue (based on ShedKey) first,
 /// then local queue
 fn shed_plumtree_send(
     local_queue: &mut VecDeque<PendingPlumtreeSend>,
@@ -914,12 +910,15 @@ fn shed_plumtree_send(
     } else {
         (false, remote_queue)
     };
+
+    // no need to loop over the full queue, look at last 1000 items
+    let oldest_window = queue.len().saturating_sub(1000);
     let victim = queue
         .iter()
         .enumerate()
-        .take(SHED_SCAN_WINDOW)
-        // Highest shed key wins; Reverse(i) breaks ties toward the oldest.
-        .max_by_key(|(i, pending)| (pending.shed_key, std::cmp::Reverse(*i)))
+        .skip(oldest_window)
+        // Highest shed key wins; the larger index breaks ties toward the oldest.
+        .max_by_key(|(i, pending)| (pending.shed_key, *i))
         .map(|(i, _)| i)?;
     queue.remove(victim).map(|pending| (was_local, pending))
 }
@@ -1050,11 +1049,10 @@ mod tests {
     #[test]
     fn shed_breaks_ties_toward_oldest() {
         let mut local = VecDeque::new();
-        let mut remote = VecDeque::from(vec![
-            gossip(5, 1), // oldest
-            gossip(5, 2),
-            gossip(5, 3), // newest
-        ]);
+        let mut remote = VecDeque::new();
+        for t in [1u8, 2, 3] {
+            remote.push_front(gossip(5, t));
+        }
         assert_eq!(
             tag(shed_plumtree_send(&mut local, &mut remote, 2)),
             1,
