@@ -63,7 +63,10 @@ use std::{
     convert::Infallible,
     net::SocketAddr,
     ops::{Deref, RangeInclusive},
-    sync::{atomic::AtomicI64, Arc},
+    sync::{
+        atomic::{AtomicI64, AtomicU64, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 use tokio::{
@@ -1776,14 +1779,42 @@ pub fn check_buffered_meta_to_clear(
     conn.prepare_cached("SELECT EXISTS(SELECT 1 FROM __corro_buffered_changes WHERE site_id = ? AND db_version >= ? AND db_version <= ?)")?.query_row(params![actor_id, versions.start(), versions.end()], |row| row.get(0))
 }
 
-pub fn log_at_pow_10(msg: &str, count: &mut u64) {
-    *count += 1;
-    if is_pow_10(*count) {
-        warn!("{msg} (log count: {count})")
+/// Increment a `u64` that is either a plain counter (`&mut u64`) or an
+/// [`AtomicU64`] (`&AtomicU64`).
+pub trait U64Counter {
+    fn increment(&mut self) -> u64;
+    fn reset(&mut self);
+}
+
+impl U64Counter for &mut u64 {
+    fn increment(&mut self) -> u64 {
+        **self += 1;
+        **self
     }
-    // reset count
-    if *count == 100000000 {
-        *count = 0;
+
+    fn reset(&mut self) {
+        **self = 0;
+    }
+}
+
+impl U64Counter for &AtomicU64 {
+    fn increment(&mut self) -> u64 {
+        self.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    fn reset(&mut self) {
+        self.store(0, Ordering::Relaxed);
+    }
+}
+
+pub fn log_at_pow_10(msg: &str, mut count: impl U64Counter) {
+    let n = count.increment();
+    if is_pow_10(n) {
+        warn!("{msg} (log count: {n})")
+    }
+
+    if n == 100000000 {
+        count.reset();
     }
 }
 
