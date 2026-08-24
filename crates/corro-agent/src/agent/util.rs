@@ -1807,14 +1807,21 @@ impl U64Counter for &AtomicU64 {
     }
 }
 
-pub fn log_at_pow_10(msg: &str, mut count: impl U64Counter) {
+/// Increment `count` and return it when it lands on a power of 10, so callers
+/// can build their log message lazily.
+pub fn should_log_pow_10(mut count: impl U64Counter) -> Option<u64> {
     let n = count.increment();
-    if is_pow_10(n) {
-        warn!("{msg} (log count: {n})")
-    }
 
     if n == 100000000 {
         count.reset();
+    }
+
+    is_pow_10(n).then_some(n)
+}
+
+pub fn log_at_pow_10(msg: &str, count: impl U64Counter) {
+    if let Some(n) = should_log_pow_10(count) {
+        warn!("{msg} (log count: {n})")
     }
 }
 
