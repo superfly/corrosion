@@ -31,7 +31,8 @@ struct TransportInner {
     conns: RwLock<HashMap<SocketAddr, Arc<Mutex<Option<Connection>>>>>,
     rtt_tx: mpsc::Sender<(SocketAddr, Duration)>,
     path_snapshots: StdMutex<HashMap<SocketAddr, PathSnapshot>>,
-    /// Last ACK count / `path.min_rtt` observed per peer by [`Transport::sample_rtts`].
+    /// Last `path.latest_rtt` pushed per peer by [`Transport::sample_rtts`],
+    /// used to skip re-pushing a measurement that has not moved.
     rtt_marks: StdMutex<HashMap<SocketAddr, Duration>>,
 }
 
@@ -40,12 +41,6 @@ struct PathSnapshot {
     cwnd: u64,
     congestion_events: u64,
     black_holes_detected: u64,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct RttMark {
-    acks: u64,
-    min_rtt: Duration,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -281,10 +276,10 @@ impl Transport {
     /// Push an RTT sample for each live cached connection that has a new
     /// measurement since the last sweep.
     ///
-    /// `Connection::rtt` is a smoothed cache. We sample `path.min_rtt` so a
-    /// stall's decay tail does not fill the ring window. A stable floor is
-    /// still pushed when ACKs arrive, so the window fills with the current
-    /// path rather than a single outlier.
+    /// `Connection::rtt` is a smoothed cache, so we sample `path.latest_rtt`
+    /// and let the ring's median window absorb the jitter. Repeats of the same
+    /// millisecond are skipped: re-pushing an unchanged value would overweight
+    /// it in that window and stop the ring tracking the current path.
     pub async fn sample_rtts(&self) {
         // Arc handles only; the map lock is released before any per-connection
         // lock is taken.
@@ -301,7 +296,7 @@ impl Transport {
             // connect() holds this across the handshake, and a peer that is
             // reconnecting has an RTT belonging to a connection already on its
             // way out. Skip it rather than stall the sweep.
-            let mark = {
+            let rtt = {
                 let Ok(lock) = conn_lock.try_lock() else {
                     continue;
                 };
@@ -314,34 +309,32 @@ impl Transport {
                 }
 
                 let stats = conn.stats();
-                // No ACK yet: min_rtt is still INITIAL_RTT / unset, not a measurement.
+                // No ACK yet: the estimate is still INITIAL_RTT, not a measurement.
                 if stats.frame_rx.acks == 0 {
                     continue;
                 }
+
                 if stats.path.min_rtt.is_zero() {
                     continue;
                 }
 
-                RttMark {
-                    acks: stats.frame_rx.acks,
-                    min_rtt: stats.path.latest_rtt,
-                }
+                stats.path.min_rtt
             };
 
             let measured = marks
                 .get(&addr)
-                .is_none_or(|prev| prev.min_rtt.as_millis() != mark.min_rtt.as_millis());
+                .is_none_or(|prev| prev.as_millis() != rtt.as_millis());
 
             if !measured {
                 counter!("corro.transport.rtt.samples", "result" => "skipped").increment(1);
                 continue;
             }
 
-            if let Err(e) = self.0.rtt_tx.try_send((addr, mark.min_rtt)) {
+            if let Err(e) = self.0.rtt_tx.try_send((addr, rtt)) {
                 debug!("could not send RTT for connection through sender: {e}");
                 counter!("corro.transport.rtt.samples", "result" => "dropped").increment(1);
             } else {
-                marks.insert(addr, mark);
+                marks.insert(addr, rtt);
                 counter!("corro.transport.rtt.samples", "result" => "sent").increment(1);
             }
         }
