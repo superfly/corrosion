@@ -929,6 +929,8 @@ impl HandleChangesState {
                 self.buf_cost -= dropped_change.processing_cost();
                 dropped_count += 1;
 
+                counter!("corro.agent.changes.dropped").increment(dropped_count);
+                log_at_pow_10("dropped old change from queue", &mut self.drop_log_count);
                 Some(dropped_change)
             } else {
                 None
@@ -937,8 +939,6 @@ impl HandleChangesState {
             None
         };
 
-        counter!("corro.agent.changes.dropped").increment(dropped_count);
-        log_at_pow_10("dropped old change from queue", &mut self.drop_log_count);
         maybe_dropped_change
     }
 
