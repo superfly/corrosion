@@ -924,7 +924,7 @@ impl HandleChangesState {
     fn maybe_drop_old_change(&mut self) -> Option<ChangeV1> {
         let mut dropped_count = 0;
 
-        let maybe_dropped_change = if self.queue.len() >= self.max_queue_len {
+        if self.queue.len() >= self.max_queue_len {
             if let Some((dropped_change, _, _)) = self.queue.pop_front() {
                 self.buf_cost -= dropped_change.processing_cost();
                 dropped_count += 1;
@@ -937,9 +937,7 @@ impl HandleChangesState {
             }
         } else {
             None
-        };
-
-        maybe_dropped_change
+        }
     }
 
     /// Handle new change arrival - check if we should spawn immediately

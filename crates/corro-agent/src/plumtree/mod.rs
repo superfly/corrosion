@@ -853,10 +853,6 @@ fn drain_plumtree_queue(
         let mut spawn_count = 0;
         let addr_count = addrs.len();
         for addr in addrs {
-            if join_set.len() >= max_inflight {
-                break;
-            }
-
             match try_transmit_uni(
                 bytes_per_sec,
                 pending.payload.clone().freeze(),
