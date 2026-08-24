@@ -902,7 +902,7 @@ fn diff_member_states(
             let rtt = members
                 .rtts
                 .get(&member.id().addr())
-                .and_then(|rtts| rtts.min_ms());
+                .and_then(|rtts| rtts.max_ms());
             match last_states.entry(*id) {
                 Entry::Occupied(mut entry) => {
                     let (prev_member, prev_rtt) = entry.get();

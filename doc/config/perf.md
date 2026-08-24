@@ -51,6 +51,30 @@ tuning this, check first that changes are being processed quickly enough.
 processing_queue_len = 20000
 ```
 
+#### `plumtree_send_queue_len`
+
+Maximum number of outgoing Plumtree messages the agent will buffer before shedding one per intake. Defaults to `40000`. Only used when `gossip.broadcast.method` is `plumtree`.
+
+This is deliberately separate from `processing_queue_len`, which also sizes the Plumtree payload and seen caches — widening the send queue should not force those caches to grow with it.
+
+Each buffered entry holds one encoded message plus its target peer list, so memory scales with queue length times message size (change gossip is capped at 8 KiB per chunk). Raise it if `corro_plumtree_send_queue_len` sits near the cap and `corro_plumtree_send_dropped` is non-zero; lower it if the agent is memory-constrained.
+
+The agent keeps two send queues, split by locality. The *local* queue holds round-0 gossip, which is gossip this node originated — no other node holds a copy of it. The *remote* queue holds everything else: forwarded gossip, `IHAVE`, `GRAFT` and `PRUNE`. The local queue is sent first, and is only shed from once the remote queue is empty.
+
+When the queue is over capacity the agent sheds the message that is cheapest to lose, rather than the most recently queued one:
+
+1. `PRUNE` always, regardless of round — it is pure tree optimization and the next duplicate regenerates it.
+2. Otherwise by **descending round**. A high round means the message has already travelled many hops, so more peers hold a copy and a node that misses it can recover by grafting a lazy peer that announced it.
+3. At equal round, `IHAVE` first (a node has up to `max_lazy` peers announcing the same id, so any one announcement is redundant), then `GRAFT`, then gossip last.
+4. Ties are broken toward the oldest entry, which has waited longest and is least likely to still be useful.
+
+Round is a proxy for how widely a message has spread, not a measurement of it — a message that travelled a long thin chain has a high round but few holders. The locality split, not the round ordering, is what guarantees a node's own writes survive shedding.
+
+```toml
+[perf]
+plumtree_send_queue_len = 40000
+```
+
 #### `apply_queue_timeout`
 
 Maximum time, in **milliseconds**, the agent will wait for more changes to accumulate before applying whatever it has. Defaults to `10` ms.
