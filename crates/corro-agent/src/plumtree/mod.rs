@@ -3,10 +3,9 @@ use std::{
     net::SocketAddr,
     num::NonZeroU32,
     ops::RangeInclusive,
+    sync::Arc,
     time::{Duration, Instant},
 };
-
-use std::sync::Arc;
 
 use arc_swap::ArcSwapOption;
 use bytes::{BufMut, Bytes, BytesMut};
@@ -871,7 +870,7 @@ fn drain_plumtree_queue(
                     TransmitError::QuotaExceeded(_) => {
                         *rate_limited = true;
                         counter!("corro.plumtree.send.rate_limited").increment(1);
-                        log_at_pow_10("plumtree broadcasts rate limited", limited_log_count);
+                        log_at_pow_10("plumtree broadcasts rate limited", &mut *limited_log_count);
                         break;
                     }
                 },
