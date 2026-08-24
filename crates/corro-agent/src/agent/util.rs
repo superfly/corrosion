@@ -63,7 +63,10 @@ use std::{
     convert::Infallible,
     net::SocketAddr,
     ops::{Deref, RangeInclusive},
-    sync::{atomic::AtomicI64, Arc},
+    sync::{
+        atomic::{AtomicI64, AtomicU64, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 use tokio::{
@@ -1774,6 +1777,18 @@ pub fn check_buffered_meta_to_clear(
     versions: CrsqlDbVersionRange,
 ) -> rusqlite::Result<bool> {
     conn.prepare_cached("SELECT EXISTS(SELECT 1 FROM __corro_buffered_changes WHERE site_id = ? AND db_version >= ? AND db_version <= ?)")?.query_row(params![actor_id, versions.start(), versions.end()], |row| row.get(0))
+}
+
+/// Increment `count` and return it when it lands on a power of 10, so callers
+/// can build their log message lazily.
+pub fn should_log_pow_10(count: &AtomicU64) -> Option<u64> {
+    let n = count.fetch_add(1, Ordering::Relaxed) + 1;
+
+    if n == 100000000 {
+        count.store(0, Ordering::Relaxed);
+    }
+
+    is_pow_10(n).then_some(n)
 }
 
 pub fn log_at_pow_10(msg: &str, count: &mut u64) {

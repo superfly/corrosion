@@ -3,10 +3,9 @@ use std::{
     net::SocketAddr,
     num::NonZeroU32,
     ops::RangeInclusive,
+    sync::Arc,
     time::{Duration, Instant},
 };
-
-use std::sync::Arc;
 
 use arc_swap::ArcSwapOption;
 use bytes::{BufMut, Bytes, BytesMut};
