@@ -870,7 +870,7 @@ fn drain_plumtree_queue(
                     TransmitError::QuotaExceeded(_) => {
                         *rate_limited = true;
                         counter!("corro.plumtree.send.rate_limited").increment(1);
-                        log_at_pow_10("plumtree broadcasts rate limited", &mut *limited_log_count);
+                        log_at_pow_10("plumtree broadcasts rate limited", limited_log_count);
                         break;
                     }
                 },
