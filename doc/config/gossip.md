@@ -79,6 +79,7 @@ If unset, Corrosion uses `gossip`. To enable Plumtree, add a `[gossip.broadcast.
 prune_threshold = 5         # optional
 optimization_threshold = 7  # optional; omit to disable
 batch_gossip = false        # optional
+ring_locked_radius = 1      # optional; 1 → 2 locked peers, 2 → 4
 ```
 
 ##### `prune_threshold`
@@ -96,6 +97,10 @@ Lower values optimize the tree more aggressively (more `GRAFT` churn); higher va
 ##### `batch_gossip`
 
 When `true`, coalesce multiple outgoing Plumtree gossip and membership messages instead of sending each one individually. Reduces per-packet overhead on busy clusters at the cost of a small amount of added latency. Defaults to `false`.
+
+##### `ring_locked_radius`
+
+Number of identity-ring neighbors locked eager on each side of this node. Those peers are never pruned, so the node cannot be isolated from the tree. Total locked peers is `2 * radius`. Defaults to `1` (two locked peers). Raise it on larger clusters if a single pair of ring neighbors is not enough to keep the tree connected.
 
 #### `gossip.tls`
 

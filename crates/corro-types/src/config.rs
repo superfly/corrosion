@@ -51,6 +51,10 @@ const fn default_processing_queue() -> usize {
     20000
 }
 
+const fn default_plumtree_send_queue() -> usize {
+    30000
+}
+
 /// Used for the apply channel
 const fn default_huge_channel() -> usize {
     2048
@@ -234,6 +238,10 @@ pub fn default_plumtree_prune_throttle_secs() -> Option<u64> {
     Some(1)
 }
 
+pub fn default_plumtree_ring_locked_radius() -> usize {
+    1
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlumtreeConfig {
     #[serde(default = "default_plumtree_prune_threshold")]
@@ -248,6 +256,10 @@ pub struct PlumtreeConfig {
     /// Near/Mid/Far split when selecting eager and lazy peers.
     #[serde(default)]
     pub eager_ratios: plum_foca::EagerRatios,
+    /// Neighbors locked eager on each side of the identity ring.
+    /// Total locked peers is `2 * radius` (default 1 → 2).
+    #[serde(default = "default_plumtree_ring_locked_radius")]
+    pub ring_locked_radius: usize,
 }
 
 impl Default for PlumtreeConfig {
@@ -258,6 +270,7 @@ impl Default for PlumtreeConfig {
             batch_gossip: false,
             prune_throttle_secs: default_plumtree_prune_throttle_secs(),
             eager_ratios: plum_foca::EagerRatios::default(),
+            ring_locked_radius: default_plumtree_ring_locked_radius(),
         }
     }
 }
@@ -408,6 +421,11 @@ pub struct PerfConfig {
     // How many unapplied changesets corrosion will buffer before starting to drop them
     #[serde(default = "default_processing_queue")]
     pub processing_queue_len: usize,
+    // How many outgoing plumtree messages to buffer before shedding.
+    // Kept separate from processing_queue_len so the send queue can be sized
+    // without also growing the plumtree payload and seen caches.
+    #[serde(default = "default_plumtree_send_queue")]
+    pub plumtree_send_queue_len: usize,
     // How many ms corrosion will wait before proceeding to apply a batch of changes
     // We wait either for apply_queue_timeout or untill at least apply_queue_min_batch_size changes accumulate
     #[serde(default = "default_apply_timeout")]
@@ -445,6 +463,7 @@ impl Default for PerfConfig {
             max_sync_backoff: default_max_sync_backoff(),
             partial_retry_backoff: default_partial_retry_backoff(),
             processing_queue_len: default_processing_queue(),
+            plumtree_send_queue_len: default_plumtree_send_queue(),
             apply_queue_timeout: default_apply_timeout(),
             apply_queue_min_batch_size: default_apply_batch_min(),
             apply_queue_step_base: default_apply_batch_step(),
@@ -843,6 +862,7 @@ mod tests {
         assert_eq!(cfg.broadcast.method(), BroadcastMethod::Plumtree);
         assert_eq!(cfg.plumtree().unwrap().prune_threshold, 7);
         assert_eq!(cfg.plumtree().unwrap().optimization_threshold, None);
+        assert_eq!(cfg.plumtree().unwrap().ring_locked_radius, 1);
     }
 
     #[test]

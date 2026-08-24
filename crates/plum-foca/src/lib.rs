@@ -29,12 +29,6 @@ impl<T> NodeId for T where T: Copy + Eq + Hash + Ord + Debug + Send + 'static {}
 
 pub type Round = u32;
 
-#[derive(Clone, Copy)]
-pub enum PlumPrio {
-    P0,
-    P1,
-}
-
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct RttInfo {
     pub ring: Option<u8>,
@@ -131,6 +125,9 @@ pub struct Config {
     pub prune_throttle: Option<Duration>,
     /// Near/Mid/Far split when selecting eager and lazy peers during rebalance.
     pub eager_ratios: EagerRatios,
+    /// Neighbors locked eager on each side of the identity ring.
+    /// Total locked peers is `2 * radius` (default 1 → 2).
+    pub ring_locked_radius: usize,
 }
 
 impl Default for Config {
@@ -146,6 +143,7 @@ impl Default for Config {
             max_cached_payloads: 8192,
             prune_throttle: Some(Duration::from_secs(1)),
             eager_ratios: EagerRatios::default(),
+            ring_locked_radius: 1,
         }
     }
 }
@@ -206,10 +204,14 @@ pub enum Notification<'a, I: MessageId, N: NodeId> {
 
 pub trait Runtime<I: MessageId, P: Payload<MessageId = I, NodeId = N>, N: NodeId> {
     /// Send a protocol message to a specific peer.
-    fn send(&mut self, to: N, msg: PlumtreeMsg<I, P, N>, prio: PlumPrio);
+    ///
+    /// The transport decides send and shed order from the message itself --
+    /// `GossipMsg::round` and the message variant -- so no separate priority
+    /// is passed down from the protocol.
+    fn send(&mut self, to: N, msg: PlumtreeMsg<I, P, N>);
 
     // Send a message to a group of peers
-    fn send_all(&mut self, peers: Vec<N>, msg: PlumtreeMsg<I, P, N>, prio: PlumPrio);
+    fn send_all(&mut self, peers: Vec<N>, msg: PlumtreeMsg<I, P, N>);
 
     /// Deliver a received message to the application layer.
     fn deliver(&mut self, payload: P);
@@ -443,8 +445,8 @@ pub struct PlumtreeState<
     lazy_peers: IndexSet<N>,
     /// Every peer we know about, eager or lazy; drives.
     known_peers: HashSet<N>,
-    /// Eager peers pinned to the tree because they are our immediate ring
-    /// neighbors; they are never pruned, ensuring a node is never isolated.
+    /// Eager peers pinned to the tree because they are our ring neighbors
+    /// within `Config::ring_locked_radius`; they are never pruned.
     ring_locked: HashSet<N>,
     /// Per-per rtt information.
     peer_topology: HashMap<N, RttInfo>,
@@ -628,7 +630,6 @@ impl<I: MessageId<NodeId = N>, P: Payload<MessageId = I, NodeId = N>, N: NodeId,
                             sender: self.local_id,
                             triggered_by: Some(id.clone()),
                         }),
-                        PlumPrio::P1,
                     );
                     self.move_to_lazy(&sender, rt);
                 }
@@ -665,7 +666,6 @@ impl<I: MessageId<NodeId = N>, P: Payload<MessageId = I, NodeId = N>, N: NodeId,
                     sender: self.local_id,
                     payload,
                 }),
-                PlumPrio::P1,
             );
         }
 
@@ -694,7 +694,6 @@ impl<I: MessageId<NodeId = N>, P: Payload<MessageId = I, NodeId = N>, N: NodeId,
                         round: entry.round,
                     }],
                 }),
-                PlumPrio::P0,
             );
 
             // paper has a prune here but we might prune a good path for different sender,
@@ -724,6 +723,8 @@ impl<I: MessageId<NodeId = N>, P: Payload<MessageId = I, NodeId = N>, N: NodeId,
             if self.seen.contains(&digest.id) {
                 continue;
             }
+            // todo: maybe we can store peers that have sent ihave's
+            // and use them as a fallback
             if self.missing.contains_key(&digest.id) {
                 continue;
             }
@@ -790,7 +791,6 @@ impl<I: MessageId<NodeId = N>, P: Payload<MessageId = I, NodeId = N>, N: NodeId,
                         sender: self.local_id,
                         payload,
                     }),
-                    PlumPrio::P0,
                 );
             } else {
                 debug!(
@@ -826,7 +826,6 @@ impl<I: MessageId<NodeId = N>, P: Payload<MessageId = I, NodeId = N>, N: NodeId,
                 sender: self.local_id,
                 triggered_by: None,
             }),
-            PlumPrio::P1,
         );
     }
 
@@ -857,7 +856,6 @@ impl<I: MessageId<NodeId = N>, P: Payload<MessageId = I, NodeId = N>, N: NodeId,
                 sender: self.local_id,
                 payload,
             }),
-            PlumPrio::P0,
         );
 
         self.enqueue_ihave(id, 0);
@@ -927,7 +925,6 @@ impl<I: MessageId<NodeId = N>, P: Payload<MessageId = I, NodeId = N>, N: NodeId,
                         send: true,
                         requests: chunk.to_vec(),
                     }),
-                    PlumPrio::P0,
                 );
             }
             // supress prunes for a recently grafted peers
@@ -943,7 +940,7 @@ impl<I: MessageId<NodeId = N>, P: Payload<MessageId = I, NodeId = N>, N: NodeId,
                         retries: retries + 1,
                         senders,
                     },
-                    self.config.ihave_timeout / 2,
+                    self.config.ihave_timeout,
                 );
             } else {
                 rt.notify(Notification::MessageMissing(ids.len()));
@@ -969,7 +966,6 @@ impl<I: MessageId<NodeId = N>, P: Payload<MessageId = I, NodeId = N>, N: NodeId,
                 sender: self.local_id,
                 digests: digests.unwrap(),
             }),
-            PlumPrio::P1,
         );
     }
 
@@ -1263,8 +1259,7 @@ impl<I: MessageId<NodeId = N>, P: Payload<MessageId = I, NodeId = N>, N: NodeId,
 
     /// Recompute ring neighbors based on current known_peers.
     ///
-    /// Clears old ring_locked set and recalculates the two peers that
-    /// are immediately before and after local_id in sorted order.
+    /// Locks `ring_locked_radius` peers on each side of `local_id` in sorted order.
     fn set_ring_neighbors(&mut self) {
         self.ring_locked.clear();
 
@@ -1275,13 +1270,20 @@ impl<I: MessageId<NodeId = N>, P: Payload<MessageId = I, NodeId = N>, N: NodeId,
         }
 
         peers.sort();
-        if let Some(position) = peers.iter().position(|p| *p == &self.local_id) {
-            let len = peers.len();
-            let after_idx = (position + 1) % len;
-            let before_idx = (position + len - 1) % len;
-
-            self.ring_locked.insert(*peers[before_idx]);
-            self.ring_locked.insert(*peers[after_idx]);
+        let Some(position) = peers.iter().position(|p| *p == &self.local_id) else {
+            return;
+        };
+        let len = peers.len();
+        let radius = self.config.ring_locked_radius.max(1);
+        for i in 1..=radius {
+            let after = *peers[(position + i) % len];
+            let before = *peers[(position + len - i) % len];
+            if after != self.local_id {
+                self.ring_locked.insert(after);
+            }
+            if before != self.local_id {
+                self.ring_locked.insert(before);
+            }
         }
     }
 
@@ -1470,6 +1472,7 @@ mod tests {
             max_received_entries: 10000,
             prune_throttle: None,
             eager_ratios: EagerRatios::default(),
+            ring_locked_radius: 1,
         }
     }
 
@@ -1513,19 +1516,13 @@ mod tests {
             &mut self,
             peers: Vec<TestNodeId>,
             msg: PlumtreeMsg<TestMsgId, TestPayload, TestNodeId>,
-            _prio: PlumPrio,
         ) {
             for peer in peers {
-                self.send(peer, msg.clone(), PlumPrio::P0);
+                self.send(peer, msg.clone());
             }
         }
 
-        fn send(
-            &mut self,
-            to: TestNodeId,
-            msg: PlumtreeMsg<TestMsgId, TestPayload, TestNodeId>,
-            _prio: PlumPrio,
-        ) {
+        fn send(&mut self, to: TestNodeId, msg: PlumtreeMsg<TestMsgId, TestPayload, TestNodeId>) {
             self.sent.push((to, msg));
         }
 
@@ -1694,6 +1691,27 @@ mod tests {
         assert!(!s.eager_peers().contains(&6));
         assert!(!s.lazy_peers().contains(&6));
         assert_eq!(s.known_peers().len(), 5);
+    }
+
+    #[test]
+    fn ring_locked_radius_locks_both_sides() {
+        let mut cfg = test_config();
+        cfg.ring_locked_radius = 2;
+        let mut s = PlumtreeState::new_with_store(0u8, cfg, TestSeenStore::default());
+        let mut rt = AccumulatingRuntime::default();
+        for i in 1..=6 {
+            s.peer_up(i, None, &mut rt);
+        }
+        s.update_peer_topology(iter::empty::<(TestNodeId, RttInfo)>(), &mut rt);
+
+        // sorted ring: 0,1,2,3,4,5,6 → radius 2 locks 5,6 and 1,2
+        assert_eq!(s.ring_locked_peers().len(), 4);
+        for p in [1u8, 2, 5, 6] {
+            assert!(s.ring_locked_peers().contains(&p));
+            assert!(s.eager_peers().contains(&p));
+        }
+        assert!(!s.ring_locked_peers().contains(&3));
+        assert!(!s.ring_locked_peers().contains(&4));
     }
 
     #[test]
