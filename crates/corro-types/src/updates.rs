@@ -280,7 +280,7 @@ fn handle_candidates(
         candidates.keys().collect::<Vec<_>>()
     );
 
-    for (_, pks) in candidates {
+    for (_table, pks) in candidates {
         let pks = pks
             .iter()
             .map(|(pk, cl)| unpack_columns(pk).map(|x| (x, *cl)))
@@ -483,6 +483,45 @@ where
     }
 }
 
+/// Resolve a V2 hash-mode tombstone pk (hashed_pk) back to a packed pk
+/// by querying the `{table}__crsql_v2_tombstone_pks` table and packing
+/// the result with `crsql_pack_columns`.
+///
+/// This is a temporary shim for subscription/updates matching. The wire
+/// protocol still sends hashed_pks directly; this resolution only happens
+/// locally when matching changes against subscription state.
+fn resolve_v2_tombstone_pk(
+    conn: &Connection,
+    table: &TableName,
+    hashed_pk: &[u8],
+) -> rusqlite::Result<Option<Vec<u8>>> {
+    // Get the PK column names for this table
+    let pk_cols: Vec<String> = conn
+        .prepare_cached(&format!(
+            r#"SELECT name FROM pragma_table_info("{table}") WHERE pk > 0 ORDER BY pk"#
+        ))?
+        .query_map([], |row| row.get(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    if pk_cols.is_empty() {
+        return Ok(None);
+    }
+
+    let cols = pk_cols.join(", ");
+    let sql = format!(
+        r#"SELECT crsql_pack_columns({cols}) FROM "{table}__crsql_v2_tombstone_pks" WHERE hashed_pk = ?"#
+    );
+
+    match conn
+        .prepare_cached(&sql)?
+        .query_row([hashed_pk], |row| row.get::<_, Vec<u8>>(0))
+    {
+        Ok(packed) => Ok(Some(packed)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
 pub fn match_changes_from_db_version<H>(
     manager: &impl Manager<H>,
     conn: &Connection,
@@ -504,27 +543,98 @@ where
         .collect::<BTreeMap<_, _>>();
 
     {
-        let mut prepped = conn.prepare_cached(
-            r#"
-        SELECT "table", pk, cid, cl
+        // SELECT DISTINCT enables cr-sqlite's scalar mode in V2 packed mode,
+        // returning unpacked rows (scalar cid, pk, etc.) instead of packed BLOBs.
+        // Note: ORDER BY seq is omitted because seq is a packed BLOB in V2 mode
+        // and including it in ORDER BY breaks the scalar unpacking.
+        let mut prepped = conn
+            .prepare_cached(
+                r#"
+        SELECT DISTINCT "table", pk, cid, cl
             FROM crsql_changes
             WHERE db_version = ?
               AND site_id = ?
-            ORDER BY seq ASC
-        "#,
-        )?;
+            "#,
+            )
+            .map_err(|e| {
+                error!(
+                    manager = %trait_type,
+                    %actor_id,
+                    %db_version,
+                    error = %e,
+                    "failed to prepare crsql_changes matching query"
+                );
+                e
+            })?;
 
-        let rows = prepped.query_map((db_version, actor_id), |row| {
-            Ok((
-                row.get::<_, TableName>(0)?,
-                row.get::<_, Vec<u8>>(1)?,
-                row.get::<_, ColumnName>(2)?,
-                row.get::<_, i64>(3)?,
-            ))
-        })?;
+        let rows = prepped
+            .query_map((db_version, actor_id), |row| {
+                Ok((
+                    row.get::<_, TableName>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, ColumnName>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })
+            .map_err(|e| {
+                error!(
+                    manager = %trait_type,
+                    %actor_id,
+                    %db_version,
+                    error = %e,
+                    "failed to execute crsql_changes matching query"
+                );
+                e
+            })?;
 
+        // Collect rows first so we can resolve V2 hash-mode tombstone pks (cid = "-2")
+        // outside the active prepared statement to avoid reentrant statement conflicts.
+        let mut collected: Vec<(TableName, Vec<u8>, ColumnName, i64)> = Vec::new();
         for change_res in rows {
-            let (table, pk, column, cl) = change_res?;
+            collected.push(change_res.map_err(|e| {
+                error!(
+                    manager = %trait_type,
+                    %actor_id,
+                    %db_version,
+                    error = %e,
+                    "failed to decode crsql_changes matching row"
+                );
+                e
+            })?);
+        }
+
+        for (table, mut pk, mut column, cl) in collected {
+            // In V2 hash mode, deletes have cid = "-2" and pk is a hashed_pk (not packed).
+            // Resolve the real pk from the v2_tombstone_pks table and rewrite to a "-1"
+            // sentinel so the existing subscription matching path (unpack_columns, etc.)
+            // works unchanged. This is a temporary shim until subscriptions are redesigned.
+            if column.as_str() == "-2" {
+                match resolve_v2_tombstone_pk(conn, &table, &pk) {
+                    Ok(Some(packed_pk)) => {
+                        pk = packed_pk;
+                        column = ColumnName("-1".into());
+                    }
+                    Ok(None) => {
+                        // Tombstone pk not found — row may have been purged. Skip it.
+                        warn!(
+                            table = %table,
+                            "V2 tombstone pk not found in v2_tombstone_pks, skipping"
+                        );
+                        continue;
+                    }
+                    Err(e) => {
+                        error!(
+                            manager = %trait_type,
+                            %actor_id,
+                            %db_version,
+                            table = %table,
+                            error = %e,
+                            "could not resolve V2 tombstone pk"
+                        );
+                        continue;
+                    }
+                }
+            }
 
             for (_id, (candidates, handle)) in candidates.iter_mut() {
                 let change = MatchableChange {
