@@ -6,6 +6,7 @@
 
 mod bi;
 mod bootstrap;
+mod crsql_maintenance;
 mod error;
 mod handlers;
 mod metrics;

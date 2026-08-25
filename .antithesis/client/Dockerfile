@@ -19,6 +19,7 @@ COPY .antithesis/client/config.toml /opt/antithesis/config.toml
 COPY .antithesis/client/test-templates/py-resources/helper.py /opt/antithesis/py-resources/helper.py
 
 COPY .antithesis/client/test-templates/check_bookkeeping.py /opt/antithesis/py-resources/check_bookkeeping.py
+COPY .antithesis/client/test-templates/check_v1_v2_integrity.py /opt/antithesis/py-resources/check_v1_v2_integrity.py
 
 COPY .antithesis/client/entrypoint.sh /entrypoint.sh
 

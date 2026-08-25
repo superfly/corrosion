@@ -9,12 +9,12 @@ use tokio::runtime::Runtime;
 use tripwire::Tripwire;
 
 use axum::Extension;
-use corro_tests::{clone_test_agent, launch_test_agent};
+use corro_tests::{clone_test_agent, is_v2_mode, launch_test_agent};
 use corro_types::{
     api::Statement,
     base::{CrsqlDbVersion, CrsqlSeq},
-    broadcast::{ChangeSource, ChangeV1, Changeset},
-    change::{row_to_change, Change},
+    broadcast::{ChangeSource, ChangeV1, Changeset, PackedChangesetPerTable},
+    change::{row_to_change, row_to_packed_change, Change, PackedChange},
 };
 use hyper::StatusCode;
 
@@ -24,6 +24,11 @@ use corro_agent::{
 };
 
 /// Configuration for a benchark run
+enum BenchChange {
+    Scalar(Box<Change>),
+    Packed(Box<PackedChange>),
+}
+
 struct BenchConfig {
     /// Seed for the random number generator
     rng_seed: u64,
@@ -37,8 +42,8 @@ struct BenchConfig {
     /// Operations per transaction - how many operations per transaction(changeset) to generate
     /// One operation might generate multiple changes
     operations_per_tx: usize,
-    /// Ratio of insert:updates:deletes ops (must sum to 100)
-    operation_mix: (u8, u8, u8),
+    /// Ratio of insert:update:delete:resurrection operations (must sum to 100)
+    operation_mix: (u8, u8, u8, u8),
     /// Whether to use partial changesets (benchmarks a different code path)
     /// If this is false then process_multiple_changes will only be called with complete changesets
     all_partial: bool,
@@ -116,14 +121,20 @@ async fn generate_changesets(
 
     // Generate transactions with mixed operations
     let max_transactions = *config.batch_sizes.iter().max().unwrap();
+    let mut deleted_ids = vec![Vec::new(); config.number_of_bench_tables];
     for tx_idx in 0..max_transactions {
         let mut statements = Vec::new();
+        let mut deleted_this_tx = vec![Vec::new(); config.number_of_bench_tables];
+        let mut resurrected_this_tx = vec![Vec::new(); config.number_of_bench_tables];
+        let mut available_deleted = deleted_ids.clone();
         for _ in 0..config.operations_per_tx {
             let table_idx = rng.random_range(0..config.number_of_bench_tables);
             let table_name = format!("bench_test_{table_idx}");
 
             let op_type = rng.random_range(0..100);
-            let (insert_pct, update_pct, _delete_pct) = config.operation_mix;
+            let (insert_pct, update_pct, delete_pct, _resurrection_pct) = config.operation_mix;
+            let update_threshold = insert_pct + update_pct;
+            let delete_threshold = update_threshold + delete_pct;
 
             let stmt = if op_type < insert_pct {
                 // Insert - use high IDs to avoid conflicts
@@ -132,19 +143,46 @@ async fn generate_changesets(
                     format!("INSERT OR REPLACE INTO {table_name} (id, value, counter, random) VALUES (?, ?, ?, ?)"),
                     vec![(id as i64).into(), format!("value_{id}").into(), rng.random_range(0..100000).into(), 0.into()],
                 )
-            } else if op_type < insert_pct + update_pct {
+            } else if op_type < update_threshold {
                 // Update - use existing IDs
                 let id = rng.random_range(1..=config.initial_rows_per_table.min(1000));
                 Statement::WithParams(
                     format!("UPDATE {table_name} SET counter = counter + 1, value = ?, random = ? WHERE id = ?"),
                     vec![format!("updated_{}", rng.random_range(0..1000)).into(), rng.random_range(0..100000).into(), (id as i64).into()],
                 )
-            } else {
-                // Delete
-                let id = rng.random_range(1..=config.initial_rows_per_table.min(1000));
+            } else if op_type < delete_threshold {
+                // Delete an active initial row so it can be resurrected later.
+                let id = rng.random_range(1..=config.initial_rows_per_table.min(1000)) as i64;
+                if !deleted_this_tx[table_idx].contains(&id) {
+                    deleted_this_tx[table_idx].push(id);
+                }
                 Statement::WithParams(
                     format!("DELETE FROM {table_name} WHERE id = ?"),
-                    vec![(id as i64).into()],
+                    vec![id.into()],
+                )
+            } else if let Some(index) = (!available_deleted[table_idx].is_empty())
+                .then(|| rng.random_range(0..available_deleted[table_idx].len()))
+            {
+                // Resurrection - reinsert a row deleted by an earlier transaction.
+                let id: i64 = available_deleted[table_idx].swap_remove(index);
+                resurrected_this_tx[table_idx].push(id);
+                Statement::WithParams(
+                    format!(
+                        "INSERT INTO {table_name} (id, value, counter, random) VALUES (?, ?, ?, ?)"
+                    ),
+                    vec![
+                        id.into(),
+                        format!("resurrected_{id}").into(),
+                        0.into(),
+                        rng.random_range(0..100000).into(),
+                    ],
+                )
+            } else {
+                // No prior delete is available yet; fall back to an update.
+                let id = rng.random_range(1..=config.initial_rows_per_table.min(1000));
+                Statement::WithParams(
+                    format!("UPDATE {table_name} SET counter = counter + 1, value = ?, random = ? WHERE id = ?"),
+                    vec![format!("updated_{}", rng.random_range(0..1000)).into(), rng.random_range(0..100000).into(), (id as i64).into()],
                 )
             };
             statements.push(stmt);
@@ -158,6 +196,11 @@ async fn generate_changesets(
         )
         .await;
         assert_eq!(status, StatusCode::OK);
+
+        for table_idx in 0..config.number_of_bench_tables {
+            deleted_ids[table_idx].retain(|id| !resurrected_this_tx[table_idx].contains(id));
+            deleted_ids[table_idx].extend(deleted_this_tx[table_idx].iter().copied());
+        }
     }
 
     // Fetch all changes since start_version
@@ -174,32 +217,83 @@ async fn generate_changesets(
     for version in (start_version.0 + 1)..=end_version.0 {
         let version = CrsqlDbVersion(version);
 
-        let changes: Vec<Change> = conn
-            .prepare_cached(
-                "SELECT \"table\", pk, cid, val, col_version, db_version, seq, site_id, cl 
-                FROM crsql_changes WHERE db_version = ? 
-                ORDER BY seq ASC",
-            )?
-            .query_map([version], row_to_change)?
-            .collect::<Result<Vec<_>, _>>()?;
+        let is_v2 = is_v2_mode();
+        let mut stmt = conn.prepare_cached(
+            "SELECT \"table\", pk, cid, val, col_version, db_version, seq, site_id, cl
+            FROM crsql_changes WHERE db_version = ?
+            ORDER BY seq ASC",
+        )?;
+        let changes: Vec<BenchChange> = if is_v2 {
+            stmt.query_map([version], |row| {
+                row_to_packed_change(row).map(|change| BenchChange::Packed(Box::new(change)))
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+        } else {
+            stmt.query_map([version], |row| {
+                row_to_change(row).map(|change| BenchChange::Scalar(Box::new(change)))
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+        };
 
         if changes.is_empty() {
             continue;
         }
 
-        let last_seq = changes.iter().map(|c| c.seq).max().unwrap_or(CrsqlSeq(0));
-        let seqs = CrsqlSeq(0)..=last_seq;
+        let actor_id = ta.agent.actor_id();
+        let timestamp = ta.agent.clock().new_timestamp().into();
+        let changeset = match is_v2 {
+            true => {
+                let mut packed_changes = PackedChangesetPerTable::default();
+                let last_seq = changes
+                    .into_iter()
+                    .filter_map(|change| match change {
+                        BenchChange::Packed(change) => Some(change),
+                        BenchChange::Scalar(_) => None,
+                    })
+                    .map(|change| {
+                        let change = *change;
+                        let max_seq = change.max_seq;
+                        packed_changes.insert(change);
+                        max_seq
+                    })
+                    .max()
+                    .unwrap_or(CrsqlSeq(0));
+                Changeset::FullV2Packed {
+                    actor_id,
+                    version,
+                    changes: packed_changes,
+                    seqs: (CrsqlSeq(0)..=last_seq).into(),
+                    last_seq,
+                    ts: timestamp,
+                }
+            }
+            false => {
+                let changes = changes
+                    .into_iter()
+                    .filter_map(|change| match change {
+                        BenchChange::Scalar(change) => Some(*change),
+                        BenchChange::Packed(_) => None,
+                    })
+                    .collect::<Vec<_>>();
+                let last_seq = changes
+                    .iter()
+                    .map(|change| change.seq)
+                    .max()
+                    .unwrap_or(CrsqlSeq(0));
+                Changeset::Full {
+                    version,
+                    changes,
+                    seqs: (CrsqlSeq(0)..=last_seq).into(),
+                    last_seq,
+                    ts: timestamp,
+                }
+            }
+        };
 
         changesets.push((
             ChangeV1 {
-                actor_id: ta.agent.actor_id(),
-                changeset: Changeset::Full {
-                    version,
-                    changes,
-                    seqs: seqs.into(),
-                    last_seq,
-                    ts: ta.agent.clock().new_timestamp().into(),
-                },
+                actor_id,
+                changeset,
             },
             ChangeSource::Broadcast,
             Instant::now(),
@@ -251,6 +345,21 @@ fn make_changesets_partial(
                     seqs,
                     ts,
                 } => Changeset::FullV2 {
+                    actor_id,
+                    version,
+                    changes,
+                    last_seq: last_seq + 10,
+                    seqs,
+                    ts,
+                },
+                Changeset::FullV2Packed {
+                    actor_id,
+                    version,
+                    changes,
+                    last_seq,
+                    seqs,
+                    ts,
+                } => Changeset::FullV2Packed {
                     actor_id,
                     version,
                     changes,
@@ -397,7 +506,7 @@ impl Default for BenchConfig {
             initial_rows_per_table: 1_000_000,
             batch_sizes: vec![1, 2, 5, 10, 25, 50, 100],
             operations_per_tx: 10,
-            operation_mix: (40, 50, 10), // 40% insert, 50% update, 10% delete
+            operation_mix: (40, 50, 10, 0), // 40% insert, 50% update, 10% delete
             all_partial: false,
         }
     }
@@ -411,6 +520,7 @@ fn bench_fulls_one_large_table_mixed(c: &mut Criterion) {
         &BenchConfig {
             number_of_bench_tables: 1,
             initial_rows_per_table: 1_000_000,
+            operation_mix: (10, 80, 5, 5), // 10% insert, 80% update, 5% delete, 5% resurrection
             ..BenchConfig::default()
         },
     );
@@ -435,7 +545,7 @@ fn bench_fulls_one_large_table_insert_only(c: &mut Criterion) {
         &BenchConfig {
             number_of_bench_tables: 1,
             initial_rows_per_table: 1_000_000,
-            operation_mix: (100, 0, 0),
+            operation_mix: (100, 0, 0, 0),
             ..BenchConfig::default()
         },
     );
@@ -448,7 +558,7 @@ fn bench_fulls_one_large_table_update_only(c: &mut Criterion) {
         &BenchConfig {
             number_of_bench_tables: 1,
             initial_rows_per_table: 1_000_000,
-            operation_mix: (0, 100, 0),
+            operation_mix: (0, 100, 0, 0),
             ..BenchConfig::default()
         },
     );
@@ -461,7 +571,7 @@ fn bench_fulls_one_large_table_delete_only(c: &mut Criterion) {
         &BenchConfig {
             number_of_bench_tables: 1,
             initial_rows_per_table: 1_000_000,
-            operation_mix: (0, 0, 100),
+            operation_mix: (0, 0, 100, 0),
             ..BenchConfig::default()
         },
     );
