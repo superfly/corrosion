@@ -39,10 +39,10 @@ use corro_types::{
     actor::ActorId,
     agent::{migrate, Agent, AgentConfig, BookedVersions, Bookie, SplitPool},
     base::{CrsqlDbVersion, CrsqlDbVersionRange},
-    broadcast::{BroadcastInput, BroadcastV1, ChangeSource, ChangeV1, FocaInput},
+    broadcast::{BroadcastInput, BroadcastV1, ChangeSource, ChangeV1, FocaInput, Timestamp},
     channel::{bounded, CorroReceiver},
     compress::ZstdDicts,
-    config::{CompressionConfig, Config},
+    config::{CompressionConfig, Config, CrsqliteConfig},
     members::Members,
     metrics_tracker::MetricsTracker,
     pubsub::{Matcher, SubsManager},
@@ -106,6 +106,14 @@ pub async fn setup(conf: Config, tripwire: Tripwire) -> eyre::Result<(Agent, Age
     let schema = {
         let mut conn = pool.write_priority().await?;
         migrate(clock.clone(), &mut conn)?;
+
+        // Apply crsqlite metadata version config transitions if configured.
+        // This must happen after schema migration but before the agent starts
+        // processing changes, so the metadata version is consistent.
+        if let Some(crsqlite_conf) = &conf.crsqlite {
+            apply_crsqlite_config(&conn, crsqlite_conf, &clock)?;
+        }
+
         let mut schema = init_schema(&conn)?;
         schema.constrain()?;
 
@@ -366,6 +374,78 @@ async fn setup_spawn_subscriptions(
     }
 
     Ok(Arc::new(TokioRwLock::new(subs_bcast_cache)))
+}
+
+/// Apply crsqlite metadata version config transitions on startup.
+///
+/// For each configured version setting, if the current DB value differs,
+/// call `crsql_config_set` to transition. Crsqlite validates transitions
+/// and will error on invalid jumps (e.g. 1→3 when CRR tables exist).
+///
+/// The transitions are applied in order: write-version, use-version, sync-log-version,
+/// since there are dependencies between them (e.g. sync-log v2 requires use-version v2).
+fn apply_crsqlite_config(
+    conn: &CrConn,
+    config: &CrsqliteConfig,
+    clock: &Arc<uhlc::HLC>,
+) -> eyre::Result<()> {
+    let ts = Timestamp::from(clock.new_timestamp());
+
+    // V2 operations require a non-zero ts
+    conn.execute_batch(&format!("SELECT crsql_set_ts({})", ts.as_u64()))?;
+
+    // Helper: read current value, transition if different
+    fn try_transition(
+        conn: &CrConn,
+        config_name: &str,
+        desired: i64,
+    ) -> eyre::Result<()> {
+        let current: i64 = conn.query_row(
+            &format!("SELECT crsql_config_get('{}')", config_name),
+            [],
+            |row| row.get(0),
+        )?;
+
+        if current == desired {
+            debug!(config_name, current, "crsqlite config already at target");
+            return Ok(());
+        }
+
+        info!(
+            config_name,
+            current,
+            desired,
+            "transitioning crsqlite metadata version"
+        );
+
+        let sql = format!("SELECT crsql_config_set('{}', {})", config_name, desired);
+        match conn.query_row::<String, _, _>(&sql, [], |row| row.get(0)) {
+            Ok(_) => {
+                info!(config_name, desired, "crsqlite config transition complete");
+                Ok(())
+            }
+            Err(e) => {
+                Err(eyre::eyre!(
+                    "failed to transition crsql_config_set('{}', {}): {e}",
+                    config_name,
+                    desired
+                ))
+            }
+        }
+    }
+
+    // Apply in dependency order
+    if let Some(wv) = config.metadata_write_version {
+        try_transition(conn, "metadata-write-version", wv)?;
+    }
+    if let Some(uv) = config.metadata_use_version {
+        try_transition(conn, "metadata-use-version", uv)?;
+    }
+    if let Some(slv) = config.sync_log_version {
+        try_transition(conn, "sync-log-version", slv)?;
+    }
+
+    Ok(())
 }
 
 fn load_dictionary(file: &mut std::fs::File) -> io::Result<Option<Vec<u8>>> {

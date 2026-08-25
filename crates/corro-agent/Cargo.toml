@@ -81,3 +81,6 @@ criterion = { version = "0.5", features = ["async_tokio"] }
 [[bench]]
 name = "process_changes"
 harness = false
+
+[features]
+running_in_antithesis = []

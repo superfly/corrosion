@@ -8,12 +8,15 @@
 use crate::{
     agent::{handlers, CountedExecutor, TO_CLEAR_COUNT},
     api::public::{
-        api_v1_health, api_v1_queries, api_v1_table_stats, api_v1_transactions,
-        pubsub::{api_v1_sub_by_id, api_v1_subs},
+        api_v1_health, api_v1_queries, api_v1_table_stats,
+        api_v1_transactions, pubsub::{api_v1_sub_by_id, api_v1_subs},
         update::SharedUpdateBroadcastCache,
     },
     transport::Transport,
 };
+
+#[cfg(feature = "running_in_antithesis")]
+use crate::api::public::{api_v1_migrate, api_v1_migrate_status};
 
 use antithesis_sdk::assert_sometimes;
 use corro_types::{
@@ -290,7 +293,39 @@ pub async fn setup_http_api_handler(
                     .layer(LoadShedLayer::new())
                     .layer(ConcurrencyLimitLayer::new(4)),
             ),
+        );
+    // migration control — only in antithesis builds, removed with crsqlite 0.19
+    #[cfg(feature = "running_in_antithesis")]
+    let api = api
+        .route(
+            "/v1/migrate",
+            post(api_v1_migrate).route_layer(
+                tower::ServiceBuilder::new()
+                    .layer(HandleErrorLayer::new(|_error: BoxError| async {
+                        Ok::<_, Infallible>((
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "max concurrency limit reached".to_string(),
+                        ))
+                    }))
+                    .layer(LoadShedLayer::new())
+                    .layer(ConcurrencyLimitLayer::new(4)),
+            ),
         )
+        .route(
+            "/v1/migrate/status",
+            get(api_v1_migrate_status).route_layer(
+                tower::ServiceBuilder::new()
+                    .layer(HandleErrorLayer::new(|_error: BoxError| async {
+                        Ok::<_, Infallible>((
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "max concurrency limit reached".to_string(),
+                        ))
+                    }))
+                    .layer(LoadShedLayer::new())
+                    .layer(ConcurrencyLimitLayer::new(4)),
+            ),
+        );
+    let api = api
         .layer(axum::middleware::from_fn(require_authz))
         .layer(
             tower::ServiceBuilder::new()

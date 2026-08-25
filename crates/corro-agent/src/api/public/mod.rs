@@ -42,7 +42,13 @@ use tokio::{
 };
 use tracing::{debug, error, trace, warn};
 
+#[cfg(feature = "running_in_antithesis")]
+use tracing::info;
+
 use corro_types::broadcast::broadcast_changes;
+
+#[cfg(feature = "running_in_antithesis")]
+use corro_types::api::{MigrateResponse, MigrateStatus, MigrateStep};
 
 pub mod pubsub;
 
@@ -660,6 +666,243 @@ pub async fn api_v1_table_stats(
             }),
         ),
     }
+}
+
+/// `POST /v1/migrate` — trigger a single migration step.
+///
+/// **Only available in antithesis builds.** Will be removed with crsqlite 0.19.
+///
+/// The body is a [`MigrateStep`] enum encoded as JSON, e.g.:
+/// ```json
+/// "v2_db_format"
+/// ```
+///
+/// Each step maps to a `crsql_config_set` call that advances (or rolls back)
+/// the metadata version. The actual data migration is performed incrementally
+/// by the background migrator task.
+#[cfg(feature = "running_in_antithesis")]
+#[tracing::instrument(skip_all)]
+pub async fn api_v1_migrate(
+    Extension(agent): Extension<Agent>,
+    axum::extract::Json(step): axum::extract::Json<MigrateStep>,
+) -> (StatusCode, axum::Json<MigrateResponse>) {
+    let (config_name, config_value): (&str, i64) = match step {
+        MigrateStep::V2DbFormat => ("metadata-write-version", 2),
+        MigrateStep::UseV2Metadata => ("metadata-use-version", 2),
+        MigrateStep::V2DbOnly => ("metadata-write-version", 3),
+        MigrateStep::V2WireFormat => ("sync-log-version", 2),
+        MigrateStep::RollbackV1 => ("metadata-write-version", 1),
+    };
+
+    let ts = Timestamp::from(agent.clock().new_timestamp());
+
+    let result = {
+        let mut conn = match agent.pool().write_low().await {
+            Ok(c) => c,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    axum::Json(MigrateResponse {
+                        success: false,
+                        message: format!("could not acquire write connection: {e}"),
+                        write_version: 0,
+                        use_version: 0,
+                        sync_log_version: 0,
+                    }),
+                );
+            }
+        };
+
+        block_in_place(|| {
+            let tx = conn.immediate_transaction()?;
+
+            // V2 operations require a non-zero ts
+            tx.prepare_cached("SELECT crsql_set_ts(?)")?
+                .query_row([&ts], |_| Ok(()))?;
+
+            let sql = format!("SELECT crsql_config_set('{}', {})", config_name, config_value);
+            let result: Result<String, rusqlite::Error> = tx
+                .prepare_cached(&sql)?
+                .query_row([], |row| row.get(0));
+
+            match result {
+                Ok(_) => {
+                    // Read back the current versions after the transition
+                    let write_version: i64 = tx
+                        .prepare_cached("SELECT crsql_config_get('metadata-write-version')")?
+                        .query_row([], |row| row.get(0))?;
+                    let use_version: i64 = tx
+                        .prepare_cached("SELECT crsql_config_get('metadata-use-version')")?
+                        .query_row([], |row| row.get(0))?;
+                    let sync_log_version: i64 = tx
+                        .prepare_cached("SELECT crsql_config_get('sync-log-version')")?
+                        .query_row([], |row| row.get(0))?;
+
+                    tx.commit()?;
+
+                    Ok((write_version, use_version, sync_log_version))
+                }
+                Err(e) => {
+                    // query_row returns an error if the SQL function itself
+                    // raises an error (e.g. invalid transition). The message
+                    // is in the error text.
+                    Err(e)
+                }
+            }
+        })
+    };
+
+    match result {
+        Ok((wv, uv, slv)) => {
+            info!(
+                step = ?config_name,
+                value = config_value,
+                write_version = wv,
+                use_version = uv,
+                sync_log_version = slv,
+                "migration step completed"
+            );
+            (
+                StatusCode::OK,
+                axum::Json(MigrateResponse {
+                    success: true,
+                    message: format!("{} set to {}", config_name, config_value),
+                    write_version: wv,
+                    use_version: uv,
+                    sync_log_version: slv,
+                }),
+            )
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            error!(step = ?config_name, value = config_value, error = %msg, "migration step failed");
+            // Read whatever versions we can for the response
+            let (wv, uv, slv) = read_versions_safe(&agent).await;
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(MigrateResponse {
+                    success: false,
+                    message: msg,
+                    write_version: wv,
+                    use_version: uv,
+                    sync_log_version: slv,
+                }),
+            )
+        }
+    }
+}
+
+/// `GET /v1/migrate/status` — query the current migration state.
+#[cfg(feature = "running_in_antithesis")]
+#[tracing::instrument(skip_all)]
+pub async fn api_v1_migrate_status(
+    Extension(agent): Extension<Agent>,
+) -> (StatusCode, axum::Json<MigrateStatus>) {
+    let conn = match agent.pool().read().await {
+        Ok(c) => c,
+        Err(_e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(MigrateStatus {
+                    write_version: 0,
+                    use_version: 0,
+                    sync_log_version: 0,
+                    migration_complete: false,
+                    cleanup_complete: false,
+                    pending_maintenance: false,
+                }),
+            );
+        }
+    };
+
+    let result = block_in_place(|| {
+        let write_version: i64 = conn
+            .prepare_cached("SELECT crsql_config_get('metadata-write-version')")?
+            .query_row([], |row| row.get(0))?;
+        let use_version: i64 = conn
+            .prepare_cached("SELECT crsql_config_get('metadata-use-version')")?
+            .query_row([], |row| row.get(0))?;
+        let sync_log_version: i64 = conn
+            .prepare_cached("SELECT crsql_config_get('sync-log-version')")?
+            .query_row([], |row| row.get(0))?;
+
+        // Check for pending migration markers
+        let migration_pending: i64 = conn
+            .prepare_cached(
+                "SELECT count(*) FROM crsql_master \
+                 WHERE key LIKE 'migration_v1_to_v2_migration_%'",
+            )?
+            .query_row([], |row| row.get(0))?;
+
+        // Check for pending cleanup markers
+        let cleanup_pending: i64 = conn
+            .prepare_cached(
+                "SELECT count(*) FROM crsql_master \
+                 WHERE key LIKE 'cleanup_v1_tables_%' OR key LIKE 'cleanup_v2_tables_%'",
+            )?
+            .query_row([], |row| row.get(0))?;
+
+        Ok::<_, rusqlite::Error>((
+            write_version,
+            use_version,
+            sync_log_version,
+            migration_pending == 0,
+            cleanup_pending == 0,
+            migration_pending > 0 || cleanup_pending > 0,
+        ))
+    });
+
+    match result {
+        Ok((wv, uv, slv, mig_done, cleanup_done, pending)) => (
+            StatusCode::OK,
+            axum::Json(MigrateStatus {
+                write_version: wv,
+                use_version: uv,
+                sync_log_version: slv,
+                migration_complete: mig_done,
+                cleanup_complete: cleanup_done,
+                pending_maintenance: pending,
+            }),
+        ),
+        Err(e) => {
+            error!(error = %e, "could not read migration status");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(MigrateStatus {
+                    write_version: 0,
+                    use_version: 0,
+                    sync_log_version: 0,
+                    migration_complete: false,
+                    cleanup_complete: false,
+                    pending_maintenance: false,
+                }),
+            )
+        }
+    }
+}
+
+/// Best-effort read of metadata versions for error responses.
+#[cfg(feature = "running_in_antithesis")]
+async fn read_versions_safe(agent: &Agent) -> (i64, i64, i64) {
+    let conn = match agent.pool().read().await {
+        Ok(c) => c,
+        Err(_) => return (0, 0, 0),
+    };
+    block_in_place(|| {
+        let wv = conn
+            .prepare_cached("SELECT crsql_config_get('metadata-write-version')")
+            .and_then(|mut s| s.query_row([], |row| row.get(0)))
+            .unwrap_or(0);
+        let uv = conn
+            .prepare_cached("SELECT crsql_config_get('metadata-use-version')")
+            .and_then(|mut s| s.query_row([], |row| row.get(0)))
+            .unwrap_or(0);
+        let slv = conn
+            .prepare_cached("SELECT crsql_config_get('sync-log-version')")
+            .and_then(|mut s| s.query_row([], |row| row.get(0)))
+            .unwrap_or(0);
+        (wv, uv, slv)
+    })
 }
 
 #[cfg(test)]

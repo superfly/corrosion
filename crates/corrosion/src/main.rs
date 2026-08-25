@@ -670,6 +670,13 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
             conn.send_command(corro_admin::Command::Log(corro_admin::LogCommand::Reset))
                 .await?;
         }
+        Command::Migrate(MigrateCommand::Status) => {
+            let mut conn = AdminConn::connect(cli.admin_path()).await?;
+            conn.send_command(corro_admin::Command::Migrate(
+                corro_admin::MigrateCommand::Status,
+            ))
+            .await?;
+        }
     }
 
     Ok(())
@@ -854,6 +861,10 @@ enum Command {
     /// Log related commands
     #[command(subcommand)]
     Log(LogCommand),
+
+    /// Crsqlite metadata migration commands (read-only)
+    #[command(subcommand)]
+    Migrate(MigrateCommand),
 }
 
 #[derive(Subcommand)]
@@ -978,4 +989,10 @@ enum LogCommand {
     Set { filter: String },
     /// Reset the log filter to default
     Reset,
+}
+
+#[derive(Subcommand)]
+enum MigrateCommand {
+    /// Show the current crsqlite metadata migration status
+    Status,
 }

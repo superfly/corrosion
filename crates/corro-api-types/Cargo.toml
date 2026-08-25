@@ -21,3 +21,6 @@ speedy = { workspace = true }
 strum = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+
+[features]
+running_in_antithesis = []

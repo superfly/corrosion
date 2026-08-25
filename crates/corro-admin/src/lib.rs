@@ -116,6 +116,14 @@ pub enum Command {
     Log(LogCommand),
     Reload,
     ReloadDicts,
+    Migrate(MigrateCommand),
+}
+
+/// Read-only migration status command.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum MigrateCommand {
+    /// Query the current crsqlite metadata version state.
+    Status,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -702,6 +710,60 @@ async fn handle_conn(
                         }
                     }
                 },
+                Command::Migrate(MigrateCommand::Status) => {
+                    let conn = match agent.pool().read().await {
+                        Ok(c) => c,
+                        Err(e) => {
+                            send_error(&mut stream, e).await;
+                            continue;
+                        }
+                    };
+
+                    let result = block_in_place(|| {
+                        let write_version: i64 = conn
+                            .prepare_cached("SELECT crsql_config_get('metadata-write-version')")?
+                            .query_row([], |row| row.get(0))?;
+                        let use_version: i64 = conn
+                            .prepare_cached("SELECT crsql_config_get('metadata-use-version')")?
+                            .query_row([], |row| row.get(0))?;
+                        let sync_log_version: i64 = conn
+                            .prepare_cached("SELECT crsql_config_get('sync-log-version')")?
+                            .query_row([], |row| row.get(0))?;
+
+                        let migration_pending: i64 = conn
+                            .prepare_cached(
+                                "SELECT count(*) FROM crsql_master \
+                                 WHERE key LIKE 'migration_v1_to_v2_migration_%'",
+                            )?
+                            .query_row([], |row| row.get(0))?;
+
+                        let cleanup_pending: i64 = conn
+                            .prepare_cached(
+                                "SELECT count(*) FROM crsql_master \
+                                 WHERE key LIKE 'cleanup_v1_tables_%' OR key LIKE 'cleanup_v2_tables_%'",
+                            )?
+                            .query_row([], |row| row.get(0))?;
+
+                        Ok::<_, rusqlite::Error>(json!({
+                            "write_version": write_version,
+                            "use_version": use_version,
+                            "sync_log_version": sync_log_version,
+                            "migration_complete": migration_pending == 0,
+                            "cleanup_complete": cleanup_pending == 0,
+                            "pending_maintenance": migration_pending > 0 || cleanup_pending > 0,
+                        }))
+                    });
+
+                    match result {
+                        Ok(json_val) => {
+                            send(&mut stream, Response::Json(json_val)).await;
+                            send_success(&mut stream).await;
+                        }
+                        Err(e) => {
+                            send_error(&mut stream, e).await;
+                        }
+                    }
+                }
             },
             Ok(None) => {
                 debug!("done with admin conn");

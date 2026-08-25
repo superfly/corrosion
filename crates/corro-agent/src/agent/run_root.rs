@@ -7,6 +7,7 @@ use crate::{
     agent::{
         handlers::{self, spawn_handle_db_maintenance},
         metrics,
+        migrator::spawn_migrator,
         reaper::spawn_reaper,
         setup, util, AgentOptions,
     },
@@ -202,6 +203,10 @@ async fn run(
     if let Err(e) = spawn_reaper(&agent, tripwire.clone()) {
         error!("could not spawn reaper: {e}");
     }
+
+    // Spawn the crsqlite metadata migrator. It is a no-op when there are
+    // no pending migration/cleanup tasks, so it is always safe to run.
+    spawn_migrator(&agent, tripwire.clone());
 
     info!("Starting peer API on udp/{gossip_addr} (QUIC)");
 
