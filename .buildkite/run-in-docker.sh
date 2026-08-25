@@ -19,6 +19,7 @@ docker run --rm -t \
     -e BUILDKITE_MESSAGE="${BUILDKITE_MESSAGE}" \
     -e BUILDKITE_BUILD_URL="${BUILDKITE_BUILD_URL}" \
     -e BUILDKITE_ANALYTICS_TOKEN="${BUILDKITE_ANALYTICS_TOKEN}" \
+    -e CORRO_TEST_V2="${CORRO_TEST_V2:-}" \
     -e SSH_AUTH_SOCK=/ssh-agent \
     -v "${SSH_AUTH_SOCK}:/ssh-agent" \
 		-v "${PWD}:/build_dir" \

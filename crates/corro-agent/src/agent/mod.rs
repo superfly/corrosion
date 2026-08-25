@@ -9,6 +9,7 @@ mod bootstrap;
 mod error;
 mod handlers;
 mod metrics;
+mod migrator;
 mod reaper;
 mod run_root;
 mod setup;

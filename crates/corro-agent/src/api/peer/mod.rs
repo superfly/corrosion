@@ -12,12 +12,14 @@ use corro_types::base::{CrsqlDbVersion, CrsqlDbVersionRange, CrsqlSeq, CrsqlSeqR
 use corro_types::broadcast::{
     BiPayload, BiPayloadV1, ChangeSource, ChangeV1, Changeset, Timestamp,
 };
-use corro_types::change::{row_to_change, Change, ChunkedChanges, MAX_CHANGES_BYTE_SIZE};
+use corro_types::change::{
+    row_to_change, row_to_packed_change, Change, ChunkedChanges, ChunkedPackedChanges,
+    PackedChange, SqliteValue,
+};
 use corro_types::config::GossipConfig;
 use corro_types::sync::{
-    generate_sync, SyncMessage, SyncMessageEncodeError, SyncMessageV1, SyncNeedV1,
-    SyncNeedValidationError, SyncRejectionV1, SyncRequestV1, SyncStateV1, SyncStateValidationError,
-    SyncTraceContextV1,
+    generate_sync, SyncMessage, SyncMessageEncodeError, SyncMessageV1, SyncNeedV1, SyncRejectionV1,
+    SyncRequestV1, SyncStateV1, SyncStateValidationError, SyncTraceContextV1,
 };
 use eyre::{ContextCompat, WrapErr};
 use futures::stream::FuturesUnordered;
@@ -58,9 +60,9 @@ pub enum SyncError {
     #[error(transparent)]
     Rejection(#[from] SyncRejectionV1),
     #[error(transparent)]
-    Transport(#[from] TransportError),
-    #[error(transparent)]
     InvalidState(#[from] SyncStateValidationError),
+    #[error(transparent)]
+    Transport(#[from] TransportError),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -375,6 +377,7 @@ impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
     }
 }
 
+const MAX_CHANGES_BYTES_PER_MESSAGE: usize = 8 * 1024;
 const MIN_CHANGES_BYTES_PER_MESSAGE: usize = 1024;
 
 const ADAPT_CHUNK_SIZE_THRESHOLD: Duration = Duration::from_millis(500);
@@ -386,7 +389,6 @@ fn handle_need(
     need: SyncNeedV1,
     sender: &Sender<SyncMessage>,
 ) -> eyre::Result<()> {
-    need.validate()?;
     debug!(%actor_id, "handle known versions! need: {need:?}");
 
     let mut empties: RangeInclusiveSet<CrsqlDbVersion> = RangeInclusiveSet::new();
@@ -396,6 +398,12 @@ fn handle_need(
     let tx = conn.transaction()?;
     let timeout = Some(Duration::from_secs(60));
     let tx = InterruptibleTransaction::new(tx, timeout, "handle_need");
+
+    // Check if V2 packed wire mode is enabled (sync-log-version = 2)
+    let sync_log_version: i64 = tx
+        .prepare_cached("SELECT crsql_config_get('sync-log-version')")?
+        .query_row([], |row| row.get(0))?;
+    let is_packed = sync_log_version == 2;
 
     let mut prepped = tx.prepare_cached(
         "
@@ -431,9 +439,16 @@ fn handle_need(
 
                 unprocessed.remove(version..=version);
 
-                let last_seq: CrsqlSeq = row.get(1)?;
+                // In V2 packed mode, `seq` is a BLOB (packed varints), so
+                // MAX(seq) returns a BLOB. Read as SqliteValue and unpack.
+                let last_seq: CrsqlSeq = if is_packed {
+                    let seq_val: SqliteValue = row.get(1)?;
+                    PackedChange::compute_max_seq(&seq_val)
+                } else {
+                    row.get(1)?
+                };
                 let ts: Timestamp = row.get(2)?;
-                debug!(%actor_id, ?version, %ts, "not empty");
+                debug!(%actor_id, ?version, ?last_seq, %ts, "not empty");
 
                 let mut prepped = tx.prepare_cached(
                     r#"
@@ -445,24 +460,55 @@ fn handle_need(
                     "#,
                 )?;
 
-                let rows = prepped.query_map(
-                    named_params! {
-                        ":actor_id": actor_id,
-                        ":version": version
-                    },
-                    row_to_change,
-                )?;
+                if is_packed {
+                    let rows = prepped.query_map(
+                        named_params! {
+                            ":actor_id": actor_id,
+                            ":version": version
+                        },
+                        row_to_packed_change,
+                    )?;
 
-                debug!(%actor_id, ?version, ?last_seq, "not empty");
+                    debug!(%actor_id, ?version, ?last_seq, "not empty (v2packed)");
 
-                send_change_chunks(
-                    sender,
-                    ChunkedChanges::new(rows, CrsqlSeq(0), last_seq, MAX_CHANGES_BYTE_SIZE),
-                    actor_id,
-                    version,
-                    last_seq,
-                    ts,
-                )?;
+                    send_packed_change_chunks(
+                        sender,
+                        ChunkedPackedChanges::new(
+                            rows,
+                            CrsqlSeq(0),
+                            last_seq,
+                            MAX_CHANGES_BYTES_PER_MESSAGE,
+                        ),
+                        actor_id,
+                        version,
+                        last_seq,
+                        ts,
+                    )?;
+                } else {
+                    let rows = prepped.query_map(
+                        named_params! {
+                            ":actor_id": actor_id,
+                            ":version": version
+                        },
+                        row_to_change,
+                    )?;
+
+                    debug!(%actor_id, ?version, ?last_seq, "not empty");
+
+                    send_change_chunks(
+                        sender,
+                        ChunkedChanges::new(
+                            rows,
+                            CrsqlSeq(0),
+                            last_seq,
+                            MAX_CHANGES_BYTES_PER_MESSAGE,
+                        ),
+                        actor_id,
+                        version,
+                        last_seq,
+                        ts,
+                    )?;
+                }
             }
 
             // now process the last unprocessed in case we have partials
@@ -510,38 +556,72 @@ fn handle_need(
                         },|row| Ok((CrsqlSeqRange::new(row.get(0)?, row.get(1)?), row.get(2)?, row.get(3)?)))?.collect::<rusqlite::Result<Vec<(CrsqlSeqRange, CrsqlSeq, Timestamp)>>>()?;
 
                     for (range_needed, last_seq, ts) in seqs {
-                        let mut prepped = tx.prepare_cached(
-                            r#"
-                                SELECT "table", pk, cid, val, col_version, db_version, seq, site_id, cl
-                                    FROM __corro_buffered_changes
-                                    WHERE site_id = :actor_id
-                                        AND db_version = :db_version
-                                        AND seq BETWEEN :start_seq AND :end_seq
-                                    ORDER BY seq ASC
-                            "#,
-                        )?;
-
                         let start_seq = range_needed.start();
                         let end_seq = range_needed.end();
 
-                        let rows = prepped.query_map(
-                            named_params! {
-                                ":actor_id": actor_id,
-                                ":db_version": version,
-                                ":start_seq": start_seq,
-                                ":end_seq": end_seq
-                            },
-                            row_to_change,
+                        // Use min_seq/max_seq overlap instead of `seq BETWEEN`
+                        // (see explanation in the Partial -> None branch below).
+                        let mut prepped = tx.prepare_cached(
+                            r#"
+                            SELECT "table", pk, cid, val, col_version, db_version, seq, site_id, cl
+                                FROM __corro_buffered_changes
+                                WHERE site_id = :actor_id
+                                    AND db_version = :db_version
+                                    AND max_seq >= :start_seq
+                                    AND min_seq <= :end_seq
+                                ORDER BY seq ASC
+                            "#,
                         )?;
 
-                        send_change_chunks(
-                            sender,
-                            ChunkedChanges::new(rows, start_seq, end_seq, MAX_CHANGES_BYTE_SIZE),
-                            actor_id,
-                            version,
-                            last_seq,
-                            ts,
-                        )?;
+                        if is_packed {
+                            let rows = prepped.query_map(
+                                named_params! {
+                                    ":actor_id": actor_id,
+                                    ":db_version": version,
+                                    ":start_seq": start_seq,
+                                    ":end_seq": end_seq,
+                                },
+                                row_to_packed_change,
+                            )?;
+
+                            send_packed_change_chunks(
+                                sender,
+                                ChunkedPackedChanges::new(
+                                    rows,
+                                    start_seq,
+                                    end_seq,
+                                    MAX_CHANGES_BYTES_PER_MESSAGE,
+                                ),
+                                actor_id,
+                                version,
+                                last_seq,
+                                ts,
+                            )?;
+                        } else {
+                            let rows = prepped.query_map(
+                                named_params! {
+                                    ":actor_id": actor_id,
+                                    ":db_version": version,
+                                    ":start_seq": start_seq,
+                                    ":end_seq": end_seq
+                                },
+                                row_to_change,
+                            )?;
+
+                            send_change_chunks(
+                                sender,
+                                ChunkedChanges::new(
+                                    rows,
+                                    start_seq,
+                                    end_seq,
+                                    MAX_CHANGES_BYTES_PER_MESSAGE,
+                                ),
+                                actor_id,
+                                version,
+                                last_seq,
+                                ts,
+                            )?;
+                        }
                     }
                 }
             }
@@ -558,45 +638,81 @@ fn handle_need(
             match rows.next()? {
                 Some(row) => {
                     let version: CrsqlDbVersion = row.get(0)?;
-                    let last_seq: CrsqlSeq = row.get(1)?;
+                    // In V2 packed mode, `seq` is a BLOB (packed varints), so
+                    // MAX(seq) returns a BLOB. Read as SqliteValue and unpack.
+                    let last_seq: CrsqlSeq = if is_packed {
+                        let seq_val: SqliteValue = row.get(1)?;
+                        PackedChange::compute_max_seq(&seq_val)
+                    } else {
+                        row.get(1)?
+                    };
                     let ts: Timestamp = row.get(2)?;
                     trace!(%version, %last_seq, "got a row from crsql_change!");
 
                     for range_needed in seqs {
+                        // crsql_changes is a vtab: xBestIndex pushes `seq BETWEEN`
+                        // into the arm WHERE on the scalar source column `c.seq`
+                        // (before GROUP BY/packing), so this works in V2 packed mode.
                         let mut prepped = tx.prepare_cached(
                             r#"
-                                SELECT "table", pk, cid, val, col_version, db_version, seq, site_id, cl
-                                    FROM crsql_changes
-                                    WHERE site_id = :actor_id
-                                      AND db_version = :version
-                                      AND seq BETWEEN :start AND :end
-                                    ORDER BY seq ASC
+                            SELECT "table", pk, cid, val, col_version, db_version, seq, site_id, cl
+                                FROM crsql_changes
+                                WHERE site_id = :actor_id
+                                  AND db_version = :version
+                                  AND seq BETWEEN :start AND :end
+                                ORDER BY seq ASC
                             "#,
                         )?;
 
-                        let rows = prepped.query_map(
-                            named_params! {
-                                ":actor_id": actor_id,
-                                ":version": version,
-                                ":start": range_needed.start(),
-                                ":end": range_needed.end(),
-                            },
-                            row_to_change,
-                        )?;
+                        if is_packed {
+                            let rows = prepped.query_map(
+                                named_params! {
+                                    ":actor_id": actor_id,
+                                    ":version": version,
+                                    ":start": range_needed.start(),
+                                    ":end": range_needed.end(),
+                                },
+                                row_to_packed_change,
+                            )?;
 
-                        send_change_chunks(
-                            sender,
-                            ChunkedChanges::new(
-                                rows,
-                                range_needed.start(),
-                                range_needed.end(),
-                                MAX_CHANGES_BYTE_SIZE,
-                            ),
-                            actor_id,
-                            version,
-                            last_seq,
-                            ts,
-                        )?;
+                            send_packed_change_chunks(
+                                sender,
+                                ChunkedPackedChanges::new(
+                                    rows,
+                                    range_needed.start(),
+                                    range_needed.end(),
+                                    MAX_CHANGES_BYTES_PER_MESSAGE,
+                                ),
+                                actor_id,
+                                version,
+                                last_seq,
+                                ts,
+                            )?;
+                        } else {
+                            let rows = prepped.query_map(
+                                named_params! {
+                                    ":actor_id": actor_id,
+                                    ":version": version,
+                                    ":start": range_needed.start(),
+                                    ":end": range_needed.end(),
+                                },
+                                row_to_change,
+                            )?;
+
+                            send_change_chunks(
+                                sender,
+                                ChunkedChanges::new(
+                                    rows,
+                                    range_needed.start(),
+                                    range_needed.end(),
+                                    MAX_CHANGES_BYTES_PER_MESSAGE,
+                                ),
+                                actor_id,
+                                version,
+                                last_seq,
+                                ts,
+                            )?;
+                        }
                     }
                 }
                 None => {
@@ -679,46 +795,81 @@ fn handle_need(
                             trace!(%version, ?seqs, "got some partial seqs!");
 
                             for (range_needed, last_seq, ts) in seqs {
-                                let mut prepped = tx.prepare_cached(
-                                r#"
-                                    SELECT "table", pk, cid, val, col_version, db_version, seq, site_id, cl
-                                        FROM __corro_buffered_changes
-                                        WHERE site_id = :actor_id
-                                            AND db_version = :version
-                                            AND seq BETWEEN :start_seq AND :end_seq
-                                        ORDER BY seq ASC
-                                "#,
-                            )?;
-
                                 // scope query to only the sequences we have
                                 let start_seq = cmp::max(range_needed.start(), seqs_range.start());
                                 let end_seq = cmp::min(range_needed.end(), seqs_range.end());
 
-                                trace!(%version, %start_seq, %end_seq, "getting seq range from crsql_changes");
+                                trace!(%version, %start_seq, %end_seq, "getting seq range from buffered changes");
 
-                                let rows = prepped.query_map(
-                                    named_params! {
-                                        ":actor_id": actor_id,
-                                        ":version": version,
-                                        ":start_seq": start_seq,
-                                        ":end_seq": end_seq
-                                    },
-                                    row_to_change,
-                                )?;
+                                // Use min_seq/max_seq overlap instead of `seq BETWEEN`:
+                                // in V2 packed mode, `seq` is a packed BLOB so `seq BETWEEN`
+                                // (BLOB vs INTEGER) is always false. The min_seq/max_seq
+                                // columns are scalar INTEGERs extracted at insert time,
+                                // so the overlap query works for both V1 and V2.
+                                // This is an over-approximation (a packed row may not
+                                // contain every seq in [min_seq, max_seq]), but the
+                                // receiver deduplicates via ON CONFLICT DO NOTHING.
+                                let mut prepped = tx.prepare_cached(
+                                    r#"
+                                    SELECT "table", pk, cid, val, col_version, db_version, seq, site_id, cl
+                                        FROM __corro_buffered_changes
+                                        WHERE site_id = :actor_id
+                                            AND db_version = :version
+                                            AND max_seq >= :start_seq
+                                            AND min_seq <= :end_seq
+                                        ORDER BY seq ASC
+                                    "#,
+                            )?;
 
-                                send_change_chunks(
-                                    sender,
-                                    ChunkedChanges::new(
-                                        rows,
-                                        start_seq,
-                                        end_seq,
-                                        MAX_CHANGES_BYTE_SIZE,
-                                    ),
-                                    actor_id,
-                                    version,
-                                    last_seq,
-                                    ts,
-                                )?;
+                                if is_packed {
+                                    let rows = prepped.query_map(
+                                        named_params! {
+                                            ":actor_id": actor_id,
+                                            ":version": version,
+                                            ":start_seq": start_seq,
+                                            ":end_seq": end_seq,
+                                        },
+                                        row_to_packed_change,
+                                    )?;
+
+                                    send_packed_change_chunks(
+                                        sender,
+                                        ChunkedPackedChanges::new(
+                                            rows,
+                                            start_seq,
+                                            end_seq,
+                                            MAX_CHANGES_BYTES_PER_MESSAGE,
+                                        ),
+                                        actor_id,
+                                        version,
+                                        last_seq,
+                                        ts,
+                                    )?;
+                                } else {
+                                    let rows = prepped.query_map(
+                                        named_params! {
+                                            ":actor_id": actor_id,
+                                            ":version": version,
+                                            ":start_seq": start_seq,
+                                            ":end_seq": end_seq,
+                                        },
+                                        row_to_change,
+                                    )?;
+
+                                    send_change_chunks(
+                                        sender,
+                                        ChunkedChanges::new(
+                                            rows,
+                                            start_seq,
+                                            end_seq,
+                                            MAX_CHANGES_BYTES_PER_MESSAGE,
+                                        ),
+                                        actor_id,
+                                        version,
+                                        last_seq,
+                                        ts,
+                                    )?;
+                                }
                             }
                         }
                     }
@@ -809,13 +960,73 @@ fn send_change_chunks<I: Iterator<Item = rusqlite::Result<Change>>>(
     Ok(())
 }
 
-fn validate_sync_needs(
-    requests: &[(ActorId, Vec<SyncNeedV1>)],
-) -> Result<(), SyncNeedValidationError> {
-    requests
-        .iter()
-        .flat_map(|(_, needs)| needs)
-        .try_for_each(SyncNeedV1::validate)
+fn send_packed_change_chunks<I: Iterator<Item = rusqlite::Result<PackedChange>>>(
+    sender: &Sender<SyncMessage>,
+    mut chunked: ChunkedPackedChanges<I>,
+    actor_id: ActorId,
+    version: CrsqlDbVersion,
+    last_seq: CrsqlSeq,
+    ts: Timestamp,
+) -> eyre::Result<()> {
+    let mut max_buf_size = chunked.max_buf_size();
+    let mut total_rows_sent = 0usize;
+    loop {
+        if sender.is_closed() {
+            eyre::bail!("sync message sender channel is closed");
+        }
+        match chunked.next() {
+            Some(Ok((changes, seqs))) => {
+                let start = Instant::now();
+                let chunk_rows: usize = changes.count().values().sum();
+                total_rows_sent += chunk_rows;
+
+                if changes.is_empty() && seqs.start() == CrsqlSeq(0) && seqs.end() == last_seq {
+                    warn!(%actor_id, %version, "got an empty packed changes we should've had");
+                    return Ok(());
+                } else {
+                    sender.blocking_send(SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
+                        actor_id,
+                        changeset: Changeset::FullV2Packed {
+                            actor_id,
+                            version,
+                            changes,
+                            seqs,
+                            last_seq,
+                            ts,
+                        },
+                    })))?;
+                }
+
+                let elapsed = start.elapsed();
+
+                if elapsed > Duration::from_secs(5) {
+                    eyre::bail!("time out: peer is too slow");
+                }
+
+                if elapsed > ADAPT_CHUNK_SIZE_THRESHOLD {
+                    if max_buf_size <= MIN_CHANGES_BYTES_PER_MESSAGE {
+                        eyre::bail!("time out: peer is too slow even after reducing throughput");
+                    }
+
+                    max_buf_size /= 2;
+                    debug!("adapting max chunk size to {max_buf_size} bytes");
+
+                    chunked.set_max_buf_size(max_buf_size);
+                }
+            }
+            Some(Err(e)) => {
+                error!(%actor_id, %version, "could not process packed changes to send via sync: {e}");
+                break;
+            }
+            None => {
+                break;
+            }
+        }
+    }
+
+    debug!(%actor_id, %version, "send_packed_change_chunks: sent {total_rows_sent} rows, last_seq={last_seq}");
+
+    Ok(())
 }
 
 async fn process_sync(
@@ -866,8 +1077,6 @@ async fn process_sync(
                     .into_iter()
                     .map(|(actor_id, reqs)| (actor_id, reqs.flat_map(|(_, reqs)| reqs).collect()))
                     .collect::<Vec<(ActorId, Vec<SyncNeedV1>)>>();
-
-                validate_sync_needs(&agg)?;
 
                 for (actor_id, needs) in agg {
                     let booked = bookie.get(&actor_id);
@@ -1732,8 +1941,7 @@ mod tests {
         api::{ColumnName, TableName},
         broadcast::ChangesetPerTable,
         config::{
-            BroadcastConfig, CompressionConfig, Config, TlsClientConfig, TlsConfig,
-            DEFAULT_GOSSIP_CLIENT_ADDR,
+            CompressionConfig, Config, TlsClientConfig, TlsConfig, DEFAULT_GOSSIP_CLIENT_ADDR,
         },
         pubsub::pack_columns,
         tls::{generate_ca, generate_client_cert, generate_server_cert},
@@ -1749,36 +1957,6 @@ mod tests {
     };
 
     use super::*;
-
-    #[test]
-    fn range_validation_checks_all_direct_needs_before_processing() {
-        let actor_id = ActorId(uuid::Uuid::new_v4());
-        let other_actor_id = ActorId(uuid::Uuid::new_v4());
-        let requests = vec![
-            (
-                actor_id,
-                vec![SyncNeedV1::Full {
-                    versions: dbvr!(5, 5),
-                }],
-            ),
-            (
-                other_actor_id,
-                vec![SyncNeedV1::Full {
-                    versions: dbvr!(10, 5),
-                }],
-            ),
-        ];
-
-        assert_eq!(
-            validate_sync_needs(&requests),
-            Err(SyncNeedValidationError::InvertedFull {
-                start: CrsqlDbVersion(10),
-                end: CrsqlDbVersion(5),
-            })
-        );
-
-        assert!(validate_sync_needs(&requests[..1]).is_ok());
-    }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_sync_changes_order() -> eyre::Result<()> {
@@ -2492,7 +2670,7 @@ mod tests {
 
         let gossip_config = GossipConfig {
             bind_addr: "127.0.0.1:0".parse()?,
-            client_addr: None,
+            client_addr: Some(DEFAULT_GOSSIP_CLIENT_ADDR),
             client_addr_v4: None,
             client_addr_v6: None,
             external_addr: None,
@@ -2519,7 +2697,7 @@ mod tests {
                 dict_dir: None,
                 dict_file: None,
             }),
-            broadcast: BroadcastConfig::Gossip,
+            broadcast: Default::default(),
         };
 
         let server = gossip_server_endpoint(&gossip_config).await?;

@@ -1,0 +1,372 @@
+{
+  "title": "Corrosion crsqlite 0.17-0.18 Migration",
+  "tags": ["corrosion", "migration", "crsqlite"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "templating": {
+    "list": [
+      {
+        "name": "region",
+        "type": "query",
+        "datasource": {"uid": "h7hN5daMz", "type": "prometheus"},
+        "query": "label_values(corro_migrator_metadata_write_version, region)",
+        "refresh": 2,
+        "includeAll": true,
+        "multi": true,
+        "current": {"text": "All", "value": "$__all"}
+      },
+      {
+        "name": "instance",
+        "type": "query",
+        "datasource": {"uid": "h7hN5daMz", "type": "prometheus"},
+        "query": "label_values(corro_migrator_metadata_write_version{region=~\"$region\"}, instance)",
+        "refresh": 2,
+        "includeAll": true,
+        "multi": true,
+        "current": {"text": "All", "value": "$__all"}
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1, "type": "row", "title": "Migration Progress",
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 0},
+      "collapsed": false, "panels": []
+    },
+    {
+      "id": 2, "type": "stat", "title": "Metadata Write Version",
+      "datasource": {"uid": "h7hN5daMz", "type": "prometheus"},
+      "gridPos": {"h": 6, "w": 4, "x": 0, "y": 1},
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {"steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 2}, {"color": "blue", "value": 3}]},
+          "mappings": [{"type": "value", "options": {"1": {"text": "V1", "color": "green"}, "2": {"text": "Dual-Write", "color": "yellow"}, "3": {"text": "V2-Only", "color": "blue"}}}]
+        }
+      },
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"], "values": false}, "orientation": "horizontal", "textMode": "auto"},
+      "targets": [{"expr": "corro_migrator_metadata_write_version{region=~\"$region\",instance=~\"$instance\"}", "legendFormat": "{{region}}/{{instance}}", "refId": "A"}]
+    },
+    {
+      "id": 3, "type": "stat", "title": "Metadata Use Version",
+      "datasource": {"uid": "h7hN5daMz", "type": "prometheus"},
+      "gridPos": {"h": 6, "w": 4, "x": 4, "y": 1},
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {"steps": [{"color": "green", "value": null}, {"color": "blue", "value": 2}]},
+          "mappings": [{"type": "value", "options": {"1": {"text": "V1", "color": "green"}, "2": {"text": "V2", "color": "blue"}}}]
+        }
+      },
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"], "values": false}, "orientation": "horizontal", "textMode": "auto"},
+      "targets": [{"expr": "corro_migrator_metadata_use_version{region=~\"$region\",instance=~\"$instance\"}", "legendFormat": "{{region}}/{{instance}}", "refId": "A"}]
+    },
+    {
+      "id": 4, "type": "stat", "title": "Sync Log (Wire) Version",
+      "datasource": {"uid": "h7hN5daMz", "type": "prometheus"},
+      "gridPos": {"h": 6, "w": 4, "x": 8, "y": 1},
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {"steps": [{"color": "green", "value": null}, {"color": "blue", "value": 2}]},
+          "mappings": [{"type": "value", "options": {"1": {"text": "V1 Wire", "color": "green"}, "2": {"text": "V2 Wire", "color": "blue"}}}]
+        }
+      },
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"], "values": false}, "orientation": "horizontal", "textMode": "auto"},
+      "targets": [{"expr": "corro_migrator_sync_log_version{region=~\"$region\",instance=~\"$instance\"}", "legendFormat": "{{region}}/{{instance}}", "refId": "A"}]
+    },
+    {
+      "id": 5, "type": "stat", "title": "Nodes on V1 (write=1)",
+      "datasource": {"uid": "h7hN5daMz", "type": "prometheus"},
+      "gridPos": {"h": 6, "w": 4, "x": 12, "y": 1},
+      "fieldConfig": {"defaults": {"thresholds": {"steps": [{"color": "blue", "value": null}, {"color": "yellow", "value": 1}, {"color": "red", "value": 5}]}}},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"], "values": false}, "textMode": "auto"},
+      "targets": [{"expr": "count(corro_migrator_metadata_write_version == 1)", "refId": "A"}]
+    },
+    {
+      "id": 6, "type": "stat", "title": "Nodes on Dual-Write (write=2)",
+      "datasource": {"uid": "h7hN5daMz", "type": "prometheus"},
+      "gridPos": {"h": 6, "w": 4, "x": 16, "y": 1},
+      "fieldConfig": {"defaults": {"thresholds": {"steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 1}, {"color": "orange", "value": 5}]}}},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"], "values": false}, "textMode": "auto"},
+      "targets": [{"expr": "count(corro_migrator_metadata_write_version == 2)", "refId": "A"}]
+    },
+    {
+      "id": 7, "type": "stat", "title": "Nodes on V2-Only (write=3)",
+      "datasource": {"uid": "h7hN5daMz", "type": "prometheus"},
+      "gridPos": {"h": 6, "w": 4, "x": 20, "y": 1},
+      "fieldConfig": {"defaults": {"thresholds": {"steps": [{"color": "green", "value": null}, {"color": "blue", "value": 1}]}}},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"], "values": false}, "textMode": "auto"},
+      "targets": [{"expr": "count(corro_migrator_metadata_write_version == 3)", "refId": "A"}]
+    },
+    {
+      "id": 10, "type": "timeseries", "title": "Migration Work Remaining",
+      "datasource": {"uid": "h7hN5daMz", "type": "prometheus"},
+      "gridPos": {"h": 8, "w": 8, "x": 0, "y": 7},
+      "fieldConfig": {"defaults": {"unit": "short"}},
+      "options": {"legend": {"displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"]}},
+      "targets": [{"expr": "corro_migrator_remaining{region=~\"$region\",instance=~\"$instance\"}", "legendFormat": "{{region}}/{{instance}}", "refId": "A"}]
+    },
+    {
+      "id": 11, "type": "timeseries", "title": "Pending Migration & Cleanup Tables",
+      "datasource": {"uid": "h7hN5daMz", "type": "prometheus"},
+      "gridPos": {"h": 8, "w": 8, "x": 8, "y": 7},
+      "fieldConfig": {"defaults": {"unit": "short"}},
+      "options": {"legend": {"displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull"]}},
+      "targets": [
+        {"expr": "corro_migrator_migration_pending_tables{region=~\"$region\",instance=~\"$instance\"}", "legendFormat": "migration - {{region}}/{{instance}}", "refId": "A"},
+        {"expr": "corro_migrator_cleanup_v1_pending_tables{region=~\"$region\",instance=~\"$instance\"}", "legendFormat": "V1 cleanup - {{region}}/{{instance}}", "refId": "B"},
+        {"expr": "corro_migrator_cleanup_v2_pending_tables{region=~\"$region\",instance=~\"$instance\"}", "legendFormat": "V2 cleanup - {{region}}/{{instance}}", "refId": "C"}
+      ]
+    },
+    {
+      "id": 12, "type": "timeseries", "title": "Per-Table Migration Remaining",
+      "datasource": {"uid": "h7hN5daMz", "type": "prometheus"},
+      "gridPos": {"h": 8, "w": 8, "x": 16, "y": 7},
+      "fieldConfig": {"defaults": {"unit": "short"}},
+      "options": {"legend": {"displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull"]}},
+      "targets": [{"expr": "corro_migrator_migration_table_remaining{region=~\"$region\",instance=~\"$instance\"}", "legendFormat": "{{table}} - {{region}}/{{instance}}", "refId": "A"}]
+    },
+    {
+      "id": 13, "type": "timeseries", "title": "Migration Step Duration (p99/p50)",
+      "datasource": {"uid": "h7hN5daMz", "type": "prometheus"},
+      "gridPos": {"h": 7, "w": 8, "x": 0, "y": 15},
+      "fieldConfig": {"defaults": {"unit": "s"}},
+      "options": {"legend": {"displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"]}},
+      "targets": [
+        {"expr": "histogram_quantile(0.99, sum(rate(corro_migrator_step_seconds_bucket{region=~\"$region\",instance=~\"$instance\"}[5m])) by (le, region))", "legendFormat": "p99 - {{region}}", "refId": "A"},
+        {"expr": "histogram_quantile(0.50, sum(rate(corro_migrator_step_seconds_bucket{region=~\"$region\",instance=~\"$instance\"}[5m])) by (le, region))", "legendFormat": "p50 - {{region}}", "refId": "B"}
+      ]
+    },
+    {
+      "id": 14, "type": "timeseries", "title": "Migration Steps & Errors Rate",
+      "datasource": {"uid": "h7hN5daMz", "type": "prometheus"},
+      "gridPos": {"h": 7, "w": 8, "x": 8, "y": 15},
+      "fieldConfig": {"defaults": {"unit": "ops"}},
+      "options": {"legend": {"displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull"]}},
+      "targets": [
+        {"expr": "sum(rate(corro_migrator_steps_total{region=~\"$region\",instance=~\"$instance\"}[5m])) by (region)", "legendFormat": "steps/s - {{region}}", "refId": "A"},
+        {"expr": "sum(rate(corro_migrator_errors_total{region=~\"$region\",instance=~\"$instance\"}[5m])) by (region)", "legendFormat": "errors/s - {{region}}", "refId": "B"}
+      ]
+    },
+    {
+      "id": 15, "type": "timeseries", "title": "Per-Table Migration Done vs Total",
+      "datasource": {"uid": "h7hN5daMz", "type": "prometheus"},
+      "gridPos": {"h": 7, "w": 8, "x": 16, "y": 15},
+      "fieldConfig": {"defaults": {"unit": "short"}},
+      "options": {"legend": {"displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull"]}},
+      "targets": [
+        {"expr": "corro_migrator_migration_table_done{region=~\"$region\",instance=~\"$instance\"}", "legendFormat": "done - {{table}}", "refId": "A"},
+        {"expr": "corro_migrator_migration_table_total{region=~\"$region\",instance=~\"$instance\"}", "legendFormat": "total - {{table}}", "refId": "B"}
+      ]
+    },
+    {
+      "id": 20, "type": "row", "title": "Change Processing & Sync Health",
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 22},
+      "collapsed": false, "panels": []
+    },
+    {
+      "id": 21, "type": "timeseries", "title": "Change Processing Latency (p99)",
+      "datasource": {"uid": "h7hN5daMz", "type": "prometheus"},
+      "gridPos": {"h": 8, "w": 8, "x": 0, "y": 23},
+      "fieldConfig": {"defaults": {"unit": "s"}},
+      "options": {"legend": {"displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"]}},
+      "targets": [{"expr": "histogram_quantile(0.99, sum(rate(corro_agent_changes_processing_time_seconds_bucket{region=~\"$region\",instance=~\"$instance\"}[5m])) by (le, source, region))", "legendFormat": "p99 {{source}} - {{region}}", "refId": "A"}]
+    },
+    {
+      "id": 22, "type": "timeseries", "title": "Changes Committed Rate",
+      "datasource": {"uid": "h7hN5daMz", "type": "prometheus"},
+      "gridPos": {"h": 8, "w": 8, "x": 8, "y": 23},
+      "fieldConfig": {"defaults": {"unit": "ops"}},
+      "options": {"legend": {"displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull"]}},
+      "targets": [{"expr": "sum(rate(corro_changes_committed_total{region=~\"$region\",instance=~\"$instance\"}[5m])) by (source, region)", "legendFormat": "{{source}} - {{region}}", "refId": "A"}]
+    },
+    {
+      "id": 23, "type": "timeseries", "title": "Change Queue Depth",
+      "datasource": {"uid": "h7hN5daMz", "type": "prometheus"},
+      "gridPos": {"h": 8, "w": 8, "x": 16, "y": 23},
+      "fieldConfig": {"defaults": {"unit": "short"}},
+      "options": {"legend": {"displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"]}},
+      "targets": [
+        {"expr": "corro_agent_changes_in_queue{region=~\"$region\",instance=~\"$instance\"}", "legendFormat": "changes - {{region}}/{{instance}}", "refId": "A"},
+        {"expr": "corro_agent_changesets_in_queue{region=~\"$region\",instance=~\"$instance\"}", "legendFormat": "changesets - {{region}}/{{instance}}", "refId": "B"}
+      ]
+    },
+    {
+      "id": 24, "type": "timeseries", "title": "Sync Changes Sent/Recv Rate",
+      "datasource": {"uid": "h7hN5daMz", "type": "prometheus"},
+      "gridPos": {"h": 7, "w": 8, "x": 0, "y": 31},
+      "fieldConfig": {"defaults": {"unit": "ops"}},
+      "options": {"legend": {"displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull"]}},
+      "targets": [
+        {"expr": "sum(rate(corro_sync_changes_sent_total{region=~\"$region\",instance=~\"$instance\"}[5m])) by (region)", "legendFormat": "sent - {{region}}", "refId": "A"},
+        {"expr": "sum(rate(corro_sync_changes_recv_total{region=~\"$region\",instance=~\"$instance\"}[5m])) by (region)", "legendFormat": "recv - {{region}}", "refId": "B"}
+      ]
+    },
+    {
+      "id": 25, "type": "timeseries", "title": "Broadcast Dropped & Rate Limited",
+      "datasource": {"uid": "h7hN5daMz", "type": "prometheus"},
+      "gridPos": {"h": 7, "w": 8, "x": 8, "y": 31},
+      "fieldConfig": {"defaults": {"unit": "ops"}},
+      "options": {"legend": {"displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull"]}},
+      "targets": [
+        {"expr": "sum(rate(corro_broadcast_dropped_total{region=~\"$region\",instance=~\"$instance\"}[5m])) by (region)", "legendFormat": "dropped - {{region}}", "refId": "A"},
+        {"expr": "sum(rate(corro_broadcast_rate_limited_total{region=~\"$region\",instance=~\"$instance\"}[5m])) by (region)", "legendFormat": "rate_limited - {{region}}", "refId": "B"}
+      ]
+    },
+    {
+      "id": 26, "type": "timeseries", "title": "Gossip Cluster Size & Members",
+      "datasource": {"uid": "h7hN5daMz", "type": "prometheus"},
+      "gridPos": {"h": 7, "w": 8, "x": 16, "y": 31},
+      "fieldConfig": {"defaults": {"unit": "short"}},
+      "options": {"legend": {"displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull"]}},
+      "targets": [
+        {"expr": "corro_gossip_cluster_size{region=~\"$region\",instance=~\"$instance\"}", "legendFormat": "cluster - {{region}}/{{instance}}", "refId": "A"},
+        {"expr": "corro_gossip_members{region=~\"$region\",instance=~\"$instance\"}", "legendFormat": "members - {{region}}/{{instance}}", "refId": "B"}
+      ]
+    },
+    {
+      "id": 30, "type": "row", "title": "DB Pool Utilization & Query Performance",
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 38},
+      "collapsed": false, "panels": []
+    },
+    {
+      "id": 31, "type": "timeseries", "title": "Read Pool Connections (Available / Waiting)",
+      "datasource": {"uid": "h7hN5daMz", "type": "prometheus"},
+      "gridPos": {"h": 7, "w": 8, "x": 0, "y": 39},
+      "fieldConfig": {"defaults": {"unit": "short"}},
+      "options": {"legend": {"displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"]}},
+      "targets": [
+        {"expr": "corro_sqlite_pool_read_connections_available{region=~\"$region\",instance=~\"$instance\"}", "legendFormat": "available - {{region}}/{{instance}}", "refId": "A"},
+        {"expr": "corro_sqlite_pool_read_connections_waiting{region=~\"$region\",instance=~\"$instance\"}", "legendFormat": "waiting - {{region}}/{{instance}}", "refId": "B"}
+      ]
+    },
+    {
+      "id": 32, "type": "timeseries", "title": "Write Pool Connections (Available / Waiting)",
+      "datasource": {"uid": "h7hN5daMz", "type": "prometheus"},
+      "gridPos": {"h": 7, "w": 8, "x": 8, "y": 39},
+      "fieldConfig": {"defaults": {"unit": "short"}},
+      "options": {"legend": {"displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"]}},
+      "targets": [
+        {"expr": "corro_sqlite_pool_write_connections_available{region=~\"$region\",instance=~\"$instance\"}", "legendFormat": "available - {{region}}/{{instance}}", "refId": "A"},
+        {"expr": "corro_sqlite_pool_write_connections_waiting{region=~\"$region\",instance=~\"$instance\"}", "legendFormat": "waiting - {{region}}/{{instance}}", "refId": "B"}
+      ]
+    },
+    {
+      "id": 33, "type": "timeseries", "title": "Write Permit Acquisition Time (p99)",
+      "datasource": {"uid": "h7hN5daMz", "type": "prometheus"},
+      "gridPos": {"h": 7, "w": 8, "x": 16, "y": 39},
+      "fieldConfig": {"defaults": {"unit": "s"}},
+      "options": {"legend": {"displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"]}},
+      "targets": [{"expr": "histogram_quantile(0.99, sum(rate(corro_sqlite_write_permit_acquisition_seconds_bucket{region=~\"$region\",instance=~\"$instance\"}[5m])) by (le, region))", "legendFormat": "p99 - {{region}}", "refId": "A"}]
+    },
+    {
+      "id": 34, "type": "timeseries", "title": "crsql_changes Data/Metadata Query Time (rate)",
+      "datasource": {"uid": "h7hN5daMz", "type": "prometheus"},
+      "gridPos": {"h": 7, "w": 12, "x": 0, "y": 46},
+      "fieldConfig": {"defaults": {"unit": "ms"}},
+      "options": {"legend": {"displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull"]}},
+      "targets": [
+        {"expr": "sum(rate(corro_db_crsql_changes_data_ms_total{region=~\"$region\",instance=~\"$instance\"}[5m])) by (region)", "legendFormat": "data ms/s - {{region}}", "refId": "A"},
+        {"expr": "sum(rate(corro_db_crsql_changes_metadata_ms_total{region=~\"$region\",instance=~\"$instance\"}[5m])) by (region)", "legendFormat": "metadata ms/s - {{region}}", "refId": "B"}
+      ]
+    },
+    {
+      "id": 35, "type": "timeseries", "title": "WAL Truncate Duration (p99)",
+      "datasource": {"uid": "h7hN5daMz", "type": "prometheus"},
+      "gridPos": {"h": 7, "w": 12, "x": 12, "y": 46},
+      "fieldConfig": {"defaults": {"unit": "s"}},
+      "options": {"legend": {"displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"]}},
+      "targets": [{"expr": "histogram_quantile(0.99, sum(rate(corro_db_wal_truncate_seconds_bucket{region=~\"$region\",instance=~\"$instance\"}[5m])) by (le, region))", "legendFormat": "p99 - {{region}}", "refId": "A"}]
+    },
+    {
+      "id": 40, "type": "row", "title": "Disk & DB Size",
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 53},
+      "collapsed": false, "panels": []
+    },
+    {
+      "id": 41, "type": "timeseries", "title": "Corrosion DB Size & WAL Size",
+      "datasource": {"uid": "h7hN5daMz", "type": "prometheus"},
+      "gridPos": {"h": 8, "w": 8, "x": 0, "y": 54},
+      "fieldConfig": {"defaults": {"unit": "bytes"}},
+      "options": {"legend": {"displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull"]}},
+      "targets": [
+        {"expr": "corro_db_size_bytes{region=~\"$region\",instance=~\"$instance\"}", "legendFormat": "db - {{region}}/{{instance}}", "refId": "A"},
+        {"expr": "corro_db_wal_size_bytes{region=~\"$region\",instance=~\"$instance\"}", "legendFormat": "wal - {{region}}/{{instance}}", "refId": "B"}
+      ]
+    },
+    {
+      "id": 42, "type": "timeseries", "title": "DB Free List Count",
+      "datasource": {"uid": "h7hN5daMz", "type": "prometheus"},
+      "gridPos": {"h": 8, "w": 8, "x": 8, "y": 54},
+      "fieldConfig": {"defaults": {"unit": "short"}},
+      "options": {"legend": {"displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"]}},
+      "targets": [{"expr": "corro_db_freelist_count{region=~\"$region\",instance=~\"$instance\"}", "legendFormat": "{{region}}/{{instance}}", "refId": "A"}]
+    },
+    {
+      "id": 43, "type": "timeseries", "title": "Disk Space Used / Total (Node Exporter)",
+      "datasource": {"uid": "h7hN5daMz", "type": "prometheus"},
+      "gridPos": {"h": 8, "w": 8, "x": 16, "y": 54},
+      "fieldConfig": {"defaults": {"unit": "bytes"}},
+      "options": {"legend": {"displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull"]}},
+      "targets": [
+        {"expr": "node_filesystem_size_bytes{mountpoint=\"/srv/corrosion\",region=~\"$region\"} - node_filesystem_free_bytes{mountpoint=\"/srv/corrosion\",region=~\"$region\"}", "legendFormat": "used - {{region}}/{{instance}}", "refId": "A"},
+        {"expr": "node_filesystem_size_bytes{mountpoint=\"/srv/corrosion\",region=~\"$region\"}", "legendFormat": "total - {{region}}/{{instance}}", "refId": "B"}
+      ]
+    },
+    {
+      "id": 44, "type": "timeseries", "title": "Disk Usage % (Node Exporter)",
+      "datasource": {"uid": "h7hN5daMz", "type": "prometheus"},
+      "gridPos": {"h": 7, "w": 12, "x": 0, "y": 62},
+      "fieldConfig": {"defaults": {"unit": "percent", "max": 100, "thresholds": {"steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 70}, {"color": "red", "value": 85}]}}},
+      "options": {"legend": {"displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"]}},
+      "targets": [{"expr": "100 * (1 - node_filesystem_free_bytes{mountpoint=\"/srv/corrosion\",region=~\"$region\"} / node_filesystem_size_bytes{mountpoint=\"/srv/corrosion\",region=~\"$region\"})", "legendFormat": "{{region}}/{{instance}}", "refId": "A"}]
+    },
+    {
+      "id": 45, "type": "timeseries", "title": "Disk I/O Time (Node Exporter)",
+      "datasource": {"uid": "h7hN5daMz", "type": "prometheus"},
+      "gridPos": {"h": 7, "w": 12, "x": 12, "y": 62},
+      "fieldConfig": {"defaults": {"unit": "s"}},
+      "options": {"legend": {"displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull"]}},
+      "targets": [{"expr": "rate(node_disk_io_time_seconds_total{device=~\"sd.*|vd.*|nvme.*|xvd.*\",region=~\"$region\"}[5m])", "legendFormat": "{{device}} - {{region}}/{{instance}}", "refId": "A"}]
+    },
+    {
+      "id": 50, "type": "row", "title": "Reaper & Compression",
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 69},
+      "collapsed": false, "panels": []
+    },
+    {
+      "id": 51, "type": "timeseries", "title": "Reaper Deletion Rate (clocks/pks)",
+      "datasource": {"uid": "h7hN5daMz", "type": "prometheus"},
+      "gridPos": {"h": 7, "w": 8, "x": 0, "y": 70},
+      "fieldConfig": {"defaults": {"unit": "ops"}},
+      "options": {"legend": {"displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull"]}},
+      "targets": [
+        {"expr": "sum(rate(corro_reaper_deleted_clocks_total{region=~\"$region\",instance=~\"$instance\"}[5m])) by (region)", "legendFormat": "clocks - {{region}}", "refId": "A"},
+        {"expr": "sum(rate(corro_reaper_deleted_pks_total{region=~\"$region\",instance=~\"$instance\"}[5m])) by (region)", "legendFormat": "pks - {{region}}", "refId": "B"}
+      ]
+    },
+    {
+      "id": 52, "type": "timeseries", "title": "Compression Ratio (bytes saved / raw)",
+      "datasource": {"uid": "h7hN5daMz", "type": "prometheus"},
+      "gridPos": {"h": 7, "w": 8, "x": 8, "y": 70},
+      "fieldConfig": {"defaults": {"unit": "percent", "max": 100}},
+      "options": {"legend": {"displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull"]}},
+      "targets": [{"expr": "100 * sum(rate(corro_compression_bytes_saved_total{region=~\"$region\",instance=~\"$instance\"}[5m])) by (region) / clamp_min(sum(rate(corro_compression_bytes_raw_total{region=~\"$region\",instance=~\"$instance\"}[5m])) by (region), 1)", "legendFormat": "{{region}}", "refId": "A"}]
+    },
+    {
+      "id": 53, "type": "timeseries", "title": "Compression/Decompression Errors Rate",
+      "datasource": {"uid": "h7hN5daMz", "type": "prometheus"},
+      "gridPos": {"h": 7, "w": 8, "x": 16, "y": 70},
+      "fieldConfig": {"defaults": {"unit": "ops"}},
+      "options": {"legend": {"displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull"]}},
+      "targets": [
+        {"expr": "sum(rate(corro_compression_errors_total{region=~\"$region\",instance=~\"$instance\"}[5m])) by (region)", "legendFormat": "compress - {{region}}", "refId": "A"},
+        {"expr": "sum(rate(corro_decompression_errors_total{region=~\"$region\",instance=~\"$instance\"}[5m])) by (region)", "legendFormat": "decompress - {{region}}", "refId": "B"}
+      ]
+    }
+  ]
+}

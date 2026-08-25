@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 use camino::Utf8PathBuf;
 use chrono::{DateTime, NaiveDateTime, Utc};
 use corro_pg::{start, PgServer};
-use corro_tests::{launch_test_agent, TestAgent};
+use corro_tests::{is_v2_mode, launch_test_agent, TestAgent};
 use corro_types::{
     config::{PgConfig, PgTlsConfig},
     tls::{generate_ca, generate_client_cert, generate_server_cert},
@@ -122,11 +122,18 @@ async fn test_information_schema() {
         .iter()
         .map(|row| row.get::<_, String>("table_name"))
         .collect::<Vec<_>>();
+    // cr-sqlite V2 uses different metadata table names (__crsql_v2_clock,
+    // __crsql_v2_pks, etc.) than V1 (__crsql_clock, __crsql_pks).
+    let (clock_tbl, pks_tbl) = if is_v2_mode() {
+        ("kitchensink__crsql_v2_clock", "kitchensink__crsql_v2_pks")
+    } else {
+        ("kitchensink__crsql_clock", "kitchensink__crsql_pks")
+    };
     for expected in [
         "__corro_schema",
         "kitchensink",
-        "kitchensink__crsql_clock",
-        "kitchensink__crsql_pks",
+        clock_tbl,
+        pks_tbl,
         "tests",
         "wide",
     ] {
@@ -222,9 +229,12 @@ async fn test_information_schema() {
 
     let internal_columns = client
         .query(
-            "SELECT column_name FROM information_schema.columns \
-             WHERE table_name = 'kitchensink__crsql_pks' \
-             ORDER BY ordinal_position",
+            &format!(
+                "SELECT column_name FROM information_schema.columns \
+                 WHERE table_name = '{}' \
+                 ORDER BY ordinal_position",
+                pks_tbl
+            ),
             &[],
         )
         .await
@@ -1055,7 +1065,6 @@ async fn test_pg_transaction_finalization_failures_recover() {
     wait_for_all_pending_handles().await;
 }
 
-#[tracing_test::traced_test]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_pg_readonly() {
     let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
@@ -1129,7 +1138,6 @@ async fn test_pg_readonly() {
     wait_for_all_pending_handles().await;
 }
 
-#[tracing_test::traced_test]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_pg_corrrosion_shutdown() {
     let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();

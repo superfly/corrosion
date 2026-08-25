@@ -47,6 +47,80 @@ jobs:
       - name: Test with latest nextest release
         run: cargo nextest run --profile ci --workspace --target ${{ matrix.target }}
 
+  test-v2-3-2-2:
+    name: Test (V2 3,2,2 - V2-only mode + packed changes)
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+
+    runs-on: ${{ matrix.os }}
+
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: "sccache"
+      CORRO_TEST_V2: "3"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install and Display Rust specified toolchain
+        run: rustup show
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+
+      - name: Run sccache-cache
+        uses: mozilla-actions/sccache-action@v0.0.9
+        with:
+          version: "v0.10.0"
+
+      - name: Test with latest nextest release (V2 3,2,2 - V2-only mode + packed changes)
+        run: cargo nextest run --profile ci --workspace --target ${{ matrix.target }}
+
+  test-v2-2-2-2:
+    name: Test (V2 2,2,2 - dual-write mode + packed changes)
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+
+    runs-on: ${{ matrix.os }}
+
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: "sccache"
+      CORRO_TEST_V2: "1"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install and Display Rust specified toolchain
+        run: rustup show
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+
+      - name: Run sccache-cache
+        uses: mozilla-actions/sccache-action@v0.0.9
+        with:
+          version: "v0.10.0"
+
+      - name: Test with latest nextest release (V2 2,2,2 - dual-write mode + packed changes)
+        run: cargo nextest run --profile ci --workspace --target ${{ matrix.target }}
+
   lint:
     strategy:
       matrix:

@@ -416,10 +416,14 @@ impl Broadcaster {
 pub fn migrate(clock: Arc<uhlc::HLC>, conn: &mut Connection) -> rusqlite::Result<()> {
     let migrations: Vec<Box<dyn Migration>> = vec![
         Box::new(init_migration as fn(&Transaction) -> rusqlite::Result<()>),
-        Box::new(crsqlite_v0_17_migration(clock)),
+        Box::new(crsqlite_v0_17_migration(clock.clone())),
+        Box::new(buffered_changes_min_max_seq_migration),
     ];
 
-    crate::sqlite::migrate(conn, migrations)
+    // Set the ts from the node's HLC so migration timestamps overlap with
+    // the clock used by make_broadcastable_changes and other write paths.
+    let ts = Timestamp::from(clock.new_timestamp());
+    crate::sqlite::migrate(conn, migrations, Some(ts))
 }
 
 fn init_migration(tx: &Transaction) -> rusqlite::Result<()> {
@@ -458,6 +462,8 @@ fn init_migration(tx: &Transaction) -> rusqlite::Result<()> {
                 db_version INTEGER NOT NULL,
                 site_id BLOB NOT NULL, -- this differs from crsql_changes, we'll never buffer our own
                 seq INTEGER NOT NULL,
+                min_seq INTEGER, -- min scalar seq in packed blob (V2); same as seq for V1
+                max_seq INTEGER, -- max scalar seq in packed blob (V2); same as seq for V1
                 cl INTEGER NOT NULL, -- causal length
                 ts TEXT NOT NULL,
 
@@ -586,6 +592,31 @@ fn crsqlite_v0_17_migration(
 //         Ok(())
 //     }
 // }
+
+/// Add `min_seq` and `max_seq` columns to `__corro_buffered_changes` so that
+/// partial sync can filter buffered rows by seq overlap without unpacking
+/// the packed `seq` BLOB. For existing rows, both columns are set to `seq`
+/// (which is correct for V1 scalar seqs; V2 packed rows in existing DBs are
+/// transient and will be re-buffered with proper values).
+fn buffered_changes_min_max_seq_migration(tx: &Transaction) -> rusqlite::Result<()> {
+    // Check if columns already exist (idempotent)
+    let has_min_seq: bool = tx
+        .prepare("SELECT COUNT(*) FROM pragma_table_info('__corro_buffered_changes') WHERE name = 'min_seq'")?
+        .query_row([], |row| row.get(0))?;
+    if has_min_seq {
+        return Ok(());
+    }
+
+    tx.execute_batch(
+        r#"
+        ALTER TABLE __corro_buffered_changes ADD COLUMN min_seq INTEGER;
+        ALTER TABLE __corro_buffered_changes ADD COLUMN max_seq INTEGER;
+        UPDATE __corro_buffered_changes SET min_seq = seq, max_seq = seq;
+        "#,
+    )?;
+
+    Ok(())
+}
 
 #[derive(Debug, Clone)]
 pub struct SplitPool(Arc<SplitPoolInner>);

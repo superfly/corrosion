@@ -19,6 +19,7 @@ use thread_local::ThreadLocal;
 use tracing::{error, info, trace, warn};
 use tripwire::Tripwire;
 
+use crate::broadcast::Timestamp;
 use crate::vtab::unnest::UnnestTab;
 
 pub type SqlitePool = sqlite_pool::Pool<CrConn>;
@@ -510,10 +511,21 @@ pub fn set_migration_version(tx: &Transaction, v: usize) -> rusqlite::Result<usi
 }
 
 // should be a noop if up to date!
-pub fn migrate(conn: &mut Connection, migrations: Vec<Box<dyn Migration>>) -> rusqlite::Result<()> {
+pub fn migrate(
+    conn: &mut Connection,
+    migrations: Vec<Box<dyn Migration>>,
+    ts: Option<Timestamp>,
+) -> rusqlite::Result<()> {
     let target_version = migrations.len();
 
     let tx = conn.transaction()?;
+
+    // crsqlite 0.18+ requires a non-zero ts before any write to clock tables.
+    // Set it from the node's HLC so migration timestamps overlap with the
+    // clock used by make_broadcastable_changes and other write paths.
+    if let Some(ts) = ts {
+        tx.query_row("SELECT crsql_set_ts(?)", [&ts], |_| Ok(()))?;
+    }
 
     // determine how many migrations to skip (skip as many as we are at)
     let skip_n = migration_version(&tx).unwrap_or_default();
@@ -574,14 +586,16 @@ mod tests {
             .create_pool_transform(rusqlite_to_crsqlite)?;
 
         {
-            let conn = pool.get().await?;
+            let mut conn = pool.get().await?;
 
-            conn.execute_batch(
-                "
-                CREATE TABLE foo (a INTEGER NOT NULL PRIMARY KEY, b INTEGER);
-                SELECT crsql_as_crr('foo');
-            ",
+            let tx = conn.immediate_transaction()?;
+            // Set default-ts config so all subsequent connections (workers) have a ts.
+            tx.query_row("SELECT crsql_config_set('default-ts', 1)", [], |_| Ok(()))?;
+            tx.execute_batch(
+                "CREATE TABLE foo (a INTEGER NOT NULL PRIMARY KEY, b INTEGER);
+                SELECT crsql_as_crr('foo');",
             )?;
+            tx.commit()?;
         }
 
         let total: i64 = 1000;
@@ -635,12 +649,17 @@ mod tests {
             .create_pool_transform(rusqlite_to_crsqlite)?;
 
         let mut conn = pool.get().await.unwrap();
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS testsbool (
-            id INTEGER NOT NULL PRIMARY KEY,
-            b boolean not null default false
-        ); SELECT crsql_as_crr('testsbool')",
-        )?;
+        {
+            let tx = conn.immediate_transaction()?;
+            tx.query_row("SELECT crsql_set_ts(1)", [], |_| Ok(()))?;
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS testsbool (
+                id INTEGER NOT NULL PRIMARY KEY,
+                b boolean not null default false
+            ); SELECT crsql_as_crr('testsbool')",
+            )?;
+            tx.commit()?;
+        }
 
         {
             let tx = conn.transaction()?;

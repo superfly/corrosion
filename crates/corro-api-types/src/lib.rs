@@ -306,6 +306,73 @@ pub enum HealthResponse {
     Error(String),
 }
 
+/// Request body for `POST /v1/migrate`.
+///
+/// **Only available in antithesis builds.** Will be removed with crsqlite 0.19.
+#[cfg(feature = "running_in_antithesis")]
+///
+/// Each step corresponds to one phase of the V1→V2 metadata migration.
+/// The three config knobs (`metadata-write-version`, `metadata-use-version`,
+/// `sync-log-version`) can be advanced independently, subject to validation
+/// constraints. This creates several valid intermediate states that the
+/// migration driver exercises.
+///
+/// - `v2_db_format`: Transition `metadata-write-version` from 1 (V1) to 2
+///   (V2&V1 dual-write). Creates V2 tables and queues migration tasks.
+///   The background migrator will then incrementally copy V1 data to V2.
+///
+/// - `use_v2_metadata`: Transition `metadata-use-version` from 1 to 2.
+///   Requires `metadata-write-version` to be 2 or 3 (dual-write or V2-only).
+///   Can be done while still in dual-write mode, creating the state
+///   (write=2, use=2, sync=1) where the node reads V2 metadata but still
+///   writes both V1 and V2.
+///
+/// - `v2_db_only`: Transition `metadata-write-version` from 2 (V2&V1) to 3
+///   (V2-only). Requires all migration tasks to be complete. Queues V1
+///   table cleanup tasks. The background migrator will then drop V1 tables.
+///   Forces `metadata-use-version` to 2.
+///
+/// - `v2_wire_format`: Transition `sync-log-version` from 1 to 2 (packed
+///   wire format). Requires `metadata-use-version` to be 2 and
+///   `metadata-write-version` to be 2 or 3. Can be done while still in
+///   dual-write mode, creating the state (write=2, use=2, sync=2).
+///
+/// - `rollback_v1`: Transition `metadata-write-version` from 2 back to 1.
+///   Aborts any in-progress migration and queues V2 table cleanup.
+///   Forces `metadata-use-version` and `sync-log-version` back to 1.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MigrateStep {
+    V2DbFormat,
+    UseV2Metadata,
+    V2DbOnly,
+    V2WireFormat,
+    RollbackV1,
+}
+
+/// Response body for `POST /v1/migrate`.
+#[cfg(feature = "running_in_antithesis")]
+#[derive(Debug, Serialize)]
+pub struct MigrateResponse {
+    pub success: bool,
+    pub message: String,
+    pub write_version: i64,
+    pub use_version: i64,
+    pub sync_log_version: i64,
+}
+
+/// Response body for `GET /v1/migrate/status`.
+#[cfg(feature = "running_in_antithesis")]
+#[derive(Debug, Serialize)]
+pub struct MigrateStatus {
+    pub write_version: i64,
+    pub use_version: i64,
+    pub sync_log_version: i64,
+    pub migration_complete: bool,
+    pub cleanup_complete: bool,
+    pub pending_maintenance: bool,
+}
+
 #[derive(Debug, Copy, Clone, PartialEq)]
 pub struct SqliteValueRef<'a>(pub ValueRef<'a>);
 
