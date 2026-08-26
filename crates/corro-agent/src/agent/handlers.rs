@@ -878,7 +878,7 @@ impl HandleChangesState {
 
         let agent_clone = agent.clone();
         let bookie_clone = bookie.clone();
-        self.processing_task = Some(tokio::spawn(process_multiple_changes(
+        self.processing_task = Some(spawn_counted(process_multiple_changes(
             agent_clone,
             bookie_clone,
             batch,
@@ -924,7 +924,22 @@ impl HandleChangesState {
                 }
             }
             Err(ref e) => {
-                error!("batch processing task panicked: {e}");
+                let issue = if e.is_panic() {
+                    "change batch processing task panicked"
+                } else if e.is_cancelled() {
+                    "change batch processing task was cancelled unexpectedly"
+                } else {
+                    "change batch processing task failed to join"
+                };
+
+                error!(error = %e, "{issue}");
+
+                // The batch has already been removed from the queue and its
+                // entries are still present in the seen cache. Restarting this
+                // actor locally would therefore make the loss permanent.
+                self.processing_task = None;
+                agent.mark_unhealthy(issue);
+                return;
             }
         }
 
@@ -990,22 +1005,20 @@ impl HandleChangesState {
     fn maybe_drop_old_change(&mut self) -> Option<ChangeV1> {
         let mut dropped_count = 0;
 
-        let maybe_dropped_change = if self.queue.len() >= self.max_queue_len {
+        if self.queue.len() >= self.max_queue_len {
             if let Some((dropped_change, _, _)) = self.queue.pop_front() {
                 self.buf_cost -= dropped_change.processing_cost();
                 dropped_count += 1;
 
+                counter!("corro.agent.changes.dropped").increment(dropped_count);
+                log_at_pow_10("dropped old change from queue", &mut self.drop_log_count);
                 Some(dropped_change)
             } else {
                 None
             }
         } else {
             None
-        };
-
-        counter!("corro.agent.changes.dropped").increment(dropped_count);
-        log_at_pow_10("dropped old change from queue", &mut self.drop_log_count);
-        maybe_dropped_change
+        }
     }
 
     /// Handle new change arrival - check if we should spawn immediately
@@ -1041,6 +1054,29 @@ impl HandleChangesState {
                 .is_none()
             {
                 unreachable!("Must spawn a batch");
+            }
+        }
+    }
+
+    async fn abort_processing_task(&mut self) {
+        let Some(task) = self.processing_task.take() else {
+            return;
+        };
+
+        task.abort();
+
+        match task.await {
+            Ok(Ok(())) => {
+                debug!("change batch processing completed during actor shutdown");
+            }
+            Ok(Err(e)) => {
+                error!("change batch processing failed during actor shutdown: {e}");
+            }
+            Err(e) if e.is_cancelled() => {
+                debug!("change batch processing cancelled during actor shutdown");
+            }
+            Err(e) => {
+                error!("change batch processing task panicked during actor shutdown: {e}");
             }
         }
     }
@@ -1249,9 +1285,11 @@ impl ChangesActor {
                 .record(recv_lag.as_secs_f64());
             }
 
+            // If we drop an old change, evict that change's actor from the
+            // seen cache so a later retransmission is not filtered out.
             while let Some(dropped_change) = state.maybe_drop_old_change() {
                 for v in dropped_change.versions() {
-                    if let Entry::Occupied(mut entry) = seen.entry((change.actor_id, v)) {
+                    if let Entry::Occupied(mut entry) = seen.entry((dropped_change.actor_id, v)) {
                         if let Some(seqs) = dropped_change.seqs() {
                             entry.get_mut().remove(seqs.into());
                         } else {
@@ -1281,6 +1319,8 @@ impl ChangesActor {
 
             state.handle_new_change(&agent, &bookie, change, src);
         }
+
+        state.abort_processing_task().await;
     }
 }
 
@@ -1446,6 +1486,52 @@ mod tests {
         assert_eq!(state.batch_threshold(), 1);
     }
 
+    #[tokio::test]
+    async fn batch_task_panic_marks_agent_unhealthy() -> eyre::Result<()> {
+        let (tripwire, _tripwire_worker, _tripwire_tx) = Tripwire::new_simple();
+        let dir = tempfile::tempdir()?;
+        let config = Config::builder()
+            .db_path(dir.path().join("corrosion.db").display().to_string())
+            .gossip_addr("127.0.0.1:0".parse()?)
+            .api_addr("127.0.0.1:0".parse()?)
+            .build()?;
+        let (agent, _agent_options) = setup(config, tripwire).await?;
+        let bookie = Bookie::new(Default::default());
+        let mut state = HandleChangesState::new(
+            1,
+            0,
+            1,
+            0.9,
+            Duration::from_millis(1),
+            Duration::from_secs(1),
+            1,
+        );
+
+        state.processing_task = Some(tokio::spawn(async {
+            panic!("synthetic change batch panic");
+        }));
+
+        let result = state
+            .processing_task
+            .as_mut()
+            .expect("batch task should be present")
+            .await;
+        assert!(result
+            .as_ref()
+            .expect_err("batch task should panic")
+            .is_panic());
+
+        state.handle_task_completion(&agent, &bookie, result);
+
+        assert!(agent.shutdown_token().is_cancelled());
+        assert_eq!(
+            agent.fatal_issue(),
+            Some("change batch processing task panicked")
+        );
+
+        Ok(())
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn test_loadshed_handle_changes() -> eyre::Result<()> {
         _ = tracing_subscriber::fmt::try_init();
@@ -1538,6 +1624,140 @@ mod tests {
         assert!(!booked.contains_version(&CrsqlDbVersion(7)));
         assert!(!booked.contains_version(&CrsqlDbVersion(8)));
         assert!(!booked.contains_version(&CrsqlDbVersion(9)));
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn test_loadshed_seen_cache_evicts_dropped_actor() -> eyre::Result<()> {
+        _ = tracing_subscriber::fmt::try_init();
+        let (tripwire, _tripwire_worker, _tripwire_tx) = Tripwire::new_simple();
+        let dir = tempfile::tempdir()?;
+
+        let mut config = Config::builder()
+            .db_path(dir.path().join("corrosion.db").display().to_string())
+            .gossip_addr("127.0.0.1:0".parse()?)
+            .api_addr("127.0.0.1:0".parse()?)
+            .build()?;
+        config.perf.processing_queue_len = 4;
+        // The threshold is clamped to one, so a single change starts the
+        // blocked processing task before the queue is filled below.
+        config.perf.apply_queue_min_batch_size = 1;
+        config.perf.apply_queue_max_batch_size = 1;
+        config.perf.apply_queue_step_base = 0;
+        config.perf.changes_channel_len = 1;
+
+        let (agent, agent_options) = setup(config, tripwire.clone()).await?;
+
+        execute_schema(&agent, vec![TEST_SCHEMA.to_owned()]).await?;
+
+        let actor_a = ActorId(uuid::Uuid::new_v4());
+        let actor_b = ActorId(uuid::Uuid::new_v4());
+        let bookie = Bookie::new(Default::default());
+        let actor_agent = agent.clone();
+        let actor_bookie = bookie.clone();
+
+        tokio::spawn(async move {
+            let mut actor = ChangesActor::new(actor_agent, actor_bookie, agent_options.rx_changes);
+            actor.run(tripwire).await;
+        });
+
+        let partial = |actor: ActorId, version: u64, seq: u64| {
+            let crsql_row = Change {
+                table: TableName("tests".into()),
+                pk: pack_columns(&vec![(seq as i64 + 1 + version as i64 * 100).into()]).unwrap(),
+                cid: ColumnName("text".into()),
+                val: "partial".into(),
+                col_version: 1,
+                db_version: CrsqlDbVersion(version),
+                seq: CrsqlSeq(seq),
+                site_id: actor.to_bytes(),
+                cl: 1,
+            };
+            (
+                ChangeV1 {
+                    actor_id: actor,
+                    changeset: Changeset::Full {
+                        version: CrsqlDbVersion(version),
+                        changes: vec![crsql_row],
+                        seqs: (CrsqlSeq(seq)..=CrsqlSeq(seq)).into(),
+                        // last_seq beyond the sent seqs => incomplete (buffered) changeset
+                        last_seq: CrsqlSeq(3),
+                        ts: agent.clock().new_timestamp().into(),
+                    },
+                },
+                ChangeSource::Broadcast,
+                None,
+            )
+        };
+
+        {
+            // hold the write connection so the first processed change blocks
+            let _conn = agent.pool().write_normal().await?;
+
+            // a complete change from B: gets drained immediately and blocks on the
+            // write connection, leaving the queue free to fill up
+            let crsql_row = Change {
+                table: TableName("tests".into()),
+                pk: pack_columns(&vec![1i64.into()])?,
+                cid: ColumnName("text".into()),
+                val: "b ten".into(),
+                col_version: 1,
+                db_version: CrsqlDbVersion(10),
+                seq: CrsqlSeq(0),
+                site_id: actor_b.to_bytes(),
+                cl: 1,
+            };
+            agent
+                .tx_changes()
+                .send((
+                    ChangeV1 {
+                        actor_id: actor_b,
+                        changeset: Changeset::Full {
+                            version: CrsqlDbVersion(10),
+                            changes: vec![crsql_row],
+                            seqs: dbsr!(0, 0),
+                            last_seq: CrsqlSeq(0),
+                            ts: agent.clock().new_timestamp().into(),
+                        },
+                    },
+                    ChangeSource::Broadcast,
+                    None,
+                ))
+                .await?;
+
+            // fill the queue (len 4) with actor A's partial seqs 0..=3 of version 1
+            for seq in 0u64..=3 {
+                agent.tx_changes().send(partial(actor_a, 1, seq)).await?;
+            }
+
+            // actor B's change arrives with the queue full: A's seq 0 gets dropped.
+            // Its seen-cache entry must be evicted under (actor_a, v1).
+            agent.tx_changes().send(partial(actor_b, 1, 0)).await?;
+        }
+
+        sleep(Duration::from_secs(2)).await;
+
+        {
+            let booked_a = bookie.get(&actor_a).unwrap().read();
+            // sanity: seqs 1..=3 of A's v1 were processed, seq 0 was dropped
+            assert!(booked_a.contains_all(dbvr!(1, 1), Some(dbsr!(1, 3))));
+            assert!(!booked_a.contains_all(dbvr!(1, 1), Some(dbsr!(0, 0))));
+        }
+
+        // the dropped change arrives again (another peer rebroadcasts it); with the
+        // seen-cache entry properly evicted it must be accepted and processed
+        agent.tx_changes().send(partial(actor_a, 1, 0)).await?;
+
+        sleep(Duration::from_secs(2)).await;
+
+        let booked_a = bookie.get(&actor_a).unwrap().read();
+        assert!(
+            booked_a.contains_all(dbvr!(1, 1), Some(dbsr!(0, 0))),
+            "re-sent copy of the dropped change was filtered as a duplicate: \
+             the seen cache still holds the entry that should have been evicted \
+             when the change was dropped from the full queue"
+        );
 
         Ok(())
     }

@@ -1,3 +1,5 @@
+use std::sync::atomic::AtomicU64;
+
 use corro_types::{
     agent::Agent,
     broadcast::{
@@ -13,6 +15,10 @@ use tokio_stream::StreamExt;
 use tokio_util::codec::{FramedRead, LengthDelimitedCodec};
 use tracing::{debug, error, trace, warn};
 use tripwire::Tripwire;
+
+use crate::agent::util::should_log_pow_10;
+
+static LOG_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Spawn a task that accepts unidirectional broadcast streams, then
 /// spawns another task for each incoming stream to handle.
@@ -119,7 +125,11 @@ pub fn spawn_unipayload_handler(tripwire: &Tripwire, conn: &quinn::Connection, a
                                                             if let PlumtreeMsgV1::Gossip(msg) =
                                                                 wire_msg
                                                             {
-                                                                warn!("broadcast algorithm set to gossip but node receieved plumtree message");
+                                                                if let Some(n) =
+                                                                    should_log_pow_10(&LOG_COUNTER)
+                                                                {
+                                                                    warn!(%remote_addr, "broadcast algorithm set to gossip but received plumtree message (log count: {n})");
+                                                                }
                                                                 let compressed = msg
                                                                     .payload
                                                                     .bcast
@@ -174,13 +184,10 @@ pub fn spawn_unipayload_handler(tripwire: &Tripwire, conn: &quinn::Connection, a
 
                         match broadcast_method {
                             BroadcastMethod::Plumtree => {
-                                if let Some((change, _, _)) = changes.first() {
-                                    warn!(
-                                        %remote_addr,
-                                        id = ?change.message_id(),
-                                        count = changes.len(),
-                                        "broadcast algorithm set to plumtree but node received gossip message"
-                                    );
+                                if !changes.is_empty() {
+                                    if let Some(n) = should_log_pow_10(&LOG_COUNTER) {
+                                        warn!(%remote_addr, "broadcast algorithm set to plumtree but received gossip message (log count: {n})");
+                                    }
                                 }
                                 for (change, _, original_bcast) in changes.into_iter().rev() {
                                     let id = change.message_id();
