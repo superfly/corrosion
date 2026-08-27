@@ -606,6 +606,7 @@ pub struct Matcher {
     pub cached_statements: HashMap<String, MatcherStmt>,
     pub pks: IndexMap<String, Vec<String>>,
     pub parsed: ParsedSelect,
+    has_aggregates: bool,
     pub evt_tx: mpsc::Sender<QueryEvent>,
     pub col_names: Vec<ColumnName>,
     pub last_rowid: u64,
@@ -885,6 +886,8 @@ impl Matcher {
 
         let processing_stats = handle.inner.processing_stats.clone();
 
+        let has_aggregates = parsed.has_aggregates;
+
         let matcher = Self {
             id,
             hash: sql_hash,
@@ -892,6 +895,7 @@ impl Matcher {
             cached_statements: statements,
             pks,
             parsed,
+            has_aggregates,
             evt_tx,
             col_names,
             last_rowid: 0,
@@ -1525,11 +1529,15 @@ impl Matcher {
         candidates: MatchCandidates,
         skip_send: bool,
     ) -> Result<(), MatcherError> {
-        let mut tables = IndexSet::new();
-
         if candidates.is_empty() {
             return Ok(());
         }
+
+        if self.has_aggregates {
+            return self.handle_aggregate_rerun(state_conn, skip_send);
+        }
+
+        let mut tables = IndexSet::new();
 
         trace!(
             "got some candidates! {:?}",
@@ -1792,6 +1800,218 @@ impl Matcher {
 
         Ok(())
     }
+
+    fn handle_aggregate_rerun(
+        &mut self,
+        state_conn: &mut Connection,
+        skip_send: bool,
+    ) -> Result<(), MatcherError> {
+        let tx = self.conn.transaction()?;
+
+        let mut query_cols = vec![];
+        for i in 0..self.parsed.columns.len() {
+            query_cols.push(format!("col_{i}"));
+        }
+
+        let mut all_cols = self
+            .pks
+            .values()
+            .flatten()
+            .cloned()
+            .collect::<Vec<String>>();
+        all_cols.extend(query_cols.iter().cloned());
+        let pk_len = all_cols.len() - query_cols.len();
+
+        let mut stmt_str = Cmd::Stmt(self.query.clone()).to_string();
+        stmt_str.pop();
+
+        let state_tx = state_conn.transaction()?;
+        let mut select = state_tx.prepare(&stmt_str)?;
+        let mut select_rows = {
+            let _guard = interrupt_deadline_guard(&state_tx, Duration::from_secs(15));
+            select.query(())?
+        };
+
+        let mut new_rows = vec![];
+        while let Some(row) = select_rows.next()? {
+            let cells = (0..all_cols.len())
+                .map(|i| row.get::<_, SqliteValue>(i))
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            new_rows.push(cells);
+        }
+
+        let mut existing = vec![];
+        {
+            let mut prepped = tx.prepare(&format!(
+                "SELECT __corro_rowid, {} FROM query ORDER BY __corro_rowid",
+                all_cols.join(",")
+            ))?;
+            let mut rows = prepped.query([])?;
+            while let Some(row) = rows.next()? {
+                let rowid: RowId = row.get(0)?;
+                let cells = (1..=all_cols.len())
+                    .map(|i| row.get::<_, SqliteValue>(i))
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                existing.push((rowid, cells));
+            }
+        }
+
+        let query_values_match =
+            |a: &[SqliteValue], b: &[SqliteValue]| a[pk_len..] == b[pk_len..];
+
+        let mut new_last_rowid = self.last_rowid;
+        let mut change_insert_stmt = tx.prepare_cached(&format!(
+            "INSERT INTO changes (__corro_rowid, {CHANGE_TYPE_COL}, {}) VALUES (?, ?, {}) RETURNING {CHANGE_ID_COL}",
+            query_cols.join(","),
+            (0..query_cols.len())
+                .map(|_| "?")
+                .collect::<Vec<_>>()
+                .join(","),
+        ))?;
+
+        let mut delete_prepped = tx.prepare_cached(
+            "DELETE FROM query WHERE __corro_rowid = ? RETURNING __corro_rowid",
+        )?;
+        let mut update_prepped = tx.prepare_cached(&format!(
+            "UPDATE query SET {} WHERE __corro_rowid = ?",
+            all_cols
+                .iter()
+                .map(|col| format!("{col} = ?"))
+                .collect::<Vec<_>>()
+                .join(",")
+        ))?;
+        let mut insert_prepped = tx.prepare_cached(&format!(
+            "INSERT INTO query ({}) VALUES ({}) RETURNING __corro_rowid",
+            all_cols.join(","),
+            (0..all_cols.len()).map(|_| "?").collect::<Vec<_>>().join(","),
+        ))?;
+
+        for (rowid, old_cells) in &existing {
+            if new_rows
+                .iter()
+                .any(|new| query_values_match(new, old_cells))
+            {
+                continue;
+            }
+
+            delete_prepped.raw_bind_parameter(1, rowid)?;
+            delete_prepped.raw_query().next()?;
+
+            let cells = old_cells[pk_len..].to_vec();
+            change_insert_stmt.raw_bind_parameter(1, rowid)?;
+            change_insert_stmt.raw_bind_parameter(2, ChangeType::Delete)?;
+            for (i, cell) in cells.iter().enumerate() {
+                change_insert_stmt.raw_bind_parameter(i + 3, cell)?;
+            }
+            let change_id: ChangeId = change_insert_stmt
+                .raw_query()
+                .next()?
+                .ok_or(MatcherError::NoChangeInserted)?
+                .get(0)?;
+
+            if !skip_send {
+                if let Err(e) = self.evt_tx.blocking_send(QueryEvent::Change(
+                    ChangeType::Delete,
+                    *rowid,
+                    cells.clone(),
+                    change_id,
+                )) {
+                    warn!("could not send aggregate change: {e}");
+                    return Err(MatcherError::EventReceiverClosed);
+                }
+            }
+            _ = self.last_change_tx.send(change_id);
+        }
+
+        for new_cells in &new_rows {
+            if let Some((rowid, old_cells)) = existing
+                .iter()
+                .find(|(_, old)| query_values_match(new_cells, old))
+            {
+                if old_cells == new_cells {
+                    continue;
+                }
+
+                for (i, cell) in new_cells.iter().enumerate() {
+                    update_prepped.raw_bind_parameter(i + 1, cell)?;
+                }
+                update_prepped.raw_bind_parameter(all_cols.len() + 1, rowid)?;
+                update_prepped.raw_execute()?;
+
+                let cells = new_cells[pk_len..].to_vec();
+                change_insert_stmt.raw_bind_parameter(1, rowid)?;
+                change_insert_stmt.raw_bind_parameter(2, ChangeType::Update)?;
+                for (i, cell) in cells.iter().enumerate() {
+                    change_insert_stmt.raw_bind_parameter(i + 3, cell)?;
+                }
+                let change_id: ChangeId = change_insert_stmt
+                    .raw_query()
+                    .next()?
+                    .ok_or(MatcherError::NoChangeInserted)?
+                    .get(0)?;
+
+                if !skip_send {
+                    if let Err(e) = self.evt_tx.blocking_send(QueryEvent::Change(
+                        ChangeType::Update,
+                        *rowid,
+                        cells.clone(),
+                        change_id,
+                    )) {
+                        warn!("could not send aggregate change: {e}");
+                        return Err(MatcherError::EventReceiverClosed);
+                    }
+                }
+                _ = self.last_change_tx.send(change_id);
+                new_last_rowid = cmp::max(new_last_rowid, rowid.0);
+                continue;
+            }
+
+            for (i, cell) in new_cells.iter().enumerate() {
+                insert_prepped.raw_bind_parameter(i + 1, cell)?;
+            }
+            let rowid: RowId = insert_prepped.raw_query().next()?.unwrap().get(0)?;
+            new_last_rowid = cmp::max(new_last_rowid, rowid.0);
+
+            let change_type = if rowid.0 > self.last_rowid {
+                ChangeType::Insert
+            } else {
+                ChangeType::Update
+            };
+            let cells = new_cells[pk_len..].to_vec();
+            change_insert_stmt.raw_bind_parameter(1, rowid)?;
+            change_insert_stmt.raw_bind_parameter(2, change_type)?;
+            for (i, cell) in cells.iter().enumerate() {
+                change_insert_stmt.raw_bind_parameter(i + 3, cell)?;
+            }
+            let change_id: ChangeId = change_insert_stmt
+                .raw_query()
+                .next()?
+                .ok_or(MatcherError::NoChangeInserted)?
+                .get(0)?;
+
+            if !skip_send {
+                if let Err(e) = self.evt_tx.blocking_send(QueryEvent::Change(
+                    change_type,
+                    rowid,
+                    cells.clone(),
+                    change_id,
+                )) {
+                    warn!("could not send aggregate change: {e}");
+                    return Err(MatcherError::EventReceiverClosed);
+                }
+            }
+            _ = self.last_change_tx.send(change_id);
+        }
+
+        drop(change_insert_stmt);
+        drop(delete_prepped);
+        drop(update_prepped);
+        drop(insert_prepped);
+
+        tx.commit()?;
+        self.last_rowid = new_last_rowid;
+        Ok(())
+    }
 }
 
 fn dump_query_plan(
@@ -1851,10 +2071,95 @@ pub struct ParsedSelect {
     aliases: HashMap<String, String>,
     pub columns: Vec<ResultColumn>,
     children: Vec<ParsedSelect>,
+    has_aggregates: bool,
+}
+
+fn is_aggregate_name(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "avg" | "count"
+            | "group_concat"
+            | "max"
+            | "min"
+            | "sum"
+            | "total"
+            | "json_group_array"
+            | "json_group_object"
+            | "jsonb_group_array"
+            | "jsonb_group_object"
+    )
+}
+
+fn expr_has_aggregate(expr: &Expr) -> bool {
+    match expr {
+        Expr::FunctionCall { name, .. } if is_aggregate_name(&name.0) => true,
+        Expr::FunctionCall { args, .. } => args
+            .as_ref()
+            .map(|args| args.iter().any(expr_has_aggregate))
+            .unwrap_or(false),
+        Expr::FunctionCallStar { .. } => true,
+        Expr::Between { lhs, .. } => expr_has_aggregate(lhs),
+        Expr::Binary(lhs, _, rhs) => expr_has_aggregate(lhs) || expr_has_aggregate(rhs),
+        Expr::Case {
+            base,
+            when_then_pairs,
+            else_expr,
+        } => {
+            base.as_ref().map(|e| expr_has_aggregate(e)).unwrap_or(false)
+                || when_then_pairs
+                    .iter()
+                    .any(|(w, t)| expr_has_aggregate(w) || expr_has_aggregate(t))
+                || else_expr
+                    .as_ref()
+                    .map(|e| expr_has_aggregate(e))
+                    .unwrap_or(false)
+        }
+        Expr::Cast { expr, .. } => expr_has_aggregate(expr),
+        Expr::Collate(expr, _) => expr_has_aggregate(expr),
+        Expr::Exists(select) => select_has_aggregates(select),
+        Expr::InList { lhs, rhs, .. } => {
+            expr_has_aggregate(lhs)
+                || rhs
+                    .as_ref()
+                    .map(|rhs| rhs.iter().any(expr_has_aggregate))
+                    .unwrap_or(false)
+        }
+        Expr::InSelect { lhs, rhs, .. } => {
+            expr_has_aggregate(lhs) || select_has_aggregates(rhs)
+        }
+        Expr::IsNull(expr) | Expr::NotNull(expr) | Expr::Unary(_, expr) => expr_has_aggregate(expr),
+        Expr::Like { lhs, rhs, .. } => expr_has_aggregate(lhs) || expr_has_aggregate(rhs),
+        Expr::Parenthesized(exprs) => exprs.iter().any(expr_has_aggregate),
+        Expr::Subquery(select) => select_has_aggregates(select),
+        _ => false,
+    }
+}
+
+fn result_column_has_aggregate(col: &ResultColumn) -> bool {
+    match col {
+        ResultColumn::Expr(expr, _) => expr_has_aggregate(expr),
+        ResultColumn::TableStar(_) | ResultColumn::Star => false,
+    }
+}
+
+fn select_has_aggregates(select: &Select) -> bool {
+    if let OneSelect::Select {
+        columns,
+        group_by,
+        ..
+    } = &select.body.select
+    {
+        if group_by.is_some() {
+            return true;
+        }
+        return columns.iter().any(result_column_has_aggregate);
+    }
+    false
 }
 
 fn extract_select_columns(select: &Select, schema: &Schema) -> Result<ParsedSelect, MatcherError> {
     let mut parsed = ParsedSelect::default();
+    parsed.has_aggregates = select_has_aggregates(select);
 
     if let OneSelect::Select {
         ref from,
@@ -2616,6 +2921,129 @@ mod tests {
             subs.remove(&handle.id());
         }
 
+        tripwire_tx.send(()).await.ok();
+        tripwire_worker.await;
+        wait_for_all_pending_handles().await;
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn test_aggregate_sum_rerun() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        _ = tracing_subscriber::fmt::try_init();
+        let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
+        let schema_sql = "CREATE TABLE foo (id INTEGER NOT NULL PRIMARY KEY);";
+        let mut schema = parse_sql(schema_sql)?;
+
+        let sql = "SELECT sum(foo.id) FROM foo";
+        let subs = SubsManager::default();
+
+        let tmpdir = TempDir::new(tempfile::tempdir()?);
+        let db_path = tmpdir.path().join("test.db");
+        let subscriptions_path: Utf8PathBuf =
+            tmpdir.path().join("subs").display().to_string().into();
+
+        let pool = SplitPool::create(db_path, Arc::new(Semaphore::new(1)), -1048576).await?;
+        let clock = Arc::new(uhlc::HLC::default());
+
+        {
+            let mut conn = pool.write_priority().await?;
+            setup_conn(&conn)?;
+            migrate(clock, &mut conn)?;
+            let tx = conn.transaction()?;
+            apply_schema(&tx, &Schema::default(), &mut schema)?;
+            tx.commit()?;
+        }
+
+        let (matcher, maybe_created) = subs.get_or_insert(
+            sql,
+            subscriptions_path.as_path(),
+            &schema,
+            &pool,
+            tripwire.clone(),
+        )?;
+
+        let mut rx = maybe_created.unwrap().evt_rx;
+        let mut conn = pool.write_priority().await?;
+
+        assert!(matches!(rx.recv().await.unwrap(), QueryEvent::Columns(_)));
+        assert!(matches!(rx.recv().await.unwrap(), QueryEvent::Row(_, _)));
+        assert!(matches!(rx.recv().await.unwrap(), QueryEvent::EndOfQuery { .. }));
+
+        let sub_db = subscriptions_path
+            .join(matcher.id().as_simple().to_string())
+            .join("sub.sqlite");
+
+        let read_sum = || -> rusqlite::Result<(i64, SqliteValue)> {
+            let conn = Connection::open(&sub_db)?;
+            let count: i64 = conn.query_row("SELECT COUNT(*) FROM query", [], |row| row.get(0))?;
+            let sum: SqliteValue = conn.query_row("SELECT col_0 FROM query LIMIT 1", [], |row| {
+                row.get(0)
+            })?;
+            Ok((count, sum))
+        };
+
+        let filter_foo_changes = |matcher: &MatcherHandle,
+                                  conn: &CrConn|
+         -> rusqlite::Result<()> {
+            let db_version: i64 = conn.query_row(
+                "SELECT COALESCE(MAX(db_version), 0) FROM crsql_changes WHERE \"table\" = 'foo'",
+                [],
+                |row| row.get(0),
+            )?;
+            filter_changes_from_db(matcher, conn, None, CrsqlDbVersion(db_version as u64))
+        };
+
+        {
+            let tx = conn.transaction()?;
+            tx.execute_batch("INSERT INTO foo(id) VALUES (1),(2),(3),(4);")?;
+            tx.commit()?;
+        }
+
+        filter_foo_changes(&matcher, &conn)?;
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Ok(evt) = tokio::time::timeout(Duration::from_millis(100), rx.recv()).await {
+                let _ = evt;
+            }
+            let (count, sum) = read_sum()?;
+            if count == 1 && sum == SqliteValue::Integer(10) {
+                break;
+            }
+            if Instant::now() >= deadline {
+                panic!("timed out waiting for sum=10, got count={count}, sum={sum:?}");
+            }
+        }
+
+        {
+            let tx = conn.transaction()?;
+            tx.execute("INSERT INTO foo(id) VALUES (?)", params![5])?;
+            tx.commit()?;
+        }
+
+        filter_foo_changes(&matcher, &conn)?;
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Ok(evt) = tokio::time::timeout(Duration::from_millis(100), rx.recv()).await {
+                let _ = evt;
+            }
+            let (count, sum) = read_sum()?;
+            if count == 1 && sum == SqliteValue::Integer(15) {
+                break;
+            }
+            if Instant::now() >= deadline {
+                panic!("timed out waiting for sum=15, got count={count}, sum={sum:?}");
+            }
+        }
+
+        let (count, sum) = read_sum()?;
+        assert_eq!(count, 1);
+        assert_eq!(sum, SqliteValue::Integer(15));
+
+        matcher.cleanup().await;
+        subs.remove(&matcher.id());
         tripwire_tx.send(()).await.ok();
         tripwire_worker.await;
         wait_for_all_pending_handles().await;
