@@ -29,7 +29,7 @@ use speedy::Writable;
 use tokio::{
     sync::mpsc,
     task::JoinSet,
-    time::{interval, MissedTickBehavior},
+    time::{interval, Interval, MissedTickBehavior},
 };
 use tokio_util::codec::{Encoder, LengthDelimitedCodec};
 use tracing::{error, info, trace, warn};
@@ -380,6 +380,46 @@ pub async fn spawn_plumtree_loop(
     .await;
 }
 
+enum PlumtreeLoopBranch {
+    Shutdown,
+    Input(PlumtreeInput),
+    InputClosed,
+    Updates(PlumtreeUpdates),
+    UpdatesClosed,
+    HandleTimer(Timer<ChangeId, ActorId>),
+    IHaveTick,
+    MaintenanceTick,
+}
+
+async fn next_plumtree_loop_branch(
+    tripwire: &mut Tripwire,
+    rx_plumtree: &mut CorroReceiver<PlumtreeInput>,
+    rx_plumtree_updates: &mut CorroReceiver<PlumtreeUpdates>,
+    plumtree_timer_rx: &mut mpsc::Receiver<(Timer<ChangeId, ActorId>, Instant)>,
+    ihave_tick_interval: &mut Interval,
+    maintenance_interval: &mut Interval,
+) -> PlumtreeLoopBranch {
+    tokio::select! {
+        biased;
+        _ = tripwire => PlumtreeLoopBranch::Shutdown,
+        // These timers drive tree repair and cache maintenance. Keep them
+        // ahead of inbound channels, which can remain continuously ready.
+        Some((timer, _seq)) = plumtree_timer_rx.recv() => {
+            PlumtreeLoopBranch::HandleTimer(timer)
+        }
+        _ = ihave_tick_interval.tick() => PlumtreeLoopBranch::IHaveTick,
+        _ = maintenance_interval.tick() => PlumtreeLoopBranch::MaintenanceTick,
+        updates = rx_plumtree_updates.recv() => match updates {
+            Some(updates) => PlumtreeLoopBranch::Updates(updates),
+            None => PlumtreeLoopBranch::UpdatesClosed,
+        },
+        input = rx_plumtree.recv() => match input {
+            Some(input) => PlumtreeLoopBranch::Input(input),
+            None => PlumtreeLoopBranch::InputClosed,
+        },
+    }
+}
+
 pub async fn plumtree_loop(
     agent: Agent,
     transport: Transport,
@@ -414,49 +454,24 @@ pub async fn plumtree_loop(
     info!("added {} peers to plumtree from members", peers.len());
     state.add_peers_bulk_with_rtt(peers, &mut rt);
 
-    enum Branch {
-        Input(PlumtreeInput),
-        Updates(PlumtreeUpdates),
-        HandleTimer(Timer<ChangeId, ActorId>),
-        IHaveTick,
-        MaintenanceTick,
-    }
-
     loop {
-        let branch = tokio::select! {
-            biased;
-            _ = &mut tripwire => {
+        let branch = next_plumtree_loop_branch(
+            &mut tripwire,
+            &mut rx_plumtree,
+            &mut rx_plumtree_updates,
+            &mut plumtree_timer_rx,
+            &mut ihave_tick_interval,
+            &mut maintenance_interval,
+        )
+        .await;
+
+        match branch {
+            PlumtreeLoopBranch::Shutdown => {
                 info!("plumtree_loop: tripwire fired, sending shutdown prunes");
                 state.handle_shutdown(&mut rt);
                 break;
-            },
-            updates = rx_plumtree_updates.recv() => match updates {
-                Some(updates) => Branch::Updates(updates),
-                None => {
-                    warn!("plumtree_loop: updates channel closed");
-                    break;
-                }
-            },
-            input = rx_plumtree.recv() => match input {
-                Some(input) => Branch::Input(input),
-                None => {
-                    warn!("plumtree_loop: input channel closed");
-                    break;
-                }
-            },
-            Some((timer, _seq)) = plumtree_timer_rx.recv() => {
-                Branch::HandleTimer(timer)
             }
-            _ = ihave_tick_interval.tick() => {
-                Branch::IHaveTick
-            }
-            _ = maintenance_interval.tick() => {
-                Branch::MaintenanceTick
-            }
-        };
-
-        match branch {
-            Branch::Input(input) => match input {
+            PlumtreeLoopBranch::Input(input) => match input {
                 PlumtreeInput::Wire(msg) => {
                     let msg_type: &'static str = (&msg).into();
                     trace!("plumtree: received {msg_type} message");
@@ -529,7 +544,11 @@ pub async fn plumtree_loop(
                     let _ = reply.send(stats);
                 }
             },
-            Branch::Updates(updates) => match updates {
+            PlumtreeLoopBranch::InputClosed => {
+                warn!("plumtree_loop: input channel closed");
+                break;
+            }
+            PlumtreeLoopBranch::Updates(updates) => match updates {
                 PlumtreeUpdates::MemberUp {
                     actor_id,
                     addr: _,
@@ -543,14 +562,18 @@ pub async fn plumtree_loop(
                     state.peer_down(&actor_id, &mut rt);
                 }
             },
-            Branch::HandleTimer(timer) => {
+            PlumtreeLoopBranch::UpdatesClosed => {
+                warn!("plumtree_loop: updates channel closed");
+                break;
+            }
+            PlumtreeLoopBranch::HandleTimer(timer) => {
                 state.timer_fired(timer, &mut rt);
             }
-            Branch::IHaveTick => {
+            PlumtreeLoopBranch::IHaveTick => {
                 trace!("plumtree: sending out ihave digests");
                 state.tick(&mut rt);
             }
-            Branch::MaintenanceTick => {
+            PlumtreeLoopBranch::MaintenanceTick => {
                 trace!("plumtree: updating peer topology");
                 state.update_peer_topology(plumtree_topology_map(&agent), &mut rt);
                 state.cache_evict_if_needed(&mut rt);
@@ -965,6 +988,73 @@ mod tests {
         let mut tx = guard.write_tx(&booked);
         tx.compute_and_apply_gaps(RangeInclusiveSet::from_iter([version..=version]));
         tx.commit();
+    }
+
+    async fn select_with_ready_input(
+        protocol_timer_ready: bool,
+        ihave_tick_ready: bool,
+        maintenance_tick_ready: bool,
+    ) -> PlumtreeLoopBranch {
+        let (tripwire, _tripwire_worker, _tripwire_tx) = Tripwire::new_simple();
+        let mut tripwire = tripwire;
+        let (tx_input, mut rx_input) = bounded(1, "plumtree_loop_test_input");
+        let (_tx_updates, mut rx_updates) = bounded(1, "plumtree_loop_test_updates");
+        let (timer_tx, mut timer_rx) = mpsc::channel::<(Timer<ChangeId, ActorId>, Instant)>(1);
+
+        let mut ihave_tick = interval(Duration::from_secs(3600));
+        let mut maintenance_tick = interval(Duration::from_secs(3600));
+        if !ihave_tick_ready {
+            ihave_tick.tick().await;
+        }
+        if !maintenance_tick_ready {
+            maintenance_tick.tick().await;
+        }
+
+        if protocol_timer_ready {
+            timer_tx
+                .send((
+                    Timer::IHaveTimeoutBatch {
+                        ids: vec![],
+                        retries: 0,
+                        senders: vec![],
+                    },
+                    Instant::now(),
+                ))
+                .await
+                .expect("timer receiver should be open");
+        }
+
+        let (stats_tx, _stats_rx) = tokio::sync::oneshot::channel();
+        tx_input
+            .send(PlumtreeInput::QueryStats(stats_tx))
+            .await
+            .expect("input receiver should be open");
+
+        next_plumtree_loop_branch(
+            &mut tripwire,
+            &mut rx_input,
+            &mut rx_updates,
+            &mut timer_rx,
+            &mut ihave_tick,
+            &mut maintenance_tick,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn plumtree_timers_preempt_ready_input() {
+        assert!(matches!(
+            select_with_ready_input(true, false, false).await,
+            PlumtreeLoopBranch::HandleTimer(_)
+        ));
+        assert!(matches!(
+            select_with_ready_input(false, true, false).await,
+            PlumtreeLoopBranch::IHaveTick
+        ));
+        assert!(matches!(
+            select_with_ready_input(false, false, true).await,
+            PlumtreeLoopBranch::MaintenanceTick
+        ));
     }
 
     #[test]
