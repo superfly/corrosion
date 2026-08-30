@@ -1,6 +1,6 @@
 use std::{
     net::{IpAddr, SocketAddr},
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
@@ -159,6 +159,19 @@ fn init_tracing(cli: &Cli) -> Result<Option<TracingHandle>, ConfigError> {
     Ok(tracing_handle)
 }
 
+async fn vacuum_into(db_path: &Path, destination: &str) -> eyre::Result<PathBuf> {
+    let destination_path = PathBuf::from(destination);
+
+    if let Some(parent) = destination_path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+
+    let conn = Connection::open(db_path)?;
+    conn.execute("VACUUM INTO ?;", [destination])?;
+
+    Ok(destination_path)
+}
+
 async fn process_cli(cli: Cli) -> eyre::Result<()> {
     let tracing_handle = init_tracing(&cli)?;
 
@@ -170,23 +183,12 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
         Command::Backup { path } => {
             // assert_sometimes!(true, "Corrosion database is backed up");
             let db_path = cli.db_path()?;
+            let backup_path = vacuum_into(db_path.as_std_path(), path).await?;
 
             {
-                let conn = Connection::open(&db_path)?;
-                conn.execute("VACUUM INTO ?;", [&path])?;
-            }
-
-            {
-                let path = PathBuf::from(path);
-
-                // make sure parent path exists
-                if let Some(parent) = path.parent() {
-                    _ = tokio::fs::create_dir_all(parent).await;
-                }
-
                 // crsqlite connection here cause crsql_site_id table has a trigger
                 // that calls a crsqlite function.
-                let conn = CrConn::init(Connection::open(&path)?)?;
+                let conn = CrConn::init(Connection::open(&backup_path)?)?;
 
                 let tables: Vec<String> = conn.prepare("SELECT name FROM sqlite_schema WHERE type = 'table' AND name LIKE '%__crsql_clock'")?.query_map([], |row| row.get(0))?.collect::<Result<Vec<_>, _>>()?;
 
@@ -995,4 +997,33 @@ enum LogCommand {
     Set { filter: String },
     /// Reset the log filter to default
     Reset,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::vacuum_into;
+    use rusqlite::Connection;
+
+    #[tokio::test]
+    async fn vacuum_into_creates_missing_parent_directories() -> eyre::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let source_path = temp_dir.path().join("source.db");
+        let destination_path = temp_dir.path().join("backups/nested/backup.db");
+
+        let source = Connection::open(&source_path)?;
+        source.execute("CREATE TABLE test (id INTEGER PRIMARY KEY)", [])?;
+        source.execute("INSERT INTO test (id) VALUES (1)", [])?;
+        drop(source);
+
+        assert!(!destination_path.parent().unwrap().exists());
+
+        let destination = destination_path.to_string_lossy();
+        vacuum_into(&source_path, &destination).await?;
+
+        let backup = Connection::open(&destination_path)?;
+        let row_count: i64 = backup.query_row("SELECT COUNT(*) FROM test", [], |row| row.get(0))?;
+        assert_eq!(row_count, 1);
+
+        Ok(())
+    }
 }
