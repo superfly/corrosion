@@ -20,6 +20,21 @@ fn test_help() {
     cmd.arg("--help").assert().success();
 }
 
+#[test]
+fn test_consul_sync_requires_consul_config() {
+    let mut cmd = CORROSION_BIN.command();
+    let config_path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../config.example.toml");
+
+    cmd.arg("--config")
+        .arg(config_path)
+        .arg("consul")
+        .arg("sync")
+        .assert()
+        .failure()
+        .stderr("missing `consul` block in corrosion config\n");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn test_query() {
     _ = tracing_subscriber::fmt::try_init();
