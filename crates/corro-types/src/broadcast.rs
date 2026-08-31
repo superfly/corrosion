@@ -263,10 +263,87 @@ pub enum ChangeSource {
     Sync,
 }
 
-#[derive(Debug, Clone, PartialEq, Readable, Writable)]
+#[derive(Debug, Clone, PartialEq, Writable)]
 pub struct ChangeV1 {
     pub actor_id: ActorId,
     pub changeset: Changeset,
+}
+
+#[derive(Readable)]
+struct UnvalidatedChangeV1 {
+    actor_id: ActorId,
+    changeset: Changeset,
+}
+
+impl<'a, C> Readable<'a, C> for ChangeV1
+where
+    C: Context,
+{
+    fn read_from<R: Reader<'a, C>>(reader: &mut R) -> Result<Self, C::Error> {
+        let change = UnvalidatedChangeV1::read_from(reader)?;
+        let change = Self {
+            actor_id: change.actor_id,
+            changeset: change.changeset,
+        };
+
+        change
+            .validate()
+            .map_err(|error| speedy::Error::custom(error.to_string()))?;
+
+        Ok(change)
+    }
+
+    #[inline]
+    fn minimum_bytes_needed() -> usize {
+        <UnvalidatedChangeV1 as Readable<'a, C>>::minimum_bytes_needed()
+    }
+}
+
+#[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
+pub enum ChangeValidationError {
+    #[error("invalid changeset version range: start {start} is greater than end {end}")]
+    InvertedVersions {
+        start: CrsqlDbVersion,
+        end: CrsqlDbVersion,
+    },
+    #[error("invalid changeset sequence range: start {start} is greater than end {end}")]
+    InvertedSeqs { start: CrsqlSeq, end: CrsqlSeq },
+}
+
+impl ChangeV1 {
+    pub fn validate(&self) -> Result<(), ChangeValidationError> {
+        match &self.changeset {
+            Changeset::Empty { versions, .. } => validate_versions(*versions)?,
+            Changeset::EmptySet { versions, .. } => {
+                for versions in versions {
+                    validate_versions(*versions)?;
+                }
+            }
+            Changeset::Full { .. } | Changeset::FullV2 { .. } => {}
+        }
+
+        if let Some(seqs) = self.seqs() {
+            if seqs.start() > seqs.end() {
+                return Err(ChangeValidationError::InvertedSeqs {
+                    start: seqs.start(),
+                    end: seqs.end(),
+                });
+            }
+        }
+
+        Ok(())
+    }
+}
+
+fn validate_versions(versions: CrsqlDbVersionRange) -> Result<(), ChangeValidationError> {
+    if versions.start() > versions.end() {
+        return Err(ChangeValidationError::InvertedVersions {
+            start: versions.start(),
+            end: versions.end(),
+        });
+    }
+
+    Ok(())
 }
 
 impl Deref for ChangeV1 {

@@ -1055,6 +1055,11 @@ pub async fn handle_changes(
             }
         };
 
+        if let Err(error) = change.validate() {
+            warn!(actor_id = %change.actor_id, %error, "dropping change with an invalid range");
+            continue;
+        }
+
         let change_len = change.len();
         counter!("corro.agent.changes.recv").increment(std::cmp::max(change_len, 1) as u64); // count empties...
 
