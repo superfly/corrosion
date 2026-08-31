@@ -15,8 +15,9 @@ use corro_types::broadcast::{
 use corro_types::change::{row_to_change, Change, ChunkedChanges};
 use corro_types::config::GossipConfig;
 use corro_types::sync::{
-    generate_sync, SyncMessage, SyncMessageEncodeError, SyncMessageV1, SyncNeedV1, SyncRejectionV1,
-    SyncRequestV1, SyncStateV1, SyncTraceContextV1,
+    generate_sync, SyncMessage, SyncMessageEncodeError, SyncMessageV1, SyncNeedV1,
+    SyncNeedValidationError, SyncRejectionV1, SyncRequestV1, SyncStateV1, SyncStateValidationError,
+    SyncTraceContextV1,
 };
 use eyre::{ContextCompat, WrapErr};
 use futures::stream::FuturesUnordered;
@@ -58,6 +59,8 @@ pub enum SyncError {
     Rejection(#[from] SyncRejectionV1),
     #[error(transparent)]
     Transport(#[from] TransportError),
+    #[error(transparent)]
+    InvalidState(#[from] SyncStateValidationError),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -381,6 +384,7 @@ fn handle_need(
     need: SyncNeedV1,
     sender: &Sender<SyncMessage>,
 ) -> eyre::Result<()> {
+    need.validate()?;
     debug!(%actor_id, "handle known versions! need: {need:?}");
 
     let mut empties: RangeInclusiveSet<CrsqlDbVersion> = RangeInclusiveSet::new();
@@ -808,6 +812,15 @@ fn send_change_chunks<I: Iterator<Item = rusqlite::Result<Change>>>(
     Ok(())
 }
 
+fn validate_sync_needs(
+    requests: &[(ActorId, Vec<SyncNeedV1>)],
+) -> Result<(), SyncNeedValidationError> {
+    requests
+        .iter()
+        .flat_map(|(_, needs)| needs)
+        .try_for_each(SyncNeedV1::validate)
+}
+
 async fn process_sync(
     pool: SplitPool,
     bookie: Bookie,
@@ -856,6 +869,8 @@ async fn process_sync(
                     .into_iter()
                     .map(|(actor_id, reqs)| (actor_id, reqs.flat_map(|(_, reqs)| reqs).collect()))
                     .collect::<Vec<(ActorId, Vec<SyncNeedV1>)>>();
+
+                validate_sync_needs(&agg)?;
 
                 for (actor_id, needs) in agg {
                     let booked = bookie.get(&actor_id);
@@ -1098,7 +1113,7 @@ pub async fn parallel_sync(
 
                     counter!("corro.sync.client.member", "traffic" => "sync").increment(1);
 
-                    let needs = our_sync_state.compute_available_needs(&their_sync_state);
+                    let needs = our_sync_state.compute_available_needs(&their_sync_state)?;
 
                     debug!(%actor_id, self_actor_id = %agent.actor_id(), "computed needs: {:?}, their_sync_state: {:?}", needs, their_sync_state);
 
@@ -1737,6 +1752,36 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn range_validation_checks_all_direct_needs_before_processing() {
+        let actor_id = ActorId(uuid::Uuid::new_v4());
+        let other_actor_id = ActorId(uuid::Uuid::new_v4());
+        let requests = vec![
+            (
+                actor_id,
+                vec![SyncNeedV1::Full {
+                    versions: dbvr!(5, 5),
+                }],
+            ),
+            (
+                other_actor_id,
+                vec![SyncNeedV1::Full {
+                    versions: dbvr!(10, 5),
+                }],
+            ),
+        ];
+
+        assert_eq!(
+            validate_sync_needs(&requests),
+            Err(SyncNeedValidationError::InvertedFull {
+                start: CrsqlDbVersion(10),
+                end: CrsqlDbVersion(5),
+            })
+        );
+
+        assert!(validate_sync_needs(&requests[..1]).is_ok());
+    }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_sync_changes_order() -> eyre::Result<()> {

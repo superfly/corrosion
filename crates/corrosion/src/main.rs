@@ -397,9 +397,7 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
                 Some(consul) => {
                     command::consul::sync::run(consul, cli.api_addr()?, cli.db_path()?).await?
                 }
-                None => {
-                    error!("missing `consul` block in corrosion config");
-                }
+                None => eyre::bail!("missing `consul` block in corrosion config"),
             },
         },
         Command::Query {
