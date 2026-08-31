@@ -143,8 +143,8 @@ curl http://localhost:8080/v1/subscriptions/ba247cbc-2a7f-486b-873c-8a9620e72182
 
 ```bash
 curl http://localhost:8080/v1/subscriptions/ba247cbc-2a7f-486b-873c-8a9620e72182?from=1
-{ "change": [2, "insert", ["shiitake"], 2] }
-{ "change": [3, "insert", ["grilled cheese"], 3] }
+{ "change": ["insert", 2, ["shiitake"], 2] }
+{ "change": ["insert", 3, ["grilled cheese"], 3] }
 ```
 
 ## Response
