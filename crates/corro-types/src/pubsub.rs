@@ -25,8 +25,8 @@ use rusqlite::{
 use spawn::spawn_counted;
 use sqlite3_parser::{
     ast::{
-        As, Cmd, Expr, FromClause, JoinConstraint, JoinOperator, JoinType, JoinedSelectTable, Name,
-        OneSelect, Operator, QualifiedName, ResultColumn, Select, SelectTable, Stmt,
+        As, Cmd, Expr, FromClause, JoinConstraint, JoinOperator, JoinType, JoinedSelectTable,
+        Literal, Name, OneSelect, Operator, QualifiedName, ResultColumn, Select, SelectTable, Stmt,
     },
     lexer::sql::Parser,
 };
@@ -625,6 +625,25 @@ pub struct MatcherStmt {
     temp_query: String,
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum RefreshMode {
+    ChangedRows,
+    FullQuery,
+}
+
+impl RefreshMode {
+    fn tracking_key_expr(self, table_name: &str, primary_key: &str) -> Expr {
+        match self {
+            Self::ChangedRows => {
+                Expr::Qualified(Name(table_name.to_owned()), Name(primary_key.to_owned()))
+            }
+            // A SELECT without an outer FROM has one result row. NULL gives it
+            // a stable identity through the existing coalesced-key machinery.
+            Self::FullQuery => Expr::Literal(Literal::Null),
+        }
+    }
+}
+
 impl MatcherStmt {
     pub fn new_query(&self) -> &String {
         &self.new_query
@@ -679,7 +698,7 @@ impl Matcher {
 
         let mut parser = Parser::new(sql.as_bytes());
 
-        let (mut stmt, parsed) = match parser.next()?.ok_or(MatcherError::StatementRequired)? {
+        let (mut stmt, mut parsed) = match parser.next()?.ok_or(MatcherError::StatementRequired)? {
             Cmd::Stmt(stmt) => {
                 let parsed = match stmt {
                     Stmt::Select(ref select) => extract_select_columns(select, schema)?,
@@ -690,6 +709,17 @@ impl Matcher {
             }
             _ => return Err(MatcherError::StatementRequired),
         };
+
+        let has_outer_from = select_has_outer_from(&stmt);
+        let refresh_mode = parsed.prepare_refresh_mode(has_outer_from);
+        let has_compound_select = matches!(
+            &stmt,
+            Stmt::Select(select) if select.body.compounds.is_some()
+        );
+
+        if refresh_mode == RefreshMode::FullQuery && has_compound_select {
+            return Err(MatcherError::UnsupportedStatement);
+        }
 
         if parsed.table_columns.is_empty() {
             return Err(MatcherError::TableRequired);
@@ -724,10 +754,7 @@ impl Matcher {
                                         entry.push(alias.clone());
 
                                         ResultColumn::Expr(
-                                            Expr::Qualified(
-                                                Name(tbl_name.clone()),
-                                                Name(pk.clone()),
-                                            ),
+                                            refresh_mode.tracking_key_expr(tbl_name, pk),
                                             Some(As::As(Name(alias))),
                                         )
                                     })
@@ -746,30 +773,36 @@ impl Matcher {
         }
 
         for (idx, (tbl_name, _cols)) in parsed.table_columns.iter().enumerate() {
-            let expr = table_to_expr(
-                &parsed.aliases,
-                schema
-                    .tables
-                    .get(tbl_name)
-                    .expect("this should not happen, missing table in schema"),
-                tbl_name,
-            )?;
+            let changed_rows_filter = if refresh_mode == RefreshMode::ChangedRows {
+                Some(table_to_expr(
+                    &parsed.aliases,
+                    schema
+                        .tables
+                        .get(tbl_name)
+                        .expect("this should not happen, missing table in schema"),
+                    tbl_name,
+                )?)
+            } else {
+                None
+            };
 
             let mut stmt = stmt.clone();
 
-            if let Stmt::Select(select) = &mut stmt {
+            if let (Some(changed_rows_filter), Stmt::Select(select)) =
+                (changed_rows_filter, &mut stmt)
+            {
                 if let OneSelect::Select {
                     where_clause, from, ..
                 } = &mut select.body.select
                 {
                     *where_clause = if let Some(prev) = where_clause.take() {
                         Some(Expr::Binary(
-                            Box::new(expr),
+                            Box::new(changed_rows_filter),
                             Operator::And,
                             Box::new(Expr::parenthesized(prev)),
                         ))
                     } else {
-                        Some(expr)
+                        Some(changed_rows_filter)
                     };
 
                     match from {
@@ -813,17 +846,8 @@ impl Matcher {
                 all_cols.push(format!("col_{i}"));
             }
 
-            let temp_query = format!(
-                "SELECT {} FROM query WHERE ({}) IN temp_{tbl_name}",
-                all_cols.join(","),
-                pks.get(tbl_name)
-                    .cloned()
-                    .ok_or(MatcherError::MissingPrimaryKeys)?
-                    .into_iter()
-                    .map(|pk| format!("coalesce({pk}, \"\")"))
-                    .collect::<Vec<_>>()
-                    .join(","),
-            );
+            let table_pks = pks.get(tbl_name).ok_or(MatcherError::MissingPrimaryKeys)?;
+            let temp_query = stored_rows_query(refresh_mode, &all_cols, tbl_name, table_pks);
 
             info!(%sql_hash, sub_id = %id, "modified query for table '{tbl_name}': {new_query}");
 
@@ -1853,6 +1877,42 @@ pub struct ParsedSelect {
     children: Vec<ParsedSelect>,
 }
 
+impl ParsedSelect {
+    fn prepare_refresh_mode(&mut self, has_outer_from: bool) -> RefreshMode {
+        if has_outer_from || !self.table_columns.is_empty() {
+            return RefreshMode::ChangedRows;
+        }
+
+        self.merge_child_table_columns();
+        RefreshMode::FullQuery
+    }
+
+    fn merge_child_table_columns(&mut self) {
+        let mut child_table_columns = IndexMap::<String, HashSet<String>>::new();
+
+        for child in &self.children {
+            child.collect_table_columns(&mut child_table_columns);
+        }
+
+        for (table, columns) in child_table_columns {
+            self.table_columns.entry(table).or_default().extend(columns);
+        }
+    }
+
+    fn collect_table_columns(&self, table_columns: &mut IndexMap<String, HashSet<String>>) {
+        for (table, columns) in &self.table_columns {
+            table_columns
+                .entry(table.clone())
+                .or_default()
+                .extend(columns.iter().cloned());
+        }
+
+        for child in &self.children {
+            child.collect_table_columns(table_columns);
+        }
+    }
+}
+
 fn extract_select_columns(select: &Select, schema: &Schema) -> Result<ParsedSelect, MatcherError> {
     let mut parsed = ParsedSelect::default();
 
@@ -2214,6 +2274,41 @@ fn extract_columns(
     Ok(())
 }
 
+fn stored_rows_query(
+    refresh_mode: RefreshMode,
+    all_columns: &[String],
+    table_name: &str,
+    table_primary_keys: &[String],
+) -> String {
+    let column_list = all_columns.join(",");
+
+    if refresh_mode == RefreshMode::FullQuery {
+        return format!("SELECT {column_list} FROM query");
+    }
+
+    let primary_key_list = table_primary_keys
+        .iter()
+        .map(|primary_key| format!("coalesce({primary_key}, \"\")"))
+        .collect::<Vec<_>>()
+        .join(",");
+
+    format!(
+        "SELECT {column_list} FROM query \
+         WHERE ({primary_key_list}) IN temp_{table_name}"
+    )
+}
+
+fn select_has_outer_from(statement: &Stmt) -> bool {
+    matches!(
+        statement,
+        Stmt::Select(select)
+            if matches!(
+                select.body.select,
+                OneSelect::Select { from: Some(_), .. }
+            )
+    )
+}
+
 fn table_to_expr(
     aliases: &HashMap<String, String>,
     tbl: &Table,
@@ -2513,6 +2608,8 @@ mod tests {
 
     use super::*;
 
+    type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync + 'static>>;
+
     #[test]
     fn test_pack_unpack() {
         let neg_one: i64 = -1;
@@ -2616,6 +2713,125 @@ mod tests {
             subs.remove(&handle.id());
         }
 
+        tripwire_tx.send(()).await.ok();
+        tripwire_worker.await;
+        wait_for_all_pending_handles().await;
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn test_matcher_with_scalar_subqueries() -> TestResult {
+        _ = tracing_subscriber::fmt::try_init();
+        let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
+        let schema_sql = "
+            CREATE TABLE foo (id INTEGER NOT NULL PRIMARY KEY);
+            CREATE TABLE bar (id INTEGER NOT NULL PRIMARY KEY);
+        ";
+        let mut schema = parse_sql(schema_sql)?;
+        let sql = "
+            SELECT json_object(
+                'foos', (SELECT json_group_array(json_object('id', foo.id)) FROM foo),
+                'bars', (SELECT json_group_array(json_object('id', bar.id)) FROM bar)
+            ) AS test;
+        ";
+
+        let subs = SubsManager::default();
+        let tmpdir = TempDir::new(tempfile::tempdir()?);
+        let db_path = tmpdir.path().join("test.db");
+        let subscriptions_path: Utf8PathBuf =
+            tmpdir.path().join("subs").display().to_string().into();
+        let pool = SplitPool::create(db_path, Arc::new(Semaphore::new(1)), -1048576).await?;
+        let clock = Arc::new(uhlc::HLC::default());
+
+        {
+            let mut conn = pool.write_priority().await?;
+            setup_conn(&conn)?;
+            migrate(clock, &mut conn)?;
+            let tx = conn.transaction()?;
+            apply_schema(&tx, &Schema::default(), &mut schema)?;
+            tx.commit()?;
+        }
+
+        let (matcher, created) = subs.get_or_insert(
+            sql,
+            subscriptions_path.as_path(),
+            &schema,
+            &pool,
+            tripwire.clone(),
+        )?;
+        let mut events = created.unwrap().evt_rx;
+
+        assert!(matches!(
+            next_query_event(&mut events).await,
+            QueryEvent::Columns(_)
+        ));
+        assert_eq!(
+            next_query_event(&mut events).await,
+            QueryEvent::Row(
+                RowId(1),
+                vec![SqliteValue::Text(r#"{"foos":[],"bars":[]}"#.into())]
+            )
+        );
+        assert!(matches!(
+            next_query_event(&mut events).await,
+            QueryEvent::EndOfQuery { .. }
+        ));
+
+        {
+            let conn = pool.write_priority().await?;
+            conn.execute("INSERT INTO foo (id) VALUES (1)", [])?;
+            filter_latest_changes_from_db(&matcher, &conn)?;
+        }
+
+        assert_eq!(
+            next_query_event(&mut events).await,
+            QueryEvent::Change(
+                ChangeType::Update,
+                RowId(1),
+                vec![SqliteValue::Text(r#"{"foos":[{"id":1}],"bars":[]}"#.into())],
+                ChangeId(1)
+            )
+        );
+
+        {
+            let conn = pool.write_priority().await?;
+            conn.execute("INSERT INTO bar (id) VALUES (10)", [])?;
+            filter_latest_changes_from_db(&matcher, &conn)?;
+        }
+
+        assert_eq!(
+            next_query_event(&mut events).await,
+            QueryEvent::Change(
+                ChangeType::Update,
+                RowId(1),
+                vec![SqliteValue::Text(
+                    r#"{"foos":[{"id":1}],"bars":[{"id":10}]}"#.into()
+                )],
+                ChangeId(2)
+            )
+        );
+
+        {
+            let conn = pool.write_priority().await?;
+            conn.execute("DELETE FROM foo WHERE id = 1", [])?;
+            filter_latest_changes_from_db(&matcher, &conn)?;
+        }
+
+        assert_eq!(
+            next_query_event(&mut events).await,
+            QueryEvent::Change(
+                ChangeType::Update,
+                RowId(1),
+                vec![SqliteValue::Text(
+                    r#"{"foos":[],"bars":[{"id":10}]}"#.into()
+                )],
+                ChangeId(3)
+            )
+        );
+
+        matcher.cleanup().await;
+        subs.remove(&matcher.id());
         tripwire_tx.send(()).await.ok();
         tripwire_worker.await;
         wait_for_all_pending_handles().await;
@@ -3178,6 +3394,25 @@ mod tests {
             let res = subs.restore(id, &subscriptions_path, &schema, &pool, tripwire.clone());
             assert!(res.is_err());
         }
+    }
+
+    async fn next_query_event(events: &mut mpsc::Receiver<QueryEvent>) -> QueryEvent {
+        tokio::time::timeout(Duration::from_secs(5), events.recv())
+            .await
+            .expect("timed out waiting for a subscription event")
+            .expect("subscription event channel closed")
+    }
+
+    fn filter_latest_changes_from_db(
+        matcher: &MatcherHandle,
+        state_conn: &Connection,
+    ) -> rusqlite::Result<()> {
+        let latest_db_version =
+            state_conn.query_row("SELECT MAX(db_version) FROM crsql_changes", [], |row| {
+                row.get(0)
+            })?;
+
+        filter_changes_from_db(matcher, state_conn, None, latest_db_version)
     }
 
     fn filter_changes_from_db(
