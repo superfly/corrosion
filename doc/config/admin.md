@@ -1,6 +1,6 @@
 # The [admin] block
 
-The `[admin]` block configures the Unix domain socket used by the [`corrosion`](../cli/README.md) CLI to send administrative commands to a running agent.
+The `[admin]` block configures the Unix domain socket used by the [`corrosion`](../cli/) CLI to send administrative commands to a running agent.
 
 ### Optional fields
 

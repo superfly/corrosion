@@ -1,15 +1,7 @@
 [book]
 authors = ["Jerome Gravel-Niquet"]
 language = "en"
-multilingual = false
 src = "doc"
 title = "Corrosion"
 
-[preprocessor.admonish]
-command = "mdbook-admonish"
-assets_version = "3.0.0" # do not edit: managed by `mdbook-admonish install`
-
 [output.html]
-additional-css = ["./doc/mdbook-admonish.css"]
-
-[output.linkcheck]

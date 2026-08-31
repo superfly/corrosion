@@ -145,6 +145,21 @@ async fn reap_table(
     clock: &uhlc::HLC,
     config: &ReaperCfg,
 ) -> Result<(usize, usize), ReaperError> {
+    reap_table_with_hook(pool, table, retention, filter, clock, config, || {}).await
+}
+
+async fn reap_table_with_hook<F>(
+    pool: &SplitPool,
+    table: &str,
+    retention: Duration,
+    filter: Option<&str>,
+    clock: &uhlc::HLC,
+    config: &ReaperCfg,
+    candidates_selected: F,
+) -> Result<(usize, usize), ReaperError>
+where
+    F: FnOnce(),
+{
     let read_conn = pool.read().await.map_err(ReaperError::ReadPool)?;
 
     let limit = config.row_limit;
@@ -179,6 +194,7 @@ async fn reap_table(
 
         Ok::<_, rusqlite::Error>((sentinel_pks, orphaned_pks))
     })?;
+    candidates_selected();
 
     if pks_to_delete.is_empty() && orphaned_pks.is_empty() {
         trace!("no pks to delete or orphaned pks found in table {table}");
@@ -196,17 +212,29 @@ async fn reap_table(
 
     let (clocks, pks) = block_in_place(|| {
         let tx = write_conn.immediate_transaction()?;
+        let filter_clause = filter.unwrap_or_default();
 
         let deleted_clocks = tx
             .prepare_cached(&format!(
-                "DELETE FROM {table}__crsql_clock WHERE key IN (SELECT value0 FROM unnest(?))",
+                "DELETE FROM {table}__crsql_clock WHERE key IN (
+                    SELECT key FROM {table}__crsql_clock
+                    LEFT JOIN {table}__crsql_pks ON key = __crsql_key
+                    WHERE key IN (SELECT value0 FROM unnest(?))
+                    AND col_name = -1 AND col_version % 2 = 0
+                    AND ts < ? {filter_clause}
+                )",
             ))?
-            .execute(params![unnest_param(pks_to_delete.clone())])?;
+            .execute(params![unnest_param(pks_to_delete.clone()), &cutoff])?;
 
         orphaned_pks.extend_from_slice(&pks_to_delete);
         let deleted_pks = tx
             .prepare_cached(&format!(
-                "DELETE FROM {table}__crsql_pks WHERE __crsql_key IN (SELECT value0 FROM unnest(?))",
+                "DELETE FROM {table}__crsql_pks
+                WHERE __crsql_key IN (SELECT value0 FROM unnest(?))
+                AND NOT EXISTS (
+                    SELECT 1 FROM {table}__crsql_clock
+                    WHERE key = __crsql_key
+                )",
             ))?
             .execute(params![unnest_param(orphaned_pks)])?;
 
@@ -236,7 +264,7 @@ mod tests {
     use corro_types::{agent::SplitPool, broadcast::Timestamp, sqlite::setup_conn};
     use std::sync::Arc;
     use tempfile::tempdir;
-    use tokio::sync::Semaphore;
+    use tokio::sync::{oneshot, Semaphore};
     use uhlc::HLCBuilder;
 
     async fn setup_test_db(path: std::path::PathBuf) -> eyre::Result<SplitPool> {
@@ -418,6 +446,104 @@ mod tests {
             |row| row.get(0),
         )?;
         assert_eq!(recent, 2, "recent sentinel entries should still exist");
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn test_reaper_keeps_row_revived_while_waiting_for_write() -> eyre::Result<()> {
+        let tmpdir = tempdir()?;
+        let pool = setup_test_db(tmpdir.path().join("test.db")).await?;
+        let clock = Arc::new(HLCBuilder::default().build());
+        let now_ts = Timestamp::from(clock.new_timestamp());
+        let old_ts =
+            Timestamp::from(now_ts.to_ntp64() - uhlc::NTP64::from(parse_duration("2w").unwrap()));
+
+        {
+            let mut conn = pool.write_priority().await?;
+            block_in_place(|| {
+                let tx = conn.immediate_transaction()?;
+                tx.prepare_cached("SELECT crsql_set_ts(?)")?
+                    .query_row([&old_ts], |_| Ok(()))?;
+                tx.execute("INSERT INTO tests (id, text) VALUES (1, 'old')", [])?;
+                tx.execute("DELETE FROM tests WHERE id = 1", [])?;
+                tx.commit()
+            })?;
+        }
+
+        // Keep the writer dispatcher occupied so the reaper waits after
+        // selecting the deleted row from its read-only snapshot.
+        let mut writer = pool.write_priority().await?;
+        let config = ReaperCfg {
+            row_limit: 500,
+            check_orphaned_pks: true,
+        };
+        let reaper_pool = pool.clone();
+        let reaper_clock = clock.clone();
+        let (selected_tx, selected_rx) = oneshot::channel();
+        let reaping = tokio::spawn(async move {
+            reap_table_with_hook(
+                &reaper_pool,
+                "tests",
+                parse_duration("1w").unwrap(),
+                None,
+                &reaper_clock,
+                &config,
+                || {
+                    _ = selected_tx.send(());
+                },
+            )
+            .await
+        });
+        selected_rx.await?;
+
+        let (key, clocks_before) = block_in_place(|| {
+            let tx = writer.immediate_transaction()?;
+            tx.prepare_cached("SELECT crsql_set_ts(?)")?
+                .query_row([&now_ts], |_| Ok(()))?;
+            tx.execute("INSERT INTO tests (id, text) VALUES (1, 'revived')", [])?;
+
+            let key = tx.query_row(
+                "SELECT __crsql_key FROM tests__crsql_pks WHERE id = 1",
+                [],
+                |row| row.get::<_, u64>(0),
+            )?;
+            let clocks = tx.query_row(
+                "SELECT COUNT(*) FROM tests__crsql_clock WHERE key = ?",
+                [key],
+                |row| row.get::<_, usize>(0),
+            )?;
+            tx.commit()?;
+            Ok::<_, rusqlite::Error>((key, clocks))
+        })?;
+        assert!(clocks_before > 0, "revival must produce clock rows");
+        drop(writer);
+
+        let (deleted_clocks, deleted_pks) = reaping.await??;
+        assert_eq!(deleted_clocks, 0, "revived clocks must not be reaped");
+        assert_eq!(deleted_pks, 0, "a revived PK must not be reaped");
+
+        let conn = pool.read().await?;
+        let text: String =
+            conn.query_row("SELECT text FROM tests WHERE id = 1", [], |row| row.get(0))?;
+        assert_eq!(text, "revived");
+
+        let clocks_after: usize = conn.query_row(
+            "SELECT COUNT(*) FROM tests__crsql_clock WHERE key = ?",
+            [key],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            clocks_after, clocks_before,
+            "revived clocks must remain intact"
+        );
+
+        let pks_after: usize = conn.query_row(
+            "SELECT COUNT(*) FROM tests__crsql_pks WHERE __crsql_key = ?",
+            [key],
+            |row| row.get(0),
+        )?;
+        assert_eq!(pks_after, 1, "the revived PK mapping must remain intact");
 
         Ok(())
     }

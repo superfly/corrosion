@@ -27,7 +27,7 @@
       in
         {
           packages.mdbook-shell = pkgs.mkShell {
-            buildInputs = with pkgs; [ mdbook mdbook-linkcheck mdbook-admonish ];
+            buildInputs = with pkgs; [ mdbook lychee ];
 
             shellHook = ''
               mdbook serve
