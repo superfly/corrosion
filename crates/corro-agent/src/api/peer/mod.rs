@@ -374,6 +374,34 @@ const MIN_CHANGES_BYTES_PER_MESSAGE: usize = 1024;
 
 const ADAPT_CHUNK_SIZE_THRESHOLD: Duration = Duration::from_millis(500);
 
+/// Never flush on buffers smaller than this, even if the reported congestion
+/// window is tiny (e.g. right after a loss event) — flushing single-digit-KB
+/// chunks would spend most of the time on per-write overhead instead of on
+/// the wire.
+const MIN_SEND_BUF_FLUSH_BYTES: u64 = 4 * 1024;
+
+/// Cap how large a single flush can grow to even if cwnd is large, so one
+/// write_chunk() call can't monopolize the stream for too long and so we
+/// keep responding to backpressure at a reasonable cadence.
+const MAX_SEND_BUF_FLUSH_BYTES: u64 = 256 * 1024;
+
+/// Pick how many bytes to accumulate in `send_buf` before flushing it to the
+/// QUIC stream, based on the connection's current congestion window.
+///
+/// `ConnectionStats.path.cwnd` (see quinn_proto) is the total number of bytes
+/// the congestion controller currently allows in flight on this path; it
+/// grows as the connection proves it can sustain more (slow start / cubic
+/// probing) and shrinks on loss/congestion signals. Sizing our flush against
+/// it means we stop handing `write_chunk` more data than the path can
+/// currently absorb in one round: if `write_chunk` doesn't return quickly,
+/// we've queued more than the peer's receive/congestion window allows, which
+/// is exactly the backpressure signal described in
+/// https://github.com/superfly/corrosion/issues/61.
+fn send_buf_flush_threshold(conn: &quinn::Connection) -> u64 {
+    let cwnd = conn.stats().path.cwnd;
+    cwnd.clamp(MIN_SEND_BUF_FLUSH_BYTES, MAX_SEND_BUF_FLUSH_BYTES)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn handle_need(
     conn: &mut Connection,
@@ -1423,7 +1451,7 @@ pub async fn parallel_sync(
         .sum::<usize>())
 }
 
-#[tracing::instrument(skip(agent, bookie, their_actor_id, read, write), fields(actor_id = %their_actor_id), err)]
+#[tracing::instrument(skip(agent, bookie, their_actor_id, read, write, conn), fields(actor_id = %their_actor_id), err)]
 #[allow(clippy::too_many_arguments)]
 pub async fn serve_sync(
     agent: &Agent,
@@ -1434,6 +1462,7 @@ pub async fn serve_sync(
     cluster_id: ClusterId,
     mut read: FramedRead<RecvStream, LengthDelimitedCodec>,
     mut write: SendStream,
+    conn: &quinn::Connection,
 ) -> Result<usize, SyncError> {
     // only compress if the peer can decode it AND we're locally configured to
     let compression_config = agent.config().gossip.compression_config();
@@ -1608,7 +1637,7 @@ pub async fn serve_sync(
                             };
                             encode_sync_msg(&mut codec, &mut encode_buf, &mut send_buf, msg)?;
 
-                            if send_buf.len() >= 16 * 1024 {
+                            if send_buf.len() as u64 >= send_buf_flush_threshold(conn) {
                                 write_buf(&mut send_buf, &mut write).await.map_err(SyncSendError::from)?;
                             }
                         },
