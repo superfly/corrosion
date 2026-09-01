@@ -42,7 +42,7 @@ regex = "1.13.1"
 
 [dev-dependencies]
 corro-tests = { path = "../corro-tests" }
-tokio-postgres = { version = "0.7.12" }
+tokio-postgres = { version = "0.7.18" }
 tracing-subscriber = { workspace = true }
 tracing-test.workspace = true
 camino = { workspace = true }

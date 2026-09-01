@@ -1192,6 +1192,11 @@ impl ChangesActor {
                 }
             };
 
+            if let Err(error) = change.validate() {
+                warn!(actor_id = %change.actor_id, %error, "dropping change with an invalid range");
+                continue;
+            }
+
             let change_len = change.len();
             counter!("corro.agent.changes.recv").increment(std::cmp::max(change_len, 1) as u64);
 
@@ -1528,6 +1533,103 @@ mod tests {
             agent.fatal_issue(),
             Some("change batch processing task panicked")
         );
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn invalid_change_is_dropped_without_stopping_actor() -> eyre::Result<()> {
+        let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
+        let dir = tempfile::tempdir()?;
+        let mut config = Config::builder()
+            .db_path(dir.path().join("corrosion.db").display().to_string())
+            .gossip_addr("127.0.0.1:0".parse()?)
+            .api_addr("127.0.0.1:0".parse()?)
+            .build()?;
+        config.perf.apply_queue_min_batch_size = 1;
+        config.perf.apply_queue_max_batch_size = 1;
+        config.perf.apply_queue_step_base = 0;
+
+        let (agent, agent_options) = setup(config, tripwire.clone()).await?;
+        execute_schema(&agent, vec![TEST_SCHEMA.to_owned()]).await?;
+
+        let other_actor = ActorId(uuid::Uuid::new_v4());
+        let bookie = Bookie::new(Default::default());
+        let actor_agent = agent.clone();
+        let actor_bookie = bookie.clone();
+        let handler = tokio::spawn(async move {
+            let mut actor = ChangesActor::new(actor_agent, actor_bookie, agent_options.rx_changes);
+            actor.run(tripwire).await;
+        });
+
+        agent
+            .tx_changes()
+            .send((
+                ChangeV1 {
+                    actor_id: other_actor,
+                    changeset: Changeset::Full {
+                        version: CrsqlDbVersion(1),
+                        changes: Vec::new(),
+                        seqs: dbsr!(10, 5),
+                        last_seq: CrsqlSeq(10),
+                        ts: agent.clock().new_timestamp().into(),
+                    },
+                },
+                ChangeSource::Sync,
+                None,
+            ))
+            .await?;
+
+        let row = Change {
+            table: TableName("tests".into()),
+            pk: pack_columns(&vec![2i64.into()])?,
+            cid: ColumnName("text".into()),
+            val: "valid after invalid".into(),
+            col_version: 1,
+            db_version: CrsqlDbVersion(2),
+            seq: CrsqlSeq(0),
+            site_id: other_actor.to_bytes(),
+            cl: 1,
+        };
+        agent
+            .tx_changes()
+            .send((
+                ChangeV1 {
+                    actor_id: other_actor,
+                    changeset: Changeset::Full {
+                        version: CrsqlDbVersion(2),
+                        changes: vec![row],
+                        seqs: dbsr!(0, 0),
+                        last_seq: CrsqlSeq(0),
+                        ts: agent.clock().new_timestamp().into(),
+                    },
+                },
+                ChangeSource::Sync,
+                None,
+            ))
+            .await?;
+
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if bookie
+                    .get(&other_actor)
+                    .is_some_and(|booked| booked.read().contains_version(&CrsqlDbVersion(2)))
+                {
+                    break;
+                }
+                sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await?;
+
+        assert!(!bookie
+            .get(&other_actor)
+            .is_some_and(|booked| booked.read().contains_version(&CrsqlDbVersion(1))));
+        assert!(!handler.is_finished());
+
+        tripwire_tx.send(()).await.ok();
+        tripwire_worker.await;
+        handler.await?;
 
         Ok(())
     }
