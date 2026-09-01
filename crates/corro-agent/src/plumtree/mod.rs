@@ -381,11 +381,9 @@ pub async fn spawn_plumtree_loop(
 }
 
 enum PlumtreeLoopBranch {
-    Shutdown,
+    Exit(&'static str),
     Input(PlumtreeInput),
-    InputClosed,
     Updates(PlumtreeUpdates),
-    UpdatesClosed,
     HandleTimer(Timer<ChangeId, ActorId>),
     IHaveTick,
     MaintenanceTick,
@@ -401,7 +399,7 @@ async fn next_plumtree_loop_branch(
 ) -> PlumtreeLoopBranch {
     tokio::select! {
         biased;
-        _ = tripwire => PlumtreeLoopBranch::Shutdown,
+        _ = tripwire => PlumtreeLoopBranch::Exit("tripwire fired"),
         // These timers drive tree repair and cache maintenance. Keep them
         // ahead of inbound channels, which can remain continuously ready.
         Some((timer, _seq)) = plumtree_timer_rx.recv() => {
@@ -411,11 +409,11 @@ async fn next_plumtree_loop_branch(
         _ = maintenance_interval.tick() => PlumtreeLoopBranch::MaintenanceTick,
         updates = rx_plumtree_updates.recv() => match updates {
             Some(updates) => PlumtreeLoopBranch::Updates(updates),
-            None => PlumtreeLoopBranch::UpdatesClosed,
+            None => PlumtreeLoopBranch::Exit("updates channel closed"),
         },
         input = rx_plumtree.recv() => match input {
             Some(input) => PlumtreeLoopBranch::Input(input),
-            None => PlumtreeLoopBranch::InputClosed,
+            None => PlumtreeLoopBranch::Exit("input channel closed"),
         },
     }
 }
@@ -444,6 +442,7 @@ pub async fn plumtree_loop(
 
     // send out ihave digests to lazy peers
     let mut ihave_tick_interval = interval(Duration::from_millis(150));
+    ihave_tick_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut maintenance_interval = interval(Duration::from_secs(60));
     maintenance_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
@@ -466,8 +465,8 @@ pub async fn plumtree_loop(
         .await;
 
         match branch {
-            PlumtreeLoopBranch::Shutdown => {
-                info!("plumtree_loop: tripwire fired, sending shutdown prunes");
+            PlumtreeLoopBranch::Exit(reason) => {
+                info!("plumtree_loop: {reason}, sending shutdown prunes");
                 state.handle_shutdown(&mut rt);
                 break;
             }
@@ -544,10 +543,6 @@ pub async fn plumtree_loop(
                     let _ = reply.send(stats);
                 }
             },
-            PlumtreeLoopBranch::InputClosed => {
-                warn!("plumtree_loop: input channel closed");
-                break;
-            }
             PlumtreeLoopBranch::Updates(updates) => match updates {
                 PlumtreeUpdates::MemberUp {
                     actor_id,
@@ -562,10 +557,6 @@ pub async fn plumtree_loop(
                     state.peer_down(&actor_id, &mut rt);
                 }
             },
-            PlumtreeLoopBranch::UpdatesClosed => {
-                warn!("plumtree_loop: updates channel closed");
-                break;
-            }
             PlumtreeLoopBranch::HandleTimer(timer) => {
                 state.timer_fired(timer, &mut rt);
             }
