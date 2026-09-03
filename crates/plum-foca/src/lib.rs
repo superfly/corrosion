@@ -1008,7 +1008,8 @@ impl<I: MessageId<NodeId = N>, P: Payload<MessageId = I, NodeId = N>, N: NodeId,
             return;
         }
 
-        self.commit_topology(peer, rtt.unwrap_or_default());
+        let info = self.cached_ring_or(&peer, rtt.unwrap_or_default());
+        self.commit_topology(peer, info);
         self.maybe_recompute_fanout();
         if self.eager_peers.len() < self.num_eager() {
             self.move_to_eager(&peer, rt);
@@ -1018,9 +1019,18 @@ impl<I: MessageId<NodeId = N>, P: Payload<MessageId = I, NodeId = N>, N: NodeId,
         self.needs_rebalance = true;
     }
 
-    /// Run the deferred rebalance if one is due — either a membership
-    /// change flagged it (`needs_rebalance`), or an overlay peer crossed a
-    /// bucket boundary (Near/Mid/Far).
+    /// Reconcile the overlay with a membership snapshot, then run the
+    /// deferred rebalance if one is due — either a membership change flagged
+    /// it (`needs_rebalance`), or an overlay peer crossed a bucket boundary
+    /// (Near/Mid/Far).
+    ///
+    /// Members that are not known are added, whether they joined for the
+    /// first time or rejoined after a `peer_down`. Known peers missing from
+    /// the snapshot are removed as if `peer_down` had been called. Known
+    /// peers present in both only move buckets after
+    /// `RING_EXTRA_CONFIRMATIONS` consecutive runs. `peer_topology` keeps an
+    /// entry for every peer ever seen: it is the RTT cache that places a
+    /// rejoining peer before a fresh ring is known.
     pub fn update_peer_topology(
         &mut self,
         updates: impl IntoIterator<Item = (N, RttInfo)>,
@@ -1029,14 +1039,14 @@ impl<I: MessageId<NodeId = N>, P: Payload<MessageId = I, NodeId = N>, N: NodeId,
         let mut topology_changed = false;
 
         let prev_count = self.known_peers().len();
+        let mut present: HashSet<N> = HashSet::with_capacity(prev_count);
         for (peer, info) in updates {
+            if peer == self.local_id {
+                continue;
+            }
+            present.insert(peer);
             match self.peer_topology.get(&peer).copied() {
-                None => {
-                    info!("topology added peer {:?}, new: {:?}", peer, info);
-                    self.commit_topology(peer, info);
-                    topology_changed = true;
-                }
-                Some(existing) => {
+                Some(existing) if self.known_peers.contains(&peer) => {
                     let old_bucket = RingBucket::of(existing);
                     let new_bucket = RingBucket::of(info);
 
@@ -1076,7 +1086,26 @@ impl<I: MessageId<NodeId = N>, P: Payload<MessageId = I, NodeId = N>, N: NodeId,
                         self.pending_topology.insert(peer, (info, confirmations));
                     }
                 }
+                // first join, or a rejoin whose peer_up never arrived
+                _ => {
+                    let info = self.cached_ring_or(&peer, info);
+                    info!("topology added peer {:?}, new: {:?}", peer, info);
+                    self.commit_topology(peer, info);
+                    topology_changed = true;
+                }
             }
+        }
+
+        let departed: Vec<N> = self
+            .known_peers
+            .iter()
+            .filter(|peer| !present.contains(peer))
+            .copied()
+            .collect();
+        for peer in departed {
+            info!("topology removed peer {:?}, absent from members", peer);
+            self.peer_down(&peer, rt);
+            topology_changed = true;
         }
 
         if self.known_peers().len() != prev_count {
@@ -1099,13 +1128,25 @@ impl<I: MessageId<NodeId = N>, P: Payload<MessageId = I, NodeId = N>, N: NodeId,
         self.pending_topology.remove(&peer);
     }
 
+    /// Fresh info wins. Without a ring, fall back to the last one cached
+    /// in `peer_topology` so a rejoining peer is placed where it was.
+    fn cached_ring_or(&self, peer: &N, info: RttInfo) -> RttInfo {
+        match (info.ring, self.peer_topology.get(peer)) {
+            (None, Some(cached)) => *cached,
+            _ => info,
+        }
+    }
+
+    /// Removes the peer from the overlay. `peer_topology` is left alone:
+    /// it is the RTT cache consulted when the peer comes back.
     pub fn peer_down(&mut self, peer: &N, _rt: &mut impl Runtime<I, P, N>) {
         let was_eager = self.eager_peers.remove(peer);
         let was_lazy = self.lazy_peers.swap_remove(peer);
         self.known_peers.remove(peer);
         self.ring_locked.remove(peer);
         self.pending_topology.remove(peer);
-        if was_eager || was_lazy || self.maybe_recompute_fanout() {
+        let fanout_changed = self.maybe_recompute_fanout();
+        if was_eager || was_lazy || fanout_changed {
             self.needs_rebalance = true;
         }
     }
@@ -1632,7 +1673,7 @@ mod tests {
         assert_eq!(s.lazy_peers().clone(), prev_lazy);
 
         // peer_up only flags a rebalance; flush it so ring neighbors are picked.
-        s.update_peer_topology(iter::empty::<(TestNodeId, RttInfo)>(), &mut rt);
+        s.update_peer_topology(known_snapshot(&s), &mut rt);
 
         // test that ring-locked peers are eager
         // since id is zero, ring locked peers are 1 and 6
@@ -1646,7 +1687,7 @@ mod tests {
 
         // new peer that takes a locked position gets ring-locked after rebalance
         s.peer_up(7, None, &mut rt);
-        s.update_peer_topology(iter::empty::<(TestNodeId, RttInfo)>(), &mut rt);
+        s.update_peer_topology(known_snapshot(&s), &mut rt);
         assert!(s.ring_locked_peers().contains(&7));
         assert!(s.eager_peers().contains(&7));
         assert!(!s.lazy_peers().contains(&7));
@@ -1654,7 +1695,7 @@ mod tests {
 
         // removal of a ring-locked peer flags a rebalance; flush selects new ones
         s.peer_down(&7, &mut rt);
-        s.update_peer_topology(iter::empty::<(TestNodeId, RttInfo)>(), &mut rt);
+        s.update_peer_topology(known_snapshot(&s), &mut rt);
         assert!(!s.ring_locked_peers().contains(&7));
         assert!(!s.eager_peers().contains(&7));
         assert!(!s.lazy_peers().contains(&7));
@@ -1702,7 +1743,7 @@ mod tests {
         for i in 1..=6 {
             s.peer_up(i, None, &mut rt);
         }
-        s.update_peer_topology(iter::empty::<(TestNodeId, RttInfo)>(), &mut rt);
+        s.update_peer_topology(known_snapshot(&s), &mut rt);
 
         // sorted ring: 0,1,2,3,4,5,6 → radius 2 locks 5,6 and 1,2
         assert_eq!(s.ring_locked_peers().len(), 4);
@@ -1756,7 +1797,7 @@ mod tests {
         s.peer_up(3, None, &mut rt); // eager (full)
         s.peer_up(4, None, &mut rt); // lazy
         s.peer_up(5, None, &mut rt); // lazy
-        s.update_peer_topology(iter::empty::<(TestNodeId, RttInfo)>(), &mut rt);
+        s.update_peer_topology(known_snapshot(&s), &mut rt);
         assert_eq!(s.eager_peers.len(), 3);
         assert_eq!(s.lazy_peers.len(), 2);
 
@@ -2443,5 +2484,197 @@ mod tests {
         let (to, m) = &rt_b.sent[0];
         assert_eq!(*to, 30);
         unwrap_graft(m);
+    }
+
+    // --- Maintenance reconciliation (update_peer_topology) ---
+
+    fn ring(r: Option<u8>) -> RttInfo {
+        RttInfo { ring: r }
+    }
+
+    /// A state bootstrapped the way `plumtree_loop` does it: every member
+    /// with its ring, then one reconcile run over the same snapshot.
+    fn reconciled(
+        members: &[(TestNodeId, Option<u8>)],
+    ) -> (
+        PlumtreeState<TestMsgId, TestPayload, TestNodeId, TestSeenStore>,
+        AccumulatingRuntime,
+    ) {
+        let mut s = state();
+        let mut rt = AccumulatingRuntime::default();
+        s.add_peers_bulk_with_rtt(snapshot(members), &mut rt);
+        s.update_peer_topology(snapshot(members), &mut rt);
+        (s, rt)
+    }
+
+    fn snapshot(members: &[(TestNodeId, Option<u8>)]) -> Vec<(TestNodeId, RttInfo)> {
+        members.iter().map(|(n, r)| (*n, ring(*r))).collect()
+    }
+
+    /// The membership snapshot that matches what the state already knows,
+    /// so a reconcile run only flushes the deferred rebalance.
+    fn known_snapshot(
+        s: &PlumtreeState<TestMsgId, TestPayload, TestNodeId, TestSeenStore>,
+    ) -> Vec<(TestNodeId, RttInfo)> {
+        s.known_peers
+            .iter()
+            .map(|p| (*p, s.peer_topology.get(p).copied().unwrap_or_default()))
+            .collect()
+    }
+
+    fn in_overlay(
+        s: &PlumtreeState<TestMsgId, TestPayload, TestNodeId, TestSeenStore>,
+        p: &TestNodeId,
+    ) -> bool {
+        s.eager_peers.contains(p) || s.lazy_peers.contains(p)
+    }
+
+    const THREE: [(TestNodeId, Option<u8>); 3] = [(1, Some(0)), (2, Some(0)), (3, Some(0))];
+
+    #[test]
+    fn reconcile_removes_departed_peer() {
+        let (mut s, mut rt) = reconciled(&THREE);
+        assert!(s.known_peers.contains(&3));
+
+        // 3 left the member map and its MemberDown never reached plumtree.
+        s.update_peer_topology(snapshot(&THREE[..2]), &mut rt);
+
+        assert!(!s.known_peers.contains(&3));
+        assert!(!in_overlay(&s, &3));
+        assert!(!s.ring_locked.contains(&3));
+        assert!(!s.pending_topology.contains_key(&3));
+        // the RTT cache keeps the entry on purpose
+        assert_eq!(s.peer_topology.get(&3), Some(&ring(Some(0))));
+    }
+
+    #[test]
+    fn reconcile_relocks_ring_neighbors_after_departure() {
+        // local id 0, sorted ring 0,1,2,3: neighbors are 1 and 3.
+        let (mut s, mut rt) = reconciled(&THREE);
+        assert_eq!(s.ring_locked, HashSet::from([1, 3]));
+
+        s.update_peer_topology(snapshot(&THREE[..2]), &mut rt);
+
+        assert_eq!(s.ring_locked, HashSet::from([1, 2]));
+        assert!(s.eager_peers.contains(&2));
+    }
+
+    #[test]
+    fn reconcile_readds_rejoined_peer_after_peer_down() {
+        let (mut s, mut rt) = reconciled(&THREE);
+        s.peer_down(&3, &mut rt);
+        s.update_peer_topology(snapshot(&THREE[..2]), &mut rt);
+        assert!(!s.known_peers.contains(&3));
+
+        // 3 is back in the member map with the same ring; its MemberUp was lost.
+        s.update_peer_topology(snapshot(&THREE), &mut rt);
+
+        assert!(s.known_peers.contains(&3));
+        assert!(in_overlay(&s, &3));
+    }
+
+    #[test]
+    fn reconcile_readds_rejoined_peer_whose_ring_appears() {
+        let (mut s, mut rt) = reconciled(&[(1, Some(0)), (2, Some(0)), (3, None)]);
+        s.peer_down(&3, &mut rt);
+        s.update_peer_topology(snapshot(&THREE[..2]), &mut rt);
+        assert!(!s.known_peers.contains(&3));
+
+        s.update_peer_topology(snapshot(&THREE), &mut rt);
+
+        assert!(s.known_peers.contains(&3));
+        assert_eq!(s.peer_topology.get(&3), Some(&ring(Some(0))));
+    }
+
+    #[test]
+    fn reconcile_places_rejoined_peer_with_cached_ring() {
+        // 3 was known in the Far bucket. It rejoins before any RTT sample
+        // exists, so the snapshot carries ring None. The cached ring wins.
+        let (mut s, mut rt) = reconciled(&[(1, Some(0)), (2, Some(0)), (3, Some(5))]);
+        s.peer_down(&3, &mut rt);
+        s.update_peer_topology(snapshot(&THREE[..2]), &mut rt);
+
+        s.update_peer_topology(snapshot(&[(1, Some(0)), (2, Some(0)), (3, None)]), &mut rt);
+
+        assert!(s.known_peers.contains(&3));
+        assert_eq!(s.peer_topology.get(&3), Some(&ring(Some(5))));
+        assert_eq!(s.peer_bucket(&3), RingBucket::Far);
+    }
+
+    #[test]
+    fn peer_up_places_rejoined_peer_with_cached_ring() {
+        let (mut s, mut rt) = reconciled(&[(1, Some(0)), (2, Some(0)), (3, Some(5))]);
+        s.peer_down(&3, &mut rt);
+
+        s.peer_up(3, None, &mut rt);
+
+        assert!(s.known_peers.contains(&3));
+        assert_eq!(s.peer_topology.get(&3), Some(&ring(Some(5))));
+    }
+
+    #[test]
+    fn reconcile_keeps_bucket_confirmation_for_known_peers() {
+        // A known peer that moves bucket still needs RING_EXTRA_CONFIRMATIONS runs.
+        let (mut s, mut rt) = reconciled(&THREE);
+        let moved = [(1, Some(0)), (2, Some(0)), (3, Some(5))];
+        for _ in 1..RING_EXTRA_CONFIRMATIONS {
+            s.update_peer_topology(snapshot(&moved), &mut rt);
+            assert_eq!(s.peer_topology.get(&3), Some(&ring(Some(0))));
+        }
+        s.update_peer_topology(snapshot(&moved), &mut rt);
+        assert_eq!(s.peer_topology.get(&3), Some(&ring(Some(5))));
+        assert!(s.known_peers.contains(&3));
+    }
+
+    #[test]
+    fn reconcile_ignores_local_id() {
+        let mut s = state(); // local id 0
+        let mut rt = AccumulatingRuntime::default();
+
+        s.update_peer_topology(snapshot(&[(0, Some(0)), (1, Some(0))]), &mut rt);
+
+        assert!(!s.known_peers.contains(&0));
+        assert!(!s.peer_topology.contains_key(&0));
+        assert!(s.known_peers.contains(&1));
+    }
+
+    #[test]
+    fn reconcile_with_empty_snapshot_removes_every_peer() {
+        let (mut s, mut rt) = reconciled(&THREE);
+
+        s.update_peer_topology(iter::empty::<(TestNodeId, RttInfo)>(), &mut rt);
+
+        assert!(s.known_peers.is_empty());
+        assert!(s.eager_peers.is_empty());
+        assert!(s.lazy_peers.is_empty());
+        assert!(s.ring_locked.is_empty());
+    }
+
+    #[test]
+    fn peer_down_recomputes_fanout_for_overlay_peers() {
+        let mut cfg = test_config();
+        cfg.num_eager = None;
+        cfg.min_lazy = None;
+        cfg.max_lazy = None;
+        let mut s = PlumtreeState::new_with_store(0u8, cfg, TestSeenStore::default());
+        let mut rt = AccumulatingRuntime::default();
+
+        // 68 peers -> cluster 69 -> round(log10(69) * 3) = 6 eager.
+        s.add_peers_bulk((1..=68u8).collect(), &mut rt);
+        assert_eq!(s.num_eager(), 6);
+
+        let overlay: Vec<u8> = s
+            .eager_peers
+            .iter()
+            .chain(s.lazy_peers.iter())
+            .copied()
+            .collect();
+        for p in overlay {
+            s.peer_down(&p, &mut rt);
+        }
+
+        let expected = resolve_fanout(s.known_peers.len(), s.config()).num_eager;
+        assert_eq!(s.num_eager(), expected);
+        assert!(s.needs_rebalance);
     }
 }
