@@ -12,7 +12,7 @@ use metrics::{counter, histogram};
 use speedy::{Readable, Writable};
 use tracing::warn;
 
-use crate::broadcast::ChangeV1;
+use crate::{broadcast::ChangeV1, change::MAX_CHANGES_BYTE_SIZE};
 
 #[derive(Debug, thiserror::Error)]
 pub enum CompressError {
@@ -102,28 +102,46 @@ fn encode_all_with_dict(data: &[u8], level: i32, dicts: Option<&ZstdDicts>) -> i
     }
 }
 
+/// Largest decompressed `ChangeV1` we will accept. Changes are
+/// chunked at `MAX_CHANGES_BYTE_SIZE` (8 KiB); 2× leaves enough room.
+pub const MAX_DECOMPRESSED_SIZE: usize = MAX_CHANGES_BYTE_SIZE * 2;
+
 /// Decodes `data`, using whichever known dictionary (peeked from compressed bytes) its embedded
-/// dictionary ID points to.
-fn decode_all_with_dict(data: &[u8], dicts: Option<&ZstdDicts>) -> io::Result<Vec<u8>> {
-    let Some(dicts) = dicts else {
-        return zstd::stream::decode_all(data);
-    };
-    match zstd::zstd_safe::get_dict_id_from_frame(data) {
-        None => zstd::stream::decode_all(data),
-        Some(id) => match dicts.decoders.get(&id) {
-            Some(decoder) => {
-                let mut decoder_reader =
-                    zstd::stream::read::Decoder::with_prepared_dictionary(data, decoder)?;
-                let mut buf = Vec::new();
-                decoder_reader.read_to_end(&mut buf)?;
-                Ok(buf)
-            }
-            None => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("no known compression dict for id {id}"),
-            )),
-        },
+/// dictionary ID points to. Output is capped at `max_size`.
+fn decode_all_with_dict(
+    data: &[u8],
+    dicts: Option<&ZstdDicts>,
+    max_size: usize,
+) -> io::Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    let limit = max_size.saturating_add(1) as u64;
+
+    match (dicts, zstd::zstd_safe::get_dict_id_from_frame(data)) {
+        (Some(dicts), Some(id)) => {
+            let decoder = dicts.decoders.get(&id).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("no known compression dict for id {id}"),
+                )
+            })?;
+            zstd::stream::read::Decoder::with_prepared_dictionary(data, decoder)?
+                .take(limit)
+                .read_to_end(&mut buf)?;
+        }
+        _ => {
+            zstd::stream::read::Decoder::new(data)?
+                .take(limit)
+                .read_to_end(&mut buf)?;
+        }
     }
+
+    if buf.len() > max_size {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("decompressed payload exceeds {max_size} bytes"),
+        ));
+    }
+    Ok(buf)
 }
 
 pub fn compress_change(
@@ -141,7 +159,7 @@ pub fn decompress_change(
     dicts: Option<&ZstdDicts>,
 ) -> Result<ChangeV1, CompressError> {
     let start = Instant::now();
-    let decompressed = match decode_all_with_dict(data, dicts) {
+    let decompressed = match decode_all_with_dict(data, dicts, MAX_DECOMPRESSED_SIZE) {
         Ok(bytes) => bytes,
         Err(e) => {
             counter!("corro.decompression.errors.total", "traffic" => traffic).increment(1);
@@ -258,7 +276,7 @@ mod tests {
 
     #[test]
     fn test_compress_change_compresses_and_roundtrips() {
-        let change = change_with_rows(200);
+        let change = change_with_rows(100);
         let raw_len = change.write_to_vec().unwrap().len();
         let bcast = BroadcastV1::Change(change.clone()).compress_for_wire(3, None);
 
@@ -357,5 +375,31 @@ mod tests {
             .into_change(Some(&decoder_dicts))
             .unwrap_err();
         assert!(matches!(err, BroadcastDecodeError::Compress(_)));
+    }
+
+    #[test]
+    fn test_decode_rejects_output_over_limit() {
+        let src = vec![0u8; 2048];
+        let compressed = zstd::stream::encode_all(&src[..], 3).unwrap();
+        let err = decode_all_with_dict(&compressed, None, 1024).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("exceeds 1024 bytes"));
+    }
+
+    #[test]
+    fn test_decode_accepts_output_at_limit() {
+        let src = vec![b'x'; 1024];
+        let compressed = zstd::stream::encode_all(&src[..], 3).unwrap();
+        let out = decode_all_with_dict(&compressed, None, 1024).unwrap();
+        assert_eq!(out, src);
+    }
+
+    #[test]
+    fn test_decode_with_dict_rejects_output_over_limit() {
+        let dicts = ZstdDicts::new(Some(&trained_dict_bytes()), 3, vec![]);
+        let src = vec![0u8; 2048];
+        let compressed = encode_all_with_dict(&src, 3, Some(&dicts)).unwrap();
+        let err = decode_all_with_dict(&compressed, Some(&dicts), 1024).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 }

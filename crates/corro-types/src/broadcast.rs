@@ -975,7 +975,7 @@ mod tests {
 
     #[test]
     fn test_compress_change_compresses_and_roundtrips() {
-        let change = change_with_rows(200);
+        let change = change_with_rows(100);
         let raw_len = change.write_to_vec().unwrap().len();
         let bcast = BroadcastV1::Change(change.clone()).compress_for_wire(3, None);
 

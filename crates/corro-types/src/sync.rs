@@ -542,7 +542,7 @@ mod tests {
 
     #[test]
     fn test_compress_changeset_roundtrips_through_wire() {
-        let change = change_with_rows(200);
+        let change = change_with_rows(100);
         let msg = SyncMessage::V1(SyncMessageV1::Changeset(change.clone())).compress_changeset(3);
 
         assert!(
