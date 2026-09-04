@@ -799,6 +799,48 @@ async fn test_pg() {
     wait_for_all_pending_handles().await;
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn test_pg_transaction_errors() {
+    let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
+    let (_ta, server) = setup_pg_test_server(tripwire, None).await;
+    let conn_str = format!(
+        "host={} port={} user=testuser",
+        server.local_addr.ip(),
+        server.local_addr.port()
+    );
+    let (client, client_conn) = tokio_postgres::connect(&conn_str, NoTls).await.unwrap();
+    tokio::spawn(client_conn);
+
+    client.batch_execute("BEGIN").await.unwrap();
+    client
+        .execute("INSERT INTO kitchensink (id) VALUES (1)", &[])
+        .await
+        .unwrap();
+    client
+        .execute("INSERT INTO kitchensink (id) VALUES (1)", &[])
+        .await
+        .unwrap_err();
+    let error = client.query_one("SELECT 1", &[]).await.unwrap_err();
+    assert_eq!(error.as_db_error().unwrap().code().code(), "25P02");
+    client.batch_execute("ROLLBACK").await.unwrap();
+    let row = client
+        .query_one("SELECT COUNT(*) FROM kitchensink", &[])
+        .await
+        .unwrap();
+    assert_eq!(row.get::<_, i64>(0), 0);
+
+    client.batch_execute("BEGIN").await.unwrap();
+    let error = client.batch_execute("BEGIN").await.unwrap_err();
+    assert_eq!(error.as_db_error().unwrap().code().code(), "25001");
+    let error = client.query_one("SELECT 1", &[]).await.unwrap_err();
+    assert_eq!(error.as_db_error().unwrap().code().code(), "25P02");
+    client.batch_execute("ROLLBACK").await.unwrap();
+
+    tripwire_tx.send(()).await.ok();
+    tripwire_worker.await;
+    wait_for_all_pending_handles().await;
+}
+
 #[tracing_test::traced_test]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_pg_readonly() {
