@@ -12,7 +12,7 @@ use corro_types::base::{CrsqlDbVersion, CrsqlDbVersionRange, CrsqlSeq, CrsqlSeqR
 use corro_types::broadcast::{
     BiPayload, BiPayloadV1, ChangeSource, ChangeV1, Changeset, Timestamp,
 };
-use corro_types::change::{row_to_change, Change, ChunkedChanges};
+use corro_types::change::{row_to_change, Change, ChunkedChanges, MAX_CHANGES_BYTE_SIZE};
 use corro_types::config::GossipConfig;
 use corro_types::sync::{
     generate_sync, SyncMessage, SyncMessageEncodeError, SyncMessageV1, SyncNeedV1, SyncRejectionV1,
@@ -369,7 +369,6 @@ impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
     }
 }
 
-const MAX_CHANGES_BYTES_PER_MESSAGE: usize = 8 * 1024;
 const MIN_CHANGES_BYTES_PER_MESSAGE: usize = 1024;
 
 const ADAPT_CHUNK_SIZE_THRESHOLD: Duration = Duration::from_millis(500);
@@ -451,7 +450,7 @@ fn handle_need(
 
                 send_change_chunks(
                     sender,
-                    ChunkedChanges::new(rows, CrsqlSeq(0), last_seq, MAX_CHANGES_BYTES_PER_MESSAGE),
+                    ChunkedChanges::new(rows, CrsqlSeq(0), last_seq, MAX_CHANGES_BYTE_SIZE),
                     actor_id,
                     version,
                     last_seq,
@@ -530,12 +529,7 @@ fn handle_need(
 
                         send_change_chunks(
                             sender,
-                            ChunkedChanges::new(
-                                rows,
-                                start_seq,
-                                end_seq,
-                                MAX_CHANGES_BYTES_PER_MESSAGE,
-                            ),
+                            ChunkedChanges::new(rows, start_seq, end_seq, MAX_CHANGES_BYTE_SIZE),
                             actor_id,
                             version,
                             last_seq,
@@ -589,7 +583,7 @@ fn handle_need(
                                 rows,
                                 range_needed.start(),
                                 range_needed.end(),
-                                MAX_CHANGES_BYTES_PER_MESSAGE,
+                                MAX_CHANGES_BYTE_SIZE,
                             ),
                             actor_id,
                             version,
@@ -711,7 +705,7 @@ fn handle_need(
                                         rows,
                                         start_seq,
                                         end_seq,
-                                        MAX_CHANGES_BYTES_PER_MESSAGE,
+                                        MAX_CHANGES_BYTE_SIZE,
                                     ),
                                     actor_id,
                                     version,

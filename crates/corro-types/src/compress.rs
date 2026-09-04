@@ -12,7 +12,7 @@ use metrics::{counter, histogram};
 use speedy::{Readable, Writable};
 use tracing::warn;
 
-use crate::{broadcast::ChangeV1, change::MAX_CHANGES_BYTE_SIZE};
+use crate::{broadcast::ChangeV1};
 
 #[derive(Debug, thiserror::Error)]
 pub enum CompressError {
@@ -103,8 +103,9 @@ fn encode_all_with_dict(data: &[u8], level: i32, dicts: Option<&ZstdDicts>) -> i
 }
 
 /// Largest decompressed `ChangeV1` we will accept. Changes are
-/// chunked at `MAX_CHANGES_BYTE_SIZE` (8 KiB); 2× leaves enough room.
-pub const MAX_DECOMPRESSED_SIZE: usize = MAX_CHANGES_BYTE_SIZE * 2;
+/// chunked at roughly `MAX_CHANGES_BYTE_SIZE` (8 KiB). This is more
+/// than enough room.
+pub const MAX_DECOMPRESSED_SIZE: usize = 10 * 1024 * 1024;
 
 /// Decodes `data`, using whichever known dictionary (peeked from compressed bytes) its embedded
 /// dictionary ID points to. Output is capped at `max_size`.
