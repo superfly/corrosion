@@ -1387,6 +1387,9 @@ impl<I: MessageId<NodeId = N>, P: Payload<MessageId = I, NodeId = N>, N: NodeId,
 }
 
 #[cfg(test)]
+mod model_check;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::iter;
