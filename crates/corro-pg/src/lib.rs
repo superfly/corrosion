@@ -271,7 +271,11 @@ impl ParsedCmd {
     }
 
     pub fn is_rollback(&self) -> bool {
-        matches!(self, ParsedCmd::Sqlite(Cmd::Stmt(Stmt::Rollback { .. })))
+        matches!(
+            self,
+            ParsedCmd::Sqlite(Cmd::Stmt(Stmt::Rollback { .. }))
+                | ParsedCmd::Postgres(PgStatement::Rollback { .. })
+        )
     }
 
     pub fn is_pg(&self) -> bool {
@@ -323,6 +327,7 @@ impl ParsedCmd {
             ParsedCmd::Postgres(stmt) => match stmt {
                 PgStatement::StartTransaction { .. } => StmtTag::Begin,
                 PgStatement::Commit { .. } => StmtTag::Commit,
+                PgStatement::Rollback { .. } => StmtTag::Rollback,
                 _ => StmtTag::Other,
             },
             _ => StmtTag::Other,
@@ -1355,6 +1360,7 @@ enum TxState {
     Started {
         kind: OpenTxKind,
         permits: Option<(OwnedSemaphorePermit, BookieWriteGuard)>,
+        failed: bool,
     },
     #[default]
     Ended,
@@ -1365,12 +1371,14 @@ impl TxState {
         Self::Started {
             kind: OpenTxKind::Implicit,
             permits: None,
+            failed: false,
         }
     }
     fn explicit() -> Self {
         Self::Started {
             kind: OpenTxKind::Explicit,
             permits: None,
+            failed: false,
         }
     }
 
@@ -1393,6 +1401,28 @@ impl TxState {
                 // do nothing, maybe bomb?
             }
         }
+    }
+
+    fn set_failed(&mut self) {
+        if let TxState::Started {
+            kind: OpenTxKind::Explicit,
+            failed,
+            ..
+        } = self
+        {
+            *failed = true;
+        }
+    }
+
+    fn is_failed(&self) -> bool {
+        matches!(
+            self,
+            TxState::Started {
+                kind: OpenTxKind::Explicit,
+                failed: true,
+                ..
+            }
+        )
     }
 
     fn is_implicit(&self) -> bool {
@@ -2715,6 +2745,7 @@ pub async fn start(
                                                     .into(),
                                             )?;
                                             discard_until_sync = true;
+                                            session.tx_state.set_failed();
                                             continue;
                                         }
                                     };
@@ -2743,6 +2774,7 @@ pub async fn start(
                                                     .into(),
                                             )?;
                                                 discard_until_sync = true;
+                                                session.tx_state.set_failed();
                                                 continue;
                                             }
 
@@ -2766,6 +2798,7 @@ pub async fn start(
                                                             .into(),
                                                     )?;
                                                     discard_until_sync = true;
+                                                    session.tx_state.set_failed();
                                                     continue;
                                                 }
                                             };
@@ -2832,6 +2865,7 @@ pub async fn start(
                                                             flush: true,
                                                         })?;
                                                         discard_until_sync = true;
+                                                        session.tx_state.set_failed();
                                                         continue;
                                                     }
                                                 };
@@ -2847,6 +2881,7 @@ pub async fn start(
                                                     back_tx
                                                         .blocking_send((e.into(), true).into())?;
                                                     discard_until_sync = true;
+                                                    session.tx_state.set_failed();
                                                     continue 'outer;
                                                 }
                                             };
@@ -2894,6 +2929,7 @@ pub async fn start(
                                                         .into(),
                                                 )?;
                                                 discard_until_sync = true;
+                                                session.tx_state.set_failed();
                                             }
                                             Some(Prepared::Empty) => {
                                                 back_tx.blocking_send(
@@ -2958,6 +2994,7 @@ pub async fn start(
                                                         .into(),
                                                 )?;
                                                 discard_until_sync = true;
+                                                session.tx_state.set_failed();
                                             }
                                             Some(Portal::Empty { .. }) => {
                                                 back_tx.blocking_send(
@@ -3028,6 +3065,7 @@ pub async fn start(
                                                     .into(),
                                             )?;
                                             discard_until_sync = true;
+                                            session.tx_state.set_failed();
                                             continue;
                                         }
                                     }
@@ -3058,6 +3096,7 @@ pub async fn start(
                                                     .into(),
                                             )?;
                                             discard_until_sync = true;
+                                            session.tx_state.set_failed();
                                             continue;
                                         }
                                         Some(Prepared::Empty) => {
@@ -3092,6 +3131,7 @@ pub async fn start(
                                                             .into(),
                                                     )?;
                                                     discard_until_sync = true;
+                                                    session.tx_state.set_failed();
                                                     continue;
                                                 }
                                             };
@@ -3133,6 +3173,7 @@ pub async fn start(
                                                         .into(),
                                                 )?;
                                                 discard_until_sync = true;
+                                                session.tx_state.set_failed();
                                                 continue;
                                             }
                                         };
@@ -3170,6 +3211,7 @@ pub async fn start(
                                                                 .into(),
                                                         )?;
                                                             discard_until_sync = true;
+                                                            session.tx_state.set_failed();
                                                             continue 'outer;
                                                         }
                                                         continue;
@@ -3198,6 +3240,7 @@ pub async fn start(
                                                                 .into(),
                                                         )?;
                                                         discard_until_sync = true;
+                                                        session.tx_state.set_failed();
                                                         continue 'outer;
                                                     }
                                                     Some(param_type) => {
@@ -3409,6 +3452,7 @@ pub async fn start(
                                                                 ).into(),
                                                             )?;
                                                                 discard_until_sync = true;
+                                                                session.tx_state.set_failed();
                                                                 continue 'outer;
                                                             }
                                                         }
@@ -3488,6 +3532,7 @@ pub async fn start(
                                                     .into(),
                                             )?;
                                             discard_until_sync = true;
+                                            session.tx_state.set_failed();
                                             continue;
                                         }
                                     };
@@ -3515,12 +3560,8 @@ pub async fn start(
                                         })?;
 
                                         discard_until_sync = true;
+                                        session.tx_state.set_failed();
 
-                                        send_ready(
-                                            &mut session,
-                                            discard_until_sync,
-                                            &back_tx,
-                                        )?;
                                         continue;
                                     }
                                 }
@@ -3543,6 +3584,7 @@ pub async fn start(
                                                 )
                                                     .into(),
                                             )?;
+                                            session.tx_state.set_failed();
                                             send_ready(
                                                 &mut session,
                                                 discard_until_sync,
@@ -3579,6 +3621,7 @@ pub async fn start(
                                                 message: e.try_into()?,
                                                 flush: true,
                                             })?;
+                                            session.tx_state.set_failed();
                                             send_ready(
                                                 &mut session,
                                                 discard_until_sync,
@@ -3614,6 +3657,7 @@ pub async fn start(
                                                 )
                                                     .into(),
                                             )?;
+                                            session.tx_state.set_failed();
                                             send_ready(
                                                 &mut session,
                                                 discard_until_sync,
@@ -3698,6 +3742,7 @@ pub async fn start(
                                                     .into(),
                                             )?;
                                             discard_until_sync = true;
+                                            session.tx_state.set_failed();
                                             continue;
                                         }
                                     }
@@ -3897,6 +3942,10 @@ impl<'conn> Session<'conn> {
         back_tx: &Sender<BackendResponse>,
         send_row_desc: bool,
     ) -> Result<(), QueryError> {
+        if self.tx_state.is_failed() && !cmd.is_rollback() {
+            return Err(QueryError::AbortedTx);
+        }
+
         if cmd.is_show() {
             back_tx
                 .blocking_send(
@@ -3943,6 +3992,11 @@ impl<'conn> Session<'conn> {
         let tag = cmd.tag();
 
         let mut changes = 0usize;
+
+        // prevent nested transactions!
+        if cmd.is_begin() && self.tx_state.is_explicit() {
+            return Err(QueryError::NestedTransaction);
+        }
 
         let count = if cmd.is_begin() {
             self.conn.execute_batch("BEGIN")?;
@@ -4065,6 +4119,15 @@ impl<'conn> Session<'conn> {
         max_rows: usize,
         back_tx: &Sender<BackendResponse>,
     ) -> Result<(), QueryError> {
+        if self.tx_state.is_failed() && !cmd.is_rollback() {
+            return Err(QueryError::AbortedTx);
+        }
+
+        // prevent nested transactions!
+        if cmd.is_begin() && self.tx_state.is_explicit() {
+            return Err(QueryError::NestedTransaction);
+        }
+
         // TODO: maybe we don't need to recompute this...
         let fields = field_types(prepped, cmd, FieldFormats::Each(result_formats))?;
 
@@ -4104,6 +4167,9 @@ impl<'conn> Session<'conn> {
             } else {
                 self.commit_db()?;
             }
+        } else if cmd.is_rollback() {
+            let _permits = self.tx_state.end();
+            self.conn.execute_batch("ROLLBACK")?;
         } else if cmd.is_begin() {
             // do nothing
             debug!("cmd is BEGIN");
@@ -4406,7 +4472,7 @@ fn send_ready(
 
         TransactionStatus::Idle
     } else if session.tx_state.is_explicit() {
-        if discard_until_sync {
+        if discard_until_sync || session.tx_state.is_failed() {
             TransactionStatus::Error
         } else {
             TransactionStatus::Transaction
@@ -4444,6 +4510,10 @@ enum QueryError {
     PermitAcquire(#[from] AcquireError),
     #[error(transparent)]
     Change(#[from] ChangeError),
+    #[error("nested transactions are not supported, use savepoints for a similar functionality")]
+    NestedTransaction,
+    #[error("current transaction is aborted, commands ignored until end of transaction block")]
+    AbortedTx,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -4482,6 +4552,12 @@ impl TryFrom<QueryError> for PgWireBackendMessage {
             QueryError::BackendResponseSendFailed => return Err(ChannelClosed),
             QueryError::Change(e) => {
                 ErrorInfo::new("ERROR".to_owned(), "XX000".to_owned(), e.to_string()).into()
+            }
+            QueryError::NestedTransaction => {
+                ErrorInfo::new("ERROR".to_owned(), "XX000".to_owned(), value.to_string()).into()
+            }
+            QueryError::AbortedTx => {
+                ErrorInfo::new("ERROR".to_owned(), "25P02".to_owned(), value.to_string()).into()
             }
         }))
     }
