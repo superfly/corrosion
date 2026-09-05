@@ -1759,3 +1759,81 @@ async fn test_unnest_vtab() {
     tripwire_worker.await;
     wait_for_all_pending_handles().await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_transaction_bulletproof_handling() {
+    let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
+
+    let (_ta, server) = setup_pg_test_server(tripwire, None).await;
+    let conn_str = format!(
+        "host={} port={} user=testuser",
+        server.local_addr.ip(),
+        server.local_addr.port()
+    );
+
+    // 1. Test aborted transaction in simple query mode
+    {
+        let (mut client, connection) = tokio_postgres::connect(&conn_str, NoTls).await.unwrap();
+        tokio::spawn(connection);
+
+        let tx = client.transaction().await.unwrap();
+        let res = tx
+            .batch_execute("INSERT INTO nonexistenttable VALUES (1)")
+            .await;
+        assert!(res.is_err());
+
+        let res = tx.batch_execute("SELECT 1").await;
+        assert_eq!(
+            res.err().unwrap().code().unwrap(),
+            &tokio_postgres::error::SqlState::IN_FAILED_SQL_TRANSACTION
+        );
+
+        tx.rollback().await.unwrap();
+
+        assert!(client.query_one("SELECT 1", &[]).await.is_ok());
+    }
+
+    // 2. Test aborted transaction in extended query mode
+    {
+        let (mut client, connection) = tokio_postgres::connect(&conn_str, NoTls).await.unwrap();
+        tokio::spawn(connection);
+
+        let tx = client.transaction().await.unwrap();
+        let res = tx
+            .execute("INSERT INTO nonexistenttable VALUES ($1)", &[&1i64])
+            .await;
+        assert!(res.is_err());
+
+        let res = tx.query_one("SELECT 1", &[]).await;
+        assert_eq!(
+            res.err().unwrap().code().unwrap(),
+            &tokio_postgres::error::SqlState::IN_FAILED_SQL_TRANSACTION
+        );
+
+        tx.rollback().await.unwrap();
+
+        assert!(client.query_one("SELECT 1", &[]).await.is_ok());
+    }
+
+    // 3. Test nested transaction rejection
+    {
+        let (mut client, connection) = tokio_postgres::connect(&conn_str, NoTls).await.unwrap();
+        tokio::spawn(connection);
+
+        let tx = client.transaction().await.unwrap();
+        let res = tx.batch_execute("BEGIN").await;
+        let err = res.err().unwrap();
+        let db_err = err.as_db_error().expect("expected db error");
+        assert!(db_err
+            .message()
+            .contains("nested transactions are not supported"));
+
+        tx.rollback().await.unwrap();
+
+        assert!(client.query_one("SELECT 1", &[]).await.is_ok());
+    }
+
+    tripwire_tx.send(()).await.ok();
+    tripwire_worker.await;
+    wait_for_all_pending_handles().await;
+}
