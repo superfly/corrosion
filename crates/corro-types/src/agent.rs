@@ -722,6 +722,7 @@ impl SplitPool {
                     Some(tx) = priority_rx.recv() => (tx, "priority"),
                     Some(tx) = normal_rx.recv() => (tx, "normal"),
                     Some(tx) = low_rx.recv() => (tx, "low"),
+                    else => break,
                 };
 
                 wait_conn_drop(tx, channel).await
