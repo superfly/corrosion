@@ -12,7 +12,7 @@ use metrics::{counter, histogram};
 use speedy::{Readable, Writable};
 use tracing::warn;
 
-use crate::{broadcast::ChangeV1};
+use crate::broadcast::ChangeV1;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CompressError {
