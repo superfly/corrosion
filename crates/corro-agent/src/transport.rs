@@ -31,9 +31,10 @@ struct TransportInner {
     conns: RwLock<HashMap<SocketAddr, Arc<Mutex<Option<Connection>>>>>,
     rtt_tx: mpsc::Sender<(SocketAddr, Duration)>,
     path_snapshots: StdMutex<HashMap<SocketAddr, PathSnapshot>>,
-    /// Last `path.latest_rtt` pushed per peer by [`Transport::sample_rtts`],
-    /// used to skip re-pushing a measurement that has not moved.
-    rtt_marks: StdMutex<HashMap<SocketAddr, Duration>>,
+    /// Last `path.min_rtt` pushed per peer by [`Transport::sample_rtts`].
+    /// Unchanged measurements are skipped until they move or this stamp
+    /// is older than [`RTT_UNCHANGED_REFRESH`].
+    rtt_marks: StdMutex<HashMap<SocketAddr, RttMark>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -42,6 +43,16 @@ struct PathSnapshot {
     congestion_events: u64,
     black_holes_detected: u64,
 }
+
+#[derive(Debug, Clone, Copy)]
+struct RttMark {
+    rtt: Duration,
+    at: Instant,
+}
+
+/// Re-push a stable `min_rtt` at least this often so a one-off spike can
+/// rotate out of the ring's 20-sample window.
+const RTT_UNCHANGED_REFRESH: Duration = Duration::from_secs(6 * 60 * 60);
 
 #[derive(Debug, Clone, Copy)]
 enum TrafficClass {
@@ -276,10 +287,11 @@ impl Transport {
     /// Push an RTT sample for each live cached connection that has a new
     /// measurement since the last sweep.
     ///
-    /// `Connection::rtt` is a smoothed cache, so we sample `path.latest_rtt`
-    /// and let the ring's median window absorb the jitter. Repeats of the same
-    /// millisecond are skipped: re-pushing an unchanged value would overweight
-    /// it in that window and stop the ring tracking the current path.
+    /// `Connection::rtt` is a smoothed cache, so we sample `path.min_rtt`
+    /// and let the ring's window absorb the jitter. Repeats of the same
+    /// millisecond are skipped so a stable path is not overweighted — except
+    /// after [`RTT_UNCHANGED_REFRESH`], when we re-push so a one-off spike
+    /// can rotate out of the 20-sample window.
     pub async fn sample_rtts(&self) {
         // Arc handles only; the map lock is released before any per-connection
         // lock is taken.
@@ -321,9 +333,10 @@ impl Transport {
                 stats.path.min_rtt
             };
 
-            let measured = marks
-                .get(&addr)
-                .is_none_or(|prev| prev.as_millis() != rtt.as_millis());
+            let measured = marks.get(&addr).is_none_or(|prev| {
+                prev.rtt.as_millis() != rtt.as_millis()
+                    || prev.at.elapsed() >= RTT_UNCHANGED_REFRESH
+            });
 
             if !measured {
                 counter!("corro.transport.rtt.samples", "result" => "skipped").increment(1);
@@ -334,7 +347,13 @@ impl Transport {
                 debug!("could not send RTT for connection through sender: {e}");
                 counter!("corro.transport.rtt.samples", "result" => "dropped").increment(1);
             } else {
-                marks.insert(addr, rtt);
+                marks.insert(
+                    addr,
+                    RttMark {
+                        rtt,
+                        at: Instant::now(),
+                    },
+                );
                 counter!("corro.transport.rtt.samples", "result" => "sent").increment(1);
             }
         }
