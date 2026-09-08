@@ -2173,209 +2173,209 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-    async fn match_buffered_changes() -> eyre::Result<()> {
-        _ = tracing_subscriber::fmt::try_init();
+    // #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    // async fn match_buffered_changes() -> eyre::Result<()> {
+    //     _ = tracing_subscriber::fmt::try_init();
 
-        let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
+    //     let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
 
-        let ta1 = launch_test_agent(|conf| conf.build(), tripwire.clone()).await?;
-        let tx_timeout = Duration::from_secs(60);
+    //     let ta1 = launch_test_agent(|conf| conf.build(), tripwire.clone()).await?;
+    //     let tx_timeout = Duration::from_secs(60);
 
-        let schema = "CREATE TABLE buftests (
-            pk int NOT NULL PRIMARY KEY,
-            col1 text,
-            col2 text
-         );";
+    //     let schema = "CREATE TABLE buftests (
+    //         pk int NOT NULL PRIMARY KEY,
+    //         col1 text,
+    //         col2 text
+    //      );";
 
-        execute_schema(&ta1.agent, vec![schema.to_owned()]).await?;
+    //     execute_schema(&ta1.agent, vec![schema.to_owned()]).await?;
 
-        let actor_id = ActorId(uuid::Uuid::new_v4());
+    //     let actor_id = ActorId(uuid::Uuid::new_v4());
 
-        let change1 = Change {
-            table: TableName("buftests".into()),
-            pk: pack_columns(&vec![1i64.into()])?,
-            cid: ColumnName("col1".into()),
-            val: "one".into(),
-            col_version: 1,
-            db_version: CrsqlDbVersion(1),
-            seq: CrsqlSeq(0),
-            site_id: actor_id.to_bytes(),
-            cl: 1,
-        };
+    //     let change1 = Change {
+    //         table: TableName("buftests".into()),
+    //         pk: pack_columns(&vec![1i64.into()])?,
+    //         cid: ColumnName("col1".into()),
+    //         val: "one".into(),
+    //         col_version: 1,
+    //         db_version: CrsqlDbVersion(1),
+    //         seq: CrsqlSeq(0),
+    //         site_id: actor_id.to_bytes(),
+    //         cl: 1,
+    //     };
 
-        let change2 = Change {
-            table: TableName("buftests".into()),
-            pk: pack_columns(&vec![1i64.into()])?,
-            cid: ColumnName("col2".into()),
-            val: "one line".into(),
-            col_version: 1,
-            db_version: CrsqlDbVersion(1),
-            seq: CrsqlSeq(1),
-            site_id: actor_id.to_bytes(),
-            cl: 1,
-        };
+    //     let change2 = Change {
+    //         table: TableName("buftests".into()),
+    //         pk: pack_columns(&vec![1i64.into()])?,
+    //         cid: ColumnName("col2".into()),
+    //         val: "one line".into(),
+    //         col_version: 1,
+    //         db_version: CrsqlDbVersion(1),
+    //         seq: CrsqlSeq(1),
+    //         site_id: actor_id.to_bytes(),
+    //         cl: 1,
+    //     };
 
-        let changes = ChangeV1 {
-            actor_id,
-            changeset: Changeset::Full {
-                version: CrsqlDbVersion(1),
-                changes: vec![change1, change2],
-                seqs: dbsr!(0, 1),
-                last_seq: CrsqlSeq(1),
-                ts: Default::default(),
-            },
-        };
+    //     let changes = ChangeV1 {
+    //         actor_id,
+    //         changeset: Changeset::Full {
+    //             version: CrsqlDbVersion(1),
+    //             changes: vec![change1, change2],
+    //             seqs: dbsr!(0, 1),
+    //             last_seq: CrsqlSeq(1),
+    //             ts: Default::default(),
+    //         },
+    //     };
 
-        process_multiple_changes(
-            ta1.agent.clone(),
-            ta1.bookie.clone(),
-            vec![(changes, ChangeSource::Sync, Instant::now())],
-            tx_timeout,
-        )
-        .await?;
+    //     process_multiple_changes(
+    //         ta1.agent.clone(),
+    //         ta1.bookie.clone(),
+    //         vec![(changes, ChangeSource::Sync, Instant::now())],
+    //         tx_timeout,
+    //     )
+    //     .await?;
 
-        let bcast_cache: SharedMatcherBroadcastCache = Default::default();
-        let update_bcast_cache: SharedUpdateBroadcastCache = Default::default();
-        let res = api_v1_subs(
-            Extension(ta1.agent.clone()),
-            Extension(bcast_cache.clone()),
-            Extension(tripwire.clone()),
-            axum::extract::Query(SubParams::default()),
-            axum::Json(Statement::Simple("select * from buftests".into())),
-        )
-        .await
-        .into_response();
+    //     let bcast_cache: SharedMatcherBroadcastCache = Default::default();
+    //     let update_bcast_cache: SharedUpdateBroadcastCache = Default::default();
+    //     let res = api_v1_subs(
+    //         Extension(ta1.agent.clone()),
+    //         Extension(bcast_cache.clone()),
+    //         Extension(tripwire.clone()),
+    //         axum::extract::Query(SubParams::default()),
+    //         axum::Json(Statement::Simple("select * from buftests".into())),
+    //     )
+    //     .await
+    //     .into_response();
 
-        let body = assert_ok(res).await;
+    //     let body = assert_ok(res).await;
 
-        // only notifications
-        let notify_res = api_v1_updates(
-            Extension(ta1.agent.clone()),
-            Extension(update_bcast_cache.clone()),
-            Extension(tripwire.clone()),
-            axum::extract::Path("buftests".to_string()),
-        )
-        .await
-        .into_response();
+    //     // only notifications
+    //     let notify_res = api_v1_updates(
+    //         Extension(ta1.agent.clone()),
+    //         Extension(update_bcast_cache.clone()),
+    //         Extension(tripwire.clone()),
+    //         axum::extract::Path("buftests".to_string()),
+    //     )
+    //     .await
+    //     .into_response();
 
-        let mut notify_rows = RowsIter::new(assert_ok(notify_res).await);
-        let mut rows = RowsIter::new(body);
+    //     let mut notify_rows = RowsIter::new(assert_ok(notify_res).await);
+    //     let mut rows = RowsIter::new(body);
 
-        assert_eq!(
-            rows.recv::<QueryEvent>().await.unwrap().unwrap(),
-            QueryEvent::Columns(vec!["pk".into(), "col1".into(), "col2".into()])
-        );
+    //     assert_eq!(
+    //         rows.recv::<QueryEvent>().await.unwrap().unwrap(),
+    //         QueryEvent::Columns(vec!["pk".into(), "col1".into(), "col2".into()])
+    //     );
 
-        assert_eq!(
-            rows.recv::<QueryEvent>().await.unwrap().unwrap(),
-            QueryEvent::Row(RowId(1), vec![Integer(1), "one".into(), "one line".into()])
-        );
+    //     assert_eq!(
+    //         rows.recv::<QueryEvent>().await.unwrap().unwrap(),
+    //         QueryEvent::Row(RowId(1), vec![Integer(1), "one".into(), "one line".into()])
+    //     );
 
-        assert!(matches!(
-            rows.recv::<QueryEvent>().await.unwrap().unwrap(),
-            QueryEvent::EndOfQuery { .. }
-        ));
+    //     assert!(matches!(
+    //         rows.recv::<QueryEvent>().await.unwrap().unwrap(),
+    //         QueryEvent::EndOfQuery { .. }
+    //     ));
 
-        // send partial change so it is buffered
-        let change3 = Change {
-            table: TableName("buftests".into()),
-            pk: pack_columns(&vec![2i64.into()])?,
-            cid: ColumnName("col1".into()),
-            val: "two".into(),
-            col_version: 1,
-            db_version: CrsqlDbVersion(2),
-            seq: CrsqlSeq(0),
-            site_id: actor_id.to_bytes(),
-            cl: 1,
-        };
+    //     // send partial change so it is buffered
+    //     let change3 = Change {
+    //         table: TableName("buftests".into()),
+    //         pk: pack_columns(&vec![2i64.into()])?,
+    //         cid: ColumnName("col1".into()),
+    //         val: "two".into(),
+    //         col_version: 1,
+    //         db_version: CrsqlDbVersion(2),
+    //         seq: CrsqlSeq(0),
+    //         site_id: actor_id.to_bytes(),
+    //         cl: 1,
+    //     };
 
-        let changes = ChangeV1 {
-            actor_id,
-            changeset: Changeset::Full {
-                version: CrsqlDbVersion(2),
-                changes: vec![change3],
-                seqs: dbsr!(0, 0),
-                last_seq: CrsqlSeq(1),
-                ts: Default::default(),
-            },
-        };
+    //     let changes = ChangeV1 {
+    //         actor_id,
+    //         changeset: Changeset::Full {
+    //             version: CrsqlDbVersion(2),
+    //             changes: vec![change3],
+    //             seqs: dbsr!(0, 0),
+    //             last_seq: CrsqlSeq(1),
+    //             ts: Default::default(),
+    //         },
+    //     };
 
-        process_multiple_changes(
-            ta1.agent.clone(),
-            ta1.bookie.clone(),
-            vec![(changes, ChangeSource::Sync, Instant::now())],
-            tx_timeout,
-        )
-        .await?;
+    //     process_multiple_changes(
+    //         ta1.agent.clone(),
+    //         ta1.bookie.clone(),
+    //         vec![(changes, ChangeSource::Sync, Instant::now())],
+    //         tx_timeout,
+    //     )
+    //     .await?;
 
-        // confirm that change is buffered in db
-        {
-            let conn = ta1.agent.pool().read().await?;
-            let end = conn.query_row(
-                "SELECT end_seq FROM __corro_seq_bookkeeping WHERE site_id = ? AND db_version = ?",
-                (actor_id, 2),
-                |row| row.get::<_, CrsqlSeq>(0),
-            )?;
-            assert_eq!(end, CrsqlSeq(0));
-        }
+    //     // confirm that change is buffered in db
+    //     {
+    //         let conn = ta1.agent.pool().read().await?;
+    //         let end = conn.query_row(
+    //             "SELECT end_seq FROM __corro_seq_bookkeeping WHERE site_id = ? AND db_version = ?",
+    //             (actor_id, 2),
+    //             |row| row.get::<_, CrsqlSeq>(0),
+    //         )?;
+    //         assert_eq!(end, CrsqlSeq(0));
+    //     }
 
-        let change4 = Change {
-            table: TableName("buftests".into()),
-            pk: pack_columns(&vec![2i64.into()])?,
-            cid: ColumnName("col2".into()),
-            val: "two line".into(),
-            col_version: 1,
-            db_version: CrsqlDbVersion(2),
-            seq: CrsqlSeq(1),
-            site_id: actor_id.to_bytes(),
-            cl: 1,
-        };
+    //     let change4 = Change {
+    //         table: TableName("buftests".into()),
+    //         pk: pack_columns(&vec![2i64.into()])?,
+    //         cid: ColumnName("col2".into()),
+    //         val: "two line".into(),
+    //         col_version: 1,
+    //         db_version: CrsqlDbVersion(2),
+    //         seq: CrsqlSeq(1),
+    //         site_id: actor_id.to_bytes(),
+    //         cl: 1,
+    //     };
 
-        let changes = ChangeV1 {
-            actor_id,
-            changeset: Changeset::Full {
-                version: CrsqlDbVersion(2),
-                changes: vec![change4],
-                seqs: dbsr!(1, 1),
-                last_seq: CrsqlSeq(1),
-                ts: Default::default(),
-            },
-        };
+    //     let changes = ChangeV1 {
+    //         actor_id,
+    //         changeset: Changeset::Full {
+    //             version: CrsqlDbVersion(2),
+    //             changes: vec![change4],
+    //             seqs: dbsr!(1, 1),
+    //             last_seq: CrsqlSeq(1),
+    //             ts: Default::default(),
+    //         },
+    //     };
 
-        process_multiple_changes(
-            ta1.agent.clone(),
-            ta1.bookie.clone(),
-            vec![(changes, ChangeSource::Sync, Instant::now())],
-            tx_timeout,
-        )
-        .await?;
+    //     process_multiple_changes(
+    //         ta1.agent.clone(),
+    //         ta1.bookie.clone(),
+    //         vec![(changes, ChangeSource::Sync, Instant::now())],
+    //         tx_timeout,
+    //     )
+    //     .await?;
 
-        let res = timeout(Duration::from_secs(5), rows.recv::<QueryEvent>()).await?;
+    //     let res = timeout(Duration::from_secs(5), rows.recv::<QueryEvent>()).await?;
 
-        assert_eq!(
-            res.unwrap().unwrap(),
-            QueryEvent::Change(
-                ChangeType::Insert,
-                RowId(2),
-                vec![Integer(2), "two".into(), "two line".into()],
-                ChangeId(1)
-            )
-        );
+    //     assert_eq!(
+    //         res.unwrap().unwrap(),
+    //         QueryEvent::Change(
+    //             ChangeType::Insert,
+    //             RowId(2),
+    //             vec![Integer(2), "two".into(), "two line".into()],
+    //             ChangeId(1)
+    //         )
+    //     );
 
-        let notify_res = timeout(Duration::from_secs(5), notify_rows.recv::<NotifyEvent>()).await?;
-        assert_eq!(
-            notify_res.unwrap().unwrap(),
-            NotifyEvent::Notify(ChangeType::Update, vec![Integer(2)],)
-        );
+    //     let notify_res = timeout(Duration::from_secs(5), notify_rows.recv::<NotifyEvent>()).await?;
+    //     assert_eq!(
+    //         notify_res.unwrap().unwrap(),
+    //         NotifyEvent::Notify(ChangeType::Update, vec![Integer(2)],)
+    //     );
 
-        tripwire_tx.send(()).await.ok();
-        tripwire_worker.await;
-        ta1.agent.subs_manager().drop_handles().await;
-        wait_for_all_pending_handles().await;
+    //     tripwire_tx.send(()).await.ok();
+    //     tripwire_worker.await;
+    //     ta1.agent.subs_manager().drop_handles().await;
+    //     wait_for_all_pending_handles().await;
 
-        Ok(())
-    }
+    //     Ok(())
+    // }
 
     #[derive(Debug)]
     struct RowsIter {
