@@ -1148,13 +1148,13 @@ pub async fn process_fully_buffered_changes(
             }
         });
 
-        block_in_place(|| {
-            if let Err(e) =
-                match_changes_from_db_version(agent.updates_manager(), &conn, version, actor_id)
-            {
-                error!(%version, "could not match changes for updates from db version: {e}");
-            }
-        });
+        // block_in_place(|| {
+        //     if let Err(e) =
+        //         match_changes_from_db_version(agent.updates_manager(), &conn, version, actor_id)
+        //     {
+        //         error!(%version, "could not match changes for updates from db version: {e}");
+        //     }
+        // });
     }
 
     Ok(rows_impacted)
@@ -1463,7 +1463,7 @@ pub async fn process_multiple_changes(
     tokio::spawn(async move {
         for (_actor_id, changeset, db_version, _src) in changesets {
             match_changes(agent.subs_manager(), &changeset, db_version);
-            match_changes(agent.updates_manager(), &changeset, db_version);
+            // match_changes(agent.updates_manager(), &changeset, db_version);
         }
     });
 
