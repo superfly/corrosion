@@ -65,7 +65,11 @@ pub async fn api_v1_updates(
         };
 
     tokio::spawn(forward_update_bytes_to_body_sender(
-        handle, sub_rx, tx, tripwire,
+        handle,
+        sub_rx,
+        tx,
+        tripwire,
+        Duration::from_millis(agent.config().perf.stream_flush_timeout),
     ));
 
     hyper::Response::builder()
@@ -189,15 +193,26 @@ async fn forward_update_bytes_to_body_sender(
     mut rx: broadcast::Receiver<Bytes>,
     mut tx: BodySender,
     mut tripwire: Tripwire,
+    flush_timeout: Duration,
 ) {
     let mut buf = BytesMut::new();
-
-    let send_deadline = tokio::time::sleep(Duration::from_millis(10));
-    tokio::pin!(send_deadline);
+    let mut send_deadline = None;
 
     loop {
         tokio::select! {
             biased;
+            _ = tx.closed() => {
+                warn!(update_id = %update.id(), "body sender was closed, stopping event broadcast sends");
+                return;
+            },
+            // Preserve the first event's deadline even when more events arrive.
+            _ = async { tokio::time::sleep_until(send_deadline.unwrap()).await }, if send_deadline.is_some() => {
+                if let Err(e) = tx.send_data(buf.split().freeze()).await {
+                    warn!(update_id = %update.id(), "could not forward subscription query event to receiver: {e}");
+                    return;
+                }
+                send_deadline = None;
+            },
             res = rx.recv() => {
                 match res {
                     Ok(event_buf) => {
@@ -207,7 +222,10 @@ async fn forward_update_bytes_to_body_sender(
                                 warn!(update_id = %update.id(), "could not forward update query event to receiver: {e}");
                                 return;
                             }
-                        };
+                            send_deadline = None;
+                        } else {
+                            send_deadline.get_or_insert_with(|| tokio::time::Instant::now() + flush_timeout);
+                        }
                     },
                     Err(RecvError::Lagged(skipped)) => {
                         warn!(update_id = %update.id(), "update skipped {} events, aborting", skipped);
@@ -215,23 +233,8 @@ async fn forward_update_bytes_to_body_sender(
                     },
                     Err(RecvError::Closed) => {
                         info!(update_id = %update.id(), "events subscription ran out");
-                        return;
+                        break;
                     },
-                }
-            },
-            _ = &mut send_deadline => {
-                if !buf.is_empty() {
-                    if let Err(e) = tx.send_data(buf.split().freeze()).await {
-                        warn!(update_id = %update.id(), "could not forward subscription query event to receiver: {e}");
-                        return;
-                    }
-                } else {
-                    if tx.is_closed() {
-                        warn!(update_id = %update.id(), "body sender was closed, stopping event broadcast sends");
-                        return;
-                    }
-                    send_deadline.as_mut().reset(tokio::time::Instant::now() + Duration::from_millis(10));
-                    continue;
                 }
             },
             _ = update.cancelled() => {
@@ -250,5 +253,205 @@ async fn forward_update_bytes_to_body_sender(
             warn!(update_id = %update.id(), "could not forward subscription query event to receiver: {e}");
             return;
         }
+    }
+
+    if !buf.is_empty() {
+        if let Err(e) = tx.send_data(buf.freeze()).await {
+            warn!(update_id = %update.id(), "could not forward last update query event to receiver: {e}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn update_handle(tripwire: Tripwire) -> UpdateHandle {
+        let schema =
+            corro_types::schema::parse_sql("CREATE TABLE items (id TEXT NOT NULL PRIMARY KEY);")
+                .unwrap();
+        let (events, _rx) = mpsc::channel(16);
+        UpdateHandle::create(Uuid::new_v4(), "items", &schema, events, tripwire).unwrap()
+    }
+
+    #[derive(Default)]
+    struct StreamWakeCount(std::sync::atomic::AtomicUsize);
+
+    impl std::task::Wake for StreamWakeCount {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn update_forwarder_does_not_wake_while_idle() {
+        use std::{future::Future, task::Context};
+
+        let (_events, rx) = broadcast::channel(16);
+        let (tx, _body) = CountedBody::channel(persistent_gauge!("test.streams"));
+        let (tripwire, _worker, _trigger) = Tripwire::new_simple();
+        let update = update_handle(tripwire.clone());
+        let mut forward = Box::pin(forward_update_bytes_to_body_sender(
+            update,
+            rx,
+            tx,
+            tripwire,
+            Duration::from_millis(10),
+        ));
+        let wakes = Arc::new(StreamWakeCount::default());
+        let waker = std::task::Waker::from(wakes.clone());
+        let mut cx = Context::from_waker(&waker);
+
+        assert!(forward.as_mut().poll(&mut cx).is_pending());
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(wakes.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn update_forwarder_batches_from_first_event_after_idle() {
+        use http_body_util::BodyExt;
+
+        let (events, rx) = broadcast::channel(16);
+        let (tx, mut body) = CountedBody::channel(persistent_gauge!("test.streams"));
+        let (tripwire, _worker, _trigger) = Tripwire::new_simple();
+        let update = update_handle(tripwire.clone());
+        let mut forward = Box::pin(forward_update_bytes_to_body_sender(
+            update,
+            rx,
+            tx,
+            tripwire,
+            Duration::from_millis(100),
+        ));
+
+        assert!(futures::poll!(&mut forward).is_pending());
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        events.send(Bytes::from_static(b"first\n")).unwrap();
+        assert!(futures::poll!(&mut forward).is_pending());
+        assert!(futures::poll!(body.frame()).is_pending());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        events.send(Bytes::from_static(b"second\n")).unwrap();
+        assert!(futures::poll!(&mut forward).is_pending());
+        assert!(futures::poll!(body.frame()).is_pending());
+        tokio::time::sleep(Duration::from_millis(51)).await;
+        assert!(futures::poll!(&mut forward).is_pending());
+        let frame = futures::poll!(body.frame())
+            .map(Option::unwrap)
+            .map(Result::unwrap);
+        assert_eq!(
+            frame.map(|f| f.into_data().unwrap()),
+            std::task::Poll::Ready(Bytes::from_static(b"first\nsecond\n"))
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn update_forwarder_flushes_at_size_limit_without_an_idle_timer() {
+        use http_body_util::BodyExt;
+        use std::{future::Future, task::Context};
+
+        let (events, rx) = broadcast::channel(16);
+        let (tx, mut body) = CountedBody::channel(persistent_gauge!("test.streams"));
+        let (tripwire, _worker, _trigger) = Tripwire::new_simple();
+        let update = update_handle(tripwire.clone());
+        let mut forward = Box::pin(forward_update_bytes_to_body_sender(
+            update,
+            rx,
+            tx,
+            tripwire,
+            Duration::from_millis(10),
+        ));
+        let wakes = Arc::new(StreamWakeCount::default());
+        let waker = std::task::Waker::from(wakes.clone());
+        let mut cx = Context::from_waker(&waker);
+        let event = Bytes::from(vec![b'x'; 64 * 1024]);
+
+        events.send(Bytes::from_static(b"prefix")).unwrap();
+        assert!(forward.as_mut().poll(&mut cx).is_pending());
+        events.send(event.clone()).unwrap();
+        assert!(forward.as_mut().poll(&mut cx).is_pending());
+        let frame = futures::poll!(body.frame())
+            .map(Option::unwrap)
+            .map(Result::unwrap);
+        assert_eq!(
+            frame.map(|f| f.into_data().unwrap().len()),
+            std::task::Poll::Ready(6 + event.len())
+        );
+        wakes.0.store(0, std::sync::atomic::Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(wakes.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn update_forwarder_flushes_buffer_on_shutdown() {
+        use http_body_util::BodyExt;
+
+        let (events, rx) = broadcast::channel(16);
+        let (tx, mut body) = CountedBody::channel(persistent_gauge!("test.streams"));
+        let (tripwire, worker, _trigger) = Tripwire::new_simple();
+        let update = update_handle(tripwire.clone());
+        let mut forward = Box::pin(forward_update_bytes_to_body_sender(
+            update,
+            rx,
+            tx,
+            tripwire,
+            Duration::from_millis(10),
+        ));
+
+        events.send(Bytes::from_static(b"last\n")).unwrap();
+        assert!(futures::poll!(&mut forward).is_pending());
+        drop(worker);
+        assert!(futures::poll!(&mut forward).is_ready());
+        let frame = futures::poll!(body.frame())
+            .map(Option::unwrap)
+            .map(Result::unwrap);
+        assert_eq!(
+            frame.map(|f| f.into_data().unwrap()),
+            std::task::Poll::Ready(Bytes::from_static(b"last\n"))
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn update_forwarder_flushes_without_delay_when_timeout_is_zero() {
+        use http_body_util::BodyExt;
+
+        let (events, rx) = broadcast::channel(16);
+        let (tx, mut body) = CountedBody::channel(persistent_gauge!("test.streams"));
+        let (tripwire, _worker, _trigger) = Tripwire::new_simple();
+        let update = update_handle(tripwire.clone());
+        let mut forward = Box::pin(forward_update_bytes_to_body_sender(
+            update,
+            rx,
+            tx,
+            tripwire,
+            Duration::ZERO,
+        ));
+
+        events.send(Bytes::from_static(b"now\n")).unwrap();
+        assert!(futures::poll!(&mut forward).is_pending());
+        let frame = futures::poll!(body.frame())
+            .map(Option::unwrap)
+            .map(Result::unwrap);
+        assert_eq!(
+            frame.map(|f| f.into_data().unwrap()),
+            std::task::Poll::Ready(Bytes::from_static(b"now\n"))
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn update_forwarder_stops_on_disconnect_without_a_timer() {
+        let (_events, rx) = broadcast::channel(16);
+        let (tx, body) = CountedBody::channel(persistent_gauge!("test.streams"));
+        let (tripwire, _worker, _trigger) = Tripwire::new_simple();
+        let update = update_handle(tripwire.clone());
+        let mut forward = Box::pin(forward_update_bytes_to_body_sender(
+            update,
+            rx,
+            tx,
+            tripwire,
+            Duration::from_millis(10),
+        ));
+
+        assert!(futures::poll!(&mut forward).is_pending());
+        drop(body);
+        assert!(futures::poll!(&mut forward).is_ready());
     }
 }

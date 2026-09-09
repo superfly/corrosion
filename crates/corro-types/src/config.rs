@@ -77,6 +77,10 @@ const fn default_apply_timeout() -> usize {
     10
 }
 
+const fn default_stream_flush_timeout() -> u64 {
+    10
+}
+
 fn default_sql_tx_timeout() -> usize {
     60
 }
@@ -412,6 +416,9 @@ pub struct PerfConfig {
     pub wal_threshold_mb: usize,
     #[serde(default = "default_sql_tx_timeout")]
     pub sql_tx_timeout: usize,
+    /// Milliseconds to buffer HTTP subscription and update events before flushing.
+    #[serde(default = "default_stream_flush_timeout")]
+    pub stream_flush_timeout: u64,
     #[serde(default = "default_min_sync_backoff")]
     pub min_sync_backoff: u32,
     #[serde(default = "default_max_sync_backoff")]
@@ -459,6 +466,7 @@ impl Default for PerfConfig {
             foca_channel_len: default_small_channel(),
             wal_threshold_mb: default_wal_threshold(),
             sql_tx_timeout: default_sql_tx_timeout(),
+            stream_flush_timeout: default_stream_flush_timeout(),
             min_sync_backoff: default_min_sync_backoff(),
             max_sync_backoff: default_max_sync_backoff(),
             partial_retry_backoff: default_partial_retry_backoff(),
@@ -837,6 +845,39 @@ pub struct TableReapConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stream_flush_timeout_defaults_to_ten_milliseconds() {
+        let deserialized: PerfConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(
+            serde_json::to_value(deserialized).unwrap()["stream_flush_timeout"],
+            10
+        );
+        assert_eq!(
+            serde_json::to_value(PerfConfig::default()).unwrap()["stream_flush_timeout"],
+            10
+        );
+    }
+
+    #[test]
+    fn stream_flush_timeout_can_be_configured() {
+        let perf: PerfConfig = serde_json::from_str(r#"{"stream_flush_timeout":100}"#).unwrap();
+        assert_eq!(
+            serde_json::to_value(perf).unwrap()["stream_flush_timeout"],
+            100
+        );
+    }
+
+    #[test]
+    fn stream_flush_timeout_accepts_zero() {
+        let perf: PerfConfig = serde_json::from_str(r#"{"stream_flush_timeout":0}"#).unwrap();
+        assert_eq!(perf.stream_flush_timeout, 0);
+    }
+
+    #[test]
+    fn stream_flush_timeout_rejects_negative_values() {
+        assert!(serde_json::from_str::<PerfConfig>(r#"{"stream_flush_timeout":-1}"#).is_err());
+    }
 
     #[test]
     fn broadcast_config_defaults_to_gossip() {
