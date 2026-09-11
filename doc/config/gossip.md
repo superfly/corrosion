@@ -34,6 +34,10 @@ It can resolve names w/ a custom DNS server:
 bootstrap = ["my-fly-app.internal:3333@[fdaa::3]:53"]
 ```
 
+#### `gossip.allow_mixed_ip`
+
+When `true`, bootstrap from both IPv4 and IPv6 peers even if this node's `gossip.addr` is the other family. Defaults to `false`, which only considers same-family addresses.
+
 #### `gossip.plaintext`
 
 Allows using QUIC without encryption. The only reason to set this to `true` is if you're running a toy cluster or if the underlying transport is already handling cryptography (such as WireGuard) AND authorization is bound by the network (such is the case for a [Fly.io](https://fly.io) app's private network).
@@ -136,6 +140,7 @@ bootstrap = []
 plaintext = false           # optional
 idle_timeout_secs = 30      # optional
 disable_gso = false         # optional
+allow_mixed_ip = false      # optional
 
 # max_mtu = 1452            # optional; unset = autodetect, must be >= 1200
 # external_addr = ""        # optional, defaults to gossip.addr

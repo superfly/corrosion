@@ -2492,6 +2492,7 @@ mod tests {
             client_addr: DEFAULT_GOSSIP_CLIENT_ADDR,
             external_addr: None,
             bootstrap: vec![],
+            allow_mixed_ip: false,
             tls: Some(TlsConfig {
                 cert_file,
                 key_file,

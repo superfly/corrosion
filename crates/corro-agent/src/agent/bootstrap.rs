@@ -10,9 +10,10 @@ use tracing::{debug, error, warn};
 pub async fn generate_bootstrap(
     bootstrap: &[String],
     our_addr: SocketAddr,
+    allow_mixed_ip: bool,
     pool: &SplitPool,
 ) -> eyre::Result<Vec<SocketAddr>> {
-    let mut addrs = match resolve_bootstrap(bootstrap, our_addr).await {
+    let mut addrs = match resolve_bootstrap(bootstrap, our_addr, allow_mixed_ip).await {
         Ok(addrs) => addrs,
         Err(e) => {
             warn!("could not resolve bootstraps, falling back to in-db nodes: {e}");
@@ -36,7 +37,7 @@ pub async fn generate_bootstrap(
                         (SocketAddr::V4(our_ip), SocketAddr::V4(ip)) if our_ip != *ip => true,
                         _ => {
                             debug!("ignore node with addr: {addr}");
-                            false
+                            allow_mixed_ip
                         }
                     })
                     .collect(),
@@ -54,6 +55,7 @@ pub async fn generate_bootstrap(
 async fn resolve_bootstrap(
     bootstrap: &[String],
     our_addr: SocketAddr,
+    allow_mixed_ip: bool,
 ) -> eyre::Result<HashSet<SocketAddr>> {
     use hickory_resolver::{
         config::{NameServerConfig, ResolverConfig},
@@ -136,7 +138,9 @@ async fn resolve_bootstrap(
                         (SocketAddr::V6(our_ip), SocketAddr::V6(ip)) if our_ip != ip => {}
                         _ => {
                             debug!("ignore node with addr: {addr}");
-                            continue;
+                            if !allow_mixed_ip {
+                                continue;
+                            }
                         }
                     }
                     addrs.insert(addr);

@@ -320,6 +320,11 @@ pub struct GossipConfig {
     pub client_addr: SocketAddr,
     #[serde(default)]
     pub bootstrap: Vec<String>,
+    /// When true, bootstrap from both IPv4 and IPv6 peers regardless of this
+    /// node's gossip bind family. Relies on Quinn dual-stack client sockets
+    /// (`client_addr = "[::]:0"`) to dial the other family.
+    #[serde(default)]
+    pub allow_mixed_ip: bool,
     #[serde(default)]
     pub tls: Option<TlsConfig>,
     #[serde(default)]
@@ -752,6 +757,7 @@ impl ConfigBuilder {
                 external_addr: self.external_addr,
                 client_addr: default_gossip_client_addr(),
                 bootstrap: self.bootstrap.unwrap_or_default(),
+                allow_mixed_ip: false,
                 plaintext: self.tls.is_none(),
                 tls: self.tls,
                 idle_timeout_secs: default_gossip_idle_timeout(),
@@ -846,6 +852,7 @@ mod tests {
         .unwrap();
         assert_eq!(cfg.broadcast.method(), BroadcastMethod::Gossip);
         assert!(cfg.plumtree().is_none());
+        assert!(!cfg.allow_mixed_ip);
     }
 
     #[test]
