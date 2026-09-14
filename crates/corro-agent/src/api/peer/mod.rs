@@ -307,10 +307,13 @@ async fn build_quinn_client_config(config: &GossipConfig) -> eyre::Result<quinn:
     Ok(client_config)
 }
 
-pub async fn gossip_client_endpoint(config: &GossipConfig) -> eyre::Result<quinn::Endpoint> {
+pub async fn gossip_client_endpoint(
+    config: &GossipConfig,
+    bind_addr: SocketAddr,
+) -> eyre::Result<quinn::Endpoint> {
     let client_config = build_quinn_client_config(config).await?;
 
-    let mut client = quinn::Endpoint::client(config.client_addr)?;
+    let mut client = quinn::Endpoint::client(bind_addr)?;
 
     client.set_default_client_config(client_config);
     Ok(client)
@@ -2489,7 +2492,9 @@ mod tests {
 
         let gossip_config = GossipConfig {
             bind_addr: "127.0.0.1:0".parse()?,
-            client_addr: DEFAULT_GOSSIP_CLIENT_ADDR,
+            client_addr: None,
+            client_addr_v4: None,
+            client_addr_v6: None,
             external_addr: None,
             bootstrap: vec![],
             allow_mixed_ip: false,
@@ -2520,7 +2525,7 @@ mod tests {
         let server = gossip_server_endpoint(&gossip_config).await?;
         let addr = server.local_addr()?;
 
-        let client = gossip_client_endpoint(&gossip_config).await?;
+        let client = gossip_client_endpoint(&gossip_config, DEFAULT_GOSSIP_CLIENT_ADDR).await?;
 
         let res = tokio::try_join!(
             async {

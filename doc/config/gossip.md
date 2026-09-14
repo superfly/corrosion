@@ -38,12 +38,32 @@ bootstrap = ["my-fly-app.internal:3333@[fdaa::3]:53"]
 
 When `true`, bootstrap from both IPv4 and IPv6 peers even if this node's `gossip.addr` is the other family. Defaults to `false`, which only considers same-family addresses.
 
+Sending to both families requires a matching outgoing socket (`gossip.client_addr_v4` / `gossip.client_addr_v6`) or a single `client_addr = "[::]:0"`.
+
+#### `gossip.client_addr`
+
+Bind address for outgoing QUIC connections. Defaults to `[::]:0` when neither family-specific bind is set.
+Port `0` opens 8 sockets to reduce kernel buffer pressure; a non-zero port uses a single socket.
+
+Mutually exclusive with `client_addr_v4` / `client_addr_v6`. Setting both styles is a config error.
+
+#### `gossip.client_addr_v4` / `gossip.client_addr_v6`
+
+Optional per-family binds for outgoing QUIC. Set either or both instead of `client_addr`. At send time, Corrosion picks the pool that matches the destination address family. A destination with no matching socket fails rather than mapping IPv4 onto an IPv6 socket.
+
+```toml
+# Mixed IPv4/IPv6 cluster: do not set client_addr
+client_addr_v4 = "0.0.0.0:0"
+client_addr_v6 = "[fdaa:2::1]:0"
+```
+
 #### `gossip.plaintext`
 
 Allows using QUIC without encryption. The only reason to set this to `true` is if you're running a toy cluster or if the underlying transport is already handling cryptography (such as WireGuard) AND authorization is bound by the network (such is the case for a [Fly.io](https://fly.io) app's private network).
 
-> [!WARNING]
-> It's highly recommended to use the `gossip.tls` configuration block to setup encryption and `gossip.tls.client` to setup authorization.
+```admonish warning
+It's highly recommended to use the `gossip.tls` configuration block to setup encryption and `gossip.tls.client` to setup authorization.
+```
 
 #### `gossip.idle_timeout_secs`
 
@@ -142,9 +162,12 @@ idle_timeout_secs = 30      # optional
 disable_gso = false         # optional
 allow_mixed_ip = false      # optional
 
+# client_addr    = "[::]:0"     # optional; mutually exclusive with the two below
+# client_addr_v4 = "0.0.0.0:0"  # optional
+# client_addr_v6 = "[::]:0"     # optional
+
 # max_mtu = 1452            # optional; unset = autodetect, must be >= 1200
 # external_addr = ""        # optional, defaults to gossip.addr
-# client_addr   = "[::]:0"  # optional
 
 member_id = 1 # optional
 

@@ -36,7 +36,9 @@ pub async fn generate_bootstrap(
                         (SocketAddr::V6(our_ip), SocketAddr::V6(ip)) if our_ip != *ip => true,
                         (SocketAddr::V4(our_ip), SocketAddr::V4(ip)) if our_ip != *ip => true,
                         _ => {
-                            debug!("ignore node with addr: {addr}");
+                            if !allow_mixed_ip {
+                                debug!("ignore node with addr: {addr}");
+                            }
                             allow_mixed_ip
                         }
                     })
