@@ -7,7 +7,7 @@ use std::{
 };
 
 use bytes::Bytes;
-use corro_types::config::GossipConfig;
+use corro_types::config::{ClientBinds, GossipConfig};
 use metrics::{counter, gauge, histogram};
 use quinn::{
     ApplicationClose, Connection, ConnectionError, Endpoint, RecvStream, SendDatagramError,
@@ -27,13 +27,22 @@ pub struct Transport(Arc<TransportInner>);
 
 #[derive(Debug)]
 struct TransportInner {
-    endpoints: Vec<Endpoint>,
+    endpoints: ClientEndpoints,
     conns: RwLock<HashMap<SocketAddr, Arc<Mutex<Option<Connection>>>>>,
     rtt_tx: mpsc::Sender<(SocketAddr, Duration)>,
     path_snapshots: StdMutex<HashMap<SocketAddr, PathSnapshot>>,
     /// Last `path.latest_rtt` pushed per peer by [`Transport::sample_rtts`],
     /// used to skip re-pushing a measurement that has not moved.
     rtt_marks: StdMutex<HashMap<SocketAddr, Duration>>,
+}
+
+#[derive(Debug)]
+enum ClientEndpoints {
+    Single(Vec<Endpoint>),
+    ByFamily {
+        v4: Vec<Endpoint>,
+        v6: Vec<Endpoint>,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -74,6 +83,11 @@ pub enum TransportError {
     TimedOut(#[from] Elapsed),
     #[error(transparent)]
     Stopped(#[from] quinn::StoppedError),
+    #[error("no {family} client socket bound for destination {addr}")]
+    NoClientSocket {
+        family: &'static str,
+        addr: SocketAddr,
+    },
 }
 
 impl Transport {
@@ -81,23 +95,22 @@ impl Transport {
         config: &GossipConfig,
         rtt_tx: mpsc::Sender<(SocketAddr, Duration)>,
     ) -> eyre::Result<Self> {
-        let mut endpoints = vec![];
-        let endpoints_count = if config.client_addr.port() == 0 {
-            // zero port means we'll use whatever is available,
-            // corrosion can use multiple sockets and reduce the risk of filling kernel buffers
-            8
-        } else {
-            // non-zero client addr port means we can only use 1
-            1
+        let endpoints = match config.client_binds()? {
+            ClientBinds::Single(addr) => {
+                ClientEndpoints::Single(bind_client_pool(config, addr, "client").await?)
+            }
+            ClientBinds::ByFamily { v4, v6 } => {
+                let v4 = match v4 {
+                    Some(addr) => bind_client_pool(config, addr, "IPv4").await?,
+                    None => Vec::new(),
+                };
+                let v6 = match v6 {
+                    Some(addr) => bind_client_pool(config, addr, "IPv6").await?,
+                    None => Vec::new(),
+                };
+                ClientEndpoints::ByFamily { v4, v6 }
+            }
         };
-        for i in 0..endpoints_count {
-            let ep = gossip_client_endpoint(config).await?;
-            info!(
-                "Transport ({i}) for outgoing connections bound to socket {}",
-                ep.local_addr().unwrap()
-            );
-            endpoints.push(ep);
-        }
         Ok(Self(Arc::new(TransportInner {
             endpoints,
             conns: Default::default(),
@@ -105,6 +118,24 @@ impl Transport {
             path_snapshots: Default::default(),
             rtt_marks: Default::default(),
         })))
+    }
+
+    fn endpoints_for(&self, addr: SocketAddr) -> Result<&[Endpoint], TransportError> {
+        match &self.0.endpoints {
+            ClientEndpoints::Single(endpoints) => Ok(endpoints),
+            ClientEndpoints::ByFamily { v4, v6 } => {
+                let (endpoints, family) = match addr {
+                    SocketAddr::V4(_) => (v4, "IPv4"),
+                    SocketAddr::V6(_) => (v6, "IPv6"),
+                };
+
+                if endpoints.is_empty() {
+                    Err(TransportError::NoClientSocket { family, addr })
+                } else {
+                    Ok(endpoints.as_slice())
+                }
+            }
+        }
     }
 
     #[tracing::instrument(skip(self, data), fields(buf_size = data.len()), level = "debug", err)]
@@ -229,14 +260,28 @@ impl Transport {
     ) -> Result<Connection, TransportError> {
         let start = Instant::now();
 
+        let endpoints = match self.endpoints_for(addr) {
+            Ok(endpoints) => endpoints,
+            Err(e) => {
+                counter!(
+                    "corro.transport.connect.errors.v2",
+                    "traffic" => traffic.as_str(),
+                    "kind" => "no_client_socket"
+                )
+                .increment(1);
+                return Err(e);
+            }
+        };
+
         let mut hasher = seahash::SeaHasher::new();
         addr.hash(&mut hasher);
-        let endpoint_idx = (hasher.finish() % self.0.endpoints.len() as u64) as usize;
+        let endpoint_idx = (hasher.finish() % endpoints.len() as u64) as usize;
+        let endpoint = endpoints[endpoint_idx].clone();
 
         async {
             match tokio::time::timeout(
                 Duration::from_secs(5),
-                self.0.endpoints[endpoint_idx].connect(addr, &server_name)?,
+                endpoint.connect(addr, &server_name)?,
             )
             .await
             {
@@ -602,6 +647,31 @@ impl Transport {
 }
 
 const NO_ERROR: quinn::VarInt = quinn::VarInt::from_u32(0);
+
+async fn bind_client_pool(
+    config: &GossipConfig,
+    bind_addr: SocketAddr,
+    label: &str,
+) -> eyre::Result<Vec<Endpoint>> {
+    let count = if bind_addr.port() == 0 {
+        // zero port means we'll use whatever is available,
+        // corrosion can use multiple sockets and reduce the risk of filling kernel buffers
+        8
+    } else {
+        // non-zero client addr port means we can only use 1
+        1
+    };
+    let mut endpoints = Vec::with_capacity(count);
+    for i in 0..count {
+        let ep = gossip_client_endpoint(config, bind_addr).await?;
+        info!(
+            "Transport ({i}) {label} outgoing connections bound to socket {}",
+            ep.local_addr().unwrap()
+        );
+        endpoints.push(ep);
+    }
+    Ok(endpoints)
+}
 
 fn datagram_error_kind(e: &SendDatagramError) -> &'static str {
     match e {
