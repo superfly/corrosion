@@ -316,10 +316,25 @@ pub struct GossipConfig {
     #[serde(alias = "addr")]
     pub bind_addr: SocketAddr,
     pub external_addr: Option<SocketAddr>,
-    #[serde(default = "default_gossip_client_addr")]
-    pub client_addr: SocketAddr,
+    /// Bind address for outgoing QUIC. When unset, and neither family-specific
+    /// bind is set, defaults to `[::]:0`. Mutually exclusive with
+    /// `client_addr_v4` / `client_addr_v6`.
+    #[serde(default)]
+    pub client_addr: Option<SocketAddr>,
+    /// IPv4 bind for outgoing QUIC. Mutually exclusive with `client_addr`.
+    #[serde(default)]
+    pub client_addr_v4: Option<SocketAddr>,
+    /// IPv6 bind for outgoing QUIC. Mutually exclusive with `client_addr`.
+    #[serde(default)]
+    pub client_addr_v6: Option<SocketAddr>,
     #[serde(default)]
     pub bootstrap: Vec<String>,
+    /// When true, bootstrap from both IPv4 and IPv6 peers regardless of this
+    /// node's gossip bind family. The other family is only reachable if a
+    /// matching `client_addr_v4` / `client_addr_v6` socket is bound or `client_addr`
+    /// is set to `[::]:0`.
+    #[serde(default)]
+    pub allow_mixed_ip: bool,
     #[serde(default)]
     pub tls: Option<TlsConfig>,
     #[serde(default)]
@@ -350,6 +365,66 @@ impl GossipConfig {
     pub fn plumtree(&self) -> Option<&PlumtreeConfig> {
         self.broadcast.plumtree()
     }
+
+    /// Resolve outgoing QUIC binds.
+    ///
+    /// `client_addr` is the legacy single-socket mode. `client_addr_v4` /
+    /// `client_addr_v6` opt into per-family sockets. The two styles cannot
+    /// be combined. When nothing is set, binds `[::]:0`.
+    pub fn client_binds(&self) -> Result<ClientBinds, ClientBindsError> {
+        match (self.client_addr, self.client_addr_v4, self.client_addr_v6) {
+            (None, None, None) => Ok(ClientBinds::Single(DEFAULT_GOSSIP_CLIENT_ADDR)),
+            (Some(addr), None, None) => Ok(ClientBinds::Single(addr)),
+            (None, v4, v6) if v4.is_some() || v6.is_some() => {
+                if let Some(addr) = v4 {
+                    if !addr.is_ipv4() {
+                        return Err(ClientBindsError::FamilyMismatch {
+                            field: "client_addr_v4",
+                            addr,
+                            expected: "IPv4",
+                        });
+                    }
+                }
+                if let Some(addr) = v6 {
+                    if !addr.is_ipv6() {
+                        return Err(ClientBindsError::FamilyMismatch {
+                            field: "client_addr_v6",
+                            addr,
+                            expected: "IPv6",
+                        });
+                    }
+                }
+                Ok(ClientBinds::ByFamily { v4, v6 })
+            }
+            _ => Err(ClientBindsError::MixedModes),
+        }
+    }
+}
+
+/// Outgoing QUIC client binds, after resolving `client_addr` vs family fields.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClientBinds {
+    /// One outgoing bind. `[::]:0` may still dual-stack map IPv4 destinations.
+    Single(SocketAddr),
+    /// Separate outgoing binds selected by destination address family.
+    ByFamily {
+        v4: Option<SocketAddr>,
+        v6: Option<SocketAddr>,
+    },
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum ClientBindsError {
+    #[error(
+        "gossip.client_addr is mutually exclusive with gossip.client_addr_v4 and gossip.client_addr_v6"
+    )]
+    MixedModes,
+    #[error("gossip.{field} must be an {expected} address, got {addr}")]
+    FamilyMismatch {
+        field: &'static str,
+        addr: SocketAddr,
+        expected: &'static str,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -480,10 +555,6 @@ fn default_gossip_idle_timeout() -> u32 {
 pub const DEFAULT_GOSSIP_CLIENT_ADDR: SocketAddr =
     SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0u16, 0, 0));
 
-fn default_gossip_client_addr() -> SocketAddr {
-    DEFAULT_GOSSIP_CLIENT_ADDR
-}
-
 fn default_compression_level() -> i32 {
     3
 }
@@ -543,6 +614,8 @@ pub enum ConfigError {
     DictFileWithoutDictDir,
     #[error("{0}")]
     InvalidEagerRatios(#[from] plum_foca::EagerRatiosError),
+    #[error(transparent)]
+    ClientBinds(#[from] ClientBindsError),
 }
 
 impl Config {
@@ -579,6 +652,7 @@ impl Config {
         if let Some(plumtree) = self.gossip.plumtree() {
             plumtree.eager_ratios.validate()?;
         }
+        self.gossip.client_binds()?;
         Ok(())
     }
 }
@@ -750,8 +824,11 @@ impl ConfigBuilder {
                     .gossip_addr
                     .ok_or(ConfigBuilderError::GossipAddrRequired)?,
                 external_addr: self.external_addr,
-                client_addr: default_gossip_client_addr(),
+                client_addr: None,
+                client_addr_v4: None,
+                client_addr_v6: None,
                 bootstrap: self.bootstrap.unwrap_or_default(),
+                allow_mixed_ip: false,
                 plaintext: self.tls.is_none(),
                 tls: self.tls,
                 idle_timeout_secs: default_gossip_idle_timeout(),
@@ -846,6 +923,7 @@ mod tests {
         .unwrap();
         assert_eq!(cfg.broadcast.method(), BroadcastMethod::Gossip);
         assert!(cfg.plumtree().is_none());
+        assert!(!cfg.allow_mixed_ip);
     }
 
     #[test]
@@ -863,6 +941,95 @@ mod tests {
         assert_eq!(cfg.plumtree().unwrap().prune_threshold, 7);
         assert_eq!(cfg.plumtree().unwrap().optimization_threshold, None);
         assert_eq!(cfg.plumtree().unwrap().ring_locked_radius, 1);
+    }
+
+    #[test]
+    fn client_binds_default_is_unspecified_v6() {
+        let cfg: GossipConfig = serde_json::from_value(serde_json::json!({
+            "bind_addr": "127.0.0.1:4001",
+        }))
+        .unwrap();
+        assert_eq!(
+            cfg.client_binds().unwrap(),
+            ClientBinds::Single(DEFAULT_GOSSIP_CLIENT_ADDR)
+        );
+    }
+
+    #[test]
+    fn client_binds_legacy_client_addr() {
+        let cfg: GossipConfig = serde_json::from_value(serde_json::json!({
+            "bind_addr": "127.0.0.1:4001",
+            "client_addr": "0.0.0.0:0",
+        }))
+        .unwrap();
+        assert_eq!(
+            cfg.client_binds().unwrap(),
+            ClientBinds::Single("0.0.0.0:0".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn client_binds_by_family() {
+        let cfg: GossipConfig = serde_json::from_value(serde_json::json!({
+            "bind_addr": "127.0.0.1:4001",
+            "client_addr_v4": "0.0.0.0:0",
+            "client_addr_v6": "[::]:0",
+        }))
+        .unwrap();
+        assert_eq!(
+            cfg.client_binds().unwrap(),
+            ClientBinds::ByFamily {
+                v4: Some("0.0.0.0:0".parse().unwrap()),
+                v6: Some("[::]:0".parse().unwrap()),
+            }
+        );
+    }
+
+    #[test]
+    fn client_binds_v4_only() {
+        let cfg: GossipConfig = serde_json::from_value(serde_json::json!({
+            "bind_addr": "127.0.0.1:4001",
+            "client_addr_v4": "127.0.0.1:0",
+        }))
+        .unwrap();
+        assert_eq!(
+            cfg.client_binds().unwrap(),
+            ClientBinds::ByFamily {
+                v4: Some("127.0.0.1:0".parse().unwrap()),
+                v6: None,
+            }
+        );
+    }
+
+    #[test]
+    fn client_binds_rejects_mixed_modes() {
+        let cfg: GossipConfig = serde_json::from_value(serde_json::json!({
+            "bind_addr": "127.0.0.1:4001",
+            "client_addr": "[::]:0",
+            "client_addr_v4": "0.0.0.0:0",
+        }))
+        .unwrap();
+        assert_eq!(
+            cfg.client_binds().unwrap_err(),
+            ClientBindsError::MixedModes
+        );
+    }
+
+    #[test]
+    fn client_binds_rejects_wrong_family() {
+        let cfg: GossipConfig = serde_json::from_value(serde_json::json!({
+            "bind_addr": "127.0.0.1:4001",
+            "client_addr_v4": "[::]:0",
+        }))
+        .unwrap();
+        assert!(matches!(
+            cfg.client_binds().unwrap_err(),
+            ClientBindsError::FamilyMismatch {
+                field: "client_addr_v4",
+                expected: "IPv4",
+                ..
+            }
+        ));
     }
 
     #[test]
