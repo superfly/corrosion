@@ -8,6 +8,7 @@ use serde_with::{formats::PreferOne, serde_as, OneOrMany};
 
 pub const DEFAULT_GOSSIP_PORT: u16 = 4001;
 const DEFAULT_GOSSIP_IDLE_TIMEOUT: u32 = 30;
+const DEFAULT_GOSSIP_REMOVE_DOWN_AFTER: u32 = 2 * 24 * 3600;
 
 #[cfg(test)]
 pub const DEFAULT_MAX_SYNC_BACKOFF: u32 = 2;
@@ -328,6 +329,9 @@ pub struct GossipConfig {
     pub max_mtu: Option<u16>,
     #[serde(default = "default_gossip_idle_timeout")]
     pub idle_timeout_secs: u32,
+    /// How long, in seconds, a member declared down stays remembered and announced to.
+    #[serde(default = "default_gossip_remove_down_after")]
+    pub remove_down_after_secs: u32,
     #[serde(default)]
     pub disable_gso: bool,
     #[serde(default)]
@@ -475,6 +479,10 @@ impl Default for PerfConfig {
 
 fn default_gossip_idle_timeout() -> u32 {
     DEFAULT_GOSSIP_IDLE_TIMEOUT
+}
+
+fn default_gossip_remove_down_after() -> u32 {
+    DEFAULT_GOSSIP_REMOVE_DOWN_AFTER
 }
 
 pub const DEFAULT_GOSSIP_CLIENT_ADDR: SocketAddr =
@@ -755,6 +763,7 @@ impl ConfigBuilder {
                 plaintext: self.tls.is_none(),
                 tls: self.tls,
                 idle_timeout_secs: default_gossip_idle_timeout(),
+                remove_down_after_secs: default_gossip_remove_down_after(),
                 max_mtu: self.max_mtu,
                 disable_gso: self.disable_gso,
                 member_id: self.member_id,

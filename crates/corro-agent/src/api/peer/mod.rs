@@ -2503,6 +2503,7 @@ mod tests {
                 insecure: false,
             }),
             idle_timeout_secs: 30,
+            remove_down_after_secs: 2 * 24 * 3600,
             plaintext: false,
             max_mtu: None,
             disable_gso: false,

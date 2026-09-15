@@ -47,6 +47,12 @@ The max idle timeout in seconds for QUIC connection.
 
 Defaults to 30 seconds.
 
+#### `gossip.remove_down_after_secs`
+
+How long, in seconds, a node remembers a member it has declared down. While a down member is remembered, the node keeps announcing to it, and each announcement to an address that no longer answers costs a connection timeout. A cluster whose members come and go under new identities, such as pods, can set this low.
+
+Defaults to 172800 seconds (2 days).
+
 #### `gossip.member_id`
 
 Specifies a member_id which identify nodes of the same Corrosion cluster. Nodes with different member_id would be unable to share changes with each other.
@@ -135,6 +141,7 @@ bootstrap = []
 
 plaintext = false           # optional
 idle_timeout_secs = 30      # optional
+remove_down_after_secs = 172800 # optional
 disable_gso = false         # optional
 
 # max_mtu = 1452            # optional; unset = autodetect, must be >= 1200
