@@ -3,6 +3,8 @@ use std::hash::Hash;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+pub mod enquote;
+
 use tracing::warn;
 
 pub async fn read_files_from_paths<P: AsRef<Path>>(
