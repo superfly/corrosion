@@ -272,7 +272,11 @@ impl ParsedCmd {
     }
 
     pub fn is_rollback(&self) -> bool {
-        matches!(self, ParsedCmd::Sqlite(Cmd::Stmt(Stmt::Rollback { .. })))
+        matches!(
+            self,
+            ParsedCmd::Sqlite(Cmd::Stmt(Stmt::Rollback { .. }))
+                | ParsedCmd::Postgres(PgStatement::Rollback { .. })
+        )
     }
 
     pub fn is_pg(&self) -> bool {
@@ -324,6 +328,7 @@ impl ParsedCmd {
             ParsedCmd::Postgres(stmt) => match stmt {
                 PgStatement::StartTransaction { .. } => StmtTag::Begin,
                 PgStatement::Commit { .. } => StmtTag::Commit,
+                PgStatement::Rollback { .. } => StmtTag::Rollback,
                 _ => StmtTag::Other,
             },
             _ => StmtTag::Other,
@@ -2826,7 +2831,17 @@ pub async fn start(
 
                                             trace!("parsed cmd: {parsed_cmd:#?}");
 
-                                            let prepped = match session.conn.prepare(&stripped_sql) {
+                                            let sql_to_prepare = if parsed_cmd.is_rollback() {
+                                                "ROLLBACK"
+                                            } else if parsed_cmd.is_commit() {
+                                                "COMMIT"
+                                            } else if parsed_cmd.is_begin() {
+                                                "BEGIN"
+                                            } else {
+                                                &stripped_sql
+                                            };
+
+                                            let prepped = match session.conn.prepare(sql_to_prepare) {
                                                 Ok(prepped) => prepped,
                                                 Err(e) => {
                                                     back_tx.blocking_send(
@@ -2932,7 +2947,7 @@ pub async fn start(
                                             prepared.insert(
                                                 name.into(),
                                                 Prepared::NonEmpty {
-                                                    sql: stripped_sql.clone(),
+                                                    sql: sql_to_prepare.to_string(),
                                                     param_types,
                                                     fields,
                                                     cmd: Box::new(parsed_cmd),
@@ -3152,7 +3167,16 @@ pub async fn start(
                                             cmd,
                                             ..
                                         }) => {
-                                            let mut prepped = match session.conn.prepare(sql) {
+                                            let sql_to_prepare = if cmd.is_rollback() {
+                                                "ROLLBACK"
+                                            } else if cmd.is_commit() {
+                                                "COMMIT"
+                                            } else if cmd.is_begin() {
+                                                "BEGIN"
+                                            } else {
+                                                sql
+                                            };
+                                            let mut prepped = match session.conn.prepare(sql_to_prepare) {
                                                 Ok(prepped) => prepped,
                                                 Err(e) => {
                                                     back_tx.blocking_send(
