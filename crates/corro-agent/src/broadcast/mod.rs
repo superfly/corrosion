@@ -132,9 +132,11 @@ pub fn runtime_loop(
     let rng = StdRng::from_os_rng();
 
     let max_mtu = agent.config().gossip.max_mtu;
+    let remove_down_after_secs = agent.config().gossip.remove_down_after_secs;
     let config = Arc::new(RwLock::new(make_foca_config(
         1.try_into().unwrap(),
         max_mtu,
+        remove_down_after_secs,
     )));
 
     let mut foca = Foca::with_custom_broadcast(
@@ -253,7 +255,8 @@ pub fn runtime_loop(
 
                             if size != last_cluster_size {
                                 debug!("Adjusting cluster size to {size}");
-                                let new_config = make_foca_config(size, max_mtu);
+                                let new_config =
+                                    make_foca_config(size, max_mtu, remove_down_after_secs);
                                 if let Err(e) = foca.set_config(new_config.clone()) {
                                     error!("foca set_config error: {e}");
                                 } else {
@@ -1028,9 +1031,13 @@ fn foca_state_is_active(state: &foca::State) -> bool {
 
 const QUIC_SHORT_HEADER_OVERHEAD: u16 = 13;
 
-fn make_foca_config(cluster_size: NonZeroU32, max_mtu: Option<u16>) -> foca::Config {
+fn make_foca_config(
+    cluster_size: NonZeroU32,
+    max_mtu: Option<u16>,
+    remove_down_after_secs: u32,
+) -> foca::Config {
     let mut config = foca::Config::new_wan(cluster_size);
-    config.remove_down_after = Duration::from_secs(2 * 24 * 3600);
+    config.remove_down_after = Duration::from_secs(remove_down_after_secs as u64);
 
     config.max_packet_size = max_mtu
         .and_then(|mtu| mtu.checked_sub(QUIC_SHORT_HEADER_OVERHEAD))
@@ -1131,9 +1138,32 @@ mod tests {
     use corro_types::{
         base::{dbsr, CrsqlDbVersion, CrsqlSeq},
         broadcast::{BroadcastV1, ChangeV1, Changeset},
+        config::GossipConfig,
     };
     use std::collections::HashSet;
     use uuid::Uuid;
+
+    #[test]
+    fn make_foca_config_sets_remove_down_after() {
+        for (secs, expected) in [
+            (0u32, Duration::from_secs(0)),
+            (60, Duration::from_secs(60)),
+            (2 * 24 * 3600, Duration::from_secs(172_800)),
+        ] {
+            let config = make_foca_config(1.try_into().unwrap(), None, secs);
+            assert_eq!(config.remove_down_after, expected, "{secs} seconds");
+        }
+    }
+
+    #[test]
+    fn make_foca_config_removes_down_members_after_two_days_by_default() {
+        let gossip: GossipConfig =
+            serde_json::from_value(serde_json::json!({"addr": "127.0.0.1:4001"})).unwrap();
+
+        let config = make_foca_config(1.try_into().unwrap(), None, gossip.remove_down_after_secs);
+
+        assert_eq!(config.remove_down_after, Duration::from_secs(2 * 24 * 3600));
+    }
 
     #[test]
     fn test_behaviour_when_queue_is_full() -> eyre::Result<()> {
@@ -1198,7 +1228,11 @@ mod tests {
         let (tx_bcast, rx_bcast) = bounded(100, "bcast");
         let (tx_rtt, _) = mpsc::channel(100);
 
-        let config = Arc::new(RwLock::new(make_foca_config(1.try_into().unwrap(), None)));
+        let config = Arc::new(RwLock::new(make_foca_config(
+            1.try_into().unwrap(),
+            None,
+            ta1_agent.config().gossip.remove_down_after_secs,
+        )));
         let transport = Transport::new(&ta1_agent.config().gossip, tx_rtt).await?;
 
         let server_config = quinn_plaintext::server_config();
