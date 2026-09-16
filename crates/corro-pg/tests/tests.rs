@@ -877,6 +877,92 @@ async fn test_pg_transaction_errors() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn test_pg_ast_rollback_handling() {
+    let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
+    let (_ta, server) = setup_pg_test_server(tripwire, None).await;
+    let conn_str = format!(
+        "host={} port={} user=testuser",
+        server.local_addr.ip(),
+        server.local_addr.port()
+    );
+    let (client, client_conn) = tokio_postgres::connect(&conn_str, NoTls).await.unwrap();
+    tokio::spawn(client_conn);
+
+    // 1. ROLLBACK WORK in simple query mode after transaction failure
+    client.batch_execute("BEGIN").await.unwrap();
+    client
+        .execute("INSERT INTO kitchensink (id) VALUES (1)", &[])
+        .await
+        .unwrap();
+    client
+        .execute("INSERT INTO kitchensink (id) VALUES (1)", &[])
+        .await
+        .unwrap_err();
+
+    let error = client.query_one("SELECT 1", &[]).await.unwrap_err();
+    assert_eq!(error.as_db_error().unwrap().code().code(), "25P02");
+
+    // ROLLBACK WORK parses as PgStatement::Rollback
+    client.batch_execute("ROLLBACK WORK").await.unwrap();
+    client.query_one("SELECT 1", &[]).await.unwrap();
+
+    let row = client
+        .query_one("SELECT COUNT(*) FROM kitchensink WHERE id = 1", &[])
+        .await
+        .unwrap();
+    assert_eq!(row.get::<_, i64>(0), 0);
+
+    // 2. ROLLBACK WORK in extended query mode
+    client.execute("BEGIN", &[]).await.unwrap();
+    client
+        .execute("INSERT INTO kitchensink (id) VALUES (2)", &[])
+        .await
+        .unwrap();
+    client.execute("ROLLBACK WORK", &[]).await.unwrap();
+    client.query_one("SELECT 1", &[]).await.unwrap();
+
+    let row = client
+        .query_one("SELECT COUNT(*) FROM kitchensink WHERE id = 2", &[])
+        .await
+        .unwrap();
+    assert_eq!(row.get::<_, i64>(0), 0);
+
+    // 3. ROLLBACK AND NO CHAIN in simple query mode
+    client.batch_execute("BEGIN").await.unwrap();
+    client
+        .execute("INSERT INTO kitchensink (id) VALUES (3)", &[])
+        .await
+        .unwrap();
+    client.batch_execute("ROLLBACK AND NO CHAIN").await.unwrap();
+    client.query_one("SELECT 1", &[]).await.unwrap();
+
+    let row = client
+        .query_one("SELECT COUNT(*) FROM kitchensink WHERE id = 3", &[])
+        .await
+        .unwrap();
+    assert_eq!(row.get::<_, i64>(0), 0);
+
+    // 4. ROLLBACK AND NO CHAIN in extended query mode
+    client.execute("BEGIN", &[]).await.unwrap();
+    client
+        .execute("INSERT INTO kitchensink (id) VALUES (4)", &[])
+        .await
+        .unwrap();
+    client.execute("ROLLBACK AND NO CHAIN", &[]).await.unwrap();
+    client.query_one("SELECT 1", &[]).await.unwrap();
+
+    let row = client
+        .query_one("SELECT COUNT(*) FROM kitchensink WHERE id = 4", &[])
+        .await
+        .unwrap();
+    assert_eq!(row.get::<_, i64>(0), 0);
+
+    tripwire_tx.send(()).await.ok();
+    tripwire_worker.await;
+    wait_for_all_pending_handles().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_pg_transaction_finalization_failures_recover() {
     let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
     let (ta, server) = setup_pg_test_server(tripwire, None).await;
