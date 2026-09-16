@@ -42,7 +42,15 @@ pub async fn api_v1_sub_by_id(
     axum::extract::Path(id): axum::extract::Path<Uuid>,
     axum::extract::Query(params): axum::extract::Query<SubParams>,
 ) -> impl IntoResponse {
-    sub_by_id(agent.subs_manager(), id, params, &bcast_cache, tripwire).await
+    sub_by_id(
+        agent.subs_manager(),
+        id,
+        params,
+        &bcast_cache,
+        tripwire,
+        Duration::from_millis(agent.config().perf.stream_flush_timeout),
+    )
+    .await
 }
 
 async fn sub_by_id(
@@ -51,6 +59,7 @@ async fn sub_by_id(
     params: SubParams,
     bcast_cache: &SharedMatcherBroadcastCache,
     tripwire: Tripwire,
+    flush_timeout: Duration,
 ) -> impl IntoResponse {
     let matcher_rx = bcast_cache.read().await.get(&id).and_then(|tx| {
         subs.get(&id).map(|matcher| {
@@ -104,7 +113,13 @@ async fn sub_by_id(
         persistent_gauge!("corro.api.active.streams", "source" => "subscriptions", "protocol" => "http"),
     );
 
-    tokio::spawn(forward_bytes_to_body_sender(id, evt_rx, tx, tripwire));
+    tokio::spawn(forward_bytes_to_body_sender(
+        id,
+        evt_rx,
+        tx,
+        tripwire,
+        flush_timeout,
+    ));
 
     hyper::Response::builder()
         .status(StatusCode::OK)
@@ -707,6 +722,7 @@ pub async fn api_v1_subs(
         forward_rx,
         tx,
         tripwire,
+        Duration::from_millis(agent.config().perf.stream_flush_timeout),
     ));
 
     let query_hash = handle.hash().to_owned();
@@ -816,17 +832,28 @@ async fn forward_bytes_to_body_sender(
     mut rx: mpsc::Receiver<(Bytes, QueryEventMeta)>,
     mut tx: BodySender,
     mut tripwire: Tripwire,
+    flush_timeout: Duration,
 ) {
     let mut buf = BytesMut::new();
-
-    let send_deadline = tokio::time::sleep(Duration::from_millis(10));
-    tokio::pin!(send_deadline);
+    let mut send_deadline = None;
 
     let mut last_change_id = ChangeId(0);
 
     loop {
         tokio::select! {
             biased;
+            _ = tx.closed() => {
+                warn!(%sub_id, "body sender was closed, stopping event broadcast sends");
+                return;
+            },
+            // Preserve the first event's deadline even when more events arrive.
+            _ = async { tokio::time::sleep_until(send_deadline.unwrap()).await }, if send_deadline.is_some() => {
+                if let Err(e) = tx.send_data(buf.split().freeze()).await {
+                    warn!(%sub_id, "could not forward subscription query event to receiver: {e}");
+                    return;
+                }
+                send_deadline = None;
+            },
             res = rx.recv() => {
                 match res {
                     Some((event_buf, meta)) => {
@@ -834,23 +861,13 @@ async fn forward_bytes_to_body_sender(
                             warn!(%sub_id, "could not forward subscription query event to receiver: {e}");
                             return;
                         }
+                        if buf.is_empty() {
+                            send_deadline = None;
+                        } else {
+                            send_deadline.get_or_insert_with(|| tokio::time::Instant::now() + flush_timeout);
+                        }
                     },
                     None => break,
-                }
-            },
-            _ = &mut send_deadline => {
-                if !buf.is_empty() {
-                    if let Err(e) = tx.send_data(buf.split().freeze()).await {
-                        warn!(%sub_id, "could not forward subscription query event to receiver: {e}");
-                        return;
-                    }
-                } else {
-                    if tx.is_closed() {
-                        warn!(%sub_id, "body sender was closed, stopping event broadcast sends");
-                        return;
-                    }
-                    send_deadline.as_mut().reset(tokio::time::Instant::now() + Duration::from_millis(10));
-                    continue;
                 }
             },
             _ = &mut tripwire => {
@@ -913,6 +930,199 @@ mod tests {
     use crate::api::public::TimeoutParams;
     use corro_tests::launch_test_agent;
     use corro_types::api::SqliteValue::Integer;
+
+    #[derive(Default)]
+    struct StreamWakeCount(std::sync::atomic::AtomicUsize);
+
+    impl std::task::Wake for StreamWakeCount {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn subscription_forwarder_does_not_wake_while_idle() {
+        use std::{future::Future, task::Context};
+
+        let (_events, rx) = mpsc::channel(16);
+        let (tx, _body) = CountedBody::channel(persistent_gauge!("test.streams"));
+        let (tripwire, _worker, _trigger) = Tripwire::new_simple();
+        let mut forward = Box::pin(forward_bytes_to_body_sender(
+            Uuid::new_v4(),
+            rx,
+            tx,
+            tripwire,
+            Duration::from_millis(10),
+        ));
+        let wakes = Arc::new(StreamWakeCount::default());
+        let waker = std::task::Waker::from(wakes.clone());
+        let mut cx = Context::from_waker(&waker);
+
+        assert!(forward.as_mut().poll(&mut cx).is_pending());
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(wakes.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn subscription_forwarder_batches_from_first_event_after_idle() {
+        use http_body_util::BodyExt;
+
+        let (events, rx) = mpsc::channel(16);
+        let (tx, mut body) = CountedBody::channel(persistent_gauge!("test.streams"));
+        let (tripwire, _worker, _trigger) = Tripwire::new_simple();
+        let mut forward = Box::pin(forward_bytes_to_body_sender(
+            Uuid::new_v4(),
+            rx,
+            tx,
+            tripwire,
+            Duration::from_millis(100),
+        ));
+
+        assert!(futures::poll!(&mut forward).is_pending());
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        events
+            .send((Bytes::from_static(b"first\n"), QueryEventMeta::Columns))
+            .await
+            .unwrap();
+        assert!(futures::poll!(&mut forward).is_pending());
+        assert!(futures::poll!(body.frame()).is_pending());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        events
+            .send((Bytes::from_static(b"second\n"), QueryEventMeta::Columns))
+            .await
+            .unwrap();
+        assert!(futures::poll!(&mut forward).is_pending());
+        assert!(futures::poll!(body.frame()).is_pending());
+        tokio::time::sleep(Duration::from_millis(51)).await;
+        assert!(futures::poll!(&mut forward).is_pending());
+        let frame = futures::poll!(body.frame())
+            .map(Option::unwrap)
+            .map(Result::unwrap);
+        assert_eq!(
+            frame.map(|f| f.into_data().unwrap()),
+            std::task::Poll::Ready(Bytes::from_static(b"first\nsecond\n"))
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn subscription_forwarder_flushes_at_size_limit_without_an_idle_timer() {
+        use http_body_util::BodyExt;
+        use std::{future::Future, task::Context};
+
+        let (events, rx) = mpsc::channel(16);
+        let (tx, mut body) = CountedBody::channel(persistent_gauge!("test.streams"));
+        let (tripwire, _worker, _trigger) = Tripwire::new_simple();
+        let mut forward = Box::pin(forward_bytes_to_body_sender(
+            Uuid::new_v4(),
+            rx,
+            tx,
+            tripwire,
+            Duration::from_millis(10),
+        ));
+        let wakes = Arc::new(StreamWakeCount::default());
+        let waker = std::task::Waker::from(wakes.clone());
+        let mut cx = Context::from_waker(&waker);
+        let event = Bytes::from(vec![b'x'; 64 * 1024]);
+
+        events
+            .send((Bytes::from_static(b"prefix"), QueryEventMeta::Columns))
+            .await
+            .unwrap();
+        assert!(forward.as_mut().poll(&mut cx).is_pending());
+        events
+            .send((event.clone(), QueryEventMeta::Columns))
+            .await
+            .unwrap();
+        assert!(forward.as_mut().poll(&mut cx).is_pending());
+        let frame = futures::poll!(body.frame())
+            .map(Option::unwrap)
+            .map(Result::unwrap);
+        assert_eq!(
+            frame.map(|f| f.into_data().unwrap().len()),
+            std::task::Poll::Ready(6 + event.len())
+        );
+        wakes.0.store(0, std::sync::atomic::Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(wakes.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn subscription_forwarder_flushes_buffer_on_shutdown() {
+        use http_body_util::BodyExt;
+
+        let (events, rx) = mpsc::channel(16);
+        let (tx, mut body) = CountedBody::channel(persistent_gauge!("test.streams"));
+        let (tripwire, worker, _trigger) = Tripwire::new_simple();
+        let mut forward = Box::pin(forward_bytes_to_body_sender(
+            Uuid::new_v4(),
+            rx,
+            tx,
+            tripwire,
+            Duration::from_millis(10),
+        ));
+
+        events
+            .send((Bytes::from_static(b"last\n"), QueryEventMeta::Columns))
+            .await
+            .unwrap();
+        assert!(futures::poll!(&mut forward).is_pending());
+        drop(worker);
+        assert!(futures::poll!(&mut forward).is_ready());
+        let frame = futures::poll!(body.frame())
+            .map(Option::unwrap)
+            .map(Result::unwrap);
+        assert_eq!(
+            frame.map(|f| f.into_data().unwrap()),
+            std::task::Poll::Ready(Bytes::from_static(b"last\n"))
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn subscription_forwarder_flushes_without_delay_when_timeout_is_zero() {
+        use http_body_util::BodyExt;
+
+        let (events, rx) = mpsc::channel(16);
+        let (tx, mut body) = CountedBody::channel(persistent_gauge!("test.streams"));
+        let (tripwire, _worker, _trigger) = Tripwire::new_simple();
+        let mut forward = Box::pin(forward_bytes_to_body_sender(
+            Uuid::new_v4(),
+            rx,
+            tx,
+            tripwire,
+            Duration::ZERO,
+        ));
+
+        events
+            .send((Bytes::from_static(b"now\n"), QueryEventMeta::Columns))
+            .await
+            .unwrap();
+        assert!(futures::poll!(&mut forward).is_pending());
+        let frame = futures::poll!(body.frame())
+            .map(Option::unwrap)
+            .map(Result::unwrap);
+        assert_eq!(
+            frame.map(|f| f.into_data().unwrap()),
+            std::task::Poll::Ready(Bytes::from_static(b"now\n"))
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn subscription_forwarder_stops_on_disconnect_without_a_timer() {
+        let (_events, rx) = mpsc::channel(16);
+        let (tx, body) = CountedBody::channel(persistent_gauge!("test.streams"));
+        let (tripwire, _worker, _trigger) = Tripwire::new_simple();
+        let mut forward = Box::pin(forward_bytes_to_body_sender(
+            Uuid::new_v4(),
+            rx,
+            tx,
+            tripwire,
+            Duration::from_millis(10),
+        ));
+
+        assert!(futures::poll!(&mut forward).is_pending());
+        drop(body);
+        assert!(futures::poll!(&mut forward).is_ready());
+    }
 
     async fn assert_ok(res: http::Response<axum::body::Body>) -> axum::body::BodyDataStream {
         let status = res.status();
@@ -1256,7 +1466,7 @@ mod tests {
         {
             // skip_rows should not affect the sub_id
             // resubscribing should not affect the sub_id
-            let s0 = make_sub_fn(
+            let mut s0 = make_sub_fn(
                 q,
                 SubParams {
                     from: None,
@@ -1264,6 +1474,9 @@ mod tests {
                 },
             )
             .await?;
+            // Finish query setup before the test can remove its database.
+            s0.assert_initial_query_results(vec!["id".into(), "text".into()], vec![], 0.into())
+                .await;
             let s1 = make_sub_fn(
                 q,
                 SubParams {
