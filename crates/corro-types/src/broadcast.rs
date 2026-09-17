@@ -37,12 +37,15 @@ use crate::{
     actor::{Actor, ActorId, ClusterId},
     agent::Agent,
     base::{CrsqlDbVersion, CrsqlSeq},
-    change::{row_to_change, Change, ChunkedChanges, MAX_CHANGES_BYTE_SIZE},
+    change::{
+        row_to_change, row_to_packed_change, Change, ChunkedChanges, ChunkedPackedChanges,
+        PackedChange, MAX_CHANGES_BYTE_SIZE,
+    },
     channel::CorroSender,
     pubsub::MatchableChange,
     sqlite::SqlitePoolError,
     sync::SyncTraceContextV1,
-    updates::match_changes,
+    updates::{match_changes, match_changes_from_db_version},
 };
 
 #[derive(Debug, Clone, Readable, Writable)]
@@ -256,6 +259,24 @@ pub struct ColumnChange {
     pub cl: i64,
 }
 
+/// Wire type for a single V2 packed change row.
+///
+/// Represents one grouped row from `crsql_changes` in V2 packed mode, where
+/// `cid`, `val`, `col_version`, and `seq` are packed BLOBs encoding multiple
+/// column values for the same primary key.  `SqliteValue` is used so that all
+/// SQLite runtime types (including BLOBs) are preserved verbatim.
+///
+/// `min_seq`/`max_seq` are NOT part of the wire payload (they are recomputed
+/// on receive from the packed `seq` blob); only `cl` is sent as a scalar.
+#[derive(Debug, Clone, PartialEq, Readable, Writable)]
+pub struct PackedChangeRow {
+    pub cid: SqliteValue,
+    pub val: SqliteValue,
+    pub col_version: SqliteValue,
+    pub seq: SqliteValue,
+    pub cl: i64,
+}
+
 #[derive(Debug, Clone, Copy, strum::IntoStaticStr)]
 #[strum(serialize_all = "snake_case")]
 pub enum ChangeSource {
@@ -319,7 +340,7 @@ impl ChangeV1 {
                     validate_versions(*versions)?;
                 }
             }
-            Changeset::Full { .. } | Changeset::FullV2 { .. } => {}
+            Changeset::Full { .. } | Changeset::FullV2 { .. } | Changeset::FullV2Packed { .. } => {}
         }
 
         if let Some(seqs) = self.seqs() {
@@ -399,18 +420,14 @@ pub enum Changeset {
         seqs: CrsqlSeqRange,
         ts: Timestamp,
     },
-}
-
-impl From<ChangesetParts> for Changeset {
-    fn from(value: ChangesetParts) -> Self {
-        Changeset::Full {
-            version: value.version,
-            changes: value.changes,
-            seqs: value.seqs,
-            last_seq: value.last_seq,
-            ts: value.ts,
-        }
-    }
+    FullV2Packed {
+        actor_id: ActorId,
+        version: CrsqlDbVersion,
+        changes: PackedChangesetPerTable,
+        last_seq: CrsqlSeq,
+        seqs: CrsqlSeqRange,
+        ts: Timestamp,
+    },
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Readable, Writable)]
@@ -493,12 +510,79 @@ impl Deref for ChangesetPerTable {
 #[derive(Debug, Default, Clone, PartialEq, Readable, Writable)]
 pub struct ChangesetPerTablePk(IndexMap<Vec<u8>, Vec<ColumnChange>>);
 
-pub struct ChangesetParts {
-    pub version: CrsqlDbVersion,
-    pub changes: Vec<Change>,
-    pub seqs: CrsqlSeqRange,
-    pub last_seq: CrsqlSeq,
-    pub ts: Timestamp,
+#[derive(Debug, Default, Clone, PartialEq, Readable, Writable)]
+pub struct PackedChangesetPerTablePk(IndexMap<Vec<u8>, PackedChangeRow>);
+
+#[derive(Debug, Default, Clone, PartialEq, Readable, Writable)]
+pub struct PackedChangesetPerTable(IndexMap<TableName, PackedChangesetPerTablePk>);
+
+impl PackedChangesetPerTable {
+    pub fn new(map: IndexMap<TableName, PackedChangesetPerTablePk>) -> Self {
+        Self(map)
+    }
+
+    pub fn count(&self) -> HashMap<String, usize> {
+        self.iter()
+            .map(|(table, rows)| (table.to_string(), rows.0.len()))
+            .collect()
+    }
+
+    /// Insert a `PackedChange` into the per-table / per-pk map, converting it
+    /// to a `PackedChangeRow` (which drops `min_seq`/`max_seq` since those are
+    /// skipped on the wire).  Returns the estimated byte cost of the insert.
+    pub fn insert(&mut self, change: PackedChange) -> usize {
+        let mut cost = change.estimated_column_byte_size();
+        let table_len = change.table.len();
+        let pk_len = change.pk.len();
+
+        let per_table = match self.0.entry(change.table) {
+            Entry::Occupied(e) => e.into_mut(),
+            Entry::Vacant(v) => {
+                cost += table_len;
+                v.insert(PackedChangesetPerTablePk::default())
+            }
+        };
+
+        let row = PackedChangeRow {
+            cid: change.cid,
+            val: change.val,
+            col_version: change.col_version,
+            seq: change.seq,
+            cl: change.cl,
+        };
+
+        match per_table.0.entry(change.pk) {
+            Entry::Occupied(mut e) => {
+                *e.get_mut() = row;
+            }
+            Entry::Vacant(v) => {
+                cost += pk_len;
+                v.insert(row);
+            }
+        }
+
+        cost
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn iter(&self) -> indexmap::map::Iter<'_, TableName, PackedChangesetPerTablePk> {
+        self.0.iter()
+    }
+
+    pub fn drain(&mut self) -> Self {
+        Self(self.0.drain(..).collect())
+    }
+}
+
+impl Deref for PackedChangesetPerTable {
+    type Target = IndexMap<TableName, PackedChangesetPerTablePk>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
 }
 
 impl Changeset {
@@ -511,6 +595,7 @@ impl Changeset {
             Changeset::EmptySet { .. } => CrsqlDbVersionRange::single(CrsqlDbVersion(0)),
             Changeset::Full { version, .. } => CrsqlDbVersionRange::single(*version),
             Changeset::FullV2 { version, .. } => CrsqlDbVersionRange::single(*version),
+            Changeset::FullV2Packed { version, .. } => CrsqlDbVersionRange::single(*version),
         }
     }
 
@@ -524,6 +609,7 @@ impl Changeset {
                 .sum::<usize>(),
             Changeset::Full { changes, .. } => changes.len(),
             Changeset::FullV2 { .. } => self.len(),
+            Changeset::FullV2Packed { .. } => self.len(),
         }
     }
 
@@ -533,6 +619,7 @@ impl Changeset {
             Changeset::EmptySet { .. } => None,
             Changeset::Full { version, .. } => Some(*version),
             Changeset::FullV2 { version, .. } => Some(*version),
+            Changeset::FullV2Packed { version, .. } => Some(*version),
         }
     }
 
@@ -543,6 +630,7 @@ impl Changeset {
             Changeset::EmptySet { .. } => None,
             Changeset::Full { seqs, .. } => Some(*seqs),
             Changeset::FullV2 { seqs, .. } => Some(*seqs),
+            Changeset::FullV2Packed { seqs, .. } => Some(*seqs),
         }
     }
 
@@ -552,6 +640,7 @@ impl Changeset {
             Changeset::EmptySet { .. } => None,
             Changeset::Full { last_seq, .. } => Some(*last_seq),
             Changeset::FullV2 { last_seq, .. } => Some(*last_seq),
+            Changeset::FullV2Packed { last_seq, .. } => Some(*last_seq),
         }
     }
 
@@ -563,6 +652,9 @@ impl Changeset {
                 seqs.start_int() == 0 && seqs.end_int() == last_seq.0
             }
             Changeset::FullV2 { seqs, last_seq, .. } => {
+                seqs.start_int() == 0 && seqs.end_int() == last_seq.0
+            }
+            Changeset::FullV2Packed { seqs, last_seq, .. } => {
                 seqs.start_int() == 0 && seqs.end_int() == last_seq.0
             }
         }
@@ -584,6 +676,11 @@ impl Changeset {
                         .sum::<usize>()
                 })
                 .sum::<usize>(),
+            Changeset::FullV2Packed { changes, .. } => changes
+                .0
+                .iter()
+                .map(|(_, pk_changes)| pk_changes.0.len())
+                .sum::<usize>(),
         }
     }
 
@@ -593,6 +690,7 @@ impl Changeset {
             Changeset::EmptySet { .. } => true,
             Changeset::Full { changes, .. } => changes.is_empty(),
             Changeset::FullV2 { changes, .. } => changes.0.is_empty(),
+            Changeset::FullV2Packed { changes, .. } => changes.0.is_empty(),
         }
     }
 
@@ -602,6 +700,7 @@ impl Changeset {
             Changeset::EmptySet { .. } => true,
             Changeset::Full { .. } => false,
             Changeset::FullV2 { .. } => false,
+            Changeset::FullV2Packed { .. } => false,
         }
     }
 
@@ -611,10 +710,14 @@ impl Changeset {
             Changeset::EmptySet { ts, .. } => Some(*ts),
             Changeset::Full { ts, .. } => Some(*ts),
             Changeset::FullV2 { ts, .. } => Some(*ts),
+            Changeset::FullV2Packed { ts, .. } => Some(*ts),
         }
     }
 
-    pub fn into_parts(self) -> Option<ChangesetParts> {
+    /// Extract the packed parts from a `Changeset`, converting scalar
+    /// (`Full`/`FullV2`) changes into `PackedChange`s.  Returns `None` for
+    /// `Empty` and `EmptySet`.
+    pub fn into_packed_parts(self) -> Option<PackedChangesetParts> {
         match self {
             Changeset::Empty { .. } => None,
             Changeset::EmptySet { .. } => None,
@@ -624,13 +727,38 @@ impl Changeset {
                 seqs,
                 last_seq,
                 ts,
-            } => Some(ChangesetParts {
-                version,
-                changes,
-                seqs,
-                last_seq,
-                ts,
-            }),
+            } => {
+                let actor_id = ActorId::default();
+                let packed_changes = changes
+                    .into_iter()
+                    .map(|change| {
+                        let site_id = change.site_id;
+                        let (min_seq, max_seq) = (change.seq, change.seq);
+                        PackedChange {
+                            table: change.table,
+                            pk: change.pk,
+                            cid: SqliteValue::from(change.cid.as_str()),
+                            val: change.val,
+                            col_version: SqliteValue::Integer(change.col_version),
+                            db_version: version,
+                            seq: SqliteValue::Integer(change.seq.0 as i64),
+                            site_id,
+                            cl: change.cl,
+                            max_seq,
+                            min_seq,
+                        }
+                    })
+                    .collect::<Vec<_>>();
+
+                Some(PackedChangesetParts {
+                    actor_id,
+                    version,
+                    changes: packed_changes,
+                    seqs,
+                    last_seq,
+                    ts,
+                })
+            }
             Changeset::FullV2 {
                 actor_id,
                 version,
@@ -639,30 +767,76 @@ impl Changeset {
                 last_seq,
                 ts,
             } => {
-                let changes = changes
+                let packed_changes = changes
                     .0
                     .into_iter()
                     .flat_map(|(table, pk_changes)| {
                         pk_changes.0.into_iter().flat_map(move |(pk, row)| {
                             let table = table.clone();
-                            row.into_iter().map(move |col_change| Change {
-                                table: table.clone(),
-                                pk: pk.clone(),
-                                cid: col_change.cid,
-                                val: col_change.val,
-                                col_version: col_change.col_version,
-                                db_version: version,
-                                seq: col_change.seq,
-                                site_id: actor_id.to_bytes(),
-                                cl: col_change.cl,
+                            row.into_iter().map(move |col_change| {
+                                let (min_seq, max_seq) = (col_change.seq, col_change.seq);
+                                PackedChange {
+                                    table: table.clone(),
+                                    pk: pk.clone(),
+                                    cid: SqliteValue::from(col_change.cid.as_str()),
+                                    val: col_change.val,
+                                    col_version: SqliteValue::Integer(col_change.col_version),
+                                    db_version: version,
+                                    seq: SqliteValue::Integer(col_change.seq.0 as i64),
+                                    site_id: actor_id.to_bytes(),
+                                    cl: col_change.cl,
+                                    max_seq,
+                                    min_seq,
+                                }
                             })
                         })
                     })
                     .collect::<Vec<_>>();
 
-                Some(ChangesetParts {
+                Some(PackedChangesetParts {
+                    actor_id,
                     version,
-                    changes,
+                    changes: packed_changes,
+                    seqs,
+                    last_seq,
+                    ts,
+                })
+            }
+            Changeset::FullV2Packed {
+                actor_id,
+                version,
+                changes,
+                seqs,
+                last_seq,
+                ts,
+            } => {
+                let packed_changes = changes
+                    .0
+                    .into_iter()
+                    .flat_map(|(table, pk_changes)| {
+                        pk_changes.0.into_iter().map(move |(pk, row)| {
+                            let (min_seq, max_seq) = PackedChange::compute_min_max_seq(&row.seq);
+                            PackedChange {
+                                table: table.clone(),
+                                pk: pk.clone(),
+                                cid: row.cid,
+                                val: row.val,
+                                col_version: row.col_version,
+                                db_version: version,
+                                seq: row.seq,
+                                site_id: actor_id.to_bytes(),
+                                cl: row.cl,
+                                max_seq,
+                                min_seq,
+                            }
+                        })
+                    })
+                    .collect::<Vec<_>>();
+
+                Some(PackedChangesetParts {
+                    actor_id,
+                    version,
+                    changes: packed_changes,
                     seqs,
                     last_seq,
                     ts,
@@ -675,6 +849,9 @@ impl Changeset {
         match self {
             Changeset::Full { changes, .. } => Box::new(changes.iter().map(MatchableChange::from)),
             Changeset::FullV2 { changes, .. } => Box::new(changes.matchable_changes()),
+            // Packed changes carry BLOB values that cannot be unpacked for
+            // matchable_changes; callers fall back to querying crsql_changes.
+            Changeset::FullV2Packed { .. } => Box::new(std::iter::empty()),
             Changeset::Empty { .. } | Changeset::EmptySet { .. } => Box::new(std::iter::empty()),
         }
     }
@@ -696,6 +873,12 @@ impl Changeset {
                 seqs,
                 last_seq,
                 ..
+            }
+            | Changeset::FullV2Packed {
+                version,
+                seqs,
+                last_seq,
+                ..
             } => ChangesetId::Full {
                 version: *version,
                 seqs: *seqs,
@@ -709,6 +892,18 @@ impl Changeset {
             }
         }
     }
+}
+
+/// Extracted packed parts from a `Changeset`, used by the change-processing
+/// pipeline to apply changes to the local database.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PackedChangesetParts {
+    pub actor_id: ActorId,
+    pub version: CrsqlDbVersion,
+    pub changes: Vec<PackedChange>,
+    pub seqs: CrsqlSeqRange,
+    pub last_seq: CrsqlSeq,
+    pub ts: Timestamp,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -813,6 +1008,9 @@ impl FromSql for Timestamp {
                 },
                 Err(e) => Err(FromSqlError::Other(Box::new(e))),
             },
+            // In V2 mode, cr-sqlite stores `ts` as an INTEGER, so MAX(ts)
+            // returns an INTEGER rather than TEXT.
+            rusqlite::types::ValueRef::Integer(i) => Ok(Timestamp(NTP64(i as u64))),
             _ => Err(FromSqlError::InvalidType),
         }
     }
@@ -966,6 +1164,11 @@ pub async fn broadcast_changes(
     trace!("got conn for broadcast");
 
     block_in_place(|| {
+        let sync_log_version: i64 = conn
+            .prepare_cached("SELECT crsql_config_get('sync-log-version')")?
+            .query_row([], |row| row.get(0))?;
+        let is_packed = sync_log_version == 2;
+
         // TODO: make this more generic so both sync and local changes can use it.
         let mut prepped = conn.prepare_cached(
             r#"
@@ -976,38 +1179,92 @@ pub async fn broadcast_changes(
                     ORDER BY seq ASC
             "#,
         )?;
-        let rows = prepped.query_map([db_version], row_to_change)?;
-        let chunked = ChunkedChanges::new(rows, CrsqlSeq(0), last_seq, MAX_CHANGES_BYTE_SIZE);
-        for changes_seqs in chunked {
-            match changes_seqs {
-                Ok((changes, seqs)) => {
-                    for (table_name, count) in changes.count() {
-                        counter!("corro.changes.committed", "table" => table_name, "source" => "local").increment(count as u64);
+
+        if is_packed {
+            let rows = prepped.query_map([db_version], row_to_packed_change)?;
+            let chunked =
+                ChunkedPackedChanges::new(rows, CrsqlSeq(0), last_seq, MAX_CHANGES_BYTE_SIZE);
+            for changes_seqs in chunked {
+                match changes_seqs {
+                    Ok((changes, seqs)) => {
+                        for (table_name, count) in changes.count() {
+                            counter!("corro.changes.committed", "table" => table_name, "source" => "local").increment(count as u64);
+                        }
+
+                        trace!("broadcasting packed changes: {changes:?} for seq: {seqs:?}");
+                        let changeset = Changeset::FullV2Packed {
+                            actor_id,
+                            version: db_version,
+                            changes,
+                            seqs,
+                            last_seq,
+                            ts,
+                        };
+                        match_changes(agent.subs_manager(), &changeset, db_version);
+                        match_changes(agent.updates_manager(), &changeset, db_version);
+                        if let Err(e) = match_changes_from_db_version(
+                            agent.subs_manager(),
+                            &conn,
+                            db_version,
+                            actor_id,
+                        ) {
+                            error!(%db_version, "could not match changes for subs from db version: {e}");
+                        }
+                        if let Err(e) = match_changes_from_db_version(
+                            agent.updates_manager(),
+                            &conn,
+                            db_version,
+                            actor_id,
+                        ) {
+                            error!(%db_version, "could not match changes for updates from db version: {e}");
+                        }
+
+                        assert_sometimes!(true, "Corrosion broadcasts changes");
+                        agent.broadcaster().broadcast_local(ChangeV1 {
+                            actor_id,
+                            changeset,
+                        });
                     }
-
-                    trace!("broadcasting changes: {changes:?} for seq: {seqs:?}");
-
-                    debug!("match_changes db_version: {db_version}");
-                    let changeset = Changeset::FullV2 {
-                        actor_id,
-                        version: db_version,
-                        changes,
-                        seqs,
-                        last_seq,
-                        ts,
-                    };
-                    match_changes(agent.subs_manager(), &changeset, db_version);
-                    match_changes(agent.updates_manager(), &changeset, db_version);
-
-                    assert_sometimes!(true, "Corrosion broadcasts changes");
-                    agent.broadcaster().broadcast_local(ChangeV1 {
-                        actor_id,
-                        changeset,
-                    });
+                    Err(e) => {
+                        error!("could not process crsql change (db_version: {db_version}) for broadcast: {e}");
+                        break;
+                    }
                 }
-                Err(e) => {
-                    error!("could not process crsql change (db_version: {db_version}) for broadcast: {e}");
-                    break;
+            }
+        } else {
+            let rows = prepped.query_map([db_version], row_to_change)?;
+            let chunked = ChunkedChanges::new(rows, CrsqlSeq(0), last_seq, MAX_CHANGES_BYTE_SIZE);
+            for changes_seqs in chunked {
+                match changes_seqs {
+                    Ok((changes, seqs)) => {
+                        for (table_name, count) in changes.count() {
+                            counter!("corro.changes.committed", "table" => table_name, "source" => "local").increment(count as u64);
+                        }
+
+                        trace!("broadcasting changes: {changes:?} for seq: {seqs:?}");
+
+                        debug!("match_changes db_version: {db_version}");
+                        let changeset = Changeset::FullV2 {
+                            actor_id,
+                            version: db_version,
+                            changes,
+                            seqs,
+                            last_seq,
+                            ts,
+                        };
+                        match_changes(agent.subs_manager(), &changeset, db_version);
+                        match_changes(agent.updates_manager(), &changeset, db_version);
+
+                        assert_sometimes!(true, "Corrosion broadcasts changes");
+                        agent.broadcaster().broadcast_local(ChangeV1 {
+                            actor_id,
+                            changeset,
+                        });
+                    }
+                    Err(e) => {
+                        error!("could not process crsql change (db_version: {db_version}) for broadcast: {e}");
+                        break;
+                    }
                 }
             }
         }

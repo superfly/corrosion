@@ -4291,14 +4291,59 @@ impl<'conn> Session<'conn> {
                                 .unwrap();
                         }
                         t @ &Type::INT8 => {
-                            encoder
-                                .encode_field_with_type_and_format(
-                                    &row.get::<_, Option<i64>>(idx)?,
-                                    t,
-                                    format,
-                                    format_opts,
-                                )
-                                .unwrap();
+                            // crsqlite 0.18 V2 packed format may return BLOB
+                            // values for columns declared as INTEGER (e.g.
+                            // crsql_changes.col_version). Handle gracefully.
+                            let data = row.get_ref_unwrap(idx);
+                            match data {
+                                ValueRef::Null => {
+                                    encoder
+                                        .encode_field_with_type_and_format(
+                                            &None::<i64>,
+                                            t,
+                                            format,
+                                            format_opts,
+                                        )
+                                        .unwrap();
+                                }
+                                ValueRef::Integer(i) => {
+                                    encoder
+                                        .encode_field_with_type_and_format(
+                                            &Some(i),
+                                            t,
+                                            format,
+                                            format_opts,
+                                        )
+                                        .unwrap();
+                                }
+                                ValueRef::Real(f) => {
+                                    encoder
+                                        .encode_field_with_type_and_format(
+                                            &Some(f as i64),
+                                            t,
+                                            format,
+                                            format_opts,
+                                        )
+                                        .unwrap();
+                                }
+                                ValueRef::Text(_) | ValueRef::Blob(_) => {
+                                    // Packed BLOB or unexpected text — encode as BYTEA
+                                    // so the client can still receive the raw bytes.
+                                    let bytes: &[u8] = match data {
+                                        ValueRef::Text(t) => t,
+                                        ValueRef::Blob(b) => b,
+                                        _ => unreachable!(),
+                                    };
+                                    encoder
+                                        .encode_field_with_type_and_format(
+                                            &bytes,
+                                            &Type::BYTEA,
+                                            format,
+                                            format_opts,
+                                        )
+                                        .unwrap();
+                                }
+                            }
                         }
                         t @ &Type::TIMESTAMP => {
                             encoder
@@ -4311,24 +4356,120 @@ impl<'conn> Session<'conn> {
                                 .unwrap();
                         }
                         t @ &Type::VARCHAR | t @ &Type::TEXT | t @ &Type::JSON => {
-                            encoder
-                                .encode_field_with_type_and_format(
-                                    &row.get::<_, Option<String>>(idx)?,
-                                    t,
-                                    format,
-                                    format_opts,
-                                )
-                                .unwrap();
+                            // crsqlite 0.18 V2 packed format may return non-TEXT
+                            // values for columns declared as TEXT (e.g.
+                            // crsql_changes.ts). Handle gracefully.
+                            let data = row.get_ref_unwrap(idx);
+                            match data {
+                                ValueRef::Null => {
+                                    encoder
+                                        .encode_field_with_type_and_format(
+                                            &None::<String>,
+                                            t,
+                                            format,
+                                            format_opts,
+                                        )
+                                        .unwrap();
+                                }
+                                ValueRef::Text(t_val) => {
+                                    encoder
+                                        .encode_field_with_type_and_format(
+                                            &String::from_utf8_lossy(t_val).as_ref(),
+                                            t,
+                                            format,
+                                            format_opts,
+                                        )
+                                        .unwrap();
+                                }
+                                ValueRef::Integer(i) => {
+                                    encoder
+                                        .encode_field_with_type_and_format(
+                                            &i.to_string(),
+                                            t,
+                                            format,
+                                            format_opts,
+                                        )
+                                        .unwrap();
+                                }
+                                ValueRef::Real(f) => {
+                                    encoder
+                                        .encode_field_with_type_and_format(
+                                            &f.to_string(),
+                                            t,
+                                            format,
+                                            format_opts,
+                                        )
+                                        .unwrap();
+                                }
+                                ValueRef::Blob(b) => {
+                                    encoder
+                                        .encode_field_with_type_and_format(
+                                            &String::from_utf8_lossy(b).as_ref(),
+                                            t,
+                                            format,
+                                            format_opts,
+                                        )
+                                        .unwrap();
+                                }
+                            }
                         }
                         t @ &Type::BYTEA | t @ &Type::JSONB => {
-                            encoder
-                                .encode_field_with_type_and_format(
-                                    &row.get::<_, Option<Vec<u8>>>(idx)?,
-                                    t,
-                                    format,
-                                    format_opts,
-                                )
-                                .unwrap();
+                            // crsqlite 0.18 V2 packed format declares some columns
+                            // (e.g. crsql_changes.cid, seq) as BLOB but returns
+                            // Text or Integer values. Handle all cases gracefully.
+                            let data = row.get_ref_unwrap(idx);
+                            match data {
+                                ValueRef::Null => {
+                                    encoder
+                                        .encode_field_with_type_and_format(
+                                            &None::<Vec<u8>>,
+                                            t,
+                                            format,
+                                            format_opts,
+                                        )
+                                        .unwrap();
+                                }
+                                ValueRef::Blob(b) => {
+                                    encoder
+                                        .encode_field_with_type_and_format(
+                                            &Some(b.to_vec()),
+                                            t,
+                                            format,
+                                            format_opts,
+                                        )
+                                        .unwrap();
+                                }
+                                ValueRef::Text(t_val) => {
+                                    encoder
+                                        .encode_field_with_type_and_format(
+                                            &Some(t_val.to_vec()),
+                                            t,
+                                            format,
+                                            format_opts,
+                                        )
+                                        .unwrap();
+                                }
+                                ValueRef::Integer(i) => {
+                                    encoder
+                                        .encode_field_with_type_and_format(
+                                            &Some(i.to_le_bytes().to_vec()),
+                                            t,
+                                            format,
+                                            format_opts,
+                                        )
+                                        .unwrap();
+                                }
+                                ValueRef::Real(f) => {
+                                    encoder
+                                        .encode_field_with_type_and_format(
+                                            &Some(f.to_le_bytes().to_vec()),
+                                            t,
+                                            format,
+                                            format_opts,
+                                        )
+                                        .unwrap();
+                                }
+                            }
                         }
                         t @ &Type::FLOAT8 => {
                             encoder

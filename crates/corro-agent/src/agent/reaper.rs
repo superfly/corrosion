@@ -168,6 +168,10 @@ where
     let cutoff = Timestamp::from(now - uhlc::NTP64::from(retention));
 
     trace!("checking table {table} for deleted clocks older than {cutoff}");
+    // TODO: V2-only mode (metadata-write-version=3) uses __crsql_v2_clock instead of
+    // __crsql_clock. The reaper currently only handles V1 clock tables. When V2-only
+    // mode is fully supported by cr-sqlite, detect which clock tables exist and
+    // query/delete from the appropriate one.
     let (pks_to_delete, mut orphaned_pks): (Vec<u64>, Vec<u64>) = block_in_place(|| {
         let filter_clause = filter.unwrap_or_default();
         let sentinel_pks = read_conn
@@ -272,10 +276,12 @@ mod tests {
         let pool = SplitPool::create(path, write_sema, -1048576).await?;
 
         // Create test table
-        let conn = pool.write_priority().await?;
+        let mut conn = pool.write_priority().await?;
         block_in_place(|| {
             setup_conn(&conn)?;
-            conn.execute_batch(
+            conn.execute_batch("SELECT crsql_config_set('default-ts', 1)")?;
+            let tx = conn.immediate_transaction()?;
+            tx.execute_batch(
                 r#"
                 CREATE TABLE tests (
                     id INTEGER NOT NULL PRIMARY KEY,
@@ -284,6 +290,7 @@ mod tests {
                 SELECT crsql_as_crr('tests');
                 "#,
             )?;
+            tx.commit()?;
             Ok::<_, rusqlite::Error>(())
         })
         .map_err(|e: rusqlite::Error| eyre::eyre!("{e}"))?;

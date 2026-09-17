@@ -609,7 +609,8 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
                 let (last_seq, ts): (CrsqlSeq, Timestamp) = tx.query_row(
                     "SELECT MAX(seq), MAX(ts)
                          FROM crsql_changes
-                         WHERE site_id = ? AND db_version = ?",
+                         WHERE site_id = ? AND db_version = ?
+                         GROUP BY true",
                     (actor_id, version),
                     |row| Ok((row.get(0)?, row.get(1)?)),
                 )?;
@@ -674,6 +675,13 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
             let mut conn = AdminConn::connect(cli.admin_path()).await?;
             conn.send_command(corro_admin::Command::Plumtree(
                 corro_admin::PlumtreeCommand::Stats,
+            ))
+            .await?;
+        }
+        Command::Migrate(MigrateCommand::Status) => {
+            let mut conn = AdminConn::connect(cli.admin_path()).await?;
+            conn.send_command(corro_admin::Command::Migrate(
+                corro_admin::MigrateCommand::Status,
             ))
             .await?;
         }
@@ -865,6 +873,10 @@ enum Command {
     /// Plumtree broadcast overlay commands
     #[command(subcommand)]
     Plumtree(PlumtreeCommand),
+
+    /// Crsqlite metadata migration commands (read-only)
+    #[command(subcommand)]
+    Migrate(MigrateCommand),
 }
 
 #[derive(Subcommand)]
@@ -1024,4 +1036,10 @@ mod tests {
 
         Ok(())
     }
+}
+
+#[derive(Subcommand)]
+enum MigrateCommand {
+    /// Show the current crsqlite metadata migration status
+    Status,
 }

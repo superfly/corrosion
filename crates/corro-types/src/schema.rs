@@ -381,7 +381,17 @@ pub fn apply_schema(
             }
 
             debug!("selecting crsql_as_crr");
-            tx.execute_batch(&format!("SELECT crsql_as_crr('{name}'); CREATE INDEX IF NOT EXISTS corro_{name}__crsql_clock_site_id_dbv ON {name}__crsql_clock (site_id, db_version);"))?;
+            // crsql_as_crr creates clock tables based on metadata-write-version:
+            //   write-version=1 → {name}__crsql_clock (V1)
+            //   write-version=2 → both V1 and V2 clock tables (dual-write)
+            //   write-version=3 → {name}__crsql_v2_clock (V2-only)
+            // Create the site_id/db_version index on whichever clock tables exist.
+            tx.execute_batch(&format!("SELECT crsql_as_crr('{name}');"))?;
+            for clock_table in ["__crsql_clock", "__crsql_v2_clock"] {
+                tx.execute_batch(&format!(
+                    "CREATE INDEX IF NOT EXISTS corro_{name}{clock_table}_site_id_dbv ON {name}{clock_table} (site_id, db_version);"
+                )).ok();
+            }
             debug!("done selecting as crr");
 
             if schema_to_merge.tables.contains_key(name) {

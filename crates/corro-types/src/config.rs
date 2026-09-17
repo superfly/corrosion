@@ -114,6 +114,41 @@ pub struct Config {
     pub consul: Option<ConsulConfig>,
     #[serde(default)]
     pub reaper: Option<ReaperConfig>,
+    #[serde(default)]
+    pub crsqlite: Option<CrsqliteConfig>,
+}
+
+/// Configuration for crsqlite metadata version management.
+///
+/// On startup, if the database's current metadata version differs from the
+/// configured value, corrosion will call `crsql_config_set` to transition.
+/// The background maintenance worker handles the incremental data movement.
+///
+/// Transitions are validated by crsqlite — invalid jumps (e.g. 1→3 directly
+/// when CRR tables exist) will cause startup to fail.
+///
+/// Valid values:
+/// - `metadata_write_version`: 1 (V1), 2 (dual-write), 3 (V2-only)
+/// - `metadata_use_version`: 1 (V1), 2 (V2)
+/// - `sync_log_version`: 1 (V1 per-column), 2 (V2 packed)
+///
+/// Example:
+/// ```toml
+/// [crsqlite]
+/// metadata_write_version = 2   # start dual-write migration
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct CrsqliteConfig {
+    /// Target `metadata-write-version` (1, 2, or 3). If omitted, no change.
+    #[serde(default)]
+    pub metadata_write_version: Option<i64>,
+    /// Target `metadata-use-version` (1 or 2). If omitted, no change.
+    #[serde(default)]
+    pub metadata_use_version: Option<i64>,
+    /// Target `sync-log-version` (1 or 2). If omitted, no change.
+    #[serde(default)]
+    pub sync_log_version: Option<i64>,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -680,6 +715,7 @@ pub struct ConfigBuilder {
     compression: Option<bool>,
     compression_level: Option<i32>,
     broadcast: Option<BroadcastConfig>,
+    crsqlite: Option<CrsqliteConfig>,
 }
 
 impl ConfigBuilder {
@@ -792,6 +828,12 @@ impl ConfigBuilder {
         self
     }
 
+    /// Configure crsqlite metadata version settings (e.g. for V2 migration testing).
+    pub fn crsqlite(mut self, config: CrsqliteConfig) -> Self {
+        self.crsqlite = Some(config);
+        self
+    }
+
     pub fn build(self) -> Result<Config, ConfigBuilderError> {
         let db_path = self.db_path.ok_or(ConfigBuilderError::DbPathRequired)?;
 
@@ -854,6 +896,7 @@ impl ConfigBuilder {
 
             consul: self.consul,
             reaper: self.reaper,
+            crsqlite: self.crsqlite,
         })
     }
 }

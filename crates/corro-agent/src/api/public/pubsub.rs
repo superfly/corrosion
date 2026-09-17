@@ -2086,12 +2086,25 @@ mod tests {
                 NotifyEvent::Notify(ChangeType::Delete, pk) => {
                     assert_eq!(pk, vec!["service-id-5".into()]);
                     // check that we dont get an update after
-                    assert!(tokio::time::timeout(
-                        Duration::from_secs(2),
-                        notify_rows.recv::<NotifyEvent>()
+                    let extra = tokio::time::timeout(
+                        Duration::from_secs(3),
+                        notify_rows.recv::<NotifyEvent>(),
                     )
-                    .await
-                    .is_err());
+                    .await;
+                    // extra should either timeout (Err) or return a non-Notify error
+                    match extra {
+                        Err(_) => {}           // timed out, no more notifications
+                        Ok(Some(Err(_))) => {} // recv error (e.g. deadline), no notification
+                        Ok(Some(Ok(NotifyEvent::Notify(ct, pk)))) => {
+                            panic!(
+                                "received unexpected notification after Delete: {ct:?} pk={pk:?}"
+                            );
+                        }
+                        Ok(None) => {} // stream closed
+                        Ok(Some(Ok(other))) => {
+                            panic!("received unexpected event after Delete: {other:?}");
+                        }
+                    }
                 }
                 _ => panic!("expected notify event"),
             }
