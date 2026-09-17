@@ -319,7 +319,7 @@ pub enum HealthResponse {
 ///
 /// - `v2_db_format`: Transition `metadata-write-version` from 1 (V1) to 2
 ///   (V2&V1 dual-write). Creates V2 tables and queues migration tasks.
-///   The background migrator will then incrementally copy V1 data to V2.
+///   The background maintenance worker will then incrementally copy V1 data to V2.
 ///
 /// - `use_v2_metadata`: Transition `metadata-use-version` from 1 to 2.
 ///   Requires `metadata-write-version` to be 2 or 3 (dual-write or V2-only).
@@ -329,7 +329,7 @@ pub enum HealthResponse {
 ///
 /// - `v2_db_only`: Transition `metadata-write-version` from 2 (V2&V1) to 3
 ///   (V2-only). Requires all migration tasks to be complete. Queues V1
-///   table cleanup tasks. The background migrator will then drop V1 tables.
+///   table cleanup tasks. The background maintenance worker will then drop V1 tables.
 ///   Forces `metadata-use-version` to 2.
 ///
 /// - `v2_wire_format`: Transition `sync-log-version` from 1 to 2 (packed

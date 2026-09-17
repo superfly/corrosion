@@ -5,9 +5,9 @@ use std::time::Instant;
 use crate::agent::util::execute_schema_from_paths;
 use crate::{
     agent::{
+        crsql_maintenance::spawn_crsql_maintenance,
         handlers::{self, spawn_handle_db_maintenance},
         metrics,
-        migrator::spawn_migrator,
         reaper::spawn_reaper,
         setup, util, AgentOptions,
     },
@@ -235,9 +235,9 @@ async fn run(
         error!("could not spawn reaper: {e}");
     }
 
-    // Spawn the crsqlite metadata migrator. It is a no-op when there are
+    // Spawn the crsqlite metadata maintenance worker. It is a no-op when there are
     // no pending migration/cleanup tasks, so it is always safe to run.
-    spawn_migrator(&agent, tripwire.clone());
+    spawn_crsql_maintenance(&agent, tripwire.clone());
 
     info!("Starting peer API on udp/{gossip_addr} (QUIC)");
 

@@ -122,7 +122,7 @@ pub struct Config {
 ///
 /// On startup, if the database's current metadata version differs from the
 /// configured value, corrosion will call `crsql_config_set` to transition.
-/// The background migrator task handles the incremental data movement.
+/// The background maintenance worker handles the incremental data movement.
 ///
 /// Transitions are validated by crsqlite — invalid jumps (e.g. 1→3 directly
 /// when CRR tables exist) will cause startup to fail.

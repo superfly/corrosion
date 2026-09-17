@@ -679,7 +679,7 @@ pub async fn api_v1_table_stats(
 ///
 /// Each step maps to a `crsql_config_set` call that advances (or rolls back)
 /// the metadata version. The actual data migration is performed incrementally
-/// by the background migrator task.
+/// by the background maintenance worker.
 #[cfg(feature = "running_in_antithesis")]
 #[tracing::instrument(skip_all)]
 pub async fn api_v1_migrate(

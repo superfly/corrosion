@@ -6,10 +6,10 @@
 
 mod bi;
 mod bootstrap;
+mod crsql_maintenance;
 mod error;
 mod handlers;
 mod metrics;
-mod migrator;
 mod reaper;
 mod run_root;
 mod setup;

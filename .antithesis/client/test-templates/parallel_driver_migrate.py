@@ -14,7 +14,7 @@ Full state diagram (write, use, sync):
 
   (1,1,1) ──v2_db_format──▶ (2,1,1)  [dual write, migration starts]
                                 │
-                          migration completes (background migrator)
+                          migration completes (background maintenance worker)
                                 │
                           (2,1,1, mig_done)
                                 ├── use_v2_metadata ──▶ (2,2,1)  [dual write, use V2, V1 wire]

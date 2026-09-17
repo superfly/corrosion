@@ -464,7 +464,7 @@ fn apply_crsqlite_config(
 /// (no remaining work). This is used during startup to complete the
 /// V1→V2 migration synchronously before transitioning metadata-use-version.
 ///
-/// In production, the background migrator handles this asynchronously,
+/// In production, the background maintenance worker handles this asynchronously,
 /// but for tests and deterministic startup we need it done before
 /// the agent starts processing changes.
 fn run_maintenance_until_done(conn: &CrConn, clock: &Arc<uhlc::HLC>) -> eyre::Result<()> {

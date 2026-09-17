@@ -15,7 +15,7 @@
         "name": "region",
         "type": "query",
         "datasource": {"uid": "h7hN5daMz", "type": "prometheus"},
-        "query": "label_values(corro_migrator_metadata_write_version, region)",
+        "query": "label_values(corro_crsql_maintenance_metadata_write_version, region)",
         "refresh": 2,
         "includeAll": true,
         "multi": true,
@@ -25,7 +25,7 @@
         "name": "instance",
         "type": "query",
         "datasource": {"uid": "h7hN5daMz", "type": "prometheus"},
-        "query": "label_values(corro_migrator_metadata_write_version{region=~\"$region\"}, instance)",
+        "query": "label_values(corro_crsql_maintenance_metadata_write_version{region=~\"$region\"}, instance)",
         "refresh": 2,
         "includeAll": true,
         "multi": true,
@@ -50,7 +50,7 @@
         }
       },
       "options": {"reduceOptions": {"calcs": ["lastNotNull"], "values": false}, "orientation": "horizontal", "textMode": "auto"},
-      "targets": [{"expr": "corro_migrator_metadata_write_version{region=~\"$region\",instance=~\"$instance\"}", "legendFormat": "{{region}}/{{instance}}", "refId": "A"}]
+      "targets": [{"expr": "corro_crsql_maintenance_metadata_write_version{region=~\"$region\",instance=~\"$instance\"}", "legendFormat": "{{region}}/{{instance}}", "refId": "A"}]
     },
     {
       "id": 3, "type": "stat", "title": "Metadata Use Version",
@@ -63,7 +63,7 @@
         }
       },
       "options": {"reduceOptions": {"calcs": ["lastNotNull"], "values": false}, "orientation": "horizontal", "textMode": "auto"},
-      "targets": [{"expr": "corro_migrator_metadata_use_version{region=~\"$region\",instance=~\"$instance\"}", "legendFormat": "{{region}}/{{instance}}", "refId": "A"}]
+      "targets": [{"expr": "corro_crsql_maintenance_metadata_use_version{region=~\"$region\",instance=~\"$instance\"}", "legendFormat": "{{region}}/{{instance}}", "refId": "A"}]
     },
     {
       "id": 4, "type": "stat", "title": "Sync Log (Wire) Version",
@@ -76,7 +76,7 @@
         }
       },
       "options": {"reduceOptions": {"calcs": ["lastNotNull"], "values": false}, "orientation": "horizontal", "textMode": "auto"},
-      "targets": [{"expr": "corro_migrator_sync_log_version{region=~\"$region\",instance=~\"$instance\"}", "legendFormat": "{{region}}/{{instance}}", "refId": "A"}]
+      "targets": [{"expr": "corro_crsql_maintenance_sync_log_version{region=~\"$region\",instance=~\"$instance\"}", "legendFormat": "{{region}}/{{instance}}", "refId": "A"}]
     },
     {
       "id": 5, "type": "stat", "title": "Nodes on V1 (write=1)",
@@ -84,7 +84,7 @@
       "gridPos": {"h": 6, "w": 4, "x": 12, "y": 1},
       "fieldConfig": {"defaults": {"thresholds": {"steps": [{"color": "blue", "value": null}, {"color": "yellow", "value": 1}, {"color": "red", "value": 5}]}}},
       "options": {"reduceOptions": {"calcs": ["lastNotNull"], "values": false}, "textMode": "auto"},
-      "targets": [{"expr": "count(corro_migrator_metadata_write_version == 1)", "refId": "A"}]
+      "targets": [{"expr": "count(corro_crsql_maintenance_metadata_write_version == 1)", "refId": "A"}]
     },
     {
       "id": 6, "type": "stat", "title": "Nodes on Dual-Write (write=2)",
@@ -92,7 +92,7 @@
       "gridPos": {"h": 6, "w": 4, "x": 16, "y": 1},
       "fieldConfig": {"defaults": {"thresholds": {"steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 1}, {"color": "orange", "value": 5}]}}},
       "options": {"reduceOptions": {"calcs": ["lastNotNull"], "values": false}, "textMode": "auto"},
-      "targets": [{"expr": "count(corro_migrator_metadata_write_version == 2)", "refId": "A"}]
+      "targets": [{"expr": "count(corro_crsql_maintenance_metadata_write_version == 2)", "refId": "A"}]
     },
     {
       "id": 7, "type": "stat", "title": "Nodes on V2-Only (write=3)",
@@ -100,7 +100,7 @@
       "gridPos": {"h": 6, "w": 4, "x": 20, "y": 1},
       "fieldConfig": {"defaults": {"thresholds": {"steps": [{"color": "green", "value": null}, {"color": "blue", "value": 1}]}}},
       "options": {"reduceOptions": {"calcs": ["lastNotNull"], "values": false}, "textMode": "auto"},
-      "targets": [{"expr": "count(corro_migrator_metadata_write_version == 3)", "refId": "A"}]
+      "targets": [{"expr": "count(corro_crsql_maintenance_metadata_write_version == 3)", "refId": "A"}]
     },
     {
       "id": 10, "type": "timeseries", "title": "Migration Work Remaining",
@@ -108,7 +108,7 @@
       "gridPos": {"h": 8, "w": 8, "x": 0, "y": 7},
       "fieldConfig": {"defaults": {"unit": "short"}},
       "options": {"legend": {"displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"]}},
-      "targets": [{"expr": "corro_migrator_remaining{region=~\"$region\",instance=~\"$instance\"}", "legendFormat": "{{region}}/{{instance}}", "refId": "A"}]
+      "targets": [{"expr": "corro_crsql_maintenance_remaining{region=~\"$region\",instance=~\"$instance\"}", "legendFormat": "{{region}}/{{instance}}", "refId": "A"}]
     },
     {
       "id": 11, "type": "timeseries", "title": "Pending Migration & Cleanup Tables",
@@ -117,9 +117,9 @@
       "fieldConfig": {"defaults": {"unit": "short"}},
       "options": {"legend": {"displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull"]}},
       "targets": [
-        {"expr": "corro_migrator_migration_pending_tables{region=~\"$region\",instance=~\"$instance\"}", "legendFormat": "migration - {{region}}/{{instance}}", "refId": "A"},
-        {"expr": "corro_migrator_cleanup_v1_pending_tables{region=~\"$region\",instance=~\"$instance\"}", "legendFormat": "V1 cleanup - {{region}}/{{instance}}", "refId": "B"},
-        {"expr": "corro_migrator_cleanup_v2_pending_tables{region=~\"$region\",instance=~\"$instance\"}", "legendFormat": "V2 cleanup - {{region}}/{{instance}}", "refId": "C"}
+        {"expr": "corro_crsql_maintenance_migration_pending_tables{region=~\"$region\",instance=~\"$instance\"}", "legendFormat": "migration - {{region}}/{{instance}}", "refId": "A"},
+        {"expr": "corro_crsql_maintenance_cleanup_v1_pending_tables{region=~\"$region\",instance=~\"$instance\"}", "legendFormat": "V1 cleanup - {{region}}/{{instance}}", "refId": "B"},
+        {"expr": "corro_crsql_maintenance_cleanup_v2_pending_tables{region=~\"$region\",instance=~\"$instance\"}", "legendFormat": "V2 cleanup - {{region}}/{{instance}}", "refId": "C"}
       ]
     },
     {
@@ -128,7 +128,7 @@
       "gridPos": {"h": 8, "w": 8, "x": 16, "y": 7},
       "fieldConfig": {"defaults": {"unit": "short"}},
       "options": {"legend": {"displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull"]}},
-      "targets": [{"expr": "corro_migrator_migration_table_remaining{region=~\"$region\",instance=~\"$instance\"}", "legendFormat": "{{table}} - {{region}}/{{instance}}", "refId": "A"}]
+      "targets": [{"expr": "corro_crsql_maintenance_migration_table_remaining{region=~\"$region\",instance=~\"$instance\"}", "legendFormat": "{{table}} - {{region}}/{{instance}}", "refId": "A"}]
     },
     {
       "id": 13, "type": "timeseries", "title": "Migration Step Duration (p99/p50)",
@@ -137,8 +137,8 @@
       "fieldConfig": {"defaults": {"unit": "s"}},
       "options": {"legend": {"displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"]}},
       "targets": [
-        {"expr": "histogram_quantile(0.99, sum(rate(corro_migrator_step_seconds_bucket{region=~\"$region\",instance=~\"$instance\"}[5m])) by (le, region))", "legendFormat": "p99 - {{region}}", "refId": "A"},
-        {"expr": "histogram_quantile(0.50, sum(rate(corro_migrator_step_seconds_bucket{region=~\"$region\",instance=~\"$instance\"}[5m])) by (le, region))", "legendFormat": "p50 - {{region}}", "refId": "B"}
+        {"expr": "histogram_quantile(0.99, sum(rate(corro_crsql_maintenance_step_seconds_bucket{region=~\"$region\",instance=~\"$instance\"}[5m])) by (le, region))", "legendFormat": "p99 - {{region}}", "refId": "A"},
+        {"expr": "histogram_quantile(0.50, sum(rate(corro_crsql_maintenance_step_seconds_bucket{region=~\"$region\",instance=~\"$instance\"}[5m])) by (le, region))", "legendFormat": "p50 - {{region}}", "refId": "B"}
       ]
     },
     {
@@ -148,8 +148,8 @@
       "fieldConfig": {"defaults": {"unit": "ops"}},
       "options": {"legend": {"displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull"]}},
       "targets": [
-        {"expr": "sum(rate(corro_migrator_steps_total{region=~\"$region\",instance=~\"$instance\"}[5m])) by (region)", "legendFormat": "steps/s - {{region}}", "refId": "A"},
-        {"expr": "sum(rate(corro_migrator_errors_total{region=~\"$region\",instance=~\"$instance\"}[5m])) by (region)", "legendFormat": "errors/s - {{region}}", "refId": "B"}
+        {"expr": "sum(rate(corro_crsql_maintenance_steps_total{region=~\"$region\",instance=~\"$instance\"}[5m])) by (region)", "legendFormat": "steps/s - {{region}}", "refId": "A"},
+        {"expr": "sum(rate(corro_crsql_maintenance_errors_total{region=~\"$region\",instance=~\"$instance\"}[5m])) by (region)", "legendFormat": "errors/s - {{region}}", "refId": "B"}
       ]
     },
     {
@@ -159,8 +159,8 @@
       "fieldConfig": {"defaults": {"unit": "short"}},
       "options": {"legend": {"displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull"]}},
       "targets": [
-        {"expr": "corro_migrator_migration_table_done{region=~\"$region\",instance=~\"$instance\"}", "legendFormat": "done - {{table}}", "refId": "A"},
-        {"expr": "corro_migrator_migration_table_total{region=~\"$region\",instance=~\"$instance\"}", "legendFormat": "total - {{table}}", "refId": "B"}
+        {"expr": "corro_crsql_maintenance_migration_table_done{region=~\"$region\",instance=~\"$instance\"}", "legendFormat": "done - {{table}}", "refId": "A"},
+        {"expr": "corro_crsql_maintenance_migration_table_total{region=~\"$region\",instance=~\"$instance\"}", "legendFormat": "total - {{table}}", "refId": "B"}
       ]
     },
     {
