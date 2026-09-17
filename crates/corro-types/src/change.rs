@@ -411,7 +411,11 @@ where
                     trace!("no more packed changes to iterate on");
                     break;
                 }
-                Some(Err(e)) => return Some(Err(e)),
+                Some(Err(e)) => {
+                    self.changes = PackedChangesetPerTable::default();
+                    self.done = true;
+                    return Some(Err(e));
+                }
             }
         }
 
@@ -694,6 +698,26 @@ mod tests {
 
         let chunk = chunker.next().unwrap().unwrap();
         assert_eq!(chunk.1, dbsr!(0, 4));
+        assert_eq!(chunker.next(), None);
+    }
+
+    #[test]
+    fn test_packed_chunker_stops_after_error() {
+        let change = PackedChange {
+            table: TableName("tests".into()),
+            pk: vec![1],
+            max_seq: CrsqlSeq(0),
+            min_seq: CrsqlSeq(0),
+            ..Default::default()
+        };
+        let mut chunker = ChunkedPackedChanges::new(
+            vec![Ok(change), Err(rusqlite::Error::InvalidQuery)].into_iter(),
+            CrsqlSeq(0),
+            CrsqlSeq(1),
+            100_000,
+        );
+
+        assert!(chunker.next().unwrap().is_err());
         assert_eq!(chunker.next(), None);
     }
 

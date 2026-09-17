@@ -1939,18 +1939,64 @@ async fn test_v2_launch_and_write() -> eyre::Result<()> {
         );
     }
 
+    // Verify scalar seq pushdown filters packed V2 rows by decoded sequence.
+    {
+        let conn = ta.agent.pool().read().await?;
+        let mut all_stmt = conn.prepare(
+            r#"SELECT "table", pk, cid, val, col_version, db_version, seq, site_id, cl
+               FROM crsql_changes
+               WHERE site_id = ? AND db_version = 1"#,
+        )?;
+        let all_changes: Vec<_> = all_stmt
+            .query_map(
+                [ta.agent.actor_id()],
+                corro_types::change::row_to_packed_change,
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        let after_last_seq = all_changes
+            .iter()
+            .map(|change| change.max_seq)
+            .max()
+            .unwrap()
+            + 1;
+
+        let mut stmt = conn.prepare(
+            r#"SELECT "table", pk, cid, val, col_version, db_version, seq, site_id, cl
+               FROM crsql_changes
+               WHERE site_id = ? AND db_version = 1 AND seq >= ? AND seq <= ?"#,
+        )?;
+        let packed_changes: Vec<_> = stmt
+            .query_map(
+                (ta.agent.actor_id(), after_last_seq, after_last_seq),
+                corro_types::change::row_to_packed_change,
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        assert!(
+            packed_changes.is_empty(),
+            "scalar seq pushdown returned rows past the decoded last sequence"
+        );
+    }
+
     // Verify GROUP BY returns scalar values
     {
         let conn = ta.agent.pool().read().await?;
-        let max_seq: i64 = conn.query_row(
-            "SELECT MAX(seq) FROM crsql_changes WHERE site_id = ? GROUP BY true",
+        let (seq_type, max_seq_type, max_seq): (String, String, i64) = conn.query_row(
+            "SELECT typeof(seq), typeof(MAX(seq)), MAX(seq) \
+             FROM crsql_changes WHERE site_id = ? AND db_version = 1 \
+             GROUP BY db_version ORDER BY db_version DESC, seq ASC",
             [ta.agent.actor_id()],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?;
-        assert!(
-            max_seq >= 0,
-            "MAX(seq) should be a scalar int with GROUP BY true"
+        assert_eq!(
+            seq_type, "integer",
+            "GROUP BY should make packed seq scalar"
         );
+        assert_eq!(
+            max_seq_type, "integer",
+            "MAX(seq) should be scalar with GROUP BY true"
+        );
+        assert!(max_seq >= 0, "MAX(seq) should be non-negative");
     }
 
     tripwire_tx.send(()).await.ok();

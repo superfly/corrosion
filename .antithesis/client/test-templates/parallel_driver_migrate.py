@@ -219,11 +219,6 @@ def main():
     fully_migrated = len(categories["v2_done"])
     total = len(args.addrs)
 
-    always(
-        fully_migrated <= total,
-        "Number of fully migrated nodes never exceeds total",
-    )
-
     # Priority 1: If any node is still V1, pick a random one and start dual-write
     if categories["v1"]:
         addr = random.choice(categories["v1"])
