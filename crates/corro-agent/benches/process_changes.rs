@@ -164,14 +164,14 @@ async fn generate_changesets(
                 .then(|| rng.random_range(0..available_deleted[table_idx].len()))
             {
                 // Resurrection - reinsert a row deleted by an earlier transaction.
-                let id = available_deleted[table_idx].swap_remove(index);
+                let id: i64 = available_deleted[table_idx].swap_remove(index);
                 resurrected_this_tx[table_idx].push(id);
                 Statement::WithParams(
                     format!(
                         "INSERT INTO {table_name} (id, value, counter, random) VALUES (?, ?, ?, ?)"
                     ),
                     vec![
-                        (id as i64).into(),
+                        id.into(),
                         format!("resurrected_{id}").into(),
                         0.into(),
                         rng.random_range(0..100000).into(),
