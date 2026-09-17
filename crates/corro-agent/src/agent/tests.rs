@@ -2006,7 +2006,7 @@ async fn test_incremental_migration_v1_to_v2() -> eyre::Result<()> {
     let schema_path = tmpdir.path().join("schema");
 
     {
-        // Explicitly force V1 mode to override CORRO_TEST_V2 env var
+        // Explicitly force V1 mode to override the CI version environment variables
         let ta = launch_test_agent(
             |conf| {
                 conf.db_path(db_path.display().to_string())

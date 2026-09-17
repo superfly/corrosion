@@ -63,7 +63,9 @@ jobs:
     env:
       SCCACHE_GHA_ENABLED: "true"
       RUSTC_WRAPPER: "sccache"
-      CORRO_TEST_V2: "3"
+      CORRO_METADATA_WRITE_VERSION: "3"
+      CORRO_METADATA_USE_VERSION: "2"
+      CORRO_SYNC_LOG_VERSION: "2"
 
     steps:
       - uses: actions/checkout@v4
@@ -100,7 +102,9 @@ jobs:
     env:
       SCCACHE_GHA_ENABLED: "true"
       RUSTC_WRAPPER: "sccache"
-      CORRO_TEST_V2: "1"
+      CORRO_METADATA_WRITE_VERSION: "2"
+      CORRO_METADATA_USE_VERSION: "2"
+      CORRO_SYNC_LOG_VERSION: "2"
 
     steps:
       - uses: actions/checkout@v4

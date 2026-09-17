@@ -19,7 +19,9 @@ steps:
     priority: 80
     key: test-v2-3-2-2
     env:
-      CORRO_TEST_V2: "3"
+      CORRO_METADATA_WRITE_VERSION: "3"
+      CORRO_METADATA_USE_VERSION: "2"
+      CORRO_SYNC_LOG_VERSION: "2"
     commands:
       - .buildkite/run-in-docker.sh .buildkite/test.sh
     agents:
@@ -29,7 +31,9 @@ steps:
     priority: 80
     key: test-v2-2-2-2
     env:
-      CORRO_TEST_V2: "1"
+      CORRO_METADATA_WRITE_VERSION: "2"
+      CORRO_METADATA_USE_VERSION: "2"
+      CORRO_SYNC_LOG_VERSION: "2"
     commands:
       - .buildkite/run-in-docker.sh .buildkite/test.sh
     agents:

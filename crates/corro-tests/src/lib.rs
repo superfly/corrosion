@@ -63,32 +63,38 @@ pub struct TestAgent {
     pub config: Config,
 }
 
-/// Environment variable name. When set, all `launch_test_agent` calls
-/// automatically enable V2 packed mode (sync-log-version=2, metadata-use-version=2).
-/// The `metadata-write-version` is determined by the value:
-/// - `"1"` or `"true"` → `metadata-write-version=2` (dual-write, default)
-/// - `"3"` → `metadata-write-version=3` (V2-only, fresh databases only)
-///
-/// This allows running the entire test suite in V2 packed mode for CI without
+/// When any of these variables is set, all `launch_test_agent` calls use the
+/// supplied cr-sqlite versions. Leave all three unset to run in the default V1
+/// mode. This allows configuring each format version explicitly in CI without
 /// modifying individual tests.
 ///
 /// Usage:
-/// - `CORRO_TEST_V2=1 cargo test -p corro-agent` (dual-write, 2,2,2)
-/// - `CORRO_TEST_V2=3 cargo test -p corro-agent` (V2-only, 3,2,2)
-pub const ENV_TEST_V2: &str = "CORRO_TEST_V2";
+/// - `CORRO_METADATA_WRITE_VERSION=2 CORRO_METADATA_USE_VERSION=2 \
+///    CORRO_SYNC_LOG_VERSION=2 cargo test -p corro-agent` (dual-write)
+/// - `CORRO_METADATA_WRITE_VERSION=3 CORRO_METADATA_USE_VERSION=2 \
+///    CORRO_SYNC_LOG_VERSION=2 cargo test -p corro-agent` (V2-only)
+pub const ENV_METADATA_WRITE_VERSION: &str = "CORRO_METADATA_WRITE_VERSION";
+pub const ENV_METADATA_USE_VERSION: &str = "CORRO_METADATA_USE_VERSION";
+pub const ENV_SYNC_LOG_VERSION: &str = "CORRO_SYNC_LOG_VERSION";
 
-/// Returns the `metadata-write-version` to use when V2 packed mode is enabled,
-/// or `None` if V2 packed mode is disabled.
-pub fn v2_write_version() -> Option<i64> {
-    match std::env::var(ENV_TEST_V2) {
-        Ok(v) if v == "1" || v.eq_ignore_ascii_case("true") => Some(2),
-        Ok(v) if v == "3" => Some(3),
-        _ => None,
-    }
+pub fn test_crsqlite_config() -> Option<CrsqliteConfig> {
+    let parse_version = |name| std::env::var(name).ok()?.parse().ok();
+    let metadata_write_version = parse_version(ENV_METADATA_WRITE_VERSION);
+    let metadata_use_version = parse_version(ENV_METADATA_USE_VERSION);
+    let sync_log_version = parse_version(ENV_SYNC_LOG_VERSION);
+
+    (metadata_write_version.is_some()
+        || metadata_use_version.is_some()
+        || sync_log_version.is_some())
+    .then_some(CrsqliteConfig {
+        metadata_write_version,
+        metadata_use_version,
+        sync_log_version,
+    })
 }
 
 pub fn is_v2_mode() -> bool {
-    v2_write_version().is_some()
+    test_crsqlite_config().is_some()
 }
 
 pub fn test_config<F: FnOnce(ConfigBuilder) -> Result<Config, ConfigBuilderError>>(
@@ -104,13 +110,9 @@ pub fn test_config<F: FnOnce(ConfigBuilder) -> Result<Config, ConfigBuilderError
         .db_path(tmpdir.path().join("corrosion.db").display().to_string())
         .add_schema_path(schema_path.display().to_string());
 
-    // Auto-enable V2 packed mode if env var is set
-    let builder = if let Some(write_version) = v2_write_version() {
-        builder.crsqlite(CrsqliteConfig {
-            metadata_write_version: Some(write_version),
-            metadata_use_version: Some(2),
-            sync_log_version: Some(2),
-        })
+    // Apply explicit cr-sqlite versions when configured for CI.
+    let builder = if let Some(crsqlite_config) = test_crsqlite_config() {
+        builder.crsqlite(crsqlite_config)
     } else {
         builder
     };
@@ -145,7 +147,7 @@ pub async fn launch_test_agent<F: FnOnce(ConfigBuilder) -> Result<Config, Config
 /// in `apply_crsqlite_config`) so the agent starts fully in V2 packed mode.
 ///
 /// Use this for tests that explicitly need V2 packed mode. For running the entire
-/// suite in V2 packed mode, set `CORRO_TEST_V2=1` instead.
+/// suite in V2 packed mode, set the three `CORRO_*_VERSION` variables instead.
 pub async fn launch_test_agent_v2<
     F: FnOnce(ConfigBuilder) -> Result<Config, ConfigBuilderError>,
 >(
