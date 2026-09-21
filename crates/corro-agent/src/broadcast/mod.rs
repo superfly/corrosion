@@ -414,9 +414,47 @@ impl Default for BroadcastOpts {
     }
 }
 
-pub(crate) async fn handle_broadcasts(
+pub(crate) struct GossipBroadcastActor {
     agent: Agent,
-    mut rx_bcast: CorroReceiver<BroadcastInput>,
+    rx_bcast: CorroReceiver<BroadcastInput>,
+    transport: Transport,
+    config: Arc<RwLock<foca::Config>>,
+    opts: BroadcastOpts,
+}
+
+impl GossipBroadcastActor {
+    pub(crate) fn new(
+        agent: Agent,
+        rx_bcast: CorroReceiver<BroadcastInput>,
+        transport: Transport,
+        config: Arc<RwLock<foca::Config>>,
+        opts: BroadcastOpts,
+    ) -> Self {
+        Self {
+            agent,
+            rx_bcast,
+            transport,
+            config,
+            opts,
+        }
+    }
+
+    pub(crate) async fn run(&mut self, tripwire: Tripwire) {
+        handle_broadcasts_inner(
+            self.agent.clone(),
+            &mut self.rx_bcast,
+            self.transport.clone(),
+            self.config.clone(),
+            tripwire,
+            self.opts,
+        )
+        .await;
+    }
+}
+
+async fn handle_broadcasts_inner(
+    agent: Agent,
+    rx_bcast: &mut CorroReceiver<BroadcastInput>,
     transport: Transport,
     config: Arc<RwLock<foca::Config>>,
     mut tripwire: Tripwire,
@@ -1233,17 +1271,23 @@ mod tests {
         .write_to_stream((&mut ser_buf).writer())?;
         let estimated_size = ser_buf.len();
 
-        tokio::spawn(handle_broadcasts(
-            ta1_agent.clone(),
-            rx_bcast,
-            transport,
-            config,
-            tripwire.clone(),
-            BroadcastOpts {
-                interval: Duration::from_secs(2),
-                bcast_cutoff: 5 * estimated_size,
-            },
-        ));
+        let actor_agent = ta1_agent.clone();
+        let actor_tripwire = tripwire.clone();
+
+        tokio::spawn(async move {
+            let mut actor = GossipBroadcastActor::new(
+                actor_agent,
+                rx_bcast,
+                transport,
+                config,
+                BroadcastOpts {
+                    interval: Duration::from_secs(2),
+                    bcast_cutoff: 5 * estimated_size,
+                },
+            );
+
+            actor.run(actor_tripwire).await;
+        });
 
         let actor_id = ta1_agent.actor_id();
         for i in 0..5 {

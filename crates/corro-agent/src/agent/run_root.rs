@@ -2,16 +2,15 @@
 
 use std::time::Instant;
 
+use super::supervisor::{
+    spawn_supervised, AgentMetricsActor, GossipToSendActor, NotificationsActor, QueryMetricsActor,
+    RestartPolicy, SyncActor,
+};
+
 use crate::agent::util::execute_schema_from_paths;
 use crate::{
-    agent::{
-        handlers::{self, spawn_handle_db_maintenance},
-        metrics,
-        reaper::spawn_reaper,
-        setup, util, AgentOptions,
-    },
-    broadcast::{handle_broadcasts, runtime_loop, BroadcastOpts},
-    plumtree::spawn_plumtree_loop,
+    agent::{handlers, reaper::spawn_reaper, setup, util, AgentOptions},
+    broadcast::{runtime_loop, BroadcastOpts, GossipBroadcastActor},
     transport::Transport,
 };
 
@@ -22,8 +21,6 @@ use corro_types::{
     config::{BroadcastMethod, Config, PerfConfig},
 };
 
-use futures::FutureExt;
-use spawn::spawn_counted;
 use tokio::task::JoinHandle;
 use tracing::{error, info};
 use tripwire::Tripwire;
@@ -115,24 +112,29 @@ async fn run(
     util::initialise_foca(&agent, loaded_member_states).await;
 
     match agent.broadcast_method() {
-        BroadcastMethod::Gossip => spawn_counted(handle_broadcasts(
-            agent.clone(),
-            rx_bcast,
-            transport.clone(),
-            foca_config,
+        BroadcastMethod::Gossip => spawn_supervised(
+            &agent,
+            GossipBroadcastActor::new(
+                agent.clone(),
+                rx_bcast,
+                transport.clone(),
+                foca_config,
+                BroadcastOpts::default(),
+            ),
             tripwire.clone(),
-            BroadcastOpts::default(),
-        )),
-        BroadcastMethod::Plumtree => spawn_counted(
-            spawn_plumtree_loop(
+            RestartPolicy::default(),
+        ),
+        BroadcastMethod::Plumtree => spawn_supervised(
+            &agent,
+            crate::plumtree::PlumtreeActor::new(
                 agent.clone(),
                 transport.clone(),
                 rx_plumtree,
                 rx_plumtree_updates,
                 agent.tx_changes().clone(),
-                tripwire.clone(),
-            )
-            .inspect(|_| info!("plumtree loop is done")),
+            ),
+            tripwire.clone(),
+            RestartPolicy::default(),
         ),
     };
 
@@ -154,32 +156,46 @@ async fn run(
     .await?;
     handles.append(&mut http_handles);
 
-    spawn_counted(util::clear_buffered_meta_loop(
-        agent.clone(),
-        rx_clear_buf,
+    spawn_supervised(
+        &agent,
+        util::ClearBufferedMetaActor::new(agent.clone(), rx_clear_buf),
         tripwire.clone(),
-    ));
+        RestartPolicy::default(),
+    );
 
-    spawn_counted(metrics::metrics_loop(
-        agent.clone(),
-        transport.clone(),
+    spawn_supervised(
+        &agent,
+        AgentMetricsActor::new(agent.clone(), transport.clone()),
         tripwire.clone(),
-    ));
+        RestartPolicy::default(),
+    );
 
-    spawn_counted(corro_types::sqlite::query_metrics_loop(tripwire.clone()));
-
-    spawn_counted(handlers::handle_gossip_to_send(
-        transport.clone(),
-        to_send_rx,
+    spawn_supervised(
+        &agent,
+        QueryMetricsActor::new(),
         tripwire.clone(),
-    ));
-    spawn_counted(handlers::handle_notifications(
-        agent.clone(),
-        notifications_rx,
-        tripwire.clone(),
-    ));
+        RestartPolicy::default(),
+    );
 
-    spawn_handle_db_maintenance(&agent);
+    spawn_supervised(
+        &agent,
+        GossipToSendActor::new(transport.clone(), to_send_rx),
+        tripwire.clone(),
+        RestartPolicy::default(),
+    );
+    spawn_supervised(
+        &agent,
+        NotificationsActor::new(agent.clone(), notifications_rx),
+        tripwire.clone(),
+        RestartPolicy::default(),
+    );
+
+    spawn_supervised(
+        &agent,
+        handlers::DbMaintenanceActor::new(&agent),
+        tripwire.clone(),
+        RestartPolicy::default(),
+    );
 
     let bookie = agent.bookie().clone();
 
@@ -210,24 +226,18 @@ async fn run(
     }
     info!("Checked bookie partials in {:?}", start.elapsed());
 
-    spawn_counted(
-        util::sync_loop(
-            agent.clone(),
-            bookie.clone(),
-            transport.clone(),
-            tripwire.clone(),
-        )
-        .inspect(|_| info!("corrosion agent sync loop is done")),
+    spawn_supervised(
+        &agent,
+        SyncActor::new(agent.clone(), bookie.clone(), transport.clone()),
+        tripwire.clone(),
+        RestartPolicy::default(),
     );
 
-    spawn_counted(
-        util::apply_fully_buffered_changes_loop(
-            agent.clone(),
-            bookie.clone(),
-            rx_apply,
-            tripwire.clone(),
-        )
-        .inspect(|_| info!("corrosion buffered changes loop is done")),
+    spawn_supervised(
+        &agent,
+        util::ApplyBufferedActor::new(agent.clone(), bookie.clone(), rx_apply),
+        tripwire.clone(),
+        RestartPolicy::default(),
     );
 
     if let Err(e) = spawn_reaper(&agent, tripwire.clone()) {
@@ -240,9 +250,11 @@ async fn run(
     //// future tree spawns additional message type sub-handlers
     handlers::spawn_gossipserver_handler(&agent, &bookie, &tripwire, gossip_server_endpoint);
 
-    let changes_handle = spawn_counted(
-        handlers::handle_changes(agent.clone(), bookie.clone(), rx_changes, tripwire.clone())
-            .inspect(|_| info!("corrosion handle changes loop is done")),
+    let changes_handle = spawn_supervised(
+        &agent,
+        handlers::ChangesActor::new(agent.clone(), bookie.clone(), rx_changes),
+        tripwire.clone(),
+        RestartPolicy::default(),
     );
     handles.push(changes_handle);
 

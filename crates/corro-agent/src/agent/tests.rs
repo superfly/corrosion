@@ -1781,12 +1781,16 @@ async fn test_schema_change_retries_all_fully_buffered_partials() -> eyre::Resul
         assert!(result.is_err());
     }
 
-    let apply_loop = tokio::spawn(crate::agent::util::apply_fully_buffered_changes_loop(
-        agent.clone(),
-        bookie.clone(),
-        rx_apply,
-        tripwire.clone(),
-    ));
+    let actor_agent = agent.clone();
+    let actor_bookie = bookie.clone();
+    let actor_tripwire = tripwire.clone();
+
+    let apply_loop = tokio::spawn(async move {
+        let mut actor =
+            crate::agent::util::ApplyBufferedActor::new(actor_agent, actor_bookie, rx_apply);
+
+        actor.run(actor_tripwire).await;
+    });
 
     tokio::task::yield_now().await;
 

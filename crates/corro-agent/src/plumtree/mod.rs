@@ -337,51 +337,72 @@ impl plum_foca::Runtime<ChangeId, PlumtreePayload, ActorId> for CorrosionPlumtre
     }
 }
 
-pub async fn spawn_plumtree_loop(
+pub(super) struct PlumtreeActor {
     agent: Agent,
     transport: Transport,
     rx_plumtree: CorroReceiver<PlumtreeInput>,
     rx_plumtree_updates: CorroReceiver<PlumtreeUpdates>,
     tx_changes: CorroSender<(ChangeV1, ChangeSource, Option<BroadcastV1>)>,
-    tripwire: Tripwire,
-) {
-    let plumtree_config = agent
-        .config()
-        .gossip
-        .plumtree()
-        .cloned()
-        .unwrap_or_default();
+}
 
-    let max_queue_len = agent.config().perf.processing_queue_len;
+impl PlumtreeActor {
+    pub(super) fn new(
+        agent: Agent,
+        transport: Transport,
+        rx_plumtree: CorroReceiver<PlumtreeInput>,
+        rx_plumtree_updates: CorroReceiver<PlumtreeUpdates>,
+        tx_changes: CorroSender<(ChangeV1, ChangeSource, Option<BroadcastV1>)>,
+    ) -> Self {
+        Self {
+            agent,
+            transport,
+            rx_plumtree,
+            rx_plumtree_updates,
+            tx_changes,
+        }
+    }
 
-    let config = plum_foca::Config {
-        ihave_timeout: Duration::from_millis(150),
-        optimization_threshold: plumtree_config.optimization_threshold,
-        max_cached_payloads: max_queue_len,
-        num_eager: None,
-        min_lazy: None,
-        max_lazy: None,
-        prune_threshold: plumtree_config.prune_threshold,
-        max_received_entries: max_queue_len,
-        prune_throttle: plumtree_config.prune_throttle_secs.map(Duration::from_secs),
-        eager_ratios: plumtree_config.eager_ratios,
-        ring_locked_radius: plumtree_config.ring_locked_radius,
-    };
+    pub(super) async fn run(&mut self, tripwire: Tripwire) -> eyre::Result<()> {
+        let plumtree_config = self
+            .agent
+            .config()
+            .gossip
+            .plumtree()
+            .cloned()
+            .unwrap_or_default();
 
-    plumtree_loop(
-        agent,
-        transport,
-        rx_plumtree,
-        rx_plumtree_updates,
-        tx_changes,
-        config,
-        tripwire,
-    )
-    .await;
+        let max_queue_len = self.agent.config().perf.processing_queue_len;
+
+        let config = plum_foca::Config {
+            ihave_timeout: Duration::from_millis(150),
+            optimization_threshold: plumtree_config.optimization_threshold,
+            max_cached_payloads: max_queue_len,
+            num_eager: None,
+            min_lazy: None,
+            max_lazy: None,
+            prune_threshold: plumtree_config.prune_threshold,
+            max_received_entries: max_queue_len,
+            prune_throttle: plumtree_config.prune_throttle_secs.map(Duration::from_secs),
+            eager_ratios: plumtree_config.eager_ratios,
+            ring_locked_radius: plumtree_config.ring_locked_radius,
+        };
+
+        plumtree_loop(
+            self.agent.clone(),
+            self.transport.clone(),
+            &mut self.rx_plumtree,
+            &mut self.rx_plumtree_updates,
+            self.tx_changes.clone(),
+            config,
+            tripwire,
+        )
+        .await
+    }
 }
 
 enum PlumtreeLoopBranch {
     Exit(&'static str),
+    SenderStopped(Option<Result<(), tokio::task::JoinError>>),
     Input(PlumtreeInput),
     Updates(PlumtreeUpdates),
     HandleTimer(Timer<ChangeId, ActorId>),
@@ -391,6 +412,7 @@ enum PlumtreeLoopBranch {
 
 async fn next_plumtree_loop_branch(
     tripwire: &mut Tripwire,
+    sender_tasks: &mut JoinSet<()>,
     rx_plumtree: &mut CorroReceiver<PlumtreeInput>,
     rx_plumtree_updates: &mut CorroReceiver<PlumtreeUpdates>,
     plumtree_timer_rx: &mut mpsc::Receiver<(Timer<ChangeId, ActorId>, Instant)>,
@@ -400,6 +422,11 @@ async fn next_plumtree_loop_branch(
     tokio::select! {
         biased;
         _ = tripwire => PlumtreeLoopBranch::Exit("tripwire fired"),
+        // Sender failures must reach the supervisor even with ready timers or
+        // inbound traffic. Normal shutdown above still wins over a sender exit.
+        result = sender_tasks.join_next(), if !sender_tasks.is_empty() => {
+            PlumtreeLoopBranch::SenderStopped(result)
+        }
         // These timers drive tree repair and cache maintenance. Keep them
         // ahead of inbound channels, which can remain continuously ready.
         Some((timer, _seq)) = plumtree_timer_rx.recv() => {
@@ -421,12 +448,12 @@ async fn next_plumtree_loop_branch(
 pub async fn plumtree_loop(
     agent: Agent,
     transport: Transport,
-    mut rx_plumtree: CorroReceiver<PlumtreeInput>,
-    mut rx_plumtree_updates: CorroReceiver<PlumtreeUpdates>,
+    rx_plumtree: &mut CorroReceiver<PlumtreeInput>,
+    rx_plumtree_updates: &mut CorroReceiver<PlumtreeUpdates>,
     tx_changes: CorroSender<(ChangeV1, ChangeSource, Option<BroadcastV1>)>,
     config: plum_foca::Config,
     mut tripwire: Tripwire,
-) {
+) -> eyre::Result<()> {
     let seen = ChangeSeenStore::new(config.max_received_entries, agent.bookie().clone());
     let mut state: PlumtreeState<ChangeId, PlumtreePayload, ActorId, ChangeSeenStore> =
         PlumtreeState::new_with_store(agent.actor_id(), config, seen);
@@ -438,7 +465,9 @@ pub async fn plumtree_loop(
 
     let send_agent = agent.clone();
     let send_transport = transport.clone();
-    let send_msgs_handle = tokio::spawn(send_messages_loop(send_agent, send_transport, rx_msgs));
+
+    let mut sender_tasks = JoinSet::new();
+    sender_tasks.spawn(send_messages_loop(send_agent, send_transport, rx_msgs));
 
     // send out ihave digests to lazy peers
     let mut ihave_tick_interval = interval(Duration::from_millis(150));
@@ -456,8 +485,9 @@ pub async fn plumtree_loop(
     loop {
         let branch = next_plumtree_loop_branch(
             &mut tripwire,
-            &mut rx_plumtree,
-            &mut rx_plumtree_updates,
+            &mut sender_tasks,
+            rx_plumtree,
+            rx_plumtree_updates,
             &mut plumtree_timer_rx,
             &mut ihave_tick_interval,
             &mut maintenance_interval,
@@ -470,6 +500,17 @@ pub async fn plumtree_loop(
                 state.handle_shutdown(&mut rt);
                 break;
             }
+            PlumtreeLoopBranch::SenderStopped(result) => match result {
+                Some(Ok(())) => {
+                    return Err(eyre::eyre!("plumtree send loop exited unexpectedly"));
+                }
+                Some(Err(e)) => {
+                    return Err(eyre::eyre!("plumtree send loop task failed: {e}"));
+                }
+                None => {
+                    return Err(eyre::eyre!("plumtree sender task set became empty"));
+                }
+            },
             PlumtreeLoopBranch::Input(input) => match input {
                 PlumtreeInput::Wire(msg) => {
                     let msg_type: &'static str = (&msg).into();
@@ -583,9 +624,14 @@ pub async fn plumtree_loop(
     }
 
     drop(rt);
-    if let Err(e) = send_msgs_handle.await {
-        error!("plumtree send loop task failed to join: {e}");
+
+    while let Some(result) = sender_tasks.join_next().await {
+        if let Err(e) = result {
+            error!("plumtree send loop task failed to join: {e}");
+        }
     }
+
+    Ok(())
 }
 
 struct PendingPlumtreeSend {
@@ -981,15 +1027,17 @@ mod tests {
         tx.commit();
     }
 
-    async fn select_with_ready_input(
+    async fn select_with_ready_inbound(
         protocol_timer_ready: bool,
         ihave_tick_ready: bool,
         maintenance_tick_ready: bool,
+        sender_tasks: &mut JoinSet<()>,
+        shutdown_ready: bool,
     ) -> PlumtreeLoopBranch {
-        let (tripwire, _tripwire_worker, _tripwire_tx) = Tripwire::new_simple();
+        let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
         let mut tripwire = tripwire;
         let (tx_input, mut rx_input) = bounded(1, "plumtree_loop_test_input");
-        let (_tx_updates, mut rx_updates) = bounded(1, "plumtree_loop_test_updates");
+        let (tx_updates, mut rx_updates) = bounded(1, "plumtree_loop_test_updates");
         let (timer_tx, mut timer_rx) = mpsc::channel::<(Timer<ChangeId, ActorId>, Instant)>(1);
 
         let mut ihave_tick = interval(Duration::from_secs(3600));
@@ -1020,32 +1068,111 @@ mod tests {
             .send(PlumtreeInput::QueryStats(stats_tx))
             .await
             .expect("input receiver should be open");
+        tx_updates
+            .send(PlumtreeUpdates::MemberDown(ActorId(uuid::Uuid::new_v4())))
+            .await
+            .expect("updates receiver should be open");
 
-        next_plumtree_loop_branch(
-            &mut tripwire,
-            &mut rx_input,
-            &mut rx_updates,
-            &mut timer_rx,
-            &mut ihave_tick,
-            &mut maintenance_tick,
+        if shutdown_ready {
+            tripwire_tx.send(()).await.unwrap();
+            tripwire_worker.await;
+        }
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            next_plumtree_loop_branch(
+                &mut tripwire,
+                sender_tasks,
+                &mut rx_input,
+                &mut rx_updates,
+                &mut timer_rx,
+                &mut ihave_tick,
+                &mut maintenance_tick,
+            ),
         )
         .await
+        .expect("a ready branch should be selected")
+    }
+
+    async fn wait_for_sender_to_finish(sender: &tokio::task::AbortHandle) {
+        // Establish readiness without consuming the result from the JoinSet.
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !sender.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("sender should have finished");
     }
 
     #[tokio::test]
     async fn plumtree_timers_preempt_ready_input() {
+        let mut sender_tasks = JoinSet::new();
+        sender_tasks.spawn(std::future::pending::<()>());
         assert!(matches!(
-            select_with_ready_input(true, false, false).await,
+            select_with_ready_inbound(true, false, false, &mut sender_tasks, false).await,
             PlumtreeLoopBranch::HandleTimer(_)
         ));
         assert!(matches!(
-            select_with_ready_input(false, true, false).await,
+            select_with_ready_inbound(false, true, false, &mut sender_tasks, false).await,
             PlumtreeLoopBranch::IHaveTick
         ));
         assert!(matches!(
-            select_with_ready_input(false, false, true).await,
+            select_with_ready_inbound(false, false, true, &mut sender_tasks, false).await,
             PlumtreeLoopBranch::MaintenanceTick
         ));
+        sender_tasks.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn plumtree_sender_exit_preempts_ready_timers_and_inbound() {
+        let mut sender_tasks = JoinSet::new();
+        let sender = sender_tasks.spawn(async {});
+        wait_for_sender_to_finish(&sender).await;
+
+        assert!(matches!(
+            select_with_ready_inbound(true, true, true, &mut sender_tasks, false).await,
+            PlumtreeLoopBranch::SenderStopped(Some(Ok(())))
+        ));
+    }
+
+    #[tokio::test]
+    async fn plumtree_sender_panic_preempts_ready_timers_and_inbound() {
+        let mut sender_tasks = JoinSet::new();
+        let sender = sender_tasks.spawn(async { panic!("synthetic plumtree sender panic") });
+        wait_for_sender_to_finish(&sender).await;
+
+        assert!(matches!(
+            select_with_ready_inbound(true, true, true, &mut sender_tasks, false).await,
+            PlumtreeLoopBranch::SenderStopped(Some(Err(error))) if error.is_panic()
+        ));
+    }
+
+    #[tokio::test]
+    async fn plumtree_sender_cancellation_preempts_ready_timers_and_inbound() {
+        let mut sender_tasks = JoinSet::new();
+        let sender = sender_tasks.spawn(std::future::pending::<()>());
+        sender.abort();
+        wait_for_sender_to_finish(&sender).await;
+
+        assert!(matches!(
+            select_with_ready_inbound(true, true, true, &mut sender_tasks, false).await,
+            PlumtreeLoopBranch::SenderStopped(Some(Err(error))) if error.is_cancelled()
+        ));
+    }
+
+    #[tokio::test]
+    async fn plumtree_shutdown_preempts_sender_exit_and_ready_work() {
+        let mut sender_tasks = JoinSet::new();
+        let sender = sender_tasks.spawn(async {});
+        wait_for_sender_to_finish(&sender).await;
+
+        assert!(matches!(
+            select_with_ready_inbound(true, true, true, &mut sender_tasks, true).await,
+            PlumtreeLoopBranch::Exit("tripwire fired")
+        ));
+        // Shutdown must leave the child result for the normal drain path.
+        assert!(matches!(sender_tasks.join_next().await, Some(Ok(()))));
     }
 
     #[test]
