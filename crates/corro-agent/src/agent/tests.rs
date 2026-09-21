@@ -1939,6 +1939,22 @@ async fn test_v2_launch_and_write() -> eyre::Result<()> {
         );
     }
 
+    // Exercise the V2 query used by subscription/update matching.
+    {
+        let conn = ta.agent.pool().read().await?;
+        let mut stmt = conn.prepare(
+            r#"SELECT DISTINCT "table", pk, cid, cl
+               FROM crsql_changes
+               WHERE db_version = 1 AND site_id = ?"#,
+        )?;
+        let rows: Vec<(String, Vec<u8>, String, i64)> = stmt
+            .query_map([ta.agent.actor_id()], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        assert!(!rows.is_empty(), "V2 matching query returned no rows");
+    }
+
     // Verify scalar seq pushdown filters packed V2 rows by decoded sequence.
     {
         let conn = ta.agent.pool().read().await?;

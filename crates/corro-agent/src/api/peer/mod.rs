@@ -1015,7 +1015,13 @@ fn send_packed_change_chunks<I: Iterator<Item = rusqlite::Result<PackedChange>>>
                 }
             }
             Some(Err(e)) => {
-                error!(%actor_id, %version, "could not process packed changes to send via sync: {e}");
+                error!(
+                    %actor_id,
+                    %version,
+                    last_seq = %last_seq,
+                    error = %e,
+                    "could not process packed changes to send via sync"
+                );
                 break;
             }
             None => {

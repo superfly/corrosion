@@ -1226,7 +1226,13 @@ pub async fn broadcast_changes(
                         });
                     }
                     Err(e) => {
-                        error!("could not process crsql change (db_version: {db_version}) for broadcast: {e}");
+                        error!(
+                            %actor_id,
+                            %db_version,
+                            last_seq = %last_seq,
+                            error = %e,
+                            "could not process packed crsql change for broadcast"
+                        );
                         break;
                     }
                 }

@@ -547,29 +547,60 @@ where
         // returning unpacked rows (scalar cid, pk, etc.) instead of packed BLOBs.
         // Note: ORDER BY seq is omitted because seq is a packed BLOB in V2 mode
         // and including it in ORDER BY breaks the scalar unpacking.
-        let mut prepped = conn.prepare_cached(
-            r#"
+        let mut prepped = conn
+            .prepare_cached(
+                r#"
         SELECT DISTINCT "table", pk, cid, cl
             FROM crsql_changes
             WHERE db_version = ?
               AND site_id = ?
             "#,
-        )?;
+            )
+            .map_err(|e| {
+                error!(
+                    manager = %trait_type,
+                    %actor_id,
+                    %db_version,
+                    error = %e,
+                    "failed to prepare crsql_changes matching query"
+                );
+                e
+            })?;
 
-        let rows = prepped.query_map((db_version, actor_id), |row| {
-            Ok((
-                row.get::<_, TableName>(0)?,
-                row.get::<_, Vec<u8>>(1)?,
-                row.get::<_, ColumnName>(2)?,
-                row.get::<_, i64>(3)?,
-            ))
-        })?;
+        let rows = prepped
+            .query_map((db_version, actor_id), |row| {
+                Ok((
+                    row.get::<_, TableName>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, ColumnName>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })
+            .map_err(|e| {
+                error!(
+                    manager = %trait_type,
+                    %actor_id,
+                    %db_version,
+                    error = %e,
+                    "failed to execute crsql_changes matching query"
+                );
+                e
+            })?;
 
         // Collect rows first so we can resolve V2 hash-mode tombstone pks (cid = "-2")
         // outside the active prepared statement to avoid reentrant statement conflicts.
         let mut collected: Vec<(TableName, Vec<u8>, ColumnName, i64)> = Vec::new();
         for change_res in rows {
-            collected.push(change_res?);
+            collected.push(change_res.map_err(|e| {
+                error!(
+                    manager = %trait_type,
+                    %actor_id,
+                    %db_version,
+                    error = %e,
+                    "failed to decode crsql_changes matching row"
+                );
+                e
+            })?);
         }
 
         for (table, mut pk, mut column, cl) in collected {
@@ -593,8 +624,12 @@ where
                     }
                     Err(e) => {
                         error!(
+                            manager = %trait_type,
+                            %actor_id,
+                            %db_version,
                             table = %table,
-                            "could not resolve V2 tombstone pk: {e}"
+                            error = %e,
+                            "could not resolve V2 tombstone pk"
                         );
                         continue;
                     }
