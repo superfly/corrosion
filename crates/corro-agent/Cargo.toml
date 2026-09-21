@@ -75,6 +75,7 @@ governor.workspace = true
 zstd = { workspace = true }
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 corro-tests = { path = "../corro-tests" }
 reqwest.workspace = true
 http-body = { workspace = true }
