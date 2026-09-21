@@ -4,11 +4,11 @@ use antithesis_sdk::assert_always;
 pub use corro_api_types::SqliteValue;
 use corro_api_types::{ColumnName, TableName};
 use corro_base_types::{varint, CrsqlDbVersion, CrsqlSeqRange};
-use rusqlite::{Connection, Row};
+use rusqlite::{Connection, OptionalExtension, Row};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use speedy::{Readable, Writable};
-use tracing::{debug, trace};
+use tracing::{debug, trace, warn};
 
 use crate::{
     agent::{Agent, BookedVersions, ChangeError},
@@ -455,49 +455,61 @@ pub fn insert_local_changes(
             version: None,
         })?;
 
-    // crsql_get_seq() returns ext_data.seq — the per-connection bump counter.
-    // After all triggers fire, ext_data.seq - 1 = the last assigned seq.
-    // This is format-agnostic: works in V1, V2-dual, and V2-wire modes.
-    // crsql_get_ts() returns the current transaction timestamp (set via crsql_set_ts).
-    let (seq, ts): (i64, i64) = tx
-        .prepare_cached("SELECT crsql_get_seq(), crsql_get_ts()")
+    // GROUP BY db_version enables cr-sqlite's scalar seq pushdown in V2 mode,
+    // while retaining the ordinary integer MAX(seq) behavior in V1 mode.
+    let version_info: (Option<CrsqlSeq>, Option<Timestamp>) = tx
+        .prepare_cached(
+            "SELECT MAX(seq), MAX(ts) FROM crsql_changes \
+             WHERE site_id = ? AND db_version = ? \
+             GROUP BY db_version",
+        )
         .map_err(|source| ChangeError::Rusqlite {
             source,
             actor_id: Some(actor_id),
             version: None,
         })?
-        .query_row((), |row| Ok((row.get(0)?, row.get(1)?)))
+        .query_row((agent.actor_id(), db_version), |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
+        .optional()
         .map_err(|source| ChangeError::Rusqlite {
             source,
             actor_id: Some(actor_id),
             version: None,
-        })?;
+        })?
+        .unwrap_or((None, None));
 
-    if seq == 0 {
-        // No changes were made this transaction
-        return Ok(None);
+    match version_info {
+        (None, None) => Ok(None),
+        (None, Some(ts)) => {
+            warn!("found db_version {db_version} without seq, last ts: {ts:?}");
+            Ok(None)
+        }
+        (Some(last_seq), ts) => {
+            let ts = ts.unwrap_or_else(|| {
+                warn!("found db_version {db_version} without ts");
+                Timestamp::from(agent.clock().new_timestamp())
+            });
+
+            debug!("found db_version {db_version} (last seq: {last_seq}, last ts: {ts})");
+
+            let db_versions = db_version..=db_version;
+
+            book_writer
+                .insert_db(tx, [db_versions].into())
+                .map_err(|source| ChangeError::Rusqlite {
+                    source,
+                    actor_id: Some(actor_id),
+                    version: Some(db_version),
+                })?;
+
+            Ok(Some(InsertChangesInfo {
+                db_version,
+                last_seq,
+                ts,
+            }))
+        }
     }
-
-    let last_seq = CrsqlSeq((seq - 1) as u64);
-    let ts = Timestamp::from(ts as u64);
-
-    debug!("found db_version {db_version} (last seq: {last_seq}, last ts: {ts})");
-
-    let db_versions = db_version..=db_version;
-
-    book_writer
-        .insert_db(tx, [db_versions].into())
-        .map_err(|source| ChangeError::Rusqlite {
-            source,
-            actor_id: Some(actor_id),
-            version: Some(db_version),
-        })?;
-
-    Ok(Some(InsertChangesInfo {
-        db_version,
-        last_seq,
-        ts,
-    }))
 }
 
 #[cfg(test)]

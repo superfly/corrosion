@@ -724,7 +724,7 @@ pub async fn api_v1_migrate(
                 "SELECT crsql_config_set('{}', {})",
                 config_name, config_value
             );
-            let result: Result<String, rusqlite::Error> =
+            let result: Result<rusqlite::types::Value, rusqlite::Error> =
                 tx.prepare_cached(&sql)?.query_row([], |row| row.get(0));
 
             match result {

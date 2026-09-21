@@ -44,15 +44,25 @@ PY
 
     local db_path="/var/lib/${node}/state.db"
     echo "[v1-v2-integrity] checking ${node}"
-    if ! python3 /opt/antithesis/py-resources/check_v1_v2_integrity.py "${db_path}"; then
-        echo "[v1-v2-integrity] integrity check failed: ${node}"
+    if ! timeout --kill-after=5s "${V1_V2_INTEGRITY_CHECK_TIMEOUT_SECONDS:-120}s" \
+        python3 /opt/antithesis/py-resources/check_v1_v2_integrity.py "${db_path}"; then
+        echo "[v1-v2-integrity] integrity check failed or timed out: ${node}"
         return 1
     fi
 }
 
-while true; do
+max_attempts="${V1_V2_INTEGRITY_MAX_ATTEMPTS:-40}"
+interval_seconds="${V1_V2_INTEGRITY_INTERVAL_SECONDS:-30}"
+
+echo "[v1-v2-integrity] starting (${max_attempts} attempts, ${interval_seconds}s interval)"
+for ((attempt = 1; attempt <= max_attempts; attempt++)); do
+    echo "[v1-v2-integrity] attempt ${attempt}/${max_attempts}"
     for config in "${configs[@]}"; do
         check_once "${config}"
     done
-    sleep "${V1_V2_INTEGRITY_INTERVAL_SECONDS:-5}"
+    if [ "${attempt}" -lt "${max_attempts}" ]; then
+        sleep "${interval_seconds}"
+    fi
 done
+
+echo "[v1-v2-integrity] completed without finding a divergence"
