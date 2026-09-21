@@ -119,9 +119,18 @@ def check_v1_v2_integrity(address):
         text=True,
         timeout=120,
     )
-    print(f"Integrity check for {address}:\n{result.stdout}{result.stderr}")
+    output = f"{result.stdout}{result.stderr}".strip()
+    print(f"Integrity check for {address} (exit={result.returncode}):\n{output}")
     ok = result.returncode == 0
-    always(ok, "V1/V2 metadata remains consistent", {"address": address})
+    always(
+        ok,
+        "V1/V2 metadata remains consistent",
+        {
+            "address": address,
+            "returncode": result.returncode,
+            "output": output[-4000:],
+        },
+    )
     return ok
 
 
@@ -205,6 +214,15 @@ def main():
     state_summary = {k: len(v) for k, v in categories.items() if v}
     print(f"Migration state: {state_summary}")
 
+    total = len(args.addrs)
+    all_nodes_reachable = len(nodes) == total
+    all_nodes_use_v2 = all_nodes_reachable and all(
+        status.get("use_version") == 2 for status, _ in nodes.values()
+    )
+    any_v2_wire = any(
+        status.get("sync_log_version") == 2 for status, _ in nodes.values()
+    )
+
     # Validate compatibility metadata only after V1→V2 migration has completed,
     # while V1 tables are still present. V2-only nodes are intentionally skipped.
     integrity_states = (
@@ -217,7 +235,6 @@ def main():
             check_v1_v2_integrity(address)
 
     fully_migrated = len(categories["v2_done"])
-    total = len(args.addrs)
 
     # Priority 1: If any node is still V1, pick a random one and start dual-write
     if categories["v1"]:
@@ -238,7 +255,7 @@ def main():
 
         # 20% chance to roll back (test the rollback path)
         roll = random.randint(1, 100)
-        if roll <= 20:
+        if roll <= 20 and not any_v2_wire:
             print(f"Step: Rolling back dual-write node {addr} to V1")
             success, resp = post_migrate_step(addr, STEP_ROLLBACK_V1)
             if success:
@@ -264,11 +281,18 @@ def main():
     #   A) Switch to V2 wire format (while still dual-writing)
     #   B) Go to V2-only DB (keeps V1 wire, becomes (3,2,1))
     if categories["dual_write_use_v2"]:
+        if not all_nodes_use_v2:
+            print(
+                "Waiting to enable V2 wire until every configured node is reachable "
+                "and uses V2 metadata"
+            )
+            return
+
         addr = random.choice(categories["dual_write_use_v2"])
         roll = random.randint(1, 100)
 
-        # 15% chance to roll back
-        if roll <= 15:
+        # Rollback is only safe before any node starts emitting V2 wire.
+        if roll <= 15 and not any_v2_wire:
             print(f"Step: Rolling back dual-write+useV2 node {addr} to V1")
             success, resp = post_migrate_step(addr, STEP_ROLLBACK_V1)
             if success:
@@ -294,15 +318,6 @@ def main():
     if categories["dual_write_v2_wire"]:
         addr = random.choice(categories["dual_write_v2_wire"])
 
-        # 10% chance to roll back
-        roll = random.randint(1, 100)
-        if roll <= 10:
-            print(f"Step: Rolling back dual-write+V2wire node {addr} to V1")
-            success, resp = post_migrate_step(addr, STEP_ROLLBACK_V1)
-            if success:
-                print(f"  {addr} rolled back to V1: {resp}")
-            return
-
         print(f"Step: Completing V2-only DB migration on {addr} (from V2 wire)")
         success, resp = post_migrate_step(addr, STEP_V2_DB_ONLY)
         if success:
@@ -312,6 +327,13 @@ def main():
     # Priority 5: If any node is in (3,2,1) — V2-only DB, V1 wire —
     # switch to V2 wire format
     if categories["v2_db_v1_wire"]:
+        if not all_nodes_use_v2:
+            print(
+                "Waiting to enable V2 wire until every configured node is reachable "
+                "and uses V2 metadata"
+            )
+            return
+
         addr = random.choice(categories["v2_db_v1_wire"])
         print(f"Step: Switching wire format to V2 on {addr}")
         success, resp = post_migrate_step(addr, STEP_V2_WIRE_FORMAT)

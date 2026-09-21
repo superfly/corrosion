@@ -45,6 +45,8 @@ def check_table(conn, table):
     mode, pk_cols = pk_info(conn, table)
     if not mode:
         return [f"{table}: missing crsql_master v2_pks metadata"]
+    if not pk_cols:
+        return [f"{table}: empty crsql_master v2_pks metadata"]
 
     v1_cols = [row[1] for row in conn.execute(f"PRAGMA table_info({qi(v1_pks)})")]
     v2_cols = [row[1] for row in conn.execute(f"PRAGMA table_info({qi(v2_pks)})")]
@@ -64,7 +66,7 @@ def check_table(conn, table):
 
     orphan_alive = conn.execute(
         f"SELECT count(*) FROM {qi(v2_pks)} vp LEFT JOIN {qi(table)} b "
-        f"ON {base_v2_join} WHERE b.rowid IS NULL"
+        f"ON {base_v2_join} WHERE b.{qi(pk_cols[0])} IS NULL"
     ).fetchone()[0]
     if orphan_alive:
         errors.append(f"orphan alive V2 PK rows={orphan_alive}")
@@ -154,7 +156,12 @@ def main():
             "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE '%__crsql_clock'"
         ).fetchall()
         tables = [name.removesuffix('__crsql_clock') for (name,) in clocks]
-        errors = [error for table in tables for error in check_table(conn, table)]
+        errors = []
+        for table in tables:
+            try:
+                errors.extend(check_table(conn, table))
+            except sqlite3.Error as error:
+                errors.append(f"{table}: checker query failed: {error}")
     finally:
         conn.close()
 
@@ -162,11 +169,11 @@ def main():
         print("V1/V2 integrity check FAILED: no V1 CRR tables found")
         return 1
     if errors:
-        print("V1/V2 integrity check FAILED")
+        print(f"V1/V2 integrity check FAILED ({sys.argv[1]}, {len(tables)} tables)")
         for error in errors:
             print(f"  - {error}")
         return 1
-    print(f"V1/V2 integrity check OK ({len(tables)} tables)")
+    print(f"V1/V2 integrity check OK ({sys.argv[1]}, {len(tables)} tables)")
     return 0
 
 
