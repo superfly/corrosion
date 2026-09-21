@@ -28,7 +28,7 @@ use corro_types::{
 };
 use hyper::StatusCode;
 use metrics::{counter, histogram};
-use rusqlite::{params_from_iter, ToSql, Transaction};
+use rusqlite::{fallible_iterator::FallibleIterator, params_from_iter, ToSql, Transaction};
 use serde::Deserialize;
 use spawn::spawn_counted;
 use sqlite_pool::{Committable, InterruptibleTransaction, SqliteConn};
@@ -271,6 +271,75 @@ pub enum QueryError {
     Rusqlite(#[from] rusqlite::Error),
 }
 
+use rusqlite::ffi;
+use std::ffi::{c_char, c_int, c_void, CStr};
+
+unsafe extern "C" fn read_only_authorizer(
+    _user_data: *mut c_void,
+    action_code: c_int,
+    arg1: *const c_char,
+    arg2: *const c_char,
+    _arg3: *const c_char,
+    _arg4: *const c_char,
+) -> c_int {
+    match action_code {
+        ffi::SQLITE_SELECT | ffi::SQLITE_READ => ffi::SQLITE_OK,
+        ffi::SQLITE_FUNCTION => {
+            if !arg2.is_null() {
+                let func_name = CStr::from_ptr(arg2).to_bytes();
+                if func_name == b"crsql_as_crr"
+                    || func_name == b"crsql_as_table"
+                    || func_name == b"crsql_set_ts"
+                    || func_name == b"crsql_finalize"
+                {
+                    return ffi::SQLITE_DENY;
+                }
+            }
+            ffi::SQLITE_OK
+        }
+        ffi::SQLITE_PRAGMA => {
+            if !arg1.is_null() {
+                let pragma_name = CStr::from_ptr(arg1).to_bytes();
+                if pragma_name == b"table_info"
+                    || pragma_name == b"table_xinfo"
+                    || pragma_name == b"collation_list"
+                    || pragma_name == b"foreign_key_list"
+                    || pragma_name == b"index_info"
+                    || pragma_name == b"index_list"
+                    || pragma_name == b"database_list"
+                {
+                    return ffi::SQLITE_OK;
+                }
+            }
+            ffi::SQLITE_DENY
+        }
+        _ => ffi::SQLITE_DENY,
+    }
+}
+
+struct ReadOnlyAuthorizerGuard<'a>(&'a rusqlite::Connection);
+
+impl<'a> ReadOnlyAuthorizerGuard<'a> {
+    fn new(conn: &'a rusqlite::Connection) -> Self {
+        unsafe {
+            ffi::sqlite3_set_authorizer(
+                conn.handle(),
+                Some(read_only_authorizer),
+                std::ptr::null_mut(),
+            );
+        }
+        Self(conn)
+    }
+}
+
+impl<'a> Drop for ReadOnlyAuthorizerGuard<'a> {
+    fn drop(&mut self) {
+        unsafe {
+            ffi::sqlite3_set_authorizer(self.0.handle(), None, std::ptr::null_mut());
+        }
+    }
+}
+
 async fn build_query_rows_response(
     agent: &Agent,
     client_addr: SocketAddr,
@@ -283,7 +352,7 @@ async fn build_query_rows_response(
     let pool = agent.pool().clone();
 
     tokio::spawn(async move {
-        let conn = match pool.read().await {
+        let pooled_conn = match pool.read().await {
             Ok(conn) => conn,
             Err(e) => {
                 _ = res_tx.send(Err((
@@ -296,12 +365,63 @@ async fn build_query_rows_response(
             }
         };
 
+        // AST validation: only read statements (SELECT, EXPLAIN) are permitted
+        {
+            let mut parser = sqlite3_parser::lexer::sql::Parser::new(stmt.query().as_bytes());
+            let mut has_statement = false;
+            loop {
+                match parser.next() {
+                    Ok(Some(cmd)) => {
+                        match cmd {
+                            sqlite3_parser::ast::Cmd::Stmt(sqlite3_parser::ast::Stmt::Select(_))
+                            | sqlite3_parser::ast::Cmd::Explain(sqlite3_parser::ast::Stmt::Select(_))
+                            | sqlite3_parser::ast::Cmd::ExplainQueryPlan(sqlite3_parser::ast::Stmt::Select(_)) => {
+                                has_statement = true;
+                            }
+                            _ => {
+                                _ = res_tx.send(Err((
+                                    StatusCode::BAD_REQUEST,
+                                    ExecResult::Error {
+                                        error: "only read statements (SELECT, EXPLAIN) are permitted".into(),
+                                    },
+                                )));
+                                return;
+                            }
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        _ = res_tx.send(Err((
+                            StatusCode::BAD_REQUEST,
+                            ExecResult::Error {
+                                error: format!("could not parse statement: {e}"),
+                            },
+                        )));
+                        return;
+                    }
+                }
+            }
+
+            if !has_statement {
+                _ = res_tx.send(Err((
+                    StatusCode::BAD_REQUEST,
+                    ExecResult::Error {
+                        error: "statement is empty".into(),
+                    },
+                )));
+                return;
+            }
+        }
+
+        // Install SQLite authorizer as active guard throughout statement preparation & execution
+        let _authorizer = ReadOnlyAuthorizerGuard::new(pooled_conn.conn());
+
         // default timeout of 1 minute if no timeout is provided
         let timeout_secs = timeout.unwrap_or(60);
         let timeout: Option<Duration> =
             (timeout_secs > 0).then(|| Duration::from_secs(timeout_secs));
 
-        let conn = InterruptibleTransaction::new(conn.conn(), timeout, "query");
+        let conn = InterruptibleTransaction::new(pooled_conn.conn(), timeout, "query");
         trace!(%client_addr, "Preparing statement {}", stmt.query());
 
         let prepped_res = block_in_place(|| conn.prepare(stmt.query()));
@@ -865,6 +985,61 @@ mod tests {
         assert!(matches!(query_evt, QueryEvent::EndOfQuery { .. }));
 
         assert!(body.next().await.is_none());
+
+        // Verify that transaction control statements are rejected
+        let res = api_v1_queries(
+            Extension(agent.clone()),
+            ConnectInfo("127.0.0.1:1234".parse().unwrap()),
+            axum::extract::Query(TimeoutParams { timeout: None }),
+            axum::Json(Statement::Simple("BEGIN;".into())),
+        )
+        .await
+        .into_response();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+        // Verify that ATTACH statements are rejected
+        let res = api_v1_queries(
+            Extension(agent.clone()),
+            ConnectInfo("127.0.0.1:1234".parse().unwrap()),
+            axum::extract::Query(TimeoutParams { timeout: None }),
+            axum::Json(Statement::Simple("ATTACH DATABASE ':memory:' AS test_attach;".into())),
+        )
+        .await
+        .into_response();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+        // Verify that multi-statement queries containing transaction control are rejected
+        let res = api_v1_queries(
+            Extension(agent.clone()),
+            ConnectInfo("127.0.0.1:1234".parse().unwrap()),
+            axum::extract::Query(TimeoutParams { timeout: None }),
+            axum::Json(Statement::Simple("SELECT 1; BEGIN;".into())),
+        )
+        .await
+        .into_response();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+        // Verify that mutating PRAGMAs are rejected
+        let res = api_v1_queries(
+            Extension(agent.clone()),
+            ConnectInfo("127.0.0.1:1234".parse().unwrap()),
+            axum::extract::Query(TimeoutParams { timeout: None }),
+            axum::Json(Statement::Simple("PRAGMA query_only = 0;".into())),
+        )
+        .await
+        .into_response();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+        // Verify that DML is rejected
+        let res = api_v1_queries(
+            Extension(agent.clone()),
+            ConnectInfo("127.0.0.1:1234".parse().unwrap()),
+            axum::extract::Query(TimeoutParams { timeout: None }),
+            axum::Json(Statement::Simple("DELETE FROM tests;".into())),
+        )
+        .await
+        .into_response();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
 
         Ok(())
     }
