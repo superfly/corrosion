@@ -459,7 +459,7 @@ pub fn insert_local_changes(
     // while retaining the ordinary integer MAX(seq) behavior in V1 mode.
     let version_info: (Option<CrsqlSeq>, Option<Timestamp>) = tx
         .prepare_cached(
-            "SELECT MAX(seq), MAX(ts) FROM crsql_changes \
+            "SELECT MAX(seq), MAX(ts) FROM main.crsql_changes \
              WHERE site_id = ? AND db_version = ? \
              GROUP BY db_version",
         )
