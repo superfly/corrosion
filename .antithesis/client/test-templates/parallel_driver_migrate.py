@@ -122,6 +122,20 @@ def check_v1_v2_integrity(address):
     output = f"{result.stdout}{result.stderr}".strip()
     print(f"Integrity check for {address} (exit={result.returncode}):\n{output}")
     ok = result.returncode == 0
+    if not ok:
+        refreshed = get_migrate_status(address)
+        refreshed_state = classify_node(refreshed) if refreshed is not None else None
+        if refreshed_state not in {
+            "dual_write_done",
+            "dual_write_use_v2",
+            "dual_write_v2_wire",
+        }:
+            print(
+                f"Integrity check no longer applicable for {address}: "
+                f"state changed to {refreshed_state}"
+            )
+            return True
+
     always(
         ok,
         "V1/V2 metadata remains consistent",

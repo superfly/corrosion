@@ -152,6 +152,25 @@ def main():
         return 2
     conn = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True, timeout=300)
     try:
+        conn.execute("BEGIN")
+        config = dict(
+            conn.execute(
+                "SELECT key, value FROM crsql_master "
+                "WHERE key IN ('config.metadata-write-version', "
+                "'config.metadata-use-version', 'config.sync-log-version')"
+            ).fetchall()
+        )
+        write_version = int(config.get("config.metadata-write-version", 1))
+        use_version = int(config.get("config.metadata-use-version", 1))
+        sync_log_version = int(config.get("config.sync-log-version", 1))
+        if write_version != 2:
+            print(
+                "V1/V2 integrity check NOT APPLICABLE "
+                f"(persisted config write={write_version}, use={use_version}, "
+                f"sync={sync_log_version})"
+            )
+            return 0
+
         clocks = conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE '%__crsql_clock'"
         ).fetchall()
