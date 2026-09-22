@@ -28,7 +28,10 @@ use corro_types::{
 };
 use hyper::StatusCode;
 use metrics::{counter, histogram};
-use rusqlite::{params_from_iter, ToSql, Transaction};
+use rusqlite::{
+    hooks::{AuthAction, AuthContext, Authorization},
+    params_from_iter, ToSql, Transaction,
+};
 use serde::Deserialize;
 use spawn::spawn_counted;
 use sqlite_pool::{Committable, InterruptibleTransaction, SqliteConn};
@@ -271,6 +274,90 @@ pub enum QueryError {
     Rusqlite(#[from] rusqlite::Error),
 }
 
+fn is_safe_crsql_function(function_name: &str) -> bool {
+    matches!(
+        function_name.to_ascii_lowercase().as_str(),
+        "crsql_config_get"
+            | "crsql_db_version"
+            | "crsql_fract_key_between"
+            | "crsql_get_seq"
+            | "crsql_get_ts"
+            | "crsql_pack_columns"
+            | "crsql_peek_next_db_version"
+            | "crsql_rows_impacted"
+            | "crsql_sha"
+            | "crsql_site_id"
+            | "crsql_version"
+    )
+}
+
+fn is_effectful_read_pragma(pragma_name: &str) -> bool {
+    matches!(
+        pragma_name.to_ascii_lowercase().as_str(),
+        "incremental_vacuum" | "optimize" | "shrink_memory" | "wal_checkpoint"
+    )
+}
+
+fn is_effectful_pragma_table(table_name: &str) -> bool {
+    table_name
+        .to_ascii_lowercase()
+        .strip_prefix("pragma_")
+        .is_some_and(is_effectful_read_pragma)
+}
+
+fn is_safe_read_pragma(pragma_name: &str, pragma_value: Option<&str>) -> bool {
+    match pragma_name.to_ascii_lowercase().as_str() {
+        // These accept a target as SQLite's second authorizer argument but do
+        // not change connection or database state.
+        "foreign_key_check" | "foreign_key_list" | "index_info" | "index_list" | "index_xinfo"
+        | "integrity_check" | "quick_check" | "table_info" | "table_list" | "table_xinfo" => true,
+        // These execute work even without an assignment argument.
+        name if is_effectful_read_pragma(name) => false,
+        // Other argument-free PRAGMAs are getters or introspection queries.
+        _ => pragma_value.is_none(),
+    }
+}
+
+fn authorize_read_query(context: AuthContext<'_>) -> Authorization {
+    match context.action {
+        AuthAction::Read { table_name, .. } if !is_effectful_pragma_table(table_name) => {
+            Authorization::Allow
+        }
+        AuthAction::Select | AuthAction::Recursive => Authorization::Allow,
+        AuthAction::Pragma {
+            pragma_name,
+            pragma_value,
+        } if is_safe_read_pragma(pragma_name, pragma_value) => Authorization::Allow,
+        AuthAction::Function { function_name }
+            if !function_name.eq_ignore_ascii_case("load_extension")
+                && (!function_name
+                    .get(..6)
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case("crsql_"))
+                    || is_safe_crsql_function(function_name)) =>
+        {
+            Authorization::Allow
+        }
+        _ => Authorization::Deny,
+    }
+}
+
+struct ReadQueryAuthorizer<'conn>(&'conn rusqlite::Connection);
+
+impl<'conn> ReadQueryAuthorizer<'conn> {
+    fn install(conn: &'conn rusqlite::Connection) -> rusqlite::Result<Self> {
+        conn.authorizer(Some(authorize_read_query))?;
+        Ok(Self(conn))
+    }
+}
+
+impl Drop for ReadQueryAuthorizer<'_> {
+    fn drop(&mut self) {
+        let _ = self
+            .0
+            .authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
+    }
+}
+
 async fn build_query_rows_response(
     agent: &Agent,
     client_addr: SocketAddr,
@@ -303,6 +390,19 @@ async fn build_query_rows_response(
 
         let conn = InterruptibleTransaction::new(conn.conn(), timeout, "query");
         trace!(%client_addr, "Preparing statement {}", stmt.query());
+
+        let _authorizer = match ReadQueryAuthorizer::install(&conn) {
+            Ok(authorizer) => authorizer,
+            Err(e) => {
+                _ = res_tx.send(Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    ExecResult::Error {
+                        error: e.to_string(),
+                    },
+                )));
+                return;
+            }
+        };
 
         let prepped_res = block_in_place(|| conn.prepare(stmt.query()));
 
@@ -679,6 +779,344 @@ mod tests {
     use super::*;
 
     use crate::{agent::setup, agent::util::execute_schema};
+
+    const VALID_READ_QUERY_CASES: &[&str] = &[
+        "SELECT 1",
+        "WITH value(x) AS (VALUES (1)) SELECT x FROM value",
+        "VALUES (1)",
+        "EXPLAIN SELECT 1",
+        "EXPLAIN QUERY PLAN SELECT 1",
+        "PRAGMA foreign_keys",
+        "PRAGMA compile_options",
+        "PRAGMA integrity_check",
+        "PRAGMA table_info('freshness')",
+        "PRAGMA table_list('freshness')",
+        "SELECT count(*) FROM pragma_function_list",
+        "SELECT count(*) FROM pragma_module_list",
+        "SELECT count(*) FROM pragma_table_info('freshness')",
+        "SELECT count(*) FROM pragma_table_list('freshness')",
+    ];
+
+    const REJECTED_READ_QUERY_CASES: &[&str] = &[
+        "BEGIN",
+        "SAVEPOINT leaked",
+        "PRAGMA query_only = ON",
+        "PRAGMA read_uncommitted = ON",
+        "PRAGMA locking_mode = EXCLUSIVE",
+        "EXPLAIN PRAGMA query_only = ON",
+        "ATTACH DATABASE ':memory:' AS leaked",
+        "PRAGMA incremental_vacuum",
+        "PRAGMA optimize",
+        "PRAGMA shrink_memory",
+        "PRAGMA wal_checkpoint",
+        "SELECT * FROM pragma_optimize(0x10002)",
+        "SELECT crsql_finalize()",
+        "UPDATE freshness SET value = 9",
+    ];
+
+    #[test]
+    fn read_query_authorizer_rejects_connection_state_statements_before_prepare() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute("CREATE TABLE freshness (value INTEGER)", ())
+            .unwrap();
+
+        for sql in VALID_READ_QUERY_CASES
+            .iter()
+            .copied()
+            .chain(["SELECT 1_000"])
+        {
+            let _authorizer = ReadQueryAuthorizer::install(&conn).unwrap();
+            let _: rusqlite::types::Value = conn
+                .query_row(sql, (), |row| row.get(0))
+                .unwrap_or_else(|error| panic!("expected a read query: {sql}: {error}"));
+        }
+
+        for sql in REJECTED_READ_QUERY_CASES.iter().copied().chain([
+            "COMMIT",
+            "ROLLBACK",
+            "RELEASE leaked",
+            "EXPLAIN QUERY PLAN PRAGMA read_uncommitted = ON",
+            "DETACH DATABASE leaked",
+            "SELECT load_extension('not-present')",
+        ]) {
+            let _authorizer = ReadQueryAuthorizer::install(&conn).unwrap();
+            assert!(conn.prepare(sql).is_err(), "expected rejection: {sql}");
+        }
+
+        assert!(conn.is_autocommit());
+        assert_eq!(
+            conn.query_row("PRAGMA query_only", (), |row| row.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+
+        {
+            let _authorizer = ReadQueryAuthorizer::install(&conn).unwrap();
+            let column_name = conn
+                .query_row("PRAGMA table_info('freshness')", (), |row| {
+                    row.get::<_, String>(1)
+                })
+                .unwrap();
+            assert_eq!(column_name, "value");
+        }
+        {
+            let _authorizer = ReadQueryAuthorizer::install(&conn).unwrap();
+            let count = conn
+                .query_row(
+                    "SELECT count(*) FROM pragma_table_info('freshness')",
+                    (),
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1);
+        }
+        assert_eq!(
+            conn.query_row("PRAGMA read_uncommitted", (), |row| row.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.query_row("PRAGMA locking_mode", (), |row| row.get::<_, String>(0))
+                .unwrap(),
+            "normal"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM pragma_database_list WHERE name = 'leaked'",
+                (),
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            0
+        );
+        conn.execute_batch("BEGIN; ROLLBACK")
+            .expect("the request authorizer should be removed on drop");
+    }
+
+    #[test]
+    fn read_query_authorizer_blocks_mutation_during_automatic_reprepare() -> eyre::Result<()> {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+
+        fn open_mutating_reader(
+            path: &std::path::Path,
+            mutated: &Arc<AtomicBool>,
+        ) -> eyre::Result<rusqlite::Connection> {
+            let reader = rusqlite::Connection::open(path)?;
+            reader.pragma_update(None, "trusted_schema", true)?;
+            let mutated = mutated.clone();
+            reader.create_scalar_function(
+                "crsql_mutate",
+                0,
+                rusqlite::functions::FunctionFlags::SQLITE_UTF8,
+                move |_| {
+                    mutated.store(true, Ordering::SeqCst);
+                    Ok(2_i64)
+                },
+            )?;
+            Ok(reader)
+        }
+
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("reprepare.db");
+        let writer = rusqlite::Connection::open(&path)?;
+        writer.execute_batch(
+            "PRAGMA journal_mode = WAL;
+             CREATE VIEW guarded AS SELECT 1 AS value;",
+        )?;
+
+        let mutated = Arc::new(AtomicBool::new(false));
+        let unguarded_reader = open_mutating_reader(&path, &mutated)?;
+
+        let mut unguarded_statement = unguarded_reader.prepare("SELECT value FROM guarded")?;
+        writer.execute_batch(
+            "DROP VIEW guarded;
+             CREATE VIEW guarded AS SELECT crsql_mutate() AS value;",
+        )?;
+        assert_eq!(
+            unguarded_statement.query_row((), |row| row.get::<_, i64>(0))?,
+            2
+        );
+        assert!(mutated.swap(false, Ordering::SeqCst));
+        drop(unguarded_statement);
+        drop(unguarded_reader);
+
+        writer.execute_batch(
+            "DROP VIEW guarded;
+             CREATE VIEW guarded AS SELECT 1 AS value;",
+        )?;
+
+        let reader = open_mutating_reader(&path, &mutated)?;
+
+        let _authorizer = ReadQueryAuthorizer::install(&reader)?;
+        let mut statement = reader.prepare("SELECT value FROM guarded")?;
+
+        writer.execute_batch(
+            "DROP VIEW guarded;
+             CREATE VIEW guarded AS SELECT crsql_mutate() AS value;",
+        )?;
+
+        let error = statement
+            .query_row((), |row| row.get::<_, i64>(0))
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                rusqlite::Error::SqliteFailure(_, Some(ref message))
+                    if message == "not authorized to use function: crsql_mutate"
+            ),
+            "unexpected reprepare error: {error:?}"
+        );
+        assert!(!mutated.load(Ordering::SeqCst));
+
+        Ok(())
+    }
+
+    async fn query_events(agent: &Agent, sql: &str) -> eyre::Result<(StatusCode, Vec<QueryEvent>)> {
+        let response = api_v1_queries(
+            Extension(agent.clone()),
+            ConnectInfo("127.0.0.1:22000".parse()?),
+            axum::extract::Query(TimeoutParams { timeout: None }),
+            axum::Json(Statement::Simple(sql.into())),
+        )
+        .await
+        .into_response();
+
+        let status = response.status();
+        let mut body = response.into_body().into_data_stream();
+        let mut bytes = BytesMut::new();
+        while let Some(chunk) = body.next().await {
+            bytes.extend_from_slice(&chunk?);
+        }
+
+        if !status.is_success() {
+            return Ok((status, Vec::new()));
+        }
+
+        let events = std::str::from_utf8(&bytes)?
+            .lines()
+            .map(serde_json::from_str)
+            .collect::<Result<Vec<QueryEvent>, _>>()?;
+        Ok((status, events))
+    }
+
+    async fn query_integer(agent: &Agent, sql: &str) -> eyre::Result<i64> {
+        let (status, events) = query_events(agent, sql).await?;
+        assert_eq!(status, StatusCode::OK);
+        events
+            .into_iter()
+            .find_map(|event| match event {
+                QueryEvent::Row(_, mut values) => match values.remove(0) {
+                    SqliteValue::Integer(value) => Some(value),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .ok_or_else(|| eyre::eyre!("query returned no integer row: {sql}"))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn query_handler_cannot_recycle_connection_state() -> eyre::Result<()> {
+        let (tripwire, _tripwire_worker, _tripwire_tx) = Tripwire::new_simple();
+        let dir = tempfile::tempdir()?;
+        let (agent, _agent_options) = setup(
+            Config::builder()
+                .db_path(dir.path().join("corrosion.db").display().to_string())
+                .gossip_addr("127.0.0.1:0".parse()?)
+                .api_addr("127.0.0.1:0".parse()?)
+                .build()?,
+            tripwire,
+        )
+        .await?;
+
+        {
+            let conn = agent.pool().write_priority().await?;
+            conn.execute_batch(
+                "CREATE TABLE freshness (
+                    id INTEGER PRIMARY KEY NOT NULL,
+                    value INTEGER NOT NULL DEFAULT 0
+                 );
+                 SELECT crsql_as_crr('freshness');
+                 INSERT INTO freshness VALUES (1, 1);",
+            )?;
+        }
+
+        for sql in VALID_READ_QUERY_CASES
+            .iter()
+            .copied()
+            .chain(["SELECT corro_json_contains('{}', '{}')"])
+        {
+            assert_eq!(
+                query_events(&agent, sql).await?.0,
+                StatusCode::OK,
+                "rejected {sql}"
+            );
+        }
+
+        let begin_status = query_events(&agent, "BEGIN").await?.0;
+        let change_value_sql = "SELECT val FROM crsql_changes
+            WHERE \"table\" = 'freshness' AND cid = 'value'
+            ORDER BY db_version DESC, seq DESC LIMIT 1";
+
+        assert_eq!(
+            query_integer(&agent, "SELECT value FROM freshness WHERE id = 1").await?,
+            1
+        );
+        assert_eq!(query_integer(&agent, change_value_sql).await?, 1);
+        {
+            let conn = agent.pool().write_priority().await?;
+            conn.execute("UPDATE freshness SET value = 2 WHERE id = 1", ())?;
+        }
+        assert_eq!(
+            query_integer(&agent, change_value_sql).await?,
+            2,
+            "the handler recycled a stale crsql_changes snapshot"
+        );
+        assert_eq!(
+            query_integer(&agent, "SELECT value FROM freshness WHERE id = 1").await?,
+            2
+        );
+        assert_eq!(begin_status, StatusCode::BAD_REQUEST, "accepted BEGIN");
+
+        for sql in REJECTED_READ_QUERY_CASES
+            .iter()
+            .copied()
+            .filter(|sql| *sql != "BEGIN")
+            .chain([
+                "SELECT crsql_set_ts(1)",
+                "SELECT crsql_as_crr('freshness')",
+                "SELECT crsql_as_table('freshness')",
+            ])
+        {
+            assert_eq!(
+                query_events(&agent, sql).await?.0,
+                StatusCode::BAD_REQUEST,
+                "accepted {sql}"
+            );
+        }
+
+        assert!(query_integer(&agent, "SELECT crsql_db_version()").await? >= 0);
+
+        let conn = agent.pool().read().await?;
+        assert!(conn.is_autocommit());
+        assert_eq!(
+            conn.query_row("PRAGMA query_only", (), |row| row.get::<_, i64>(0))?,
+            0
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM pragma_database_list WHERE name = 'leaked'",
+                (),
+                |row| row.get::<_, i64>(0),
+            )?,
+            0
+        );
+        conn.execute_batch("BEGIN; ROLLBACK")?;
+
+        Ok(())
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn test_api_db_execute() -> eyre::Result<()> {
