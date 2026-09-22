@@ -1192,8 +1192,9 @@ pub async fn process_multiple_changes(
 
         unknown_changes
             .entry(change.actor_id)
-            .and_modify(|(_, per_actor_changes)| per_actor_changes.push((change.clone(), src)))
-            .or_insert_with(|| (booked, vec![(change, src)]));
+            .or_insert_with(|| (booked, vec![]))
+            .1
+            .push((change, src));
     }
     let elapsed = start.elapsed();
     if elapsed >= PROCESSING_WARN_THRESHOLD {
