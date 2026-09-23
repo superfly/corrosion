@@ -143,8 +143,8 @@ pub async fn launch_test_agent<F: FnOnce(ConfigBuilder) -> Result<Config, Config
 /// Launch a test agent with V2 packed mode enabled.
 ///
 /// This sets `metadata-write-version=2`, `metadata-use-version=2`, and `sync-log-version=2`.
-/// The V1→V2 migration is run synchronously during startup (via `run_maintenance_until_done`
-/// in `apply_crsqlite_config`) so the agent starts fully in V2 packed mode.
+/// The database must already be V2-compatible when this is used; startup does not run
+/// a potentially unbounded migration loop.
 ///
 /// Use this for tests that explicitly need V2 packed mode. For running the entire
 /// suite in V2 packed mode, set the three `CORRO_*_VERSION` variables instead.

@@ -443,14 +443,7 @@ fn apply_crsqlite_config(
         try_transition(conn, "metadata-write-version", wv)?;
     }
 
-    // If we're transitioning to use-version 2, we need to run incremental
-    // maintenance until the V1→V2 migration is complete first.
-    // crsql_config_set('metadata-use-version', 2) will error if any
-    // table still has pending migration markers.
     if let Some(uv) = config.metadata_use_version {
-        if uv == 2 {
-            run_maintenance_until_done(conn, clock)?;
-        }
         try_transition(conn, "metadata-use-version", uv)?;
     }
     if let Some(slv) = config.sync_log_version {
@@ -462,40 +455,6 @@ fn apply_crsqlite_config(
 
 /// Run `crsql_incremental_maintenance` in a loop until it returns 0
 /// (no remaining work). This is used during startup to complete the
-/// V1→V2 migration synchronously before transitioning metadata-use-version.
-///
-/// In production, the background maintenance worker handles this asynchronously,
-/// but for tests and deterministic startup we need it done before
-/// the agent starts processing changes.
-fn run_maintenance_until_done(conn: &CrConn, clock: &Arc<uhlc::HLC>) -> eyre::Result<()> {
-    const MAX_ITERATIONS: usize = 1000;
-    const CHUNK_SIZE: i64 = 100_000;
-
-    for i in 0..MAX_ITERATIONS {
-        let ts = Timestamp::from(clock.new_timestamp());
-        conn.execute_batch(&format!("SELECT crsql_set_ts({})", ts.as_u64()))?;
-
-        let remaining: i64 = conn.query_row(
-            "SELECT crsql_incremental_maintenance(?)",
-            [CHUNK_SIZE],
-            |row| row.get(0),
-        )?;
-
-        if remaining == 0 {
-            debug!(iterations = i, "crsqlite V1→V2 migration complete");
-            return Ok(());
-        }
-        debug!(
-            iterations = i,
-            remaining, "crsqlite V1→V2 migration in progress"
-        );
-    }
-
-    Err(eyre::eyre!(
-        "crsqlite V1→V2 migration did not complete after {MAX_ITERATIONS} iterations"
-    ))
-}
-
 fn load_dictionary(file: &mut std::fs::File) -> io::Result<Option<Vec<u8>>> {
     let mut prefix = [0u8; 4];
     let peeked = file.read(&mut prefix)?;

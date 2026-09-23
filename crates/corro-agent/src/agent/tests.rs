@@ -47,8 +47,9 @@ use corro_types::{
     api::{ColumnName, TableName},
     change::row_to_change,
     pubsub::pack_columns,
+    sqlite::CrConn,
 };
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn http_api_requested_endpoint_name_header_enforced() -> eyre::Result<()> {
@@ -2110,11 +2111,27 @@ async fn test_incremental_migration_v1_to_v2() -> eyre::Result<()> {
     tripwire_worker.await;
     wait_for_all_pending_handles().await;
 
+    // Complete migration explicitly in the test before restarting in V2 mode.
+    // Production startup must not perform this unbounded maintenance loop.
+    {
+        let conn = CrConn::init(Connection::open(&db_path)?)?;
+        conn.execute_batch(
+            "SELECT crsql_config_set('default-ts', 1); \
+             SELECT crsql_config_set('metadata-write-version', 2)",
+        )?;
+        for _ in 0..1000 {
+            let remaining: i64 = conn.query_row(
+                "SELECT crsql_incremental_maintenance(?)",
+                [100_000i64],
+                |row| row.get(0),
+            )?;
+            if remaining == 0 {
+                break;
+            }
+        }
+    }
+
     // Restart with V2 packed mode on the same database.
-    // The startup will:
-    // 1. Set metadata-write-version=2 (triggers dual-write)
-    // 2. Run incremental maintenance until V1→V2 migration is complete
-    // 3. Set metadata-use-version=2 and sync-log-version=2
     let (tripwire2, tripwire_worker2, tripwire_tx2) = Tripwire::new_simple();
     {
         tokio::fs::create_dir(&schema_path).await.ok(); // may already exist
