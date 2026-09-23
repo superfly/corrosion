@@ -43,6 +43,58 @@ pub mod command;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+fn rewrite_local_site_id_ordinals(conn: &Connection) -> eyre::Result<()> {
+    let tables: Vec<String> = conn
+        .prepare(
+            "SELECT name FROM sqlite_schema WHERE type = 'table' AND (\
+             name LIKE '%__crsql_clock' OR \
+             name LIKE '%__crsql_v2_clock' OR \
+             name LIKE '%__crsql_v2_tombstones')",
+        )?
+        .query_map([], |row| row.get(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let site_id: Option<[u8; 16]> = conn
+        .query_row(
+            "DELETE FROM crsql_site_id WHERE ordinal = 0 RETURNING site_id;",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+
+    match site_id {
+        Some(site_id) => {
+            let new_ordinal: i64 = conn.query_row(
+                "INSERT INTO crsql_site_id (site_id) VALUES (?) RETURNING ordinal;",
+                [&site_id],
+                |row| row.get(0),
+            )?;
+
+            for table in tables {
+                let n = conn.execute(
+                    &format!("UPDATE \"{table}\" SET site_id = ? WHERE site_id = 0"),
+                    [new_ordinal],
+                )?;
+                debug!("updated {n} rows in {table}");
+            }
+        }
+        None => {
+            for table in tables {
+                let exists = conn.query_row(
+                    &format!("SELECT EXISTS (SELECT 1 FROM \"{table}\" WHERE site_id = 0)"),
+                    [],
+                    |row| row.get::<_, bool>(0),
+                )?;
+                if exists {
+                    eyre::bail!("Site id missing (but has rows in table: {table})");
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 pub static CONFIG: OnceCell<Config> = OnceCell::new();
 pub static API_CLIENT: OnceCell<CorrosionApiClient> = OnceCell::new();
 
@@ -190,48 +242,7 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
                 // that calls a crsqlite function.
                 let conn = CrConn::init(Connection::open(&backup_path)?)?;
 
-                let tables: Vec<String> = conn.prepare("SELECT name FROM sqlite_schema WHERE type = 'table' AND name LIKE '%__crsql_clock'")?.query_map([], |row| row.get(0))?.collect::<Result<Vec<_>, _>>()?;
-
-                let site_id: Option<[u8; 16]> = conn
-                    .query_row(
-                        "DELETE FROM crsql_site_id WHERE ordinal = 0 RETURNING site_id;",
-                        [],
-                        |row| row.get(0),
-                    )
-                    .optional()?;
-
-                match site_id {
-                    Some(site_id) => {
-                        let new_ordinal: i64 = conn.query_row(
-                            "INSERT INTO crsql_site_id (site_id) VALUES (?) RETURNING ordinal;",
-                            [&site_id],
-                            |row| row.get(0),
-                        )?;
-
-                        for table in tables {
-                            let n = conn.execute(
-                                &format!("UPDATE \"{table}\" SET site_id = ? WHERE site_id = 0"),
-                                [new_ordinal],
-                            )?;
-                            debug!("updated {n} rows in {table}");
-                        }
-                    }
-                    None => {
-                        // check if any tables have rows with site_id = 0 and return an error
-                        for table in tables {
-                            let exists = conn.query_row(
-                                &format!(
-                                    "SELECT EXISTS (SELECT 1 FROM \"{table}\" WHERE site_id = 0)"
-                                ),
-                                [],
-                                |row| row.get::<_, bool>(0),
-                            )?;
-                            if exists {
-                                eyre::bail!("Site id missing (but has rows in table: {table})");
-                            }
-                        }
-                    }
-                }
+                rewrite_local_site_id_ordinals(&conn)?;
 
                 // clear __corro_members, this state is per actor
                 conn.execute("DELETE FROM __corro_members;", [])?;
@@ -320,7 +331,15 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
                         warn!("skipping clock table site_id rewrite: ordinal was 0 and therefore did not change");
                     } else {
                         info!("rewriting clock tables site_id");
-                        let tables: Vec<String> = conn.prepare("SELECT name FROM sqlite_schema WHERE type = 'table' AND name LIKE '%__crsql_clock'")?.query_map([], |row| row.get(0))?.collect::<Result<Vec<_>, _>>()?;
+                        let tables: Vec<String> = conn
+                            .prepare(
+                                "SELECT name FROM sqlite_schema WHERE type = 'table' AND (\
+                         name LIKE '%__crsql_clock' OR \
+                         name LIKE '%__crsql_v2_clock' OR \
+                         name LIKE '%__crsql_v2_tombstones')",
+                            )?
+                            .query_map([], |row| row.get(0))?
+                            .collect::<Result<Vec<_>, _>>()?;
 
                         for table in tables {
                             let n = conn.execute(
@@ -1011,8 +1030,65 @@ enum LogCommand {
 
 #[cfg(test)]
 mod tests {
-    use super::vacuum_into;
+    use super::{rewrite_local_site_id_ordinals, vacuum_into};
+    use corro_types::sqlite::CrConn;
     use rusqlite::Connection;
+
+    #[test]
+    fn backup_rewrites_v2_site_ids() -> eyre::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let db_path = temp_dir.path().join("v2.db");
+        let conn = CrConn::init(Connection::open(&db_path)?)?;
+
+        conn.execute_batch(
+            "SELECT crsql_config_set('default-ts', 1);\
+             SELECT crsql_config_set('metadata-write-version', 3);\
+             CREATE TABLE items (id INTEGER PRIMARY KEY NOT NULL, value TEXT);\
+             SELECT crsql_as_crr('items');\
+             INSERT INTO items VALUES (1, 'one');\
+             DELETE FROM items WHERE id = 1;\
+             INSERT INTO items VALUES (2, 'two');\
+             INSERT INTO crsql_site_id(site_id) VALUES (X'01010101010101010101010101010101');\
+             INSERT INTO crsql_site_id(site_id) VALUES (X'02020202020202020202020202020202');",
+        )?;
+
+        let local_site_id: Vec<u8> = conn.query_row(
+            "SELECT site_id FROM crsql_site_id WHERE ordinal = 0",
+            [],
+            |row| row.get(0),
+        )?;
+        rewrite_local_site_id_ordinals(&conn)?;
+
+        let new_ordinal: i64 = conn.query_row(
+            "SELECT ordinal FROM crsql_site_id WHERE site_id = ?",
+            [&local_site_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(new_ordinal, 3);
+
+        let v2_clock_count: i64 =
+            conn.query_row("SELECT count(*) FROM items__crsql_v2_clock", [], |row| {
+                row.get(0)
+            })?;
+        let v2_clock_sites: Vec<i64> = conn
+            .prepare("SELECT DISTINCT site_id FROM items__crsql_v2_clock")?
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        assert!(
+            !v2_clock_sites.is_empty(),
+            "v2 clock count: {v2_clock_count}"
+        );
+        assert!(v2_clock_sites.iter().all(|site| *site == new_ordinal));
+
+        let v2_tombstone_sites: Vec<i64> = conn
+            .prepare("SELECT DISTINCT site_id FROM items__crsql_v2_tombstones")?
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        assert!(!v2_tombstone_sites.is_empty());
+        assert!(v2_tombstone_sites.iter().all(|site| *site == new_ordinal));
+
+        Ok(())
+    }
 
     #[tokio::test]
     async fn vacuum_into_creates_missing_parent_directories() -> eyre::Result<()> {
