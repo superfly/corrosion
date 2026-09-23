@@ -2270,29 +2270,41 @@ async fn test_migration_v2_to_v3() -> eyre::Result<()> {
             assert_eq!(count, 50, "data should be preserved after 2→3 migration");
         }
 
-        // Verify V1 clock tables are dropped and V2 clock tables exist
+        // Run the asynchronous V2-only cleanup explicitly in the test.
         {
-            let conn = ta.agent.pool().read().await?;
-            let v1_clock_exists: bool = conn.query_row(
-                "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='tests3__crsql_clock'",
-                [],
-                |row| row.get(0),
-            )?;
-            assert!(
-                !v1_clock_exists,
-                "V1 clock table should be dropped in V2-only mode"
-            );
-
-            let v2_clock_exists: bool = conn.query_row(
-                "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='tests3__crsql_v2_clock'",
-                [],
-                |row| row.get(0),
-            )?;
-            assert!(
-                v2_clock_exists,
-                "V2 clock table should exist in V2-only mode"
-            );
+            let conn = ta.agent.pool().write_priority().await?;
+            conn.execute_batch("SELECT crsql_config_set('default-ts', 1)")?;
+            for _ in 0..1000 {
+                let remaining: i64 = conn.query_row(
+                    "SELECT crsql_incremental_maintenance(?)",
+                    [100_000i64],
+                    |row| row.get(0),
+                )?;
+                if remaining == 0 {
+                    break;
+                }
+            }
         }
+
+        let conn = ta.agent.pool().read().await?;
+        let v1_clock_exists: bool = conn.query_row(
+            "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='tests3__crsql_clock'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert!(
+            !v1_clock_exists,
+            "V1 clock table should be dropped in V2-only mode"
+        );
+        let v2_clock_exists: bool = conn.query_row(
+            "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='tests3__crsql_v2_clock'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert!(
+            v2_clock_exists,
+            "V2 clock table should exist in V2-only mode"
+        );
 
         // Insert more data in V2-only mode
         insert_rows(ta.agent.clone(), 51, 100).await;
