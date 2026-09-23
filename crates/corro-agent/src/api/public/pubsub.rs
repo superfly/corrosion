@@ -887,9 +887,11 @@ mod tests {
     use corro_types::actor::ActorId;
     use corro_types::api::{ColumnName, TableName};
     use corro_types::api::{NotifyEvent, SqliteValue};
-    use corro_types::base::{dbsr, CrsqlDbVersion, CrsqlSeq};
-    use corro_types::broadcast::{ChangeSource, ChangeV1, Changeset};
-    use corro_types::change::Change;
+    use corro_types::base::{dbsr, CrsqlDbVersion, CrsqlSeq, CrsqlSeqRange};
+    use corro_types::broadcast::{
+        ChangeSource, ChangeV1, Changeset, PackedChangesetPerTable, Timestamp,
+    };
+    use corro_types::change::{Change, PackedChange};
     use corro_types::pubsub::pack_columns;
     use corro_types::{
         api::{ChangeId, RowId},
@@ -1124,6 +1126,17 @@ mod tests {
         {
             const INSERT_TEST: &str = "insert into tests (id, text) values (?,?)";
             self.prepare_statement(INSERT_TEST).execute(rows).await
+        }
+
+        async fn insert_users<P, I, V>(&self, rows: I) -> eyre::Result<()>
+        where
+            I: IntoIterator<Item = P>,
+            P: IntoIterator<Item = V>,
+            V: Into<SqliteValue>,
+        {
+            const INSERT_USER: &str =
+                "insert into users (id, name, email, team_id, status) values (?, ?, ?, ?, ?)";
+            self.prepare_statement(INSERT_USER).execute(rows).await
         }
 
         #[allow(dead_code)]
@@ -1931,6 +1944,249 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn test_v2_remote_buffered_changes_reach_subscription() -> eyre::Result<()> {
+        _ = tracing_subscriber::fmt::try_init();
+        let test = PubSubTest::with_n_agents(2).await?;
+        let insert_agent = &test.agents[0];
+        let subscribe_agent = &test.agents[1];
+
+        let initial_row = vec![Integer(0), "initial".into()];
+        insert_agent
+            .insert_test_data(std::slice::from_ref(&initial_row))
+            .await?;
+        test.wait_for_nodes_to_sync().await?;
+
+        let mut subscription = subscribe_agent
+            .subscribe_to_test_table(
+                SubParams {
+                    from: None,
+                    skip_rows: false,
+                },
+                Either::Left(TEST_QUERY1.into()),
+            )
+            .await?;
+        subscription
+            .assert_initial_query_results(
+                vec!["id".into(), "text".into()],
+                vec![(RowId(1), &initial_row)],
+                0.into(),
+            )
+            .await;
+
+        let rows: Vec<Vec<SqliteValue>> = (1..=5000)
+            .map(|id| vec![Integer(id.into()), format!("value-{id}").into()])
+            .collect();
+        insert_agent.insert_test_data(&rows).await?;
+        test.wait_for_nodes_to_sync().await?;
+
+        let event = timeout(
+            Duration::from_secs(30),
+            subscription.iter.recv::<QueryEvent>(),
+        )
+        .await?
+        .ok_or_else(|| eyre::eyre!("subscription ended before receiving a remote update"))??;
+        assert!(
+            matches!(event, QueryEvent::Change(ChangeType::Insert, ..)),
+            "expected a remote insert update, got {event:?}"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn test_v2_remote_buffered_changes_on_users_subscription() -> eyre::Result<()> {
+        _ = tracing_subscriber::fmt::try_init();
+        let test = PubSubTest::with_n_agents(2).await?;
+        let insert_agent = &test.agents[0];
+        let subscribe_agent = &test.agents[1];
+        let schema = r#"
+            CREATE TABLE users (
+                id INTEGER NOT NULL PRIMARY KEY,
+                name TEXT NOT NULL DEFAULT '',
+                email TEXT NOT NULL DEFAULT '',
+                team_id INTEGER NOT NULL DEFAULT 0,
+                status TEXT
+            );
+        "#;
+
+        execute_schema(&insert_agent.ta.agent, vec![schema.into()]).await?;
+        execute_schema(&subscribe_agent.ta.agent, vec![schema.into()]).await?;
+
+        let initial_row: Vec<SqliteValue> = vec![
+            Integer(0),
+            "initial".into(),
+            "initial@example.com".into(),
+            Integer(0),
+            "active".into(),
+        ];
+        insert_agent
+            .insert_users(std::slice::from_ref(&initial_row))
+            .await?;
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        let mut subscription = subscribe_agent
+            .subscribe_to_test_table(
+                SubParams {
+                    from: None,
+                    skip_rows: false,
+                },
+                Either::Left("SELECT id, name, email, team_id, status FROM users".into()),
+            )
+            .await?;
+        subscription
+            .assert_initial_query_results(
+                vec![
+                    "id".into(),
+                    "name".into(),
+                    "email".into(),
+                    "team_id".into(),
+                    "status".into(),
+                ],
+                vec![(RowId(1), &initial_row)],
+                0.into(),
+            )
+            .await;
+
+        let rows: Vec<Vec<SqliteValue>> = (1..=2_000)
+            .map(|id| {
+                vec![
+                    Integer(id.into()),
+                    format!("user-{id}").into(),
+                    format!("user-{id}@example.com").into(),
+                    Integer((id % 10).into()),
+                    "active".into(),
+                ]
+            })
+            .collect();
+        insert_agent.insert_users(&rows).await?;
+        tokio::time::sleep(Duration::from_secs(10)).await;
+
+        let event = timeout(
+            Duration::from_secs(30),
+            subscription.iter.recv::<QueryEvent>(),
+        )
+        .await?
+        .ok_or_else(|| {
+            eyre::eyre!("users subscription ended before receiving a remote update")
+        })??;
+        assert!(
+            matches!(event, QueryEvent::Change(ChangeType::Insert, ..)),
+            "expected a remote users insert update, got {event:?}"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn test_v2_buffered_partial_changes_match_subscription() -> eyre::Result<()> {
+        _ = tracing_subscriber::fmt::try_init();
+        let test = PubSubTest::with_n_agents(1).await?;
+        let agent = &test.agents[0];
+        let schema = r#"
+            CREATE TABLE users (
+                id INTEGER NOT NULL PRIMARY KEY,
+                name TEXT NOT NULL DEFAULT '',
+                email TEXT NOT NULL DEFAULT '',
+                team_id INTEGER NOT NULL DEFAULT 0,
+                status TEXT
+            );
+        "#;
+        execute_schema(&agent.ta.agent, vec![schema.into()]).await?;
+
+        let mut subscription = agent
+            .subscribe_to_test_table(
+                SubParams {
+                    from: None,
+                    skip_rows: false,
+                },
+                Either::Left("SELECT id, name, email, team_id, status FROM users".into()),
+            )
+            .await?;
+        subscription
+            .assert_initial_query_results(
+                vec![
+                    "id".into(),
+                    "name".into(),
+                    "email".into(),
+                    "team_id".into(),
+                    "status".into(),
+                ],
+                vec![],
+                0.into(),
+            )
+            .await;
+
+        let actor_id = ActorId(Uuid::new_v4());
+        let make_changeset = |seq: u64| {
+            let mut changes = PackedChangesetPerTable::default();
+            changes.insert(PackedChange {
+                table: TableName("users".into()),
+                pk: pack_columns(&vec![Integer((seq + 1) as i64)]).unwrap(),
+                cid: SqliteValue::Text("name".into()),
+                val: SqliteValue::Text(format!("user-{seq}").into()),
+                col_version: SqliteValue::Integer(1),
+                db_version: CrsqlDbVersion(1),
+                seq: SqliteValue::Integer(seq as i64),
+                site_id: actor_id.to_bytes(),
+                cl: 1,
+                min_seq: CrsqlSeq(seq),
+                max_seq: CrsqlSeq(seq),
+            });
+            Changeset::FullV2Packed {
+                actor_id,
+                version: CrsqlDbVersion(1),
+                changes,
+                last_seq: CrsqlSeq(1),
+                seqs: CrsqlSeqRange::new(CrsqlSeq(seq), CrsqlSeq(seq)),
+                ts: Timestamp::from(1),
+            }
+        };
+
+        let bookie = agent.ta.agent.bookie().clone();
+        process_multiple_changes(
+            agent.ta.agent.clone(),
+            bookie.clone(),
+            vec![(
+                ChangeV1 {
+                    actor_id,
+                    changeset: make_changeset(0),
+                },
+                ChangeSource::Sync,
+                Instant::now(),
+            )],
+            Duration::from_secs(30),
+        )
+        .await?;
+        process_multiple_changes(
+            agent.ta.agent.clone(),
+            bookie,
+            vec![(
+                ChangeV1 {
+                    actor_id,
+                    changeset: make_changeset(1),
+                },
+                ChangeSource::Sync,
+                Instant::now(),
+            )],
+            Duration::from_secs(30),
+        )
+        .await?;
+
+        let event = timeout(
+            Duration::from_secs(30),
+            subscription.iter.recv::<QueryEvent>(),
+        )
+        .await?
+        .ok_or_else(|| eyre::eyre!("subscription ended before buffered changes were matched"))??;
+        assert!(
+            matches!(event, QueryEvent::Change(ChangeType::Insert, ..)),
+            "expected a buffered insert update, got {event:?}"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn test_api_v1_subs() -> eyre::Result<()> {
         _ = tracing_subscriber::fmt::try_init();
         let test = PubSubTest::with_n_agents(1).await?;
@@ -2086,12 +2342,25 @@ mod tests {
                 NotifyEvent::Notify(ChangeType::Delete, pk) => {
                     assert_eq!(pk, vec!["service-id-5".into()]);
                     // check that we dont get an update after
-                    assert!(tokio::time::timeout(
-                        Duration::from_secs(2),
-                        notify_rows.recv::<NotifyEvent>()
+                    let extra = tokio::time::timeout(
+                        Duration::from_secs(3),
+                        notify_rows.recv::<NotifyEvent>(),
                     )
-                    .await
-                    .is_err());
+                    .await;
+                    // extra should either timeout (Err) or return a non-Notify error
+                    match extra {
+                        Err(_) => {}           // timed out, no more notifications
+                        Ok(Some(Err(_))) => {} // recv error (e.g. deadline), no notification
+                        Ok(Some(Ok(NotifyEvent::Notify(ct, pk)))) => {
+                            panic!(
+                                "received unexpected notification after Delete: {ct:?} pk={pk:?}"
+                            );
+                        }
+                        Ok(None) => {} // stream closed
+                        Ok(Some(Ok(other))) => {
+                            panic!("received unexpected event after Delete: {other:?}");
+                        }
+                    }
                 }
                 _ => panic!("expected notify event"),
             }

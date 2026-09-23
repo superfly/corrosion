@@ -48,7 +48,7 @@ RUN --mount=type=cache,target=/usr/local/cargo,from=rust:bookworm,source=/usr/lo
     cargo build --release --features running_in_antithesis && mv target/release/corrosion ./ && mv target/release/rust-load-generator ./
 
 # Runtime image
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 
 RUN apt update && apt install -y sqlite3 sqlite3-tools watch socat iproute2 gettext-base ca-certificates supervisor && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /usr/local/bin/consul /usr/src/app/corrosion /usr/src/app/rust-load-generator /usr/local/bin/
