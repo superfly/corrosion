@@ -453,8 +453,6 @@ fn apply_crsqlite_config(
     Ok(())
 }
 
-/// Run `crsql_incremental_maintenance` in a loop until it returns 0
-/// (no remaining work). This is used during startup to complete the
 fn load_dictionary(file: &mut std::fs::File) -> io::Result<Option<Vec<u8>>> {
     let mut prefix = [0u8; 4];
     let peeked = file.read(&mut prefix)?;
