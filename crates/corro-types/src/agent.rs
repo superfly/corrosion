@@ -416,10 +416,15 @@ impl Broadcaster {
 pub fn migrate(clock: Arc<uhlc::HLC>, conn: &mut Connection) -> rusqlite::Result<()> {
     let migrations: Vec<Box<dyn Migration>> = vec![
         Box::new(init_migration as fn(&Transaction) -> rusqlite::Result<()>),
-        Box::new(crsqlite_v0_17_migration(clock)),
+        Box::new(crsqlite_v0_17_migration(clock.clone())),
+        Box::new(buffered_changes_min_max_seq_migration),
+        Box::new(buffered_changes_nullable_col_version_migration),
     ];
 
-    crate::sqlite::migrate(conn, migrations)
+    // Set the ts from the node's HLC so migration timestamps overlap with
+    // the clock used by make_broadcastable_changes and other write paths.
+    let ts = Timestamp::from(clock.new_timestamp());
+    crate::sqlite::migrate(conn, migrations, Some(ts))
 }
 
 fn init_migration(tx: &Transaction) -> rusqlite::Result<()> {
@@ -452,17 +457,19 @@ fn init_migration(tx: &Transaction) -> rusqlite::Result<()> {
             CREATE TABLE __corro_buffered_changes (
                 "table" TEXT NOT NULL,
                 pk BLOB NOT NULL,
-                cid TEXT NOT NULL,
-                val ANY, -- shouldn't matter I don't think
-                col_version INTEGER NOT NULL,
+                cid ANY NOT NULL, -- SqliteValue: TEXT for V1/tombstones, BLOB for packed V2
+                val ANY, -- SqliteValue preserves the SQLite value type from the wire
+                col_version ANY, -- SqliteValue: INTEGER/BLOB/NULL for packed V2, pk-only, and hash tombstones
                 db_version INTEGER NOT NULL,
                 site_id BLOB NOT NULL, -- this differs from crsql_changes, we'll never buffer our own
-                seq INTEGER NOT NULL,
+                seq ANY NOT NULL, -- SqliteValue: INTEGER for V1, packed BLOB for V2
+                min_seq INTEGER NOT NULL, -- min scalar seq in packed blob (V2); same as seq for V1
+                max_seq INTEGER NOT NULL, -- max scalar seq in packed blob (V2); same as seq for V1
                 cl INTEGER NOT NULL, -- causal length
-                ts TEXT NOT NULL,
+                ts ANY NOT NULL, -- Timestamp currently serializes as TEXT; keep this rollback-compatible
 
                 PRIMARY KEY (site_id, db_version, seq)
-            ) WITHOUT ROWID;
+            ) WITHOUT ROWID, STRICT;
 
             -- SWIM memberships
             CREATE TABLE __corro_members (
@@ -586,6 +593,89 @@ fn crsqlite_v0_17_migration(
 //         Ok(())
 //     }
 // }
+
+/// Add `min_seq` and `max_seq` columns to `__corro_buffered_changes` so that
+/// partial sync can filter buffered rows by seq overlap without unpacking
+/// the packed `seq` BLOB. For existing rows, both columns are set to `seq`
+/// (which is correct for V1 scalar seqs; V2 packed rows in existing DBs are
+/// transient and will be re-buffered with proper values).
+fn buffered_changes_min_max_seq_migration(tx: &Transaction) -> rusqlite::Result<()> {
+    // Check if columns already exist (idempotent)
+    let has_min_seq: bool = tx
+        .prepare("SELECT COUNT(*) FROM pragma_table_info('__corro_buffered_changes') WHERE name = 'min_seq'")?
+        .query_row([], |row| row.get(0))?;
+    if has_min_seq {
+        return Ok(());
+    }
+
+    tx.execute_batch(
+        r#"
+        ALTER TABLE __corro_buffered_changes ADD COLUMN min_seq INTEGER;
+        ALTER TABLE __corro_buffered_changes ADD COLUMN max_seq INTEGER;
+        UPDATE __corro_buffered_changes SET min_seq = seq, max_seq = seq;
+        "#,
+    )?;
+
+    Ok(())
+}
+
+/// Rebuild `__corro_buffered_changes` for databases created before
+/// `col_version` was made nullable. SQLite cannot drop a NOT NULL constraint
+/// with ALTER TABLE, so preserve the rows while replacing the table definition.
+fn buffered_changes_nullable_col_version_migration(tx: &Transaction) -> rusqlite::Result<()> {
+    let col_version_not_null: bool = tx
+        .prepare(
+            r#"SELECT COALESCE((SELECT "notnull" FROM pragma_table_info('__corro_buffered_changes') WHERE name = 'col_version'), 0)"#,
+        )?
+        .query_row([], |row| row.get(0))?;
+    if !col_version_not_null {
+        return Ok(());
+    }
+
+    tx.execute_batch(
+        r#"
+        ALTER TABLE __corro_buffered_changes RENAME TO __corro_buffered_changes_old;
+
+        CREATE TABLE __corro_buffered_changes (
+            "table" TEXT NOT NULL,
+            pk BLOB NOT NULL,
+            cid ANY NOT NULL, -- SqliteValue: TEXT for V1/tombstones, BLOB for packed V2
+            val ANY, -- SqliteValue preserves the SQLite value type from the wire
+            col_version ANY, -- SqliteValue: INTEGER/BLOB/NULL for packed V2, pk-only, and hash tombstones
+            db_version INTEGER NOT NULL,
+            site_id BLOB NOT NULL,
+            seq ANY NOT NULL, -- SqliteValue: INTEGER for V1, packed BLOB for V2
+            min_seq INTEGER NOT NULL,
+            max_seq INTEGER NOT NULL,
+            cl INTEGER NOT NULL,
+            ts ANY NOT NULL, -- Preserve the Timestamp representation for rollback compatibility(TEXT in v1, INTEGER in v2)
+
+            PRIMARY KEY (site_id, db_version, seq)
+        ) WITHOUT ROWID, STRICT;
+
+        INSERT INTO __corro_buffered_changes
+            ("table", pk, cid, val, col_version, db_version, site_id, seq, min_seq, max_seq, cl, ts)
+        SELECT
+            "table", pk, cid, val, col_version, db_version, site_id, seq,
+            CASE
+                WHEN typeof(min_seq) = 'integer' THEN min_seq
+                WHEN typeof(seq) = 'integer' THEN seq
+                ELSE 0
+            END,
+            CASE
+                WHEN typeof(max_seq) = 'integer' THEN max_seq
+                WHEN typeof(seq) = 'integer' THEN seq
+                ELSE 0
+            END,
+            cl, ts
+        FROM __corro_buffered_changes_old;
+
+        DROP TABLE __corro_buffered_changes_old;
+        "#,
+    )?;
+
+    Ok(())
+}
 
 #[derive(Debug, Clone)]
 pub struct SplitPool(Arc<SplitPoolInner>);
@@ -899,6 +989,79 @@ where
     timeout(duration, fut)
         .await
         .map_err(|_| PoolError::TimedOut { op: op.to_string() })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn buffered_changes_migration_drops_col_version_constraint() -> rusqlite::Result<()> {
+        let conn = rusqlite_to_crsqlite(Connection::open_in_memory()?);
+        let mut conn = conn?;
+        setup_conn(&conn)?;
+        conn.execute_batch("SELECT crsql_config_set('default-ts', 1)")?;
+        conn.execute_batch(
+            r#"
+            CREATE TABLE __corro_state (key TEXT NOT NULL PRIMARY KEY, value);
+            INSERT INTO __corro_state (key, value) VALUES ('schema_version', 3);
+
+            CREATE TABLE __corro_buffered_changes (
+                "table" TEXT NOT NULL,
+                pk BLOB NOT NULL,
+                cid TEXT NOT NULL,
+                val ANY,
+                col_version INTEGER NOT NULL,
+                db_version INTEGER NOT NULL,
+                site_id BLOB NOT NULL,
+                seq INTEGER NOT NULL,
+                min_seq INTEGER,
+                max_seq INTEGER,
+                cl INTEGER NOT NULL,
+                ts TEXT NOT NULL,
+                PRIMARY KEY (site_id, db_version, seq)
+            ) WITHOUT ROWID;
+
+            INSERT INTO __corro_buffered_changes
+                ("table", pk, cid, val, col_version, db_version, site_id, seq, min_seq, max_seq, cl, ts)
+            VALUES ('tests', X'01', 'text', NULL, 1, 2, X'02', 3, NULL, NULL, 1, '1');
+            "#,
+        )?;
+
+        migrate(Arc::new(uhlc::HLC::default()), &mut conn)?;
+
+        let columns: Vec<(String, i64)> = conn
+            .prepare("SELECT name, \"notnull\" FROM pragma_table_info('__corro_buffered_changes')")?
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let notnull = |name: &str| {
+            columns
+                .iter()
+                .find(|(column, _)| column == name)
+                .map(|(_, value)| *value)
+        };
+
+        assert_eq!(notnull("col_version"), Some(0));
+        assert_eq!(notnull("min_seq"), Some(1));
+        assert_eq!(notnull("max_seq"), Some(1));
+
+        let preserved: (String, Option<i64>, i64, i64, String) = conn.query_row(
+            "SELECT \"table\", col_version, min_seq, max_seq, ts FROM __corro_buffered_changes",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )?;
+        assert_eq!(preserved, ("tests".into(), Some(1), 3, 3, "1".into()));
+
+        Ok(())
+    }
 }
 
 pub struct WriteConn {

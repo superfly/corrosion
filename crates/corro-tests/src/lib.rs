@@ -5,7 +5,7 @@ use corro_agent::agent::start_with_config;
 pub use corro_client::{CorrosionApiClient, CorrosionClient};
 use corro_types::{
     agent::{Agent, Bookie},
-    config::{Config, ConfigBuilder, ConfigBuilderError},
+    config::{Config, ConfigBuilder, ConfigBuilderError, CrsqliteConfig},
     sqlite::{rusqlite_to_crsqlite, SqlitePool},
 };
 use tripwire::Tripwire;
@@ -63,18 +63,61 @@ pub struct TestAgent {
     pub config: Config,
 }
 
+/// When any of these variables is set, all `launch_test_agent` calls use the
+/// supplied cr-sqlite versions. Leave all three unset to run in the default V1
+/// mode. This allows configuring each format version explicitly in CI without
+/// modifying individual tests.
+///
+/// Usage:
+/// - `CORRO_METADATA_WRITE_VERSION=2 CORRO_METADATA_USE_VERSION=2 \
+///    CORRO_SYNC_LOG_VERSION=2 cargo test -p corro-agent` (dual-write)
+/// - `CORRO_METADATA_WRITE_VERSION=3 CORRO_METADATA_USE_VERSION=2 \
+///    CORRO_SYNC_LOG_VERSION=2 cargo test -p corro-agent` (V2-only)
+pub const ENV_METADATA_WRITE_VERSION: &str = "CORRO_METADATA_WRITE_VERSION";
+pub const ENV_METADATA_USE_VERSION: &str = "CORRO_METADATA_USE_VERSION";
+pub const ENV_SYNC_LOG_VERSION: &str = "CORRO_SYNC_LOG_VERSION";
+
+pub fn test_crsqlite_config() -> Option<CrsqliteConfig> {
+    let parse_version = |name| std::env::var(name).ok()?.parse().ok();
+    let metadata_write_version = parse_version(ENV_METADATA_WRITE_VERSION);
+    let metadata_use_version = parse_version(ENV_METADATA_USE_VERSION);
+    let sync_log_version = parse_version(ENV_SYNC_LOG_VERSION);
+
+    (metadata_write_version.is_some()
+        || metadata_use_version.is_some()
+        || sync_log_version.is_some())
+    .then_some(CrsqliteConfig {
+        metadata_write_version,
+        metadata_use_version,
+        sync_log_version,
+    })
+}
+
+pub fn is_v2_mode() -> bool {
+    test_crsqlite_config().is_some()
+}
+
 pub fn test_config<F: FnOnce(ConfigBuilder) -> Result<Config, ConfigBuilderError>>(
     f: F,
 ) -> eyre::Result<(TempDir, Config)> {
     let tmpdir = TempDir::new(tempfile::tempdir()?);
     let schema_path = tmpdir.path().join("schema");
 
-    let conf = f(Config::builder()
+    let builder = Config::builder()
         .api_addr("127.0.0.1:0".parse()?)
         .gossip_addr("127.0.0.1:0".parse()?)
         .admin_path(tmpdir.path().join("admin.sock").display().to_string())
         .db_path(tmpdir.path().join("corrosion.db").display().to_string())
-        .add_schema_path(schema_path.display().to_string()))?;
+        .add_schema_path(schema_path.display().to_string());
+
+    // Apply explicit cr-sqlite versions when configured for CI.
+    let builder = if let Some(crsqlite_config) = test_crsqlite_config() {
+        builder.crsqlite(crsqlite_config)
+    } else {
+        builder
+    };
+
+    let conf = f(builder)?;
 
     std::fs::create_dir(&schema_path)?;
     std::fs::write(schema_path.join("tests.sql"), TEST_SCHEMA.as_bytes())?;
@@ -95,6 +138,33 @@ pub async fn launch_test_agent<F: FnOnce(ConfigBuilder) -> Result<Config, Config
         tmpdir: Arc::new(tmpdir),
         config: conf,
     })
+}
+
+/// Launch a test agent with V2 packed mode enabled.
+///
+/// This sets `metadata-write-version=2`, `metadata-use-version=2`, and `sync-log-version=2`.
+/// The database must already be V2-compatible when this is used; startup does not run
+/// a potentially unbounded migration loop.
+///
+/// Use this for tests that explicitly need V2 packed mode. For running the entire
+/// suite in V2 packed mode, set the three `CORRO_*_VERSION` variables instead.
+pub async fn launch_test_agent_v2<
+    F: FnOnce(ConfigBuilder) -> Result<Config, ConfigBuilderError>,
+>(
+    f: F,
+    tripwire: Tripwire,
+) -> eyre::Result<TestAgent> {
+    launch_test_agent(
+        |conf| {
+            f(conf.crsqlite(CrsqliteConfig {
+                metadata_write_version: Some(2),
+                metadata_use_version: Some(2),
+                sync_log_version: Some(2),
+            }))
+        },
+        tripwire,
+    )
+    .await
 }
 
 impl TestAgent {

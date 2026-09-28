@@ -10,7 +10,7 @@ if [[ -z "$TAG" ]]; then
     exit 1
 fi
 
-oses=("darwin-aarch64" "linux-aarch64" "linux-x86_64")
+oses=("darwin-aarch64" "darwin-x86_64" "linux-aarch64" "linux-x86_64")
 
 for os in "${oses[@]}"; do
     if [[ $os == *"darwin"* ]]; then
