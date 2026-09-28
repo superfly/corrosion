@@ -1024,6 +1024,7 @@ pub async fn apply_buffered_version_in_chunks(
                 bookedw
                     .clear_partials(&tx, RangeInclusiveSet::from([version..=version]))
                     .map_err(rusqlite_err)?;
+                info!(%actor_id, %version, "cleared completed buffered version");
             }
 
             tx.commit().map_err(rusqlite_err)?;
@@ -1198,6 +1199,7 @@ pub async fn process_fully_buffered_changes(
                     actor_id: Some(actor_id),
                     version: Some(version),
                 })?;
+            info!(%actor_id, %version, "cleared completed buffered version");
 
             tx.commit().map_err(|source| ChangeError::Rusqlite {
                 source,
@@ -1671,8 +1673,12 @@ pub fn process_incomplete_version<T: Deref<Target = rusqlite::Connection> + Comm
                 ":ts_arr": unnest_param(changes.iter().map(|_| ts)),
             },
             |row| row.get::<_, String>(0),
-        )?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
+        )
+        .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>())
+        .map_err(|error| {
+            error!(%actor_id, %version, ?changes, error = %error, "failed to insert rows into __corro_buffered_changes");
+            error
+        })?;
 
     let inserted = table_names.len();
     for table_name in table_names {
