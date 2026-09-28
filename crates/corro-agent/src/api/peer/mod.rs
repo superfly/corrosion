@@ -913,22 +913,24 @@ fn send_change_chunks<I: Iterator<Item = rusqlite::Result<Change>>>(
             Some(Ok((changes, seqs))) => {
                 let start = Instant::now();
 
-                if changes.is_empty() && seqs.start() == CrsqlSeq(0) && seqs.end() == last_seq {
-                    warn!(%actor_id, %version, "got an empty changes we should've had");
-                    return Ok(());
-                } else {
-                    sender.blocking_send(SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
-                        actor_id,
-                        changeset: Changeset::FullV2 {
-                            actor_id,
-                            version,
-                            changes,
-                            seqs,
-                            last_seq,
-                            ts,
-                        },
-                    })))?;
+                if changes.is_empty() {
+                    info!(%actor_id, %version, ?seqs, %last_seq, "sending empty sync changeset");
+                    if seqs.start() == CrsqlSeq(0) && seqs.end() == last_seq {
+                        return Ok(());
+                    }
                 }
+
+                sender.blocking_send(SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
+                    actor_id,
+                    changeset: Changeset::FullV2 {
+                        actor_id,
+                        version,
+                        changes,
+                        seqs,
+                        last_seq,
+                        ts,
+                    },
+                })))?;
 
                 let elapsed = start.elapsed();
 
@@ -980,22 +982,24 @@ fn send_packed_change_chunks<I: Iterator<Item = rusqlite::Result<PackedChange>>>
                 let chunk_rows: usize = changes.count().values().sum();
                 total_rows_sent += chunk_rows;
 
-                if changes.is_empty() && seqs.start() == CrsqlSeq(0) && seqs.end() == last_seq {
-                    warn!(%actor_id, %version, "got an empty packed changes we should've had");
-                    return Ok(());
-                } else {
-                    sender.blocking_send(SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
-                        actor_id,
-                        changeset: Changeset::FullV2Packed {
-                            actor_id,
-                            version,
-                            changes,
-                            seqs,
-                            last_seq,
-                            ts,
-                        },
-                    })))?;
+                if changes.is_empty() {
+                    info!(%actor_id, %version, ?seqs, %last_seq, "sending empty packed sync changeset");
+                    if seqs.start() == CrsqlSeq(0) && seqs.end() == last_seq {
+                        return Ok(());
+                    }
                 }
+
+                sender.blocking_send(SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
+                    actor_id,
+                    changeset: Changeset::FullV2Packed {
+                        actor_id,
+                        version,
+                        changes,
+                        seqs,
+                        last_seq,
+                        ts,
+                    },
+                })))?;
 
                 let elapsed = start.elapsed();
 
