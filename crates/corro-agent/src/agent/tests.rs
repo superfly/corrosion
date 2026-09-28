@@ -1005,6 +1005,140 @@ async fn test_clear_empty_versions() -> eyre::Result<()> {
     Ok(())
 }
 
+/// Reproduces the sync failure caused by a V2 tombstone carrying a NULL
+/// col_version. The missing tombstone is requested through the real QUIC sync
+/// path after the target has received the preceding sequence.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn v2_tombstones_can_be_inserted_into_buffered_changes() -> eyre::Result<()> {
+    _ = tracing_subscriber::fmt::try_init();
+
+    let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
+    let source = launch_test_agent_v2(|conf| conf.build(), tripwire.clone()).await?;
+    let target = launch_test_agent_v2(|conf| conf.build(), tripwire.clone()).await?;
+    let actor_id = source.agent.actor_id();
+    let (status, _) = api_v1_transactions(
+        Extension(source.agent.clone()),
+        axum::extract::Query(TimeoutParams { timeout: None }),
+        axum::Json(vec![Statement::WithParams(
+            "INSERT INTO tests (id, text) VALUES (?, ?)".into(),
+            vec![1.into(), "existing".into()],
+        )]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, _) = api_v1_transactions(
+        Extension(source.agent.clone()),
+        axum::extract::Query(TimeoutParams { timeout: None }),
+        axum::Json(vec![
+            Statement::WithParams(
+                "INSERT INTO tests (id, text) VALUES (?, ?)".into(),
+                vec![2.into(), "new".into()],
+            ),
+            Statement::Simple("DELETE FROM tests WHERE id = 1".into()),
+        ]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (version, tombstone_seq, tombstone_cid, col_version): (
+        CrsqlDbVersion,
+        CrsqlSeq,
+        String,
+        Option<i64>,
+    ) = source.agent.pool().read().await?.query_row(
+        r#"
+        SELECT db_version, seq, CAST(cid AS TEXT), NULL
+        FROM crsql_changes
+        WHERE typeof(col_version) = 'null'
+        ORDER BY db_version DESC, seq DESC
+        LIMIT 1
+        "#,
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    )?;
+    assert!(
+        tombstone_seq.0 > 0,
+        "tombstone must follow an earlier sequence"
+    );
+    assert_eq!(
+        col_version, None,
+        "expected the V2 tombstone fixture to have NULL col_version"
+    );
+
+    // Send the preceding rows through the normal processing path, leaving the
+    // tombstone sequence as the gap requested through parallel_sync below.
+    let seed_rows = get_rows(
+        source.agent.clone(),
+        vec![(
+            version..=version,
+            Some(CrsqlSeq(0)..=CrsqlSeq(tombstone_seq.0 - 1)),
+        )],
+    )
+    .await?;
+    process_multiple_changes(
+        target.agent.clone(),
+        target.bookie.clone(),
+        seed_rows,
+        Duration::from_secs(60),
+    )
+    .await?;
+
+    let (rtt_tx, _rtt_rx) = mpsc::channel(1024);
+    let target_transport = Transport::new(&target.agent.config().gossip, rtt_tx).await?;
+    parallel_sync(
+        &target.agent,
+        &target_transport,
+        vec![(source.agent.actor_id(), source.agent.gossip_addr())],
+        generate_sync(&target.bookie, target.agent.actor_id()).await,
+    )
+    .await?;
+
+    let mut received_tombstone = false;
+    for _ in 0..40 {
+        let conn = target.agent.pool().read().await?;
+        let tombstone_count: u64 = conn
+            .prepare_cached(
+                r#"
+                SELECT
+                    (SELECT COUNT(*) FROM crsql_changes
+                     WHERE site_id = ? AND db_version = ? AND seq = ? AND CAST(cid AS TEXT) = ?)
+                  + (SELECT COUNT(*) FROM __corro_buffered_changes
+                     WHERE site_id = ? AND db_version = ? AND max_seq = ? AND CAST(cid AS TEXT) = ?)
+                "#,
+            )?
+            .query_row(
+                (
+                    actor_id.as_bytes(),
+                    version,
+                    tombstone_seq,
+                    &tombstone_cid,
+                    actor_id.as_bytes(),
+                    version,
+                    tombstone_seq,
+                    &tombstone_cid,
+                ),
+                |row| row.get(0),
+            )?;
+        if tombstone_count > 0 {
+            received_tombstone = true;
+            break;
+        }
+        drop(conn);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    assert!(
+        received_tombstone,
+        "official sync dropped the V2 tombstone after the buffered insert"
+    );
+
+    tripwire_tx.send(()).await.ok();
+    tripwire_worker.await;
+    wait_for_all_pending_handles().await;
+
+    Ok(())
+}
 /// V1-only test: verifies that a change with a nonexistent column causes the
 /// entire version to be rejected. In V2 mode, cr-sqlite handles column
 /// validation differently (via __crsql_v2_col_map integer IDs) and may not
