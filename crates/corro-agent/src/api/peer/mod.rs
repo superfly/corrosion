@@ -389,7 +389,7 @@ fn handle_need(
     need: SyncNeedV1,
     sender: &Sender<SyncMessage>,
 ) -> eyre::Result<()> {
-    debug!(%actor_id, "handle known versions! need: {need:?}");
+    info!(%actor_id, ?need, "handling sync version request");
 
     let mut empties: RangeInclusiveSet<CrsqlDbVersion> = RangeInclusiveSet::new();
 
@@ -915,6 +915,7 @@ fn send_change_chunks<I: Iterator<Item = rusqlite::Result<Change>>>(
                     }
                 }
 
+                info!(%actor_id, %version, ?seqs, %last_seq, rows = changes.len(), "sending sync changeset chunk");
                 sender.blocking_send(SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
                     actor_id,
                     changeset: Changeset::FullV2 {
@@ -978,21 +979,24 @@ fn send_packed_change_chunks<I: Iterator<Item = rusqlite::Result<PackedChange>>>
                 total_rows_sent += chunk_rows;
 
                 if changes.is_empty() && seqs.is_empty() {
-                    warn!(%actor_id, %version, "got an empty packed changes we should've had");
-                    return Ok(());
-                } else {
-                    sender.blocking_send(SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
-                        actor_id,
-                        changeset: Changeset::FullV2Packed {
-                            actor_id,
-                            version,
-                            changes,
-                            seqs,
-                            last_seq,
-                            ts,
-                        },
-                    })))?;
+                    info!(%actor_id, %version, ?seqs, %last_seq, "sending empty packed sync changeset");
+                    if seqs.start() == CrsqlSeq(0) && seqs.end() == last_seq {
+                        return Ok(());
+                    }
                 }
+
+                info!(%actor_id, %version, ?seqs, %last_seq, rows = changes.count().values().sum::<usize>(), "sending packed sync changeset chunk");
+                sender.blocking_send(SyncMessage::V1(SyncMessageV1::Changeset(ChangeV1 {
+                    actor_id,
+                    changeset: Changeset::FullV2Packed {
+                        actor_id,
+                        version,
+                        changes,
+                        seqs,
+                        last_seq,
+                        ts,
+                    },
+                })))?;
 
                 let elapsed = start.elapsed();
 
@@ -1324,7 +1328,7 @@ pub async fn parallel_sync(
 
                     let needs = our_sync_state.compute_available_needs(&their_sync_state)?;
 
-                    debug!(%actor_id, self_actor_id = %agent.actor_id(), "computed needs: {:?}, their_sync_state: {:?}", needs, their_sync_state);
+                    info!(%actor_id, self_actor_id = %agent.actor_id(), ?needs, ?their_sync_state, "computed sync needs");
 
                     Ok::<_, SyncError>((needs, tx, read))
                 }.await
@@ -1515,6 +1519,7 @@ pub async fn parallel_sync(
 
                     let req_len = actual_needs.len();
 
+                    info!(%server_actor_id, %actor_id, ?actual_needs, "sending sync request");
                     if let Err(e) = encode_sync_msg(
                         &mut codec,
                         &mut encode_buf,
@@ -1579,8 +1584,8 @@ pub async fn parallel_sync(
                             counter!("corro.sync.changes.recv", "traffic" => "sync")
                                 .increment(changes_len as u64);
 
-                            debug!(
-                                "handling versions: {:?}, actor_id: {:?}, seqs: {:?}, len: {changes_len} (is_empty: {}, is_complete: {}) from {actor_id}",
+                            info!(
+                               "received sync changes: versions={:?}, actor_id={:?}, seqs={:?}, len={changes_len}, is_empty={}, is_complete={} from {actor_id}",
                                 change.versions(),
                                 change.actor_id,
                                 change.seqs(),
@@ -1881,7 +1886,7 @@ pub async fn serve_sync(
                     }
                     Ok(Some(msg)) => match msg {
                         SyncMessage::V1(SyncMessageV1::Request(req)) => {
-                            trace!(actor_id = %their_actor_id, self_actor_id = %agent.actor_id(), "read req: {req:?}");
+                            info!(actor_id = %their_actor_id, self_actor_id = %agent.actor_id(), ?req, "received sync request message");
                             count += req
                                 .iter()
                                 .map(|(_, needs)| {
