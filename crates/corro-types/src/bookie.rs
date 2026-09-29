@@ -13,7 +13,7 @@ use rangemap::{RangeInclusiveSet, StepLite};
 use rusqlite::{named_params, Connection, OptionalExtension, Transaction};
 use serde_json::json;
 use sqlite_pool::InterruptibleTransaction;
-use tracing::{debug, trace, warn};
+use tracing::{debug, info, trace, warn};
 
 use crate::{
     actor::ActorId,
@@ -813,6 +813,7 @@ impl BookieDbParams {
 
     pub fn execute(&self, conn: &Connection) -> rusqlite::Result<()> {
         if !self.gap_deletes.is_empty() {
+            info!(?self.gap_deletes, "removing version gaps from bookkeeping");
             let actors = unnest_param(self.gap_deletes.iter().map(|(a, _, _)| a));
             let starts = unnest_param(self.gap_deletes.iter().map(|(_, s, _)| s));
             let ends = unnest_param(self.gap_deletes.iter().map(|(_, _, e)| e));
@@ -836,6 +837,7 @@ impl BookieDbParams {
         }
 
         if !self.gap_inserts.is_empty() {
+            info!(?self.gap_inserts, "adding version gaps to bookkeeping");
             let actors = unnest_param(self.gap_inserts.iter().map(|(a, _, _)| a));
             let starts = unnest_param(self.gap_inserts.iter().map(|(_, s, _)| s));
             let ends = unnest_param(self.gap_inserts.iter().map(|(_, _, e)| e));
@@ -858,6 +860,7 @@ impl BookieDbParams {
         }
 
         if !self.complete_version_deletes.is_empty() {
+            info!(?self.complete_version_deletes, "removing partial version bookkeeping");
             let actors = unnest_param(self.complete_version_deletes.iter().map(|(a, _)| a));
             let versions = unnest_param(self.complete_version_deletes.iter().map(|(_, v)| v));
             conn.prepare_cached(
@@ -871,6 +874,7 @@ impl BookieDbParams {
         }
 
         if !self.partials_deletes.is_empty() {
+            info!(?self.partials_deletes, "removing partial sequence bookkeeping");
             let actors = unnest_param(self.partials_deletes.iter().map(|a| a.0));
             let versions = unnest_param(self.partials_deletes.iter().map(|a| a.1));
             let start_seqs = unnest_param(self.partials_deletes.iter().map(|a| a.2));
@@ -896,6 +900,7 @@ impl BookieDbParams {
         }
 
         if !self.partial_inserts.is_empty() {
+            info!(?self.partial_inserts, "adding partial sequence bookkeeping");
             let actors = unnest_param(self.partial_inserts.iter().map(|a| a.0));
             let versions = unnest_param(self.partial_inserts.iter().map(|a| a.1));
             let start_seqs = unnest_param(self.partial_inserts.iter().map(|a| a.2));
