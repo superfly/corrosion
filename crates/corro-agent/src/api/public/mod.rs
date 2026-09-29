@@ -40,10 +40,7 @@ use tokio::{
     },
     task::block_in_place,
 };
-use tracing::{debug, error, trace, warn};
-
-#[cfg(feature = "running_in_antithesis")]
-use tracing::info;
+use tracing::{debug, error, info, trace, warn};
 
 use corro_types::broadcast::broadcast_changes;
 
@@ -69,6 +66,7 @@ where
     F: FnOnce(&InterruptibleTransaction<Transaction>) -> Result<T, ChangeError>,
 {
     let actor_id = agent.actor_id();
+    info!(%actor_id, ?timeout, "starting local write transaction");
     trace!("getting conn...");
     let mut conn = agent.pool().write_priority().await?;
     trace!("got conn");
@@ -110,6 +108,12 @@ where
         let ret = f(&tx)?;
 
         let insert_info = insert_local_changes(agent, &tx, &mut book_writer)?;
+        info!(
+            %actor_id,
+            db_version = ?insert_info.as_ref().map(|info| info.db_version),
+            last_seq = ?insert_info.as_ref().map(|info| info.last_seq),
+            "local write extracted crsql changes"
+        );
         tx.commit().map_err(|source| {
             let ce = ChangeError::Rusqlite {
                 source,
@@ -137,6 +141,7 @@ where
                 trace!("committed tx, db_version: {db_version}, last_seq: {last_seq:?}");
 
                 book_writer.commit();
+                info!(%actor_id, %db_version, %last_seq, %ts, "committed local version and scheduling broadcast");
 
                 let agent = agent.clone();
 

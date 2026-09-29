@@ -1342,6 +1342,14 @@ pub async fn process_multiple_changes(
             let mut seen = RangeInclusiveMap::new();
 
             for (change, src) in changes {
+                info!(
+                    actor_id = %change.actor_id,
+                    ?src,
+                    versions = ?change.versions(),
+                    seqs = ?change.seqs(),
+                    len = change.len(),
+                    "processing changeset"
+                );
                 trace!("handling a single changeset: {change:?}");
                 let seqs = change.seqs();
                 if booked_write.contains_all(change.versions(), change.seqs()) {
@@ -1430,7 +1438,7 @@ pub async fn process_multiple_changes(
                     known
                 };
 
-                debug!(%actor_id, self_actor_id = %agent.actor_id(), ?versions, "got known to insert: {known:?}");
+                info!(%actor_id, self_actor_id = %agent.actor_id(), ?versions, ?known, "processed changeset bookkeeping result");
                 let partial = match known {
                     KnownDbVersion::Partial(partial) => Some(partial),
                     _ => None,
@@ -1461,7 +1469,7 @@ pub async fn process_multiple_changes(
                 .expect("booked write guard should be present for every actor");
 
             let (changes, completed_partials) = booked_write.compute_and_apply(processed);
-            debug!(%actor_id, "computed and applied changes: {changes:?}, completed versions: {completed_partials:?}");
+            info!(%actor_id, ?changes, ?completed_partials, "computed version bookkeeping changes");
             let clear_versions = changes
                 .clear_versions
                 .iter()
@@ -1471,6 +1479,7 @@ pub async fn process_multiple_changes(
             all_changes.push(changes);
         }
 
+        info!(?all_changes, "persisting version and gap bookkeeping");
         BookieDbParams::from_changes(&all_changes)
             .execute(&tx)
             .map_err(|source| ChangeError::Rusqlite {
@@ -1636,7 +1645,7 @@ pub fn process_incomplete_version<T: Deref<Target = rusqlite::Connection> + Comm
 
     let mut changes_per_table = BTreeMap::new();
 
-    debug!(%actor_id, %version, "incomplete change, seqs: {seqs:?}, last_seq: {last_seq:?}, len: {}", changes.len());
+    info!(%actor_id, %version, ?seqs, ?last_seq, len = changes.len(), "processing incomplete version into buffered changes");
     assert_sometimes!(true, "Corrosion processes incomplete changes");
 
     trace!("buffering changes! {changes:?}");
@@ -1687,7 +1696,7 @@ pub fn process_incomplete_version<T: Deref<Target = rusqlite::Connection> + Comm
             .and_modify(|c| *c += 1)
             .or_insert(1);
     }
-    debug!(%actor_id, %version, "buffered {inserted} changes");
+    info!(%actor_id, %version, inserted, "buffered changes result");
 
     for (table_name, count) in changes_per_table {
         counter!("corro.changes.committed", "table" => table_name.to_string(), "source" => "remote").increment(count);
@@ -1719,7 +1728,7 @@ pub fn process_complete_version<T: Deref<Target = rusqlite::Connection> + Commit
 
     let len = changes.len();
 
-    debug!(%actor_id, %version, "complete change, applying right away! seqs: {seqs:?}, last_seq: {last_seq}, changes len: {len}, db version: {version}");
+    info!(%actor_id, %version, ?seqs, %last_seq, len, "processing complete version directly into crsql_changes");
 
     debug_assert!(len <= seqs.len(), "change from actor {actor_id} version {version} has len {len} but seqs range is {seqs:?} and last_seq is {last_seq}");
 
@@ -1753,7 +1762,7 @@ pub fn process_complete_version<T: Deref<Target = rusqlite::Connection> + Commit
 
     let last_rowids_len = last_rowids.len();
 
-    debug!("successfully inserted {len} changes into crsql_changes");
+    info!(%actor_id, %version, inserted = len, "inserted complete version into crsql_changes");
     trace!("last_rowids before shift: {last_rowids:?}");
 
     // RETURNING returns rows BEFORE the insert, not after

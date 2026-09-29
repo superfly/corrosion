@@ -811,7 +811,7 @@ impl HandleChangesState {
             return None;
         }
 
-        debug!(count = %batch_cost, reason = %reason, batch_size = %self.current_batch_size, "spawning batch processing task");
+        info!(count = %batch_cost, reason = %reason, batch_size = %self.current_batch_size, "spawning version processing batch");
 
         let agent_clone = agent.clone();
         let bookie_clone = bookie.clone();
@@ -837,10 +837,10 @@ impl HandleChangesState {
         // Handle task result
         match result {
             Ok(Ok(())) => {
-                debug!("batch processing completed successfully");
+                info!("version processing batch completed successfully");
             }
             Ok(Err(ref e)) => {
-                error!("error processing batch: {e}");
+                error!("error processing version batch: {e}");
 
                 if let Some(issue) = e.fatal_db_issue() {
                     error!("fatal DB issue detected: {issue}");
@@ -1072,10 +1072,20 @@ pub async fn handle_changes(
         }
 
         let change_len = change.len();
+        info!(
+            actor_id = %change.actor_id,
+            ?src,
+            versions = ?change.versions(),
+            seqs = ?change.seqs(),
+            change_len,
+            is_complete = change.is_complete(),
+            "received changeset"
+        );
         counter!("corro.agent.changes.recv").increment(std::cmp::max(change_len, 1) as u64); // count empties...
 
         // Skip changes from ourselves
         if change.actor_id == agent.actor_id() {
+            info!(actor_id = %change.actor_id, "skipping changeset from local actor");
             continue;
         }
 
@@ -1084,6 +1094,7 @@ pub async fn handle_changes(
             let v = change.versions().start();
             if let Some(seen_seqs) = seen.get(&(change.actor_id, v)) {
                 if seqs.all(|seq| seen_seqs.contains(&seq)) {
+                    info!(actor_id = %change.actor_id, versions = ?change.versions(), seqs = ?change.seqs(), ?src, "skipping already-seen changeset from seen cache");
                     if matches!(src, ChangeSource::Broadcast) {
                         counter!("corro.broadcast.duplicate.count", "from" => "cache").increment(1);
                     }
@@ -1094,6 +1105,7 @@ pub async fn handle_changes(
             .versions()
             .all(|v| seen.contains_key(&(change.actor_id, v)))
         {
+            info!(actor_id = %change.actor_id, versions = ?change.versions(), ?src, "skipping already-seen version from seen cache");
             if matches!(src, ChangeSource::Broadcast) {
                 counter!("corro.broadcast.duplicate.count", "from" => "cache").increment(1);
             }
@@ -1124,6 +1136,7 @@ pub async fn handle_changes(
         let booked = bookie.get(&change.actor_id);
         if let Some(booked) = booked {
             if booked.read().contains_all(change.versions(), change.seqs()) {
+                info!(actor_id = %change.actor_id, versions = ?change.versions(), seqs = ?change.seqs(), ?src, "skipping already-known changeset from bookie");
                 trace!("already seen, stop disseminating");
                 if matches!(src, ChangeSource::Broadcast) {
                     counter!("corro.broadcast.duplicate.count", "from" => "bookie").increment(1);
@@ -1171,6 +1184,7 @@ pub async fn handle_changes(
         }
 
         // Handle the new change - queue it and potentially spawn a batch
+        info!(actor_id = %change.actor_id, ?src, "queueing changeset for version processing");
         state.handle_new_change(&agent, &bookie, change, src);
     }
 }
