@@ -30,7 +30,7 @@ use tokio::{
     sync::{mpsc, oneshot},
     task::block_in_place,
 };
-use tracing::{debug, error, trace};
+use tracing::{debug, error, info, trace};
 use uhlc::NTP64;
 
 use crate::{
@@ -1161,6 +1161,7 @@ pub async fn broadcast_changes(
     ts: Timestamp,
 ) -> Result<(), BroadcastError> {
     let actor_id = agent.actor_id();
+    info!(%actor_id, %db_version, %last_seq, "starting local crsql broadcast extraction");
     let conn = agent.pool().read().await?;
     trace!("got conn for broadcast");
 
@@ -1195,7 +1196,7 @@ pub async fn broadcast_changes(
                             counter!("corro.changes.committed", "table" => table_name, "source" => "local").increment(count as u64);
                         }
 
-                        trace!("broadcasting packed changes: {changes:?} for seq: {seqs:?}");
+                        info!(%actor_id, %db_version, ?seqs, %last_seq, rows = changes.count().values().sum::<usize>(), "broadcasting packed local changes chunk");
                         let changeset = Changeset::FullV2Packed {
                             actor_id,
                             version: db_version,
@@ -1251,7 +1252,7 @@ pub async fn broadcast_changes(
                             counter!("corro.changes.committed", "table" => table_name, "source" => "local").increment(count as u64);
                         }
 
-                        trace!("broadcasting changes: {changes:?} for seq: {seqs:?}");
+                        info!(%actor_id, %db_version, ?seqs, %last_seq, rows = changes.len(), "broadcasting local changes chunk");
 
                         debug!("match_changes db_version: {db_version}");
                         let changeset = Changeset::FullV2 {
