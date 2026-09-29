@@ -1078,6 +1078,7 @@ pub async fn handle_changes(
             versions = ?change.versions(),
             seqs = ?change.seqs(),
             change_len,
+            is_empty = change.is_empty(),
             is_complete = change.is_complete(),
             "received changeset"
         );
