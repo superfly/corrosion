@@ -4062,7 +4062,7 @@ impl<'conn> Session<'conn> {
             let schema = Arc::new(fields);
 
             if !self.tx_state.is_writing() && !prepped.readonly() {
-                trace!("query statement writes, acquiring permit...");
+                info!("pg query statement writes, acquiring write permit");
                 let write_permit = self.agent.write_permit_blocking()?;
                 let bookie_permit = self.agent.bookie().write_lock_blocking();
                 self.tx_state.set_write_context(write_permit, bookie_permit);
@@ -4581,10 +4581,18 @@ impl<'conn> Session<'conn> {
         trace!("HANDLE COMMIT");
 
         let actor_id = self.agent.actor_id();
+        info!(%actor_id, "pg commit extracting local crsql changes");
 
         let mut book_writer = bookie_write.write_tx(self.agent.booked());
 
         let insert_info = insert_local_changes(&self.agent, self.conn, &mut book_writer)?;
+        info!(
+            %actor_id,
+            db_version = ?insert_info.as_ref().map(|info| info.db_version),
+            last_seq = ?insert_info.as_ref().map(|info| info.last_seq),
+            "pg commit extracted local crsql changes"
+        );
+        info!(%actor_id, "pg committing database transaction");
         self.conn
             .execute_batch("COMMIT")
             .map_err(|source| ChangeError::Rusqlite {
@@ -4599,7 +4607,7 @@ impl<'conn> Session<'conn> {
             ts,
         }) = insert_info
         {
-            trace!("committed tx, db_version: {db_version}, last_seq: {last_seq:?}");
+            info!(%actor_id, %db_version, %last_seq, %ts, "pg committed local version and scheduling broadcast");
 
             book_writer.commit();
 
