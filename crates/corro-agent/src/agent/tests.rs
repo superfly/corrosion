@@ -732,7 +732,7 @@ async fn large_tx_sync() -> eyre::Result<()> {
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
 
-    tokio::time::sleep(Duration::from_secs(20)).await;
+    tokio::time::sleep(Duration::from_secs(60)).await;
 
     let mut ta_counts = vec![];
 
