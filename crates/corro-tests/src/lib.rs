@@ -87,6 +87,7 @@ pub fn test_crsqlite_config() -> Option<CrsqliteConfig> {
         || metadata_use_version.is_some()
         || sync_log_version.is_some())
     .then_some(CrsqliteConfig {
+        debug: None,
         metadata_write_version,
         metadata_use_version,
         sync_log_version,
@@ -157,6 +158,7 @@ pub async fn launch_test_agent_v2<
     launch_test_agent(
         |conf| {
             f(conf.crsqlite(CrsqliteConfig {
+                debug: None,
                 metadata_write_version: Some(2),
                 metadata_use_version: Some(2),
                 sync_log_version: Some(2),

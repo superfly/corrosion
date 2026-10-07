@@ -50,7 +50,7 @@ use corro_types::{
     metrics_tracker::MetricsTracker,
     pubsub::{Matcher, SubsManager},
     schema::{init_schema, Schema},
-    sqlite::CrConn,
+    sqlite::{configure_crsqlite_debug, CrConn},
     updates::UpdatesManager,
 };
 
@@ -405,6 +405,11 @@ fn apply_crsqlite_config(
 
     // V2 operations require a non-zero ts
     conn.execute_batch(&format!("SELECT crsql_set_ts({})", ts.as_u64()))?;
+
+    if let Some(enabled) = config.debug {
+        configure_crsqlite_debug(conn, enabled)?;
+        info!(enabled, "configured crsqlite debug logging");
+    }
 
     // Helper: read current value, transition if different
     fn try_transition(conn: &CrConn, config_name: &str, desired: i64) -> eyre::Result<()> {

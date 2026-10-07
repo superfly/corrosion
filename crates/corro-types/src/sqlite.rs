@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    ffi::{c_char, c_void},
     ops::{Deref, DerefMut},
     sync::atomic::{AtomicBool, Ordering},
     time::{Duration, Instant},
@@ -8,6 +9,7 @@ use std::{
 use metrics::counter;
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
+use rusqlite::ffi;
 use rusqlite::types::{ToSql, ToSqlOutput, Value};
 use rusqlite::{
     params, trace::TraceEventCodes, vtab::eponymous_only_module, Connection, Transaction, MAIN_DB,
@@ -341,6 +343,22 @@ fn handle_changes_metrics() {
 }
 
 const CRSQL_EXT_GENERIC_NAME: &str = "crsqlite";
+const CRSQL_DEBUG_CALLBACK_TYPE: &[u8] = b"crsql_debug_callback\0";
+
+#[repr(C)]
+struct CrsqlDebugCallback {
+    callback: Option<unsafe extern "C" fn(*mut c_void, *const u8, usize)>,
+    context: *mut c_void,
+}
+
+unsafe extern "C" fn crsql_debug_callback(_context: *mut c_void, message: *const u8, len: usize) {
+    let message = if message.is_null() {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(message, len) }
+    };
+    info!(target: "crsqlite", "{}", String::from_utf8_lossy(message));
+}
 
 #[cfg(target_os = "macos")]
 pub const CRSQL_EXT_FILENAME: &str = "crsqlite.dylib";
@@ -389,6 +407,63 @@ pub fn rusqlite_to_crsqlite(mut conn: rusqlite::Connection) -> rusqlite::Result<
     trace_heavy_queries(&conn)?;
 
     Ok(CrConn(conn))
+}
+
+pub fn configure_crsqlite_debug(conn: &Connection, enabled: bool) -> rusqlite::Result<()> {
+    let registration = CrsqlDebugCallback {
+        callback: Some(crsql_debug_callback),
+        context: std::ptr::null_mut(),
+    };
+    let mut stmt = std::ptr::null_mut();
+    let sql = b"SELECT crsql_set_debug_callback(?1)\0";
+
+    let result = unsafe {
+        let rc = ffi::sqlite3_prepare_v2(
+            conn.handle(),
+            sql.as_ptr() as *const c_char,
+            -1,
+            &mut stmt,
+            std::ptr::null_mut(),
+        );
+        if rc != ffi::SQLITE_OK {
+            return Err(rusqlite::Error::SqliteFailure(
+                ffi::Error::new(rc),
+                Some("could not prepare crsqlite debug callback registration".into()),
+            ));
+        }
+
+        let rc = ffi::sqlite3_bind_pointer(
+            stmt,
+            1,
+            &registration as *const CrsqlDebugCallback as *mut c_void,
+            CRSQL_DEBUG_CALLBACK_TYPE.as_ptr() as *const c_char,
+            None,
+        );
+        if rc == ffi::SQLITE_OK {
+            let rc = ffi::sqlite3_step(stmt);
+            if rc != ffi::SQLITE_ROW && rc != ffi::SQLITE_DONE {
+                rc
+            } else {
+                ffi::SQLITE_OK
+            }
+        } else {
+            rc
+        }
+    };
+
+    unsafe {
+        ffi::sqlite3_finalize(stmt);
+    }
+
+    if result != ffi::SQLITE_OK {
+        return Err(rusqlite::Error::SqliteFailure(
+            ffi::Error::new(result),
+            Some("could not bind or invoke crsqlite debug callback registration".into()),
+        ));
+    }
+
+    conn.query_row("SELECT crsql_set_debug(?1)", [enabled as i64], |_| Ok(()))?;
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -576,6 +651,29 @@ mod tests {
     use tokio::task::block_in_place;
 
     use super::*;
+
+    #[test]
+    fn configures_crsqlite_debug_logging() -> Result<(), Box<dyn std::error::Error>> {
+        let conn = rusqlite_to_crsqlite(Connection::open_in_memory()?)?;
+
+        configure_crsqlite_debug(&conn, true)?;
+        assert_eq!(
+            conn.query_row("SELECT crsql_set_debug(?1)", [1i64], |row| {
+                row.get::<_, i64>(0)
+            })?,
+            1
+        );
+
+        configure_crsqlite_debug(&conn, false)?;
+        assert_eq!(
+            conn.query_row("SELECT crsql_set_debug(?1)", [0i64], |row| {
+                row.get::<_, i64>(0)
+            })?,
+            0
+        );
+
+        Ok(())
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_writes() -> Result<(), Box<dyn std::error::Error>> {

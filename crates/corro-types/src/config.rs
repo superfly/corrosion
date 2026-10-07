@@ -131,15 +131,20 @@ pub struct Config {
 /// - `metadata_write_version`: 1 (V1), 2 (dual-write), 3 (V2-only)
 /// - `metadata_use_version`: 1 (V1), 2 (V2)
 /// - `sync_log_version`: 1 (V1 per-column), 2 (V2 packed)
+/// - `debug`: enable CR-SQLite debug logging and route it through Corrosion's logs
 ///
 /// Example:
 /// ```toml
 /// [crsqlite]
 /// metadata_write_version = 2   # start dual-write migration
+/// debug = true                 # enable CR-SQLite debug logging
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct CrsqliteConfig {
+    /// Enable or disable CR-SQLite debug logging. If omitted, leave it unchanged.
+    #[serde(default)]
+    pub debug: Option<bool>,
     /// Target `metadata-write-version` (1, 2, or 3). If omitted, no change.
     #[serde(default)]
     pub metadata_write_version: Option<i64>,

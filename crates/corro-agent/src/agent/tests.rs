@@ -2209,6 +2209,7 @@ async fn test_incremental_migration_v1_to_v2() -> eyre::Result<()> {
                 conf.db_path(db_path.display().to_string())
                     .add_schema_path(schema_path.display().to_string())
                     .crsqlite(CrsqliteConfig {
+                        debug: None,
                         metadata_write_version: Some(1),
                         metadata_use_version: Some(1),
                         sync_log_version: Some(1),
@@ -2376,6 +2377,7 @@ async fn test_migration_v2_to_v3() -> eyre::Result<()> {
                 conf.db_path(db_path.display().to_string())
                     .add_schema_path(schema_path.display().to_string())
                     .crsqlite(CrsqliteConfig {
+                        debug: None,
                         metadata_write_version: Some(3),
                         metadata_use_version: Some(2),
                         sync_log_version: Some(2),
