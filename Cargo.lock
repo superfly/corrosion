@@ -926,6 +926,7 @@ dependencies = [
  "camino",
  "compact_str 0.7.1",
  "config",
+ "corro-api-types",
  "corro-pg",
  "corro-tests",
  "corro-types",
