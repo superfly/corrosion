@@ -15,7 +15,21 @@ use crate::{
     transport::Transport,
 };
 
+use super::BcastCache;
+use crate::api::public::update::api_v1_updates;
 use antithesis_sdk::assert_sometimes;
+use antithesis_sdk::assert_unreachable;
+use axum::{
+    error_handling::HandleErrorLayer,
+    extract::DefaultBodyLimit,
+    routing::{get, post},
+    BoxError, Extension, Router,
+};
+use axum_extra::{
+    headers::{authorization::Bearer, Authorization},
+    TypedHeader,
+};
+use corro_types::broadcast::Timestamp;
 use corro_types::{
     actor::{Actor, ActorId},
     agent::{
@@ -33,23 +47,8 @@ use corro_types::{
     sqlite::unnest_param,
     updates::{match_changes, match_changes_from_db_version},
 };
-use corro_utils::ThrottleMap;
-
-use super::BcastCache;
-use crate::api::public::update::api_v1_updates;
-use antithesis_sdk::assert_unreachable;
-use axum::{
-    error_handling::HandleErrorLayer,
-    extract::DefaultBodyLimit,
-    routing::{get, post},
-    BoxError, Extension, Router,
-};
-use axum_extra::{
-    headers::{authorization::Bearer, Authorization},
-    TypedHeader,
-};
-use corro_types::broadcast::Timestamp;
 use foca::Member;
+use futures::stream::{FusedStream, FuturesUnordered};
 use http::StatusCode;
 use metrics::{counter, histogram};
 use rangemap::{RangeInclusiveMap, RangeInclusiveSet};
@@ -61,8 +60,10 @@ use std::{
     cmp,
     collections::{BTreeMap, HashSet},
     convert::Infallible,
+    future::Future,
     net::SocketAddr,
     ops::{Deref, RangeInclusive},
+    pin::Pin,
     sync::{
         atomic::{AtomicI64, AtomicU64, Ordering},
         Arc,
@@ -74,6 +75,7 @@ use tokio::{
     sync::mpsc,
     task::{block_in_place, JoinHandle},
 };
+use tokio_stream::StreamExt;
 use tower::{limit::ConcurrencyLimitLayer, load_shed::LoadShedLayer};
 use tower_http::trace::TraceLayer;
 use tracing::{debug, error, info, trace, warn};
@@ -479,6 +481,17 @@ pub async fn sync_loop(agent: Agent, bookie: Bookie, transport: Transport, mut t
     }
 }
 
+/// Base wait before the first retry. Later retries double.
+const PARTIAL_RETRY_MIN_BACKOFF: Duration = Duration::from_secs(5 * 60);
+/// In-flight retry sleeps. A new retry is dropped once this many are waiting.
+const MAX_PARTIAL_RETRY_SLEEPS: usize = 2000;
+
+struct RetryPartial {
+    actor_id: ActorId,
+    db_version: CrsqlDbVersion,
+    attempt: u32,
+}
+
 pub async fn apply_fully_buffered_changes_loop(
     agent: Agent,
     bookie: Bookie,
@@ -491,38 +504,29 @@ pub async fn apply_fully_buffered_changes_loop(
     let max_timeout_increase: u64 = 6;
     let step_timeout_secs: u64 = 20;
 
-    let throttle_max = agent.config().perf.partial_retry_backoff;
-    let scan_enabled = throttle_max > 0;
-    let throttle_min = Duration::from_secs(5 * 60);
+    let max_partial_retries = agent.config().perf.partial_retries;
+    let retries_enabled = max_partial_retries > 0;
 
-    let mut retry_interval = tokio::time::interval(Duration::from_secs(5 * 60));
+    let mut retry_sleeps: FuturesUnordered<Pin<Box<dyn Future<Output = RetryPartial> + Send>>> =
+        FuturesUnordered::new();
 
-    // map to throttle retries for failed versions that took too long to apply
-    let mut limit_retries =
-        ThrottleMap::new(throttle_min, Duration::from_secs(throttle_max as u64));
-
-    retry_interval.tick().await;
-    if !scan_enabled {
-        info!("periodic fully-buffered partial scan disabled (partial_retry_backoff = 0)");
+    if !retries_enabled {
+        info!("fully-buffered partial retries disabled (partial_retries = 0)");
     }
 
     loop {
-        let partial_versions = tokio::select! {
+        // `retry_attempt` is set when this apply is a scheduled retry.
+        let (partial_versions, retry_attempt) = tokio::select! {
             biased;
             _ = &mut tripwire => break,
             maybe_trigger = rx_apply.recv() => match maybe_trigger {
                 Some(ApplyTrigger::Version(actor_id, version)) => {
-                    vec![(actor_id, version)]
+                    (vec![(actor_id, version)], None)
                 }
                 Some(ApplyTrigger::SchemaChanged) => {
                     match find_fully_buffered_partials(&agent, None).await {
                         Ok(partials) if partials.is_empty() => continue,
-                        Ok(partials) => {
-                            for partial in &partials {
-                                limit_retries.unblock(partial);
-                            }
-                            partials
-                        }
+                        Ok(partials) => (partials, None),
                         Err(e) => {
                             warn!("could not query for fully buffered partials: {e}");
                             continue;
@@ -532,34 +536,20 @@ pub async fn apply_fully_buffered_changes_loop(
                 None => break,
             },
 
-            _ = retry_interval.tick(), if scan_enabled => {
-                match find_fully_buffered_partials(&agent, Some(1)).await {
-                    Ok(partials) if partials.is_empty() => continue,
-                    Ok(partials) => partials,
-                    Err(e) => {
-                        warn!("could not query for fully buffered partials: {e}");
-                        continue;
-                    },
-                }
+            woke = retry_sleeps.next(), if retries_enabled && !retry_sleeps.is_terminated() => match woke {
+                Some(pending) => (vec![(pending.actor_id, pending.db_version)], Some(pending.attempt)),
+                None => continue,
             },
         };
 
-        for partial_version in partial_versions {
-            if let Some(blocked_until) = limit_retries.is_throttled(&partial_version) {
-                let next_retry = blocked_until.duration_since(Instant::now()).as_secs();
-                warn!(
-                    ?partial_version,
-                    "previous attempt to apply buffered changes took too long, will retry in {next_retry} seconds"
-                );
-                continue;
-            }
+        let prior_failures = retry_attempt
+            .map(|attempt| u64::from(attempt) + 1)
+            .unwrap_or(0);
+        let timeout_bump = prior_failures.min(max_timeout_increase);
 
-            let (actor_id, version) = partial_version;
-            let throttle_count = limit_retries
-                .throttle_count(&(actor_id, version))
-                .min(max_timeout_increase);
+        for (actor_id, version) in partial_versions {
             let tx_timeout =
-                sql_tx_timeout_secs + Duration::from_secs(step_timeout_secs * throttle_count);
+                sql_tx_timeout_secs + Duration::from_secs(step_timeout_secs * timeout_bump);
 
             debug!(%actor_id, %version, ?tx_timeout, "picked up background apply of buffered changes");
             let start = Instant::now();
@@ -571,16 +561,13 @@ pub async fn apply_fully_buffered_changes_loop(
             match res {
                 Ok(false) => {
                     warn!(%actor_id, %version, "did not apply buffered changes");
-                    limit_retries.remove(&(actor_id, version));
                 }
                 Ok(true) => {
                     debug!(%actor_id, %version, "succesfully applied buffered changes");
                     histogram!("corro.agent.changes.processing.time.seconds", "source" => "buffered")
                         .record(elapsed.as_secs_f64());
-                    limit_retries.remove(&(actor_id, version));
                 }
                 Err(e) => {
-                    let is_interrupt_error = e.is_interrupt_error();
                     error!(%actor_id, %version, "could not apply fully buffered changes with timeout {tx_timeout:?}: {e}");
 
                     if let Some(issue) = e.fatal_db_issue() {
@@ -591,8 +578,29 @@ pub async fn apply_fully_buffered_changes_loop(
                     let details = json!({"error": e.to_string()});
                     assert_unreachable!("could not apply fully buffered changes", &details);
 
-                    if is_interrupt_error {
-                        limit_retries.throttle((actor_id, version));
+                    if retries_enabled {
+                        let next_attempt = retry_attempt
+                            .map(|attempt| attempt.saturating_add(1))
+                            .unwrap_or(0);
+                        if next_attempt < max_partial_retries
+                            && retry_sleeps.len() >= MAX_PARTIAL_RETRY_SLEEPS
+                        {
+                            error!(%actor_id, %version, "retry queue full at {MAX_PARTIAL_RETRY_SLEEPS} items, not going to retry fully buffered partial;");
+                        } else if next_attempt < max_partial_retries {
+                            let mult = 1u32.checked_shl(next_attempt.min(16)).unwrap_or(u32::MAX);
+                            let delay = PARTIAL_RETRY_MIN_BACKOFF * mult;
+                            debug!(%actor_id, %version, attempt = next_attempt, ?delay, "scheduling fully-buffered partial retry");
+                            retry_sleeps.push(Box::pin(async move {
+                                tokio::time::sleep(delay).await;
+                                RetryPartial {
+                                    actor_id,
+                                    db_version: version,
+                                    attempt: next_attempt,
+                                }
+                            }));
+                        } else {
+                            error!(%actor_id, %version, "reached retry limit for fully buffered partial; won’t retry again");
+                        }
                     }
                 }
             }

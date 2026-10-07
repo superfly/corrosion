@@ -89,7 +89,7 @@ fn default_max_sync_backoff() -> u32 {
     DEFAULT_MAX_SYNC_BACKOFF
 }
 
-fn default_partial_retry_backoff() -> u32 {
+fn default_partial_retries() -> u32 {
     0
 }
 
@@ -491,8 +491,10 @@ pub struct PerfConfig {
     pub min_sync_backoff: u32,
     #[serde(default = "default_max_sync_backoff")]
     pub max_sync_backoff: u32,
-    #[serde(default = "default_partial_retry_backoff")]
-    pub partial_retry_backoff: u32,
+    /// How many times to retry a failed buffered partial apply. `0` disables
+    /// retries. Each retry waits 5 minutes, doubling after every failure.
+    #[serde(default = "default_partial_retries")]
+    pub partial_retries: u32,
     // How many unapplied changesets corrosion will buffer before starting to drop them
     #[serde(default = "default_processing_queue")]
     pub processing_queue_len: usize,
@@ -536,7 +538,7 @@ impl Default for PerfConfig {
             sql_tx_timeout: default_sql_tx_timeout(),
             min_sync_backoff: default_min_sync_backoff(),
             max_sync_backoff: default_max_sync_backoff(),
-            partial_retry_backoff: default_partial_retry_backoff(),
+            partial_retries: default_partial_retries(),
             processing_queue_len: default_processing_queue(),
             plumtree_send_queue_len: default_plumtree_send_queue(),
             apply_queue_timeout: default_apply_timeout(),
