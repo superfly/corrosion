@@ -486,6 +486,12 @@ const PARTIAL_RETRY_MIN_BACKOFF: Duration = Duration::from_secs(5 * 60);
 /// In-flight retry sleeps. A new retry is dropped once this many are waiting.
 const MAX_PARTIAL_RETRY_SLEEPS: usize = 2000;
 
+struct RetryPartial {
+    actor_id: ActorId,
+    db_version: CrsqlDbVersion,
+    attempt: u32,
+}
+
 pub async fn apply_fully_buffered_changes_loop(
     agent: Agent,
     bookie: Bookie,
@@ -501,9 +507,8 @@ pub async fn apply_fully_buffered_changes_loop(
     let max_partial_retries = agent.config().perf.partial_retries;
     let retries_enabled = max_partial_retries > 0;
 
-    let mut retry_sleeps: FuturesUnordered<
-        Pin<Box<dyn Future<Output = (ActorId, CrsqlDbVersion, u32)> + Send>>,
-    > = FuturesUnordered::new();
+    let mut retry_sleeps: FuturesUnordered<Pin<Box<dyn Future<Output = RetryPartial> + Send>>> =
+        FuturesUnordered::new();
 
     if !retries_enabled {
         info!("fully-buffered partial retries disabled (partial_retries = 0)");
@@ -532,7 +537,7 @@ pub async fn apply_fully_buffered_changes_loop(
             },
 
             woke = retry_sleeps.next(), if retries_enabled && !retry_sleeps.is_terminated() => match woke {
-                Some((actor_id, version, attempt)) => (vec![(actor_id, version)], Some(attempt)),
+                Some(pending) => (vec![(pending.actor_id, pending.db_version)], Some(pending.attempt)),
                 None => continue,
             },
         };
@@ -587,7 +592,11 @@ pub async fn apply_fully_buffered_changes_loop(
                             debug!(%actor_id, %version, attempt = next_attempt, ?delay, "scheduling fully-buffered partial retry");
                             retry_sleeps.push(Box::pin(async move {
                                 tokio::time::sleep(delay).await;
-                                (actor_id, version, next_attempt)
+                                RetryPartial {
+                                    actor_id,
+                                    db_version: version,
+                                    attempt: next_attempt,
+                                }
                             }));
                         } else {
                             error!(%actor_id, %version, "reached retry limit for fully buffered partial; won’t retry again");
