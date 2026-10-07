@@ -580,7 +580,7 @@ pub async fn apply_fully_buffered_changes_loop(
                         if next_attempt < max_partial_retries
                             && retry_sleeps.len() >= MAX_PARTIAL_RETRY_SLEEPS
                         {
-                            error!(%actor_id, %version, "dropping fully buffered partial; {MAX_PARTIAL_RETRY_SLEEPS} retries already scheduled");
+                            error!(%actor_id, %version, "retry queue full at {MAX_PARTIAL_RETRY_SLEEPS} items, not going to retry fully buffered partial;");
                         } else if next_attempt < max_partial_retries {
                             let mult = 1u32.checked_shl(next_attempt.min(16)).unwrap_or(u32::MAX);
                             let delay = PARTIAL_RETRY_MIN_BACKOFF * mult;
@@ -590,7 +590,7 @@ pub async fn apply_fully_buffered_changes_loop(
                                 (actor_id, version, next_attempt)
                             }));
                         } else {
-                            error!(%actor_id, %version, "dropping fully buffered partial after {max_partial_retries} retries: {e}");
+                            error!(%actor_id, %version, "reached retry limit for fully buffered partial; won’t retry again");
                         }
                     }
                 }
