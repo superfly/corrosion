@@ -964,14 +964,15 @@ impl Sim {
 
         // duplicate copies delivered per message, in broadcast order, to show
         // tree convergence. 0 = perfect spanning tree (no duplicates); >0 = extra
-        // copies each node receives on average.
-        let mut by_time: Vec<&MsgStat> = self.msgs.values().collect();
-        by_time.sort_unstable_by_key(|m| m.sent_at);
-        let dups_per_msg = |msgs: &[&MsgStat]| -> f64 {
+        // copies each node receives on average. The id breaks ties so the
+        // deciles do not depend on `HashMap` order.
+        let mut by_time: Vec<(&MId, &MsgStat)> = self.msgs.iter().collect();
+        by_time.sort_unstable_by_key(|(id, m)| (m.sent_at, id.0));
+        let dups_per_msg = |msgs: &[(&MId, &MsgStat)]| -> f64 {
             if msgs.is_empty() {
                 return 0.0;
             }
-            let sends: u64 = msgs.iter().map(|m| m.gossip_sends).sum();
+            let sends: u64 = msgs.iter().map(|(_, m)| m.gossip_sends).sum();
             sends as f64 / (msgs.len() as f64 * (self.params.n - 1) as f64) - 1.0
         };
         let decile = (by_time.len() / 10).max(1);
