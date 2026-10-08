@@ -1,12 +1,13 @@
 use indexmap::{IndexMap, IndexSet};
 use rand::rngs::SmallRng;
-use rand::seq::{IteratorRandom, SliceRandom};
+use rand::seq::{IndexedRandom, IteratorRandom, SliceRandom};
 use rand::{Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
 use speedy::{Readable, Writable};
+use std::cmp::{Ordering, Reverse};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
-use std::hash::Hash;
+use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
 use thiserror::Error;
 use tracing::{debug, info, trace, warn};
@@ -98,6 +99,26 @@ pub struct EagerRatiosError {
     pub sum: u16,
 }
 
+/// How eager and lazy peers follow membership changes. Only
+/// `FullRebalance` is used in production; the others are compared against
+/// it in `tests/sim.rs`. Under the others, a joining peer that is not made
+/// eager starts lazy while the lazy set has room.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum PeerSelection {
+    /// Membership changes flag a rebalance; the next maintenance tick clears
+    /// both sets and refills them from shuffled bucket pools.
+    #[default]
+    FullRebalance,
+    /// Rendezvous hashing: each node ranks every bucket by a salted hash and
+    /// takes eager, then lazy peers from the top. A change only moves the
+    /// peers whose label (eager, lazy or neither) changed.
+    Hrw,
+    /// A joining peer becomes eager with probability ~k/n, demoting a random
+    /// eager peer if the set is full. A departing peer's slot is refilled at
+    /// random from its bucket.
+    IncrementalRandom,
+}
+
 /// Tunable parameters for the Plumtree protocol.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -128,6 +149,8 @@ pub struct Config {
     /// Neighbors locked eager on each side of the identity ring.
     /// Total locked peers is `2 * radius` (default 1 → 2).
     pub ring_locked_radius: usize,
+    /// How the sets follow membership changes.
+    pub peer_selection: PeerSelection,
 }
 
 impl Default for Config {
@@ -144,6 +167,7 @@ impl Default for Config {
             prune_throttle: Some(Duration::from_secs(1)),
             eager_ratios: EagerRatios::default(),
             ring_locked_radius: 1,
+            peer_selection: PeerSelection::FullRebalance,
         }
     }
 }
@@ -166,6 +190,81 @@ fn resolve_fanout(known_peers: usize, config: &Config) -> FanoutTargets {
         min_lazy: config.min_lazy.unwrap_or(num_eager * 3 / 2),
         max_lazy: config.max_lazy.unwrap_or(num_eager * 2),
     }
+}
+
+/// Rendezvous score of `peer` for the node with `salt`. A fixed function
+/// rather than `DefaultHasher`, whose output may change between Rust
+/// releases.
+fn rank<N: Hash>(salt: u64, peer: &N) -> u64 {
+    let mut hasher = RankHasher(salt);
+    peer.hash(&mut hasher);
+    hasher.finish()
+}
+
+struct RankHasher(u64);
+
+impl Hasher for RankHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for chunk in bytes.chunks(8) {
+            let mut word = [0; 8];
+            word[..chunk.len()].copy_from_slice(chunk);
+            self.0 = mix64(self.0 ^ u64::from_le_bytes(word));
+        }
+    }
+}
+
+/// One SplitMix64 step: the gamma increment, then the output mix.
+fn mix64(mut z: u64) -> u64 {
+    z = z.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
+}
+
+/// Eager and lazy peers picked by a full selection.
+#[derive(Debug, Clone)]
+struct Targets<N> {
+    eager: IndexSet<N>,
+    lazy: IndexSet<N>,
+}
+
+impl<N> Default for Targets<N> {
+    fn default() -> Self {
+        Self {
+            eager: IndexSet::new(),
+            lazy: IndexSet::new(),
+        }
+    }
+}
+
+/// A full selection's split of one RTT bucket.
+#[derive(Debug, Clone, Copy)]
+struct BucketShare {
+    /// Ring-locked peers in the bucket; they count toward its eager share.
+    locked: usize,
+    /// The other known peers in the bucket.
+    pool: usize,
+    /// How many pool peers are made eager, and lazy.
+    eager: usize,
+    lazy: usize,
+}
+
+/// What happened to a peer, for [`PlumtreeState::apply_change`].
+#[derive(Debug, Clone, Copy)]
+enum PeerChange {
+    Joined,
+    Left {
+        bucket: RingBucket,
+        was_eager: bool,
+        was_lazy: bool,
+    },
+    MovedBucket {
+        from: RingBucket,
+    },
 }
 
 pub trait SeenStore<I: MessageId> {
@@ -440,14 +539,14 @@ pub struct PlumtreeState<
     config: Config,
 
     /// Peers on the spanning tree: they get full `Gossip` payloads (push).
-    eager_peers: HashSet<N>,
+    eager_peers: IndexSet<N>,
     /// Lazy peers only get `IHave` digests (lazy push).
     lazy_peers: IndexSet<N>,
     /// Every peer we know about, eager or lazy; drives.
-    known_peers: HashSet<N>,
+    known_peers: IndexSet<N>,
     /// Eager peers pinned to the tree because they are our ring neighbors
     /// within `Config::ring_locked_radius`; they are never pruned.
-    ring_locked: HashSet<N>,
+    ring_locked: IndexSet<N>,
     /// Per-per rtt information.
     peer_topology: HashMap<N, RttInfo>,
     /// Candidate topology change awaiting confirmation
@@ -463,6 +562,9 @@ pub struct PlumtreeState<
     /// Recently-delivered payloads, kept so we can answer inbound `Graft`s.
     cache: PayloadCache<I, P>,
     /// PRNG for random peer selection (seedable for deterministic tests).
+    /// The peer sets are `IndexSet`s so that their iteration order, which
+    /// decides what this RNG picks and the order of sends, depends only on
+    /// the sequence of inserts and removes, not on the hasher.
     rng: SmallRng,
     /// Rate-limits outbound `Prune`s per peer to avoid flapping links.
     prune_throttle: PruneThrottle<N>,
@@ -471,6 +573,11 @@ pub struct PlumtreeState<
     // target number of eager and lazy peers, calculated based on config
     // or cluster size if config is not set.
     fanout: FanoutTargets,
+    /// `PeerSelection::Hrw`: this node's salt for `rank`, and the sets the
+    /// last selection picked. A change moves only the peers whose label
+    /// (eager, lazy, neither) differs between that and the new selection.
+    rank_salt: u64,
+    targets: Targets<N>,
 }
 
 impl<I: MessageId<NodeId = N>, P: Payload<MessageId = I, NodeId = N>, N: NodeId, S: SeenStore<I>>
@@ -491,10 +598,10 @@ impl<I: MessageId<NodeId = N>, P: Payload<MessageId = I, NodeId = N>, N: NodeId,
         Self {
             local_id,
             config,
-            eager_peers: HashSet::new(),
+            eager_peers: IndexSet::new(),
             lazy_peers: IndexSet::new(),
-            known_peers: HashSet::new(),
-            ring_locked: HashSet::new(),
+            known_peers: IndexSet::new(),
+            ring_locked: IndexSet::new(),
             peer_topology: HashMap::new(),
             pending_topology: HashMap::new(),
             lazy_queue: Vec::new(),
@@ -505,10 +612,13 @@ impl<I: MessageId<NodeId = N>, P: Payload<MessageId = I, NodeId = N>, N: NodeId,
             prune_throttle: PruneThrottle::default(),
             needs_rebalance: false,
             fanout,
+            // derived from the seed without drawing from `rng`
+            rank_salt: mix64(seed),
+            targets: Targets::default(),
         }
     }
 
-    pub fn ring_locked_peers(&self) -> &HashSet<N> {
+    pub fn ring_locked_peers(&self) -> &IndexSet<N> {
         &self.ring_locked
     }
 
@@ -516,7 +626,7 @@ impl<I: MessageId<NodeId = N>, P: Payload<MessageId = I, NodeId = N>, N: NodeId,
         self.seen.contains(id)
     }
 
-    pub fn eager_peers(&self) -> &HashSet<N> {
+    pub fn eager_peers(&self) -> &IndexSet<N> {
         &self.eager_peers
     }
 
@@ -524,7 +634,7 @@ impl<I: MessageId<NodeId = N>, P: Payload<MessageId = I, NodeId = N>, N: NodeId,
         &self.lazy_peers
     }
 
-    pub fn known_peers(&self) -> &HashSet<N> {
+    pub fn known_peers(&self) -> &IndexSet<N> {
         &self.known_peers
     }
 
@@ -1010,6 +1120,10 @@ impl<I: MessageId<NodeId = N>, P: Payload<MessageId = I, NodeId = N>, N: NodeId,
 
         let info = self.cached_ring_or(&peer, rtt.unwrap_or_default());
         self.commit_topology(peer, info);
+        if self.config.peer_selection != PeerSelection::FullRebalance {
+            self.apply_change(peer, PeerChange::Joined, rt);
+            return;
+        }
         self.maybe_recompute_fanout();
         if self.eager_peers.len() < self.num_eager() {
             self.move_to_eager(&peer, rt);
@@ -1031,6 +1145,10 @@ impl<I: MessageId<NodeId = N>, P: Payload<MessageId = I, NodeId = N>, N: NodeId,
     /// `RING_EXTRA_CONFIRMATIONS` consecutive runs. `peer_topology` keeps an
     /// entry for every peer ever seen: it is the RTT cache that places a
     /// rejoining peer before a fresh ring is known.
+    ///
+    /// Outside `PeerSelection::FullRebalance`, every change found here updates
+    /// the sets right away and the run ends with `top_up` instead of a
+    /// rebalance.
     pub fn update_peer_topology(
         &mut self,
         updates: impl IntoIterator<Item = (N, RttInfo)>,
@@ -1056,6 +1174,11 @@ impl<I: MessageId<NodeId = N>, P: Payload<MessageId = I, NodeId = N>, N: NodeId,
                         self.peer_topology.insert(peer, info);
                         if new_bucket != old_bucket {
                             topology_changed = true;
+                            self.apply_change(
+                                peer,
+                                PeerChange::MovedBucket { from: old_bucket },
+                                rt,
+                            );
                         }
                         continue;
                     }
@@ -1081,6 +1204,7 @@ impl<I: MessageId<NodeId = N>, P: Payload<MessageId = I, NodeId = N>, N: NodeId,
                         );
                         self.commit_topology(peer, info);
                         topology_changed = true;
+                        self.apply_change(peer, PeerChange::MovedBucket { from: old_bucket }, rt);
                     } else {
                         // Not yet stable, record the candidate and wait.
                         self.pending_topology.insert(peer, (info, confirmations));
@@ -1092,6 +1216,7 @@ impl<I: MessageId<NodeId = N>, P: Payload<MessageId = I, NodeId = N>, N: NodeId,
                     info!("topology added peer {:?}, new: {:?}", peer, info);
                     self.commit_topology(peer, info);
                     topology_changed = true;
+                    self.apply_change(peer, PeerChange::Joined, rt);
                 }
             }
         }
@@ -1112,7 +1237,9 @@ impl<I: MessageId<NodeId = N>, P: Payload<MessageId = I, NodeId = N>, N: NodeId,
             self.maybe_recompute_fanout();
         }
 
-        if self.needs_rebalance || topology_changed {
+        if self.config.peer_selection != PeerSelection::FullRebalance {
+            self.top_up(rt);
+        } else if self.needs_rebalance || topology_changed {
             info!(
                 "rebalancing peers: topology_changed: {topology_changed}, needs rebalance: {:?}",
                 self.needs_rebalance
@@ -1139,16 +1266,283 @@ impl<I: MessageId<NodeId = N>, P: Payload<MessageId = I, NodeId = N>, N: NodeId,
 
     /// Removes the peer from the overlay. `peer_topology` is left alone:
     /// it is the RTT cache consulted when the peer comes back.
-    pub fn peer_down(&mut self, peer: &N, _rt: &mut impl Runtime<I, P, N>) {
-        let was_eager = self.eager_peers.remove(peer);
+    pub fn peer_down(&mut self, peer: &N, rt: &mut impl Runtime<I, P, N>) {
+        let was_eager = self.eager_peers.swap_remove(peer);
         let was_lazy = self.lazy_peers.swap_remove(peer);
-        self.known_peers.remove(peer);
-        self.ring_locked.remove(peer);
+        self.known_peers.swap_remove(peer);
+        self.ring_locked.swap_remove(peer);
         self.pending_topology.remove(peer);
+        if self.config.peer_selection != PeerSelection::FullRebalance {
+            let change = PeerChange::Left {
+                bucket: self.peer_bucket(peer),
+                was_eager,
+                was_lazy,
+            };
+            self.apply_change(*peer, change, rt);
+            return;
+        }
         let fanout_changed = self.maybe_recompute_fanout();
         if was_eager || was_lazy || fanout_changed {
             self.needs_rebalance = true;
         }
+    }
+
+    // --- Hrw and IncrementalRandom ---
+
+    /// Updates the sets right away for a peer that joined, left or moved
+    /// bucket. `FullRebalance` instead flags a rebalance for the next tick,
+    /// see the callers.
+    fn apply_change(&mut self, peer: N, change: PeerChange, rt: &mut impl Runtime<I, P, N>) {
+        if self.config.peer_selection == PeerSelection::FullRebalance {
+            return;
+        }
+        let prev_num_eager = self.num_eager();
+        self.maybe_recompute_fanout();
+        if self.config.peer_selection == PeerSelection::Hrw {
+            self.apply_ranked_targets(rt);
+            if let PeerChange::Joined = change {
+                self.default_to_lazy(peer, rt);
+            }
+        } else {
+            self.place_randomly(peer, change, prev_num_eager, rt);
+        }
+    }
+
+    /// A joining peer that is not eager starts lazy, so that it gets IHaves
+    /// and can GRAFT. With a full lazy set it is only tracked: evicting
+    /// another entry would change two entries instead of none.
+    fn default_to_lazy(&mut self, peer: N, rt: &mut impl Runtime<I, P, N>) {
+        if self.lazy_peers.len() < self.max_lazy() {
+            self.ensure_in_lazy(&peer, rt);
+        }
+    }
+
+    /// The maintenance tick outside `FullRebalance`: an idempotent repair
+    /// instead of a rebalance.
+    fn top_up(&mut self, rt: &mut impl Runtime<I, P, N>) {
+        match self.config.peer_selection {
+            PeerSelection::FullRebalance => {}
+            PeerSelection::Hrw => self.apply_ranked_targets(rt),
+            PeerSelection::IncrementalRandom => {
+                self.lock_ring_neighbors(rt);
+                // Refills lazy only: eager below the fanout is where PRUNE
+                // left it, and refilling it every tick would undo that.
+                while self.lazy_peers.len() < self.min_lazy().min(self.max_lazy()) {
+                    let untracked = self.untracked_peers(None);
+                    let Some(peer) = self.pick(untracked, None) else {
+                        break;
+                    };
+                    self.insert_into_lazy(peer, rt);
+                }
+            }
+        }
+    }
+
+    /// `Hrw`: moves only the peers whose label (eager, lazy or neither)
+    /// differs between the previous and the new ranked selection. Every other
+    /// entry stays as GRAFT, PRUNE or a gossip sender left it.
+    fn apply_ranked_targets(&mut self, rt: &mut impl Runtime<I, P, N>) {
+        self.set_ring_neighbors();
+        let new = self.select_targets();
+        let old = std::mem::replace(&mut self.targets, new.clone());
+
+        // Removals first, then promotions, so that lazy inserts find room.
+        for p in old.eager.iter().chain(&old.lazy) {
+            if new.eager.contains(p) || new.lazy.contains(p) {
+                continue;
+            }
+            if !old.eager.contains(p) {
+                if self.lazy_peers.swap_remove(p) {
+                    rt.notify(Notification::PeerEvictedFromLazy(p));
+                }
+            } else if self.eager_peers.swap_remove(p) {
+                rt.notify(Notification::PeerDroppedFromEager(p));
+            }
+        }
+        for p in new.eager.difference(&old.eager) {
+            self.move_to_eager(p, rt);
+        }
+        for p in new.lazy.difference(&old.lazy) {
+            if old.eager.contains(p) {
+                self.move_to_lazy(p, rt);
+            } else {
+                self.ensure_in_lazy(p, rt);
+            }
+        }
+        // A new ring neighbor may keep its eager label while an earlier
+        // PRUNE left it in lazy.
+        for p in self.ring_locked.clone() {
+            self.move_to_eager(&p, rt);
+        }
+    }
+
+    /// `IncrementalRandom`: places the one peer that changed and refills or
+    /// trims a slot; every other entry stays.
+    fn place_randomly(
+        &mut self,
+        peer: N,
+        change: PeerChange,
+        prev_num_eager: usize,
+        rt: &mut impl Runtime<I, P, N>,
+    ) {
+        self.lock_ring_neighbors(rt);
+        match change {
+            PeerChange::Joined => self.admit_randomly(peer, rt),
+            PeerChange::Left {
+                bucket,
+                was_eager,
+                was_lazy,
+            } => self.refill(peer, bucket, was_eager, was_lazy, rt),
+            // a bucket change is a departure from the old bucket and a
+            // join to the new one
+            PeerChange::MovedBucket { from } => {
+                let was_eager =
+                    !self.ring_locked.contains(&peer) && self.eager_peers.swap_remove(&peer);
+                if was_eager {
+                    rt.notify(Notification::PeerDroppedFromEager(&peer));
+                }
+                let was_lazy = self.lazy_peers.swap_remove(&peer);
+                if was_lazy {
+                    rt.notify(Notification::PeerEvictedFromLazy(&peer));
+                }
+                self.refill(peer, from, was_eager, was_lazy, rt);
+                self.admit_randomly(peer, rt);
+            }
+        }
+
+        // A fanout change adds or removes one eager peer, from any bucket,
+        // if the eager set is not already at the new size.
+        let eager = self.eager_peers.len();
+        match self.num_eager().cmp(&prev_num_eager) {
+            Ordering::Greater if eager < self.num_eager() => {
+                let candidates = self.non_eager_peers(None);
+                if let Some(p) = self.pick(candidates, None) {
+                    self.move_to_eager(&p, rt);
+                }
+            }
+            Ordering::Less if eager > self.num_eager() => self.demote_random(None, rt),
+            _ => {}
+        }
+    }
+
+    /// One draw: eager with probability ~k/n, else lazy. k and n are taken
+    /// per bucket (its eager share and its known peers, ring neighbors
+    /// included), so that the Near/Mid/Far mix holds; with one bucket this is
+    /// exactly k/n.
+    fn admit_randomly(&mut self, peer: N, rt: &mut impl Runtime<I, P, N>) {
+        if self.eager_peers.contains(&peer) {
+            // a new ring neighbor
+            return;
+        }
+        let bucket = self.peer_bucket(&peer);
+        let mut pool = [0; 3];
+        for p in self.known_peers.iter() {
+            if !self.ring_locked.contains(p) {
+                pool[self.peer_bucket(p) as usize] += 1;
+            }
+        }
+        let share = self.bucket_shares(pool)[bucket as usize];
+        let known = (share.locked + share.pool).max(1) as f64;
+        let eager = (share.locked + share.eager) as f64 / known;
+
+        if self.rng.random::<f64>() < eager {
+            self.make_eager(peer, rt);
+        } else {
+            self.default_to_lazy(peer, rt);
+        }
+    }
+
+    /// Makes `peer` eager; with a full eager set, first demotes a random
+    /// eager peer to lazy.
+    fn make_eager(&mut self, peer: N, rt: &mut impl Runtime<I, P, N>) {
+        if self.eager_peers.len() >= self.num_eager() {
+            self.demote_random(Some(self.peer_bucket(&peer)), rt);
+        }
+        self.move_to_eager(&peer, rt);
+    }
+
+    /// Demotes a random eager peer that is not ring-locked to lazy, from
+    /// `bucket` if it has one.
+    fn demote_random(&mut self, bucket: Option<RingBucket>, rt: &mut impl Runtime<I, P, N>) {
+        let candidates = self
+            .eager_peers
+            .iter()
+            .filter(|p| !self.ring_locked.contains(*p))
+            .copied()
+            .collect();
+        if let Some(p) = self.pick(candidates, bucket) {
+            self.move_to_lazy(&p, rt);
+        }
+    }
+
+    /// Refills the slot `left` held, below the fanout or `min_lazy`, with a
+    /// random peer from `bucket` if it has one.
+    fn refill(
+        &mut self,
+        left: N,
+        bucket: RingBucket,
+        was_eager: bool,
+        was_lazy: bool,
+        rt: &mut impl Runtime<I, P, N>,
+    ) {
+        if was_eager && self.eager_peers.len() < self.num_eager() {
+            let candidates = self.non_eager_peers(Some(left));
+            if let Some(p) = self.pick(candidates, Some(bucket)) {
+                self.move_to_eager(&p, rt);
+            }
+        }
+        if was_lazy && self.lazy_peers.len() < self.min_lazy() {
+            let candidates = self.untracked_peers(Some(left));
+            if let Some(p) = self.pick(candidates, Some(bucket)) {
+                self.insert_into_lazy(p, rt);
+            }
+        }
+    }
+
+    /// Recomputes the ring neighbors and makes new ones eager. A former
+    /// neighbor keeps its place as an ordinary entry.
+    fn lock_ring_neighbors(&mut self, rt: &mut impl Runtime<I, P, N>) {
+        self.set_ring_neighbors();
+        let unlocked: Vec<N> = self
+            .ring_locked
+            .iter()
+            .filter(|p| !self.eager_peers.contains(*p))
+            .copied()
+            .collect();
+        for p in unlocked {
+            self.make_eager(p, rt);
+        }
+    }
+
+    fn non_eager_peers(&self, except: Option<N>) -> Vec<N> {
+        self.known_peers
+            .iter()
+            .filter(|p| !self.eager_peers.contains(*p) && Some(**p) != except)
+            .copied()
+            .collect()
+    }
+
+    /// Known peers in neither set.
+    fn untracked_peers(&self, except: Option<N>) -> Vec<N> {
+        self.non_eager_peers(except)
+            .into_iter()
+            .filter(|p| !self.lazy_peers.contains(p))
+            .collect()
+    }
+
+    /// A random candidate, from `bucket` if one is there.
+    fn pick(&mut self, mut candidates: Vec<N>, bucket: Option<RingBucket>) -> Option<N> {
+        if let Some(bucket) = bucket {
+            let same: Vec<N> = candidates
+                .iter()
+                .copied()
+                .filter(|p| self.peer_bucket(p) == bucket)
+                .collect();
+            if !same.is_empty() {
+                candidates = same;
+            }
+        }
+        candidates.choose(&mut self.rng).copied()
     }
 
     // --- Rebalance ---
@@ -1166,71 +1560,11 @@ impl<I: MessageId<NodeId = N>, P: Payload<MessageId = I, NodeId = N>, N: NodeId,
         self.lazy_peers.clear();
         self.ring_locked.clear();
 
-        if self.known_peers.is_empty() {
-            return;
-        }
-
         self.set_ring_neighbors();
-        if self.known_peers.len() <= self.num_eager() {
-            self.eager_peers.extend(self.known_peers.iter().copied());
-            return;
-        }
-
-        // ring-locked peers are always eager so a node is never isolated.
-        // count them per bucket so they count toward that bucket's target.
-        let mut locked_near = 0;
-        let mut locked_mid = 0;
-        let mut locked_far = 0;
-        for p in self.ring_locked.iter().copied() {
-            match self.peer_bucket(&p) {
-                RingBucket::Near => locked_near += 1,
-                RingBucket::Mid => locked_mid += 1,
-                RingBucket::Far => locked_far += 1,
-            }
-            self.eager_peers.insert(p);
-        }
-
-        let num_eager = self.num_eager();
-
-        // pools exclude ring_locked peers so they aren't reselected.
-        let (near_pool, mid_pool, far_pool) = self.bucket_pools();
-
-        // Near/Mid/Far split for eager and lazy peer selection (see `EagerRatios`).
-        let (near_t, mid_t, far_t) = Self::bucket_targets(
-            num_eager,
-            near_pool.len() + locked_near,
-            mid_pool.len() + locked_mid,
-            far_pool.len() + locked_far,
-            self.config.eager_ratios,
-        );
-        let eager_near = near_t.saturating_sub(locked_near);
-        let eager_mid = mid_t.saturating_sub(locked_mid);
-        let eager_far = far_t.saturating_sub(locked_far);
-
-        self.eager_peers
-            .extend(near_pool.iter().take(eager_near).copied());
-        self.eager_peers
-            .extend(mid_pool.iter().take(eager_mid).copied());
-        self.eager_peers
-            .extend(far_pool.iter().take(eager_far).copied());
-
-        // same selection logic for lazy peers since they are eager candidates.
-        // pools already exclude ring_locked, so lazy can never grab a locked peer.
-        let num_lazy = self.min_lazy();
-        let (lazy_near, lazy_mid, lazy_far) = Self::bucket_targets(
-            num_lazy,
-            near_pool.len().saturating_sub(eager_near),
-            mid_pool.len().saturating_sub(eager_mid),
-            far_pool.len().saturating_sub(eager_far),
-            self.config.eager_ratios,
-        );
-
-        self.lazy_peers
-            .extend(near_pool.iter().skip(eager_near).take(lazy_near).copied());
-        self.lazy_peers
-            .extend(mid_pool.iter().skip(eager_mid).take(lazy_mid).copied());
-        self.lazy_peers
-            .extend(far_pool.iter().skip(eager_far).take(lazy_far).copied());
+        let targets = self.select_targets();
+        self.eager_peers.extend(targets.eager.iter().copied());
+        self.lazy_peers.extend(targets.lazy.iter().copied());
+        self.targets = targets;
         trace!(
             self_actor_id = ?self.local_id,
             eager = self.eager_peers.len(),
@@ -1241,25 +1575,90 @@ impl<I: MessageId<NodeId = N>, P: Payload<MessageId = I, NodeId = N>, N: NodeId,
         );
     }
 
-    fn bucket_pools(&mut self) -> (Vec<N>, Vec<N>, Vec<N>) {
-        let mut near = Vec::new();
-        let mut mid = Vec::new();
-        let mut far = Vec::new();
+    /// The eager and lazy peers of a full selection, given the current ring
+    /// neighbors: every known peer if they fit in the fanout, else the ring
+    /// neighbors plus each bucket's eager share from the front of its pool,
+    /// and the lazy share right after it.
+    fn select_targets(&mut self) -> Targets<N> {
+        let mut targets = Targets::default();
+        if self.known_peers.len() <= self.num_eager() {
+            targets.eager.extend(self.known_peers.iter().copied());
+            return targets;
+        }
+
+        // ring-locked peers are always eager so a node is never isolated.
+        targets.eager.extend(self.ring_locked.iter().copied());
+
+        // pools exclude ring_locked peers so they aren't reselected.
+        let pools = self.bucket_pools();
+        let shares = self.bucket_shares(pools.each_ref().map(Vec::len));
+        for (pool, share) in pools.iter().zip(shares) {
+            targets.eager.extend(pool.iter().take(share.eager).copied());
+        }
+
+        // same selection logic for lazy peers since they are eager candidates.
+        for (pool, share) in pools.iter().zip(shares) {
+            targets
+                .lazy
+                .extend(pool.iter().skip(share.eager).take(share.lazy).copied());
+        }
+        targets
+    }
+
+    /// Known peers that are not ring-locked, per bucket (Near, Mid, Far), in
+    /// selection order: ranked for `Hrw`, shuffled otherwise.
+    fn bucket_pools(&mut self) -> [Vec<N>; 3] {
+        let mut pools: [Vec<N>; 3] = Default::default();
         for p in self.known_peers.iter() {
-            if self.eager_peers.contains(p) || self.lazy_peers.contains(p) {
-                continue;
-            }
-            match self.peer_bucket(p) {
-                RingBucket::Near => near.push(*p),
-                RingBucket::Mid => mid.push(*p),
-                RingBucket::Far => far.push(*p),
+            if !self.ring_locked.contains(p) {
+                pools[self.peer_bucket(p) as usize].push(*p);
             }
         }
 
-        near.shuffle(&mut self.rng);
-        mid.shuffle(&mut self.rng);
-        far.shuffle(&mut self.rng);
-        (near, mid, far)
+        let salt = self.rank_salt;
+        for pool in &mut pools {
+            if self.config.peer_selection == PeerSelection::Hrw {
+                pool.sort_by_cached_key(|p| Reverse(rank(salt, p)));
+            } else {
+                pool.shuffle(&mut self.rng);
+            }
+        }
+        pools
+    }
+
+    /// Splits the fanout across the buckets for pools of the given sizes,
+    /// with the Near/Mid/Far ratios of `EagerRatios`.
+    fn bucket_shares(&self, pool: [usize; 3]) -> [BucketShare; 3] {
+        let mut locked = [0; 3];
+        for p in self.ring_locked.iter() {
+            locked[self.peer_bucket(p) as usize] += 1;
+        }
+        let (near, mid, far) = Self::bucket_targets(
+            self.num_eager(),
+            pool[0] + locked[0],
+            pool[1] + locked[1],
+            pool[2] + locked[2],
+            self.config.eager_ratios,
+        );
+        let eager = [
+            near.saturating_sub(locked[0]),
+            mid.saturating_sub(locked[1]),
+            far.saturating_sub(locked[2]),
+        ];
+        let (near, mid, far) = Self::bucket_targets(
+            self.min_lazy(),
+            pool[0].saturating_sub(eager[0]),
+            pool[1].saturating_sub(eager[1]),
+            pool[2].saturating_sub(eager[2]),
+            self.config.eager_ratios,
+        );
+        let lazy = [near, mid, far];
+        std::array::from_fn(|b| BucketShare {
+            locked: locked[b],
+            pool: pool[b],
+            eager: eager[b],
+            lazy: lazy[b],
+        })
     }
 
     fn bucket_targets(
@@ -1357,7 +1756,7 @@ impl<I: MessageId<NodeId = N>, P: Payload<MessageId = I, NodeId = N>, N: NodeId,
             return;
         }
 
-        let was_eager = self.eager_peers.remove(peer);
+        let was_eager = self.eager_peers.swap_remove(peer);
         if was_eager {
             rt.notify(Notification::PeerDroppedFromEager(peer));
         }
@@ -1514,6 +1913,7 @@ mod tests {
             prune_throttle: None,
             eager_ratios: EagerRatios::default(),
             ring_locked_radius: 1,
+            peer_selection: PeerSelection::FullRebalance,
         }
     }
 
@@ -1715,7 +2115,7 @@ mod tests {
         let rand_eager = *s
             .eager_peers()
             .iter()
-            .find(|p| !s.ring_locked_peers().contains(p))
+            .find(|p| !s.ring_locked_peers().contains(*p))
             .unwrap();
         s.handle_prune(
             PruneMsg {
@@ -2551,11 +2951,11 @@ mod tests {
     fn reconcile_relocks_ring_neighbors_after_departure() {
         // local id 0, sorted ring 0,1,2,3: neighbors are 1 and 3.
         let (mut s, mut rt) = reconciled(&THREE);
-        assert_eq!(s.ring_locked, HashSet::from([1, 3]));
+        assert_eq!(s.ring_locked, IndexSet::from([1, 3]));
 
         s.update_peer_topology(snapshot(&THREE[..2]), &mut rt);
 
-        assert_eq!(s.ring_locked, HashSet::from([1, 2]));
+        assert_eq!(s.ring_locked, IndexSet::from([1, 2]));
         assert!(s.eager_peers.contains(&2));
     }
 
@@ -2676,5 +3076,484 @@ mod tests {
         let expected = resolve_fanout(s.known_peers.len(), s.config()).num_eager;
         assert_eq!(s.num_eager(), expected);
         assert!(s.needs_rebalance);
+    }
+
+    // --- Peer selection strategies ---
+
+    type TestState = PlumtreeState<TestMsgId, TestPayload, TestNodeId, TestSeenStore>;
+
+    /// Rings 0..=5 by id, so the peers spread over Near, Mid and Far.
+    fn ring_of(p: TestNodeId) -> RttInfo {
+        ring(Some(p % 6))
+    }
+
+    /// A state with a derived fanout, bootstrapped with `peers`.
+    fn selecting(
+        selection: PeerSelection,
+        peers: impl IntoIterator<Item = (TestNodeId, RttInfo)>,
+    ) -> (TestState, AccumulatingRuntime) {
+        selecting_seeded(selection, peers, 7)
+    }
+
+    fn selecting_seeded(
+        selection: PeerSelection,
+        peers: impl IntoIterator<Item = (TestNodeId, RttInfo)>,
+        seed: u64,
+    ) -> (TestState, AccumulatingRuntime) {
+        let mut cfg = test_config();
+        cfg.num_eager = None;
+        cfg.min_lazy = None;
+        cfg.max_lazy = None;
+        cfg.peer_selection = selection;
+        let mut s = PlumtreeState::new_with_store_seeded(0, cfg, TestSeenStore::default(), seed);
+        let mut rt = AccumulatingRuntime::default();
+        s.add_peers_bulk_with_rtt(peers.into_iter().collect(), &mut rt);
+        (s, rt)
+    }
+
+    fn sets(s: &TestState) -> (IndexSet<TestNodeId>, IndexSet<TestNodeId>) {
+        (s.eager_peers.clone(), s.lazy_peers.clone())
+    }
+
+    /// Eager and lazy entries changed since `before`.
+    fn changed(s: &TestState, before: &(IndexSet<TestNodeId>, IndexSet<TestNodeId>)) -> usize {
+        before.0.symmetric_difference(&s.eager_peers).count()
+            + before.1.symmetric_difference(&s.lazy_peers).count()
+    }
+
+    /// 300 random joins and departures over ids 1..=150, starting from
+    /// 1..=120 known. `check` runs after each one.
+    fn random_churn(selection: PeerSelection, mut check: impl FnMut(&mut TestState, usize)) {
+        let (mut s, mut rt) = selecting(selection, (1..=120).map(|p| (p, ring_of(p))));
+        let mut events = SmallRng::seed_from_u64(1);
+        for _ in 0..300 {
+            let p = events.random_range(1..=150);
+            let before = sets(&s);
+            if s.known_peers.contains(&p) {
+                s.peer_down(&p, &mut rt);
+            } else {
+                s.peer_up(p, Some(ring_of(p)), &mut rt);
+            }
+            let changed = changed(&s, &before);
+            check(&mut s, changed);
+        }
+    }
+
+    #[test]
+    fn hrw_flap_restores_the_eager_set() {
+        let (mut s, mut rt) = selecting(PeerSelection::Hrw, (1..=120).map(|p| (p, ring_of(p))));
+        let (eager, lazy) = sets(&s);
+        let mut started_lazy = IndexSet::new();
+        // eager, lazy, untracked and ring-locked (1 and 120) peers alike
+        for p in 1..=120 {
+            if !in_overlay(&s, &p) {
+                started_lazy.insert(p);
+            }
+            s.peer_down(&p, &mut rt);
+            s.peer_up(p, Some(ring_of(p)), &mut rt);
+            assert_eq!(s.eager_peers, eager, "flap of {p}");
+            // an untracked peer comes back lazy while there is room
+            assert!(lazy.is_subset(&s.lazy_peers), "flap of {p}");
+            assert!(
+                s.lazy_peers
+                    .difference(&lazy)
+                    .all(|q| started_lazy.contains(q))
+            );
+        }
+        assert_eq!(s.lazy_peers.len(), s.max_lazy());
+        s.update_peer_topology(known_snapshot(&s), &mut rt);
+        assert_eq!(s.eager_peers, eager);
+    }
+
+    #[test]
+    fn graft_learned_eager_peer_survives_unrelated_joins() {
+        // Members have even ids and joins odd ones in between, so the ring
+        // neighbors stay the same. Under Hrw the joins rank around the
+        // grafted Near peers. IncrementalRandom demotes from the newcomer's
+        // bucket first: Far joins that are not drawn eager leave again, so
+        // the Far bucket stays small and many joins evict a Far peer.
+        for (selection, join_ring) in [
+            (PeerSelection::Hrw, 0),
+            (PeerSelection::IncrementalRandom, 4),
+        ] {
+            let far = [40, 80, 120, 160];
+            let members = (1..=100).map(|i| {
+                let p = 2 * i;
+                let info = if far.contains(&p) {
+                    ring(Some(4))
+                } else {
+                    ring(Some(p % 4))
+                };
+                (p, info)
+            });
+            let (mut s, mut rt) = selecting(selection, members);
+            let near = |p: &&u8| s.peer_bucket(p) == RingBucket::Near;
+            let untracked = *s
+                .known_peers
+                .iter()
+                .filter(near)
+                .find(|p| !in_overlay(&s, p))
+                .unwrap();
+            let lazy = *s.lazy_peers.iter().rfind(near).unwrap();
+            for p in [untracked, lazy] {
+                s.handle_graft(graft_msg(p, false, vec![]), &mut rt);
+            }
+
+            let mut evictions = 0;
+            for p in (101..=199).step_by(2) {
+                let before = s.eager_peers.clone();
+                s.peer_up(p, Some(ring(Some(join_ring))), &mut rt);
+                evictions += before.difference(&s.eager_peers).count();
+                if selection == PeerSelection::IncrementalRandom && !s.eager_peers.contains(&p) {
+                    s.peer_down(&p, &mut rt);
+                }
+                for grafted in [untracked, lazy] {
+                    assert!(
+                        s.eager_peers.contains(&grafted),
+                        "{selection:?}: join of {p} dropped {grafted}"
+                    );
+                }
+            }
+            s.update_peer_topology(known_snapshot(&s), &mut rt);
+            assert!(s.eager_peers.contains(&untracked) && s.eager_peers.contains(&lazy));
+            if selection == PeerSelection::Hrw {
+                // the joins did push the lazy one out of its ranked slot
+                assert!(!s.targets.lazy.contains(&lazy) && !s.targets.eager.contains(&lazy));
+            } else {
+                assert!(evictions >= 5, "{evictions} evictions");
+            }
+        }
+    }
+
+    #[test]
+    fn membership_change_moves_few_entries() {
+        for selection in [PeerSelection::Hrw, PeerSelection::IncrementalRandom] {
+            let (mut total, mut max) = (0, 0);
+            random_churn(selection, |_, changed| {
+                total += changed;
+                max = max.max(changed);
+            });
+            // Guards against changes that touch most of the sets: a full
+            // rebuild changes up to 2 * (num_eager + min_lazy) = 30 entries
+            // here. One change moves the peer itself, the slice boundaries it
+            // shifts, a ring lock that changes bucket, and a fanout step that
+            // moves every bucket's slice. Over 300 event seeds Hrw reaches 10
+            // per change and 307 per 300 changes.
+            assert!(max <= 12, "{selection:?}: {max} entries in one change");
+            assert!(
+                total <= 350,
+                "{selection:?}: {total} entries in 300 changes"
+            );
+        }
+    }
+
+    #[test]
+    fn ring_neighbors_stay_locked_and_eager() {
+        for selection in [
+            PeerSelection::FullRebalance,
+            PeerSelection::Hrw,
+            PeerSelection::IncrementalRandom,
+        ] {
+            random_churn(selection, |s, _| {
+                if selection == PeerSelection::FullRebalance {
+                    // relocks on the tick
+                    let mut rt = AccumulatingRuntime::default();
+                    s.update_peer_topology(known_snapshot(s), &mut rt);
+                }
+                // local id 0: the smallest and the largest known id
+                let neighbors = IndexSet::from([
+                    *s.known_peers.iter().min().unwrap(),
+                    *s.known_peers.iter().max().unwrap(),
+                ]);
+                assert_eq!(s.ring_locked, neighbors, "{selection:?}");
+                assert!(s.ring_locked.is_subset(&s.eager_peers), "{selection:?}");
+            });
+        }
+    }
+
+    #[test]
+    fn new_ring_neighbor_is_eager_after_an_earlier_prune() {
+        for selection in [PeerSelection::Hrw, PeerSelection::IncrementalRandom] {
+            let (mut s, mut rt) = selecting(selection, (1..=120).map(|p| (p, ring_of(p))));
+            let p = *s
+                .eager_peers
+                .iter()
+                .filter(|p| !s.ring_locked.contains(*p))
+                .max()
+                .unwrap();
+            s.handle_prune(
+                PruneMsg {
+                    sender: p,
+                    triggered_by: None,
+                },
+                &mut rt,
+            );
+            assert!(s.lazy_peers.contains(&p));
+            // p becomes the largest id, a ring neighbor of 0
+            for q in (p + 1)..=120 {
+                s.peer_down(&q, &mut rt);
+            }
+            assert!(s.ring_locked.contains(&p), "{selection:?}");
+            assert!(s.eager_peers.contains(&p), "{selection:?}");
+            s.update_peer_topology(known_snapshot(&s), &mut rt);
+            assert!(s.ring_locked.is_subset(&s.eager_peers), "{selection:?}");
+        }
+    }
+
+    /// Each node ranks with its own salt, so nodes with the same members pick
+    /// different eager peers and no peer is eager everywhere.
+    #[test]
+    fn hrw_rankings_differ_between_nodes() {
+        let mut picked: HashMap<TestNodeId, u32> = HashMap::new();
+        for seed in 0..40 {
+            let members = (1..=120).map(|p| (p, ring_of(p)));
+            let (s, _) = selecting_seeded(PeerSelection::Hrw, members, seed);
+            for p in s.eager_peers.difference(&s.ring_locked) {
+                *picked.entry(*p).or_default() += 1;
+            }
+        }
+        // 4 non-locked eager peers out of 118 per node: about 1.4 picks per
+        // peer over 40 nodes; one shared ranking would give 40.
+        let max = picked.values().max().unwrap();
+        assert!(*max <= 10, "one peer is eager at {max} of 40 nodes");
+    }
+
+    #[test]
+    fn ring_neighbor_stays_eager_when_its_bucket_changes() {
+        for selection in [PeerSelection::Hrw, PeerSelection::IncrementalRandom] {
+            let mut members: Vec<_> = (1..=120).map(|p| (p, ring_of(p))).collect();
+            let (mut s, mut rt) = selecting(selection, members.clone());
+            // 1 is a ring neighbor of 0 and moves from Near to Far
+            assert!(s.ring_locked.contains(&1));
+            let before = sets(&s);
+            members[0].1 = ring(Some(5));
+            for _ in 0..RING_EXTRA_CONFIRMATIONS {
+                s.update_peer_topology(members.clone(), &mut rt);
+            }
+            assert_eq!(s.peer_bucket(&1), RingBucket::Far);
+            assert!(s.ring_locked.contains(&1), "{selection:?}");
+            assert!(s.eager_peers.contains(&1), "{selection:?}");
+            if selection == PeerSelection::IncrementalRandom {
+                // a locked peer is not dropped and drawn again
+                assert_eq!(sets(&s), before);
+            }
+        }
+    }
+
+    #[test]
+    fn hrw_sets_depend_only_on_membership() {
+        let (mut s, mut rt) = selecting(PeerSelection::Hrw, (1..=120).map(|p| (p, ring_of(p))));
+        for p in [3, 10, 64, 120] {
+            s.peer_down(&p, &mut rt);
+        }
+        for p in [121, 122, 130] {
+            s.peer_up(p, Some(ring_of(p)), &mut rt);
+        }
+        // 7 moves from Near to Far once the move is confirmed
+        let mut members = known_snapshot(&s);
+        for (p, info) in members.iter_mut() {
+            if *p == 7 {
+                *info = ring(Some(5));
+            }
+        }
+        for _ in 0..RING_EXTRA_CONFIRMATIONS {
+            s.update_peer_topology(members.clone(), &mut rt);
+        }
+        assert_eq!(s.peer_bucket(&7), RingBucket::Far);
+
+        let (fresh, _) = selecting(PeerSelection::Hrw, members);
+        assert_eq!(s.eager_peers, fresh.eager_peers);
+        // plus the joins that started lazy
+        assert!(fresh.lazy_peers.is_subset(&s.lazy_peers));
+        assert!(
+            s.lazy_peers
+                .difference(&fresh.lazy_peers)
+                .all(|p| [121, 122, 130].contains(p))
+        );
+    }
+
+    #[test]
+    fn incremental_random_bucket_change_is_a_leave_and_a_join() {
+        let members: Vec<_> = (1..=120).map(|p| (p, ring_of(p))).collect();
+        let (mut s, mut rt) = selecting(PeerSelection::IncrementalRandom, members.clone());
+        // a non-locked Near peer from each set moves to Far
+        let moved = [
+            *s.eager_peers
+                .iter()
+                .find(|p| !s.ring_locked.contains(*p) && s.peer_bucket(p) == RingBucket::Near)
+                .unwrap(),
+            *s.lazy_peers
+                .iter()
+                .find(|p| s.peer_bucket(p) == RingBucket::Near)
+                .unwrap(),
+        ];
+        let mut members = members;
+        for (p, info) in members.iter_mut() {
+            if moved.contains(p) {
+                *info = ring(Some(5));
+            }
+        }
+        let before = sets(&s);
+        for _ in 0..RING_EXTRA_CONFIRMATIONS {
+            s.update_peer_topology(members.clone(), &mut rt);
+        }
+        for p in moved {
+            assert_eq!(s.peer_bucket(&p), RingBucket::Far);
+        }
+        // each move: the peer, a refill and an eviction at most
+        assert!(
+            changed(&s, &before) <= 2 * 5,
+            "{} entries",
+            changed(&s, &before)
+        );
+        assert!(s.eager_peers.len() <= s.num_eager());
+        assert!(s.ring_locked.is_subset(&s.eager_peers));
+    }
+
+    /// Every event keeps the eager set at the derived fanout: an eager
+    /// admission demotes one, an eager departure is refilled, and a fanout
+    /// change adds or removes one. Known peers move across 30/31, where the
+    /// fanout steps between 4 and 5.
+    #[test]
+    fn incremental_random_keeps_the_eager_set_at_the_fanout() {
+        let (mut s, mut rt) = selecting(
+            PeerSelection::IncrementalRandom,
+            (1..=31).map(|p| (p, ring_of(p))),
+        );
+        let mut events = SmallRng::seed_from_u64(3);
+        let mut fanout_changes = 0;
+        for _ in 0..400 {
+            let p = events.random_range(1..=40);
+            let num_eager = s.num_eager();
+            if s.known_peers.contains(&p) {
+                s.peer_down(&p, &mut rt);
+            } else {
+                s.peer_up(p, Some(ring_of(p)), &mut rt);
+            }
+            fanout_changes += (s.num_eager() != num_eager) as u32;
+            let derived = resolve_fanout(s.known_peers.len(), s.config()).num_eager;
+            assert_eq!(s.num_eager(), derived);
+            assert_eq!(s.eager_peers.len(), s.num_eager(), "after {p}");
+        }
+        assert!(fanout_changes >= 4, "{fanout_changes} fanout changes");
+    }
+
+    /// The draw admits a joining peer as eager with its bucket's eager share
+    /// over its known peers: 0.075 for Near and 0.025 for Far with 120
+    /// peers over three buckets, 0.05 with one bucket.
+    #[test]
+    fn incremental_random_admission_odds_per_bucket() {
+        let three = ring_of as fn(TestNodeId) -> RttInfo;
+        let one = (|_| ring(Some(0))) as fn(TestNodeId) -> RttInfo;
+        for (rings, joiner, expected) in [(three, 60, 0.075), (three, 64, 0.025), (one, 60, 0.05)] {
+            let (mut s, mut rt) = selecting(
+                PeerSelection::IncrementalRandom,
+                (1..=120).map(|p| (p, rings(p))),
+            );
+            let trials = 4000;
+            let mut eager = 0;
+            for _ in 0..trials {
+                s.peer_down(&joiner, &mut rt);
+                s.peer_up(joiner, Some(rings(joiner)), &mut rt);
+                eager += s.eager_peers.contains(&joiner) as u32;
+            }
+            let observed = eager as f64 / trials as f64;
+            let sigma = (expected * (1.0 - expected) / trials as f64).sqrt();
+            assert!(
+                (observed - expected).abs() < 4.0 * sigma,
+                "joiner {joiner}: {observed:.4} eager, expected {expected}"
+            );
+        }
+    }
+
+    /// A full eager set demotes a peer from the newcomer's bucket, an eager
+    /// departure is refilled from the departed peer's bucket, and a joining
+    /// peer that is not drawn eager starts lazy.
+    #[test]
+    fn incremental_random_evicts_and_refills_within_the_bucket() {
+        // 60 peers over three buckets; ring neighbors 1 and 60 are Near, so
+        // one non-locked Near peer is eager next to two Mid ones.
+        let (mut s, mut rt) = selecting(
+            PeerSelection::IncrementalRandom,
+            (1..=60).map(|p| (p, ring_of(p))),
+        );
+        let num_eager = s.num_eager();
+        assert_eq!(s.eager_peers.len(), num_eager);
+        let (mut evictions, mut refills) = (0, 0);
+        for round in 0..20 {
+            for p in 2..60 {
+                if s.ring_locked.contains(&p) || s.peer_bucket(&p) != RingBucket::Near {
+                    continue;
+                }
+                let bucket = s.peer_bucket(&p);
+                let was_eager = s.eager_peers.contains(&p);
+                let before = s.eager_peers.clone();
+                s.peer_down(&p, &mut rt);
+                assert_eq!(s.eager_peers.len(), num_eager, "round {round}, down {p}");
+                for q in s.eager_peers.difference(&before) {
+                    assert!(was_eager);
+                    assert_eq!(s.peer_bucket(q), bucket, "refilled {p} with {q}");
+                    refills += 1;
+                }
+
+                let before = s.eager_peers.clone();
+                let lazy_full = s.lazy_peers.len() >= s.max_lazy();
+                s.peer_up(p, Some(ring_of(p)), &mut rt);
+                assert_eq!(s.eager_peers.len(), num_eager, "round {round}, up {p}");
+                // not drawn eager: lazy while there is room
+                assert!(s.eager_peers.contains(&p) || lazy_full || s.lazy_peers.contains(&p));
+                for q in before.difference(&s.eager_peers) {
+                    assert_eq!(s.peer_bucket(q), bucket, "{p} demoted {q}");
+                    evictions += 1;
+                }
+            }
+        }
+        assert!(
+            evictions >= 10 && refills >= 5,
+            "{evictions} evictions, {refills} refills"
+        );
+    }
+
+    #[test]
+    fn incremental_random_refills_lazy() {
+        let (mut s, mut rt) = selecting(
+            PeerSelection::IncrementalRandom,
+            (1..=120).map(|p| (p, ring_of(p))),
+        );
+        // a lazy departure is refilled from its bucket
+        let left = *s.lazy_peers.first().unwrap();
+        let before = s.lazy_peers.clone();
+        s.peer_down(&left, &mut rt);
+        assert_eq!(s.lazy_peers.len(), s.min_lazy());
+        for p in s.lazy_peers.difference(&before) {
+            assert_eq!(s.peer_bucket(p), s.peer_bucket(&left));
+        }
+
+        // the tick tops lazy up after GRAFTs took some
+        let grafted: Vec<_> = s.lazy_peers.iter().take(3).copied().collect();
+        for p in grafted {
+            s.handle_graft(graft_msg(p, false, vec![]), &mut rt);
+        }
+        assert_eq!(s.lazy_peers.len(), s.min_lazy() - 3);
+        s.update_peer_topology(known_snapshot(&s), &mut rt);
+        assert_eq!(s.lazy_peers.len(), s.min_lazy());
+    }
+
+    #[test]
+    fn top_up_ends_when_min_lazy_exceeds_max_lazy() {
+        let mut cfg = test_config();
+        cfg.peer_selection = PeerSelection::IncrementalRandom;
+        cfg.min_lazy = Some(20);
+        cfg.max_lazy = Some(15);
+        let mut s = PlumtreeState::new_with_store_seeded(0, cfg, TestSeenStore::default(), 7);
+        let mut rt = AccumulatingRuntime::default();
+        s.add_peers_bulk_with_rtt((1..=120).map(|p| (p, ring_of(p))).collect(), &mut rt);
+        let grafted: Vec<_> = s.lazy_peers.iter().take(8).copied().collect();
+        for p in grafted {
+            s.handle_graft(graft_msg(p, false, vec![]), &mut rt);
+        }
+        assert_eq!(s.lazy_peers.len(), 12);
+        s.update_peer_topology(known_snapshot(&s), &mut rt);
+        assert_eq!(s.lazy_peers.len(), 15);
     }
 }
