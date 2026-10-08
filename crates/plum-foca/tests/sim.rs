@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 /// `Runtime::now()` — keeps time-windowed protocol logic deterministic.
 static SIM_EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
 
-use indexmap::IndexMap;
+use indexmap::{IndexMap, IndexSet};
 use plum_foca::{
     Config, EagerRatios, Notification, Payload, PlumtreeMsg, PlumtreeState, Round, RttInfo,
     Runtime, SeenStore, Timer,
@@ -181,6 +181,7 @@ struct NotificationStats {
     promotions: u64,
     demotions: u64,
     prune_suppressed: u64,
+    rebalances: u64,
 }
 
 #[derive(Default)]
@@ -224,7 +225,7 @@ impl Runtime<MId, SimPayload, NId> for SimRuntime {
             Notification::PeerDroppedFromEager(_) => self.notification_stats.demotions += 1,
             Notification::PeerMovedToLazy(_) | Notification::PeerEvictedFromLazy(_) => {}
             Notification::PruneSuppressed(_) => self.notification_stats.prune_suppressed += 1,
-            Notification::Rebalance => {}
+            Notification::Rebalance => self.notification_stats.rebalances += 1,
         }
     }
 
@@ -272,6 +273,19 @@ enum Event {
     MemberUp {
         observer: NId,
         subject: NId,
+    },
+    /// The agent's maintenance tick (`update_peer_topology`). `incarnation`
+    /// drops the ticks of a process that has since restarted.
+    Maintain {
+        node: NId,
+        incarnation: u32,
+    },
+    /// Sample the in-degree of the eager graph.
+    SampleIndegree,
+    /// Record where a restarted `node` sits in the other nodes' overlays
+    /// once every observer has seen it come back.
+    Landing {
+        node: NId,
     },
 }
 
@@ -336,6 +350,10 @@ struct Params {
     /// cluster (real nodes don't all notice a change at the same instant).
     detection_delay_min: Duration,
     detection_delay_max: Duration,
+    /// Run the agent's maintenance tick on every node, each with a random
+    /// phase, until the end of `broadcast_window`. A restarted node starts
+    /// a new phase. `None` = no tick, so the overlay is never rebuilt.
+    maintenance_interval: Option<Duration>,
 }
 
 impl Params {
@@ -357,7 +375,18 @@ impl Params {
             flap_downtime: Duration::from_secs(5),
             detection_delay_min: Duration::from_secs(2),
             detection_delay_max: Duration::from_secs(8),
+            maintenance_interval: None,
         }
+    }
+
+    /// `rate` broadcasts/s cluster-wide for `duration`, with the
+    /// maintenance tick on and `CHURN_DETECTION_DELAY`.
+    fn with_churn_traffic(mut self, rate: u64, duration: Duration) -> Self {
+        self.msgs_per_node = (rate * duration.as_secs() / self.n as u64) as u32;
+        self.broadcast_window = duration;
+        self.maintenance_interval = Some(MAINTENANCE_INTERVAL);
+        let (min, max) = CHURN_DETECTION_DELAY;
+        self.with_detection_delay(min, max)
     }
 
     fn with_eager_ratios(mut self, eager_ratios: EagerRatios) -> Self {
@@ -411,6 +440,15 @@ const TICK_INTERVAL: Duration = Duration::from_millis(200);
 const SIM_PRUNE_THROTTLE: Duration = Duration::from_millis(500);
 /// A gossip send crossing a link slower than this counts as long-haul.
 const LONGHAUL_RTT_MS: u64 = 150;
+/// The agent's maintenance tick (`spawn_plumtree_loop`).
+const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60);
+const INDEGREE_SAMPLE_INTERVAL: Duration = Duration::from_secs(10);
+/// How long a node stays down when restarted in the churn scenarios.
+const RESTART_DOWNTIME: Duration = Duration::from_secs(5);
+/// Detection delay range in the churn scenarios. The max must not exceed
+/// the downtime of a restart, see `Sim::schedule_restart`.
+const CHURN_DETECTION_DELAY: (Duration, Duration) =
+    (Duration::from_secs(2), Duration::from_secs(5));
 
 struct MsgStat {
     sent_at: u64,
@@ -441,6 +479,38 @@ struct Stats {
     hops: Vec<u32>,
     /// One entry per delivery: broadcast-to-delivery latency in µs.
     latencies_us: Vec<u64>,
+    /// Full rebuilds, bootstrap excluded.
+    rebuilds: u64,
+    maintenance_runs: u64,
+    /// Eager and lazy entries added or removed by `peer_up`, `peer_down`
+    /// and the maintenance tick, summed over nodes.
+    overlay_churn_eager: u64,
+    overlay_churn_lazy: u64,
+    /// Of those, the entries changed by the maintenance tick.
+    tick_churn: u64,
+    /// `MemberUp`s handled, and how many put the peer straight into eager.
+    member_ups: u64,
+    member_ups_eager: u64,
+    indegree: Vec<IndegreeSample>,
+    landings: Vec<Landing>,
+    /// µs from a restart to the node's first delivery.
+    catchup_us: Vec<u64>,
+}
+
+/// Eager-graph in-degree (how many eager sets a node is in), counted over
+/// live nodes, at one point in time.
+struct IndegreeSample {
+    max: usize,
+    mean: f64,
+}
+
+/// How many other live nodes have a restarted node as eager, as lazy, or
+/// only know it.
+#[derive(Default)]
+struct Landing {
+    eager: usize,
+    lazy: usize,
+    known_only: usize,
 }
 
 struct Sim {
@@ -474,6 +544,15 @@ struct Sim {
     /// down when the message originated, or a real delivery attempt reached
     /// it while down and got dropped. See `failure_miss_stats`.
     missed_during_downtime: HashMap<NId, HashSet<MId>>,
+    /// Per node, the peers it believes are down: the agent's `Members`
+    /// view, which lags `down` by the detection delay.
+    believed_down: Vec<HashSet<NId>>,
+    /// Restarts per node, see `Event::Maintain`.
+    incarnation: Vec<u32>,
+    /// When a restarted node came back, cleared on its first delivery.
+    rejoined_at: Vec<Option<u64>>,
+    /// Times of each node's `NodeDown` and `NodeUp`, in order.
+    up_down_at: Vec<Vec<u64>>,
 }
 
 impl Sim {
@@ -533,8 +612,9 @@ impl Sim {
                 .collect();
             states[i].add_peers_bulk_with_rtt(peers, &mut rt);
         }
-        // bootstrap produces no traffic
+        // bootstrap produces no traffic, and its rebuilds are not churn
         assert!(rt.outbox.is_empty() && rt.timers.is_empty());
+        rt.notification_stats = NotificationStats::default();
 
         let mut sim = Self {
             now: 0,
@@ -555,6 +635,10 @@ impl Sim {
             crashed: HashSet::new(),
             flapped: HashSet::new(),
             missed_during_downtime: HashMap::new(),
+            believed_down: vec![HashSet::new(); n],
+            incarnation: vec![0; n],
+            rejoined_at: vec![None; n],
+            up_down_at: vec![Vec::new(); n],
         };
 
         // Optionally over-fill each node's eager set (model admission without
@@ -623,7 +707,56 @@ impl Sim {
             }
         }
 
+        if let Some(interval) = sim.params.maintenance_interval {
+            for node in 0..n as NId {
+                let at = sim.rng.random_range(0..interval.as_micros() as u64);
+                if at <= window_us {
+                    sim.push(
+                        at,
+                        Event::Maintain {
+                            node,
+                            incarnation: 0,
+                        },
+                    );
+                }
+            }
+            let step = INDEGREE_SAMPLE_INTERVAL.as_micros() as u64;
+            for at in (step..=window_us).step_by(step as usize) {
+                sim.push(at, Event::SampleIndegree);
+            }
+        }
+
         sim
+    }
+
+    /// Takes `node` down at `at` and brings it back `downtime` later.
+    fn schedule_restart(&mut self, at: Duration, node: NId, downtime: Duration) {
+        // A longer delay could deliver one observer's `MemberUp` before its
+        // `MemberDown` for the same restart, which the sim does not order.
+        assert!(
+            self.params.detection_delay_max <= downtime,
+            "detection delay exceeds the downtime"
+        );
+        self.push(
+            at.as_micros() as u64,
+            Event::NodeDown {
+                node,
+                restart_after: Some(downtime),
+            },
+        );
+    }
+
+    /// Schedules `node`'s next maintenance tick one interval from now, if
+    /// the tick is on and the run has not ended.
+    fn schedule_maintenance(&mut self, node: NId) {
+        let Some(interval) = self.params.maintenance_interval else {
+            return;
+        };
+        let at = self.now + interval.as_micros() as u64;
+        if at <= self.params.broadcast_window.as_micros() as u64 {
+            let incarnation = self.incarnation[node as usize];
+            self.push(at, Event::Maintain { node, incarnation });
+        }
     }
 
     fn push(&mut self, at: u64, ev: Event) {
@@ -756,6 +889,8 @@ impl Sim {
                     restart_after,
                 } => {
                     self.down[node as usize] = true;
+                    self.up_down_at[node as usize].push(self.now);
+                    self.rejoined_at[node as usize] = None;
                     if restart_after.is_none() {
                         self.crashed.insert(node);
                     }
@@ -782,6 +917,9 @@ impl Sim {
                 Event::NodeUp { node } => {
                     self.down[node as usize] = false;
                     self.flapped.insert(node);
+                    self.up_down_at[node as usize].push(self.now);
+                    self.incarnation[node as usize] += 1;
+                    self.rejoined_at[node as usize] = Some(self.now);
                     let config = self.params.config();
                     let seed = self.rng.random();
                     self.states[node as usize] = PlumtreeState::new_with_store_seeded(
@@ -800,8 +938,13 @@ impl Sim {
                         .filter(|&j| j != node && !self.down[j as usize])
                         .map(|j| (j, self.rtt_info(node, j)))
                         .collect();
+                    self.believed_down[node as usize] =
+                        (0..n).filter(|&j| self.down[j as usize]).collect();
                     self.states[node as usize].add_peers_bulk_with_rtt(peers, &mut self.runtime);
+                    // its own bootstrap is not churn
+                    self.runtime.notification_stats.rebalances = 0;
                     self.drain(node);
+                    self.schedule_maintenance(node);
 
                     // Every other alive node's foca instance notices the
                     // rejoin after its own random detection delay.
@@ -819,30 +962,144 @@ impl Sim {
                             },
                         );
                     }
+                    let at = self.now + self.params.detection_delay_max.as_micros() as u64;
+                    self.push(at, Event::Landing { node });
                 }
                 Event::MemberDown { observer, subject } => {
                     if !self.down[observer as usize] {
+                        self.believed_down[observer as usize].insert(subject);
+                        let before = self.overlay(observer);
                         self.states[observer as usize].peer_down(&subject, &mut self.runtime);
+                        self.record_overlay_churn(observer, before);
                         self.drain(observer);
                     }
                 }
                 Event::MemberUp { observer, subject } => {
                     if !self.down[observer as usize] && !self.down[subject as usize] {
+                        self.believed_down[observer as usize].remove(&subject);
                         let info = self.rtt_info(observer, subject);
+                        let before = self.overlay(observer);
                         self.states[observer as usize].peer_up(
                             subject,
                             Some(info),
                             &mut self.runtime,
                         );
+                        self.stats.member_ups += 1;
+                        if self.states[observer as usize]
+                            .eager_peers()
+                            .contains(&subject)
+                        {
+                            self.stats.member_ups_eager += 1;
+                        }
+                        self.record_overlay_churn(observer, before);
                         self.drain(observer);
+                    }
+                }
+                Event::Maintain { node, incarnation } => {
+                    if self.down[node as usize] || incarnation != self.incarnation[node as usize] {
+                        continue;
+                    }
+                    self.maintain(node);
+                    self.schedule_maintenance(node);
+                }
+                Event::SampleIndegree => self.sample_indegree(),
+                Event::Landing { node } => {
+                    if !self.down[node as usize] {
+                        self.record_landing(node);
                     }
                 }
             }
         }
     }
 
+    /// The agent's maintenance tick. It passes the members this node
+    /// believes alive, as the agent passes its `Members` table, and not the
+    /// true membership: the tick must not see a restart before the node's
+    /// failure detector does.
+    fn maintain(&mut self, node: NId) {
+        let believed_down = &self.believed_down[node as usize];
+        let members: Vec<(NId, RttInfo)> = (0..self.params.n as NId)
+            .filter(|&j| j != node && !believed_down.contains(&j))
+            .map(|j| (j, self.rtt_info(node, j)))
+            .collect();
+        let before = self.overlay(node);
+        self.states[node as usize].update_peer_topology(members, &mut self.runtime);
+        self.stats.tick_churn += self.record_overlay_churn(node, before);
+        self.stats.maintenance_runs += 1;
+        self.drain(node);
+    }
+
+    fn overlay(&self, node: NId) -> (IndexSet<NId>, IndexSet<NId>) {
+        let state = &self.states[node as usize];
+        (state.eager_peers().clone(), state.lazy_peers().clone())
+    }
+
+    /// Adds and returns how many eager and lazy entries `node` changed
+    /// since `before`.
+    fn record_overlay_churn(&mut self, node: NId, before: (IndexSet<NId>, IndexSet<NId>)) -> u64 {
+        let (eager, lazy) = self.overlay(node);
+        let eager = before.0.symmetric_difference(&eager).count() as u64;
+        let lazy = before.1.symmetric_difference(&lazy).count() as u64;
+        self.stats.overlay_churn_eager += eager;
+        self.stats.overlay_churn_lazy += lazy;
+        eager + lazy
+    }
+
+    /// Samples the eager in-degree of the live nodes, leaving out those that
+    /// restarted less than a maintenance interval plus `detection_delay_max`
+    /// ago: not every observer has rebuilt since, and `Landing` covers them.
+    fn sample_indegree(&mut self) {
+        let n = self.params.n;
+        let mut indegree = vec![0usize; n];
+        for (i, state) in self.states.iter().enumerate() {
+            if !self.down[i] {
+                for &p in state.eager_peers() {
+                    indegree[p as usize] += 1;
+                }
+            }
+        }
+        let recent = (self.params.maintenance_interval.unwrap_or_default()
+            + self.params.detection_delay_max)
+            .as_micros() as u64;
+        let regular: Vec<usize> = (0..n)
+            .filter(|&i| {
+                !self.down[i]
+                    && self.up_down_at[i]
+                        .last()
+                        .is_none_or(|&t| self.now >= t + recent)
+            })
+            .map(|i| indegree[i])
+            .collect();
+        self.stats.indegree.push(IndegreeSample {
+            max: regular.iter().copied().max().unwrap_or(0),
+            mean: regular.iter().sum::<usize>() as f64 / regular.len().max(1) as f64,
+        });
+    }
+
+    fn record_landing(&mut self, node: NId) {
+        let mut landing = Landing::default();
+        for (i, state) in self.states.iter().enumerate() {
+            if i == node as usize || self.down[i] {
+                continue;
+            }
+            if state.eager_peers().contains(&node) {
+                landing.eager += 1;
+            } else if state.lazy_peers().contains(&node) {
+                landing.lazy += 1;
+            } else if state.known_peers().contains(&node) {
+                landing.known_only += 1;
+            }
+        }
+        self.stats.landings.push(landing);
+    }
+
     /// Apply everything the node just asked the runtime to do.
     fn drain(&mut self, from: NId) {
+        if !self.runtime.inbox.is_empty()
+            && let Some(at) = self.rejoined_at[from as usize].take()
+        {
+            self.stats.catchup_us.push(self.now - at);
+        }
         for payload in std::mem::take(&mut self.runtime.inbox) {
             let stat = self
                 .msgs
@@ -864,6 +1121,7 @@ impl Sim {
         self.stats.promotions += notification_stats.promotions;
         self.stats.demotions += notification_stats.demotions;
         self.stats.prune_suppressed += notification_stats.prune_suppressed;
+        self.stats.rebuilds += notification_stats.rebalances;
 
         for (timer, after) in std::mem::take(&mut self.runtime.timers) {
             let at = self.now + after.as_micros() as u64;
@@ -964,14 +1222,15 @@ impl Sim {
 
         // duplicate copies delivered per message, in broadcast order, to show
         // tree convergence. 0 = perfect spanning tree (no duplicates); >0 = extra
-        // copies each node receives on average.
-        let mut by_time: Vec<&MsgStat> = self.msgs.values().collect();
-        by_time.sort_unstable_by_key(|m| m.sent_at);
-        let dups_per_msg = |msgs: &[&MsgStat]| -> f64 {
+        // copies each node receives on average. The id breaks ties so the
+        // deciles do not depend on `HashMap` order.
+        let mut by_time: Vec<(&MId, &MsgStat)> = self.msgs.iter().collect();
+        by_time.sort_unstable_by_key(|(id, m)| (m.sent_at, id.0));
+        let dups_per_msg = |msgs: &[(&MId, &MsgStat)]| -> f64 {
             if msgs.is_empty() {
                 return 0.0;
             }
-            let sends: u64 = msgs.iter().map(|m| m.gossip_sends).sum();
+            let sends: u64 = msgs.iter().map(|(_, m)| m.gossip_sends).sum();
             sends as f64 / (msgs.len() as f64 * (self.params.n - 1) as f64) - 1.0
         };
         let decile = (by_time.len() / 10).max(1);
@@ -1028,6 +1287,54 @@ impl Sim {
             flapped: self.flapped.len(),
             missed_due_to_failure,
             unexplained_missing,
+            churn: self.churn_report(),
+        }
+    }
+
+    fn churn_report(&self) -> ChurnReport {
+        let stats = &self.stats;
+        let n = self.params.n;
+
+        // Up at `at - margin`, with no restart until `at + margin`.
+        let margin = self.params.detection_delay_max.as_micros() as u64;
+        let settled = |node: NId, at: u64| {
+            let times = &self.up_down_at[node as usize];
+            let i = times.partition_point(|&t| t < at.saturating_sub(margin));
+            i % 2 == 0 && times.get(i).is_none_or(|&t| t > at + margin)
+        };
+        let (mut settled_delivered, mut settled_expected) = (0, 0);
+        for (&mid, stat) in &self.msgs {
+            for r in (0..n as NId).filter(|&r| r != origin_of(mid) && settled(r, stat.sent_at)) {
+                settled_expected += 1;
+                settled_delivered += stat.delivered_to.contains(&r) as u64;
+            }
+        }
+
+        let samples = &stats.indegree;
+        let landings = stats.landings.len().max(1) as f64;
+        let mut catchup = stats.catchup_us.clone();
+        catchup.sort_unstable();
+
+        ChurnReport {
+            member_events: self.up_down_at.iter().map(Vec::len).sum::<usize>() as u64,
+            maintenance_runs: stats.maintenance_runs,
+            rebuilds: stats.rebuilds,
+            overlay_churn_eager: stats.overlay_churn_eager,
+            overlay_churn_lazy: stats.overlay_churn_lazy,
+            tick_churn: stats.tick_churn,
+            settled_delivered,
+            settled_expected,
+            indegree_max: samples.iter().map(|s| s.max).max().unwrap_or(0),
+            indegree_mean: samples.iter().map(|s| s.mean).sum::<f64>()
+                / samples.len().max(1) as f64,
+            up_eager_pct: stats.member_ups_eager as f64 / stats.member_ups.max(1) as f64 * 100.0,
+            landings: stats.landings.len(),
+            landing_eager: stats.landings.iter().map(|l| l.eager).sum::<usize>() as f64 / landings,
+            landing_lazy: stats.landings.iter().map(|l| l.lazy).sum::<usize>() as f64 / landings,
+            landing_known_only: stats.landings.iter().map(|l| l.known_only).sum::<usize>() as f64
+                / landings,
+            catchup_p50_ms: pct(&catchup, 0.50) / 1000,
+            catchup_max_ms: catchup.last().copied().unwrap_or(0) / 1000,
         }
     }
 }
@@ -1119,6 +1426,49 @@ struct Report {
     /// Non-deliveries that aren't explained by any known failure — should be
     /// 0 in a healthy run; a nonzero value signals a real protocol miss.
     unexplained_missing: u64,
+    churn: ChurnReport,
+}
+
+/// Membership churn and maintenance tick metrics, printed by
+/// `print_churn_table`; all zero for the gossip baseline.
+#[derive(Default)]
+struct ChurnReport {
+    /// `NodeDown` and `NodeUp` events.
+    member_events: u64,
+    maintenance_runs: u64,
+    /// Full rebuilds (`Notification::Rebalance`), bootstrap excluded.
+    rebuilds: u64,
+    overlay_churn_eager: u64,
+    overlay_churn_lazy: u64,
+    tick_churn: u64,
+    /// Delivery to the recipients that were up, and seen by every observer,
+    /// around the send: no restart within `detection_delay_max` before or
+    /// after it. A restarted node misses what is sent before its observers
+    /// see it return; `unexplained_missing` counts that too, so under
+    /// repeated restarts this is the protocol signal, and the time to a
+    /// restarted node's first delivery is reported separately.
+    settled_delivered: u64,
+    settled_expected: u64,
+    /// Eager in-degree of the nodes that did not restart recently: max of
+    /// the sample maxima and mean of the sample means.
+    indegree_max: usize,
+    indegree_mean: f64,
+    /// Share of `MemberUp`s that put the peer straight into eager.
+    up_eager_pct: f64,
+    /// Mean `Landing` over all returns.
+    landings: usize,
+    landing_eager: f64,
+    landing_lazy: f64,
+    landing_known_only: f64,
+    /// Time from a restart to the node's first delivery.
+    catchup_p50_ms: u64,
+    catchup_max_ms: u64,
+}
+
+impl ChurnReport {
+    fn settled_delivery_pct(&self) -> f64 {
+        self.settled_delivered as f64 / self.settled_expected.max(1) as f64 * 100.0
+    }
 }
 
 impl Report {
@@ -1838,6 +2188,7 @@ impl GossipSim {
             flapped: self.flapped.len(),
             missed_due_to_failure,
             unexplained_missing,
+            churn: ChurnReport::default(),
         }
     }
 }
@@ -2325,5 +2676,231 @@ fn sim_gossip_vs_plumtree_failures() {
     assert_eq!(
         plum_report.unexplained_missing, 0,
         "plumtree has non-delivery not explained by the injected crashes"
+    );
+}
+
+/// Restarts `node` every `period`, from `first` until `until`.
+fn schedule_flapper(sim: &mut Sim, node: NId, first: Duration, period: Duration, until: Duration) {
+    let mut at = first;
+    while at < until {
+        sim.schedule_restart(at, node, RESTART_DOWNTIME);
+        at += period;
+    }
+}
+
+/// Runs to quiescence and checks the invariants.
+fn run_churn(mut sim: Sim) -> Report {
+    sim.drain_queue_to_quiescence();
+    sim.check_invariants();
+    let report = sim.report();
+    println!("{report}");
+    report
+}
+
+/// One row per run. `churn e/l` counts the eager and lazy entries changed
+/// by `peer_up`, `peer_down` and the tick, `/rebuild` the entries the tick
+/// changed per full rebuild, `up-eager%` the share of `MemberUp`s that
+/// made the returning node eager, and `land e/l/k` where it sits once
+/// every observer saw it.
+fn print_churn_table(title: &str, rows: &[(String, Report)]) {
+    println!("\n=== {title} ===");
+    println!(
+        "{:>5} {:>9} {:>6} {:>6} {:>8} {:>13} {:>8} {:>6} {:>6} {:>14} {:>9} {:>12} {:>11}",
+        "run",
+        "settled%",
+        "p99ms",
+        "ticks",
+        "rebuilds",
+        "churn e/l",
+        "/rebuild",
+        "prune",
+        "graft",
+        "indeg max/mean",
+        "up-eager%",
+        "land e/l/k",
+        "catchup ms",
+    );
+    let dash = || "-".to_string();
+    for (run, r) in rows {
+        let c = &r.churn;
+        let per_rebuild = match c.rebuilds {
+            0 => dash(),
+            rebuilds => format!("{:.1}", c.tick_churn as f64 / rebuilds as f64),
+        };
+        let (up_eager, landing, catchup) = match c.landings {
+            0 => (dash(), dash(), dash()),
+            _ => (
+                format!("{:.1}", c.up_eager_pct),
+                format!(
+                    "{:.0}/{:.0}/{:.0}",
+                    c.landing_eager, c.landing_lazy, c.landing_known_only
+                ),
+                format!("{}/{}", c.catchup_p50_ms, c.catchup_max_ms),
+            ),
+        };
+        println!(
+            "{:>5} {:>9.4} {:>6} {:>6} {:>8} {:>13} {:>8} {:>6} {:>6} {:>14} {:>9} {:>12} {:>11}",
+            run,
+            c.settled_delivery_pct(),
+            r.lat_p99_ms,
+            c.maintenance_runs,
+            c.rebuilds,
+            format!("{}/{}", c.overlay_churn_eager, c.overlay_churn_lazy),
+            per_rebuild,
+            r.sent_prune,
+            r.sent_graft,
+            format!("{}/{:.1}", c.indegree_max, c.indegree_mean),
+            up_eager,
+            landing,
+            catchup,
+        );
+    }
+}
+
+/// One node restarts every 15 s under sustained traffic, with the agent's
+/// 60 s maintenance tick. The longer runs are the ignored tests below.
+#[test]
+fn sim_small_flapper_maintenance() {
+    const N: usize = 100;
+    let duration = Duration::from_secs(60);
+    let run = || {
+        let mut sim = Sim::new(Params::new(N, 5).with_churn_traffic(15, duration));
+        let flapper = sim.rng.random_range(0..N as NId);
+        schedule_flapper(
+            &mut sim,
+            flapper,
+            Duration::from_secs(5),
+            Duration::from_secs(15),
+            duration,
+        );
+        run_churn(sim)
+    };
+    let rows = [("42".to_string(), run())];
+    print_churn_table(
+        "one node restarting every 15 s (n=100, 60 s, 15 msg/s)",
+        &rows,
+    );
+    let report = &rows[0].1;
+    let churn = &report.churn;
+
+    assert_eq!(report.flapped, 1);
+    assert_eq!(churn.member_events, 8);
+    assert_eq!(churn.landings, 4);
+    // every node that never restarts ticks once in its first interval
+    assert!(
+        churn.maintenance_runs >= N as u64 - 1,
+        "maintenance tick did not run"
+    );
+    assert!(churn.rebuilds > 0, "maintenance tick never rebuilt");
+    assert_eq!(
+        churn.settled_delivered, churn.settled_expected,
+        "a settled node missed a message"
+    );
+    assert!(
+        churn.indegree_max < N / 4,
+        "eager in-degree {} of a node that did not restart",
+        churn.indegree_max
+    );
+
+    // The same seed must give the same run, or numbers from different
+    // runs cannot be compared.
+    let again = run();
+    let counters = |r: &Report| {
+        (
+            r.sent_gossip,
+            r.sent_prune,
+            r.sent_graft,
+            r.duplicates,
+            r.churn.rebuilds,
+        )
+    };
+    assert_eq!(
+        counters(&again),
+        counters(report),
+        "same seed, different run"
+    );
+}
+
+/// One node restarting every 20 s, n=200, 240 s at 50 msg/s.
+/// Run with: cargo test --release -p plum-foca --test sim sim_flapper_200 -- --ignored --nocapture
+#[test]
+#[ignore = "slow; run in release mode"]
+fn sim_flapper_200() {
+    const N: usize = 200;
+    let duration = Duration::from_secs(240);
+    // same traffic without restarts, for the PRUNE/GRAFT baseline
+    let calm = run_churn(Sim::new(Params::new(N, 5).with_churn_traffic(50, duration)));
+    let mut rows = vec![("calm".to_string(), calm)];
+    for seed in 42..45 {
+        let mut params = Params::new(N, 5).with_churn_traffic(50, duration);
+        params.seed = seed;
+        let mut sim = Sim::new(params);
+        let flapper = sim.rng.random_range(0..N as NId);
+        schedule_flapper(
+            &mut sim,
+            flapper,
+            Duration::from_secs(10),
+            Duration::from_secs(20),
+            duration,
+        );
+        rows.push((seed.to_string(), run_churn(sim)));
+    }
+    print_churn_table(
+        "one node restarting every 20 s (n=200, 240 s, 50 msg/s)",
+        &rows,
+    );
+}
+
+/// Rolling restart of every node, one per second, n=200, 240 s at 50 msg/s.
+/// Run with: cargo test --release -p plum-foca --test sim sim_rolling_restart_200 -- --ignored --nocapture
+#[test]
+#[ignore = "slow; run in release mode"]
+fn sim_rolling_restart_200() {
+    const N: usize = 200;
+    let duration = Duration::from_secs(240);
+    let mut rows = Vec::new();
+    for seed in 42..45 {
+        let mut params = Params::new(N, 5).with_churn_traffic(50, duration);
+        params.seed = seed;
+        let mut sim = Sim::new(params);
+        let mut order: Vec<NId> = (0..N as NId).collect();
+        order.shuffle(&mut sim.rng);
+        for (i, node) in order.into_iter().enumerate() {
+            let at = Duration::from_secs(10 + i as u64);
+            sim.schedule_restart(at, node, RESTART_DOWNTIME);
+        }
+        rows.push((seed.to_string(), run_churn(sim)));
+    }
+    print_churn_table(
+        "rolling restart, one node per second (n=200, 240 s, 50 msg/s)",
+        &rows,
+    );
+}
+
+/// Steady state with rare events: four restarts of different nodes, 150 s
+/// apart, n=500, 10 min at 10 msg/s.
+/// Run with: cargo test --release -p plum-foca --test sim sim_rare_restarts_500 -- --ignored --nocapture
+#[test]
+#[ignore = "slow; run in release mode"]
+fn sim_rare_restarts_500() {
+    const N: usize = 500;
+    let duration = Duration::from_secs(600);
+    let calm = run_churn(Sim::new(Params::new(N, 5).with_churn_traffic(10, duration)));
+    let mut rows = vec![("calm".to_string(), calm)];
+    for seed in 42..45 {
+        let mut params = Params::new(N, 5).with_churn_traffic(10, duration);
+        params.seed = seed;
+        let mut sim = Sim::new(params);
+        let mut nodes: Vec<NId> = (0..N as NId).collect();
+        nodes.shuffle(&mut sim.rng);
+        for (i, &node) in nodes.iter().take(4).enumerate() {
+            let at = Duration::from_secs(30 + 150 * i as u64);
+            sim.schedule_restart(at, node, RESTART_DOWNTIME);
+        }
+        rows.push((seed.to_string(), run_churn(sim)));
+    }
+    print_churn_table(
+        "four restarts of different nodes 150 s apart (n=500, 600 s, 10 msg/s)",
+        &rows,
     );
 }
