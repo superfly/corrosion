@@ -25,8 +25,8 @@ static SIM_EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
 
 use indexmap::{IndexMap, IndexSet};
 use plum_foca::{
-    Config, EagerRatios, Notification, Payload, PlumtreeMsg, PlumtreeState, Round, RttInfo,
-    Runtime, SeenStore, Timer,
+    Config, EagerRatios, Notification, Payload, PeerSelection, PlumtreeMsg, PlumtreeState, Round,
+    RttInfo, Runtime, SeenStore, Timer,
 };
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
@@ -354,6 +354,8 @@ struct Params {
     /// phase, until the end of `broadcast_window`. A restarted node starts
     /// a new phase. `None` = no tick, so the overlay is never rebuilt.
     maintenance_interval: Option<Duration>,
+    /// How every node picks its eager and lazy peers.
+    peer_selection: PeerSelection,
 }
 
 impl Params {
@@ -376,6 +378,7 @@ impl Params {
             detection_delay_min: Duration::from_secs(2),
             detection_delay_max: Duration::from_secs(8),
             maintenance_interval: None,
+            peer_selection: PeerSelection::FullRebalance,
         }
     }
 
@@ -430,6 +433,7 @@ impl Params {
             prune_throttle: self.prune_throttle,
             eager_ratios: self.eager_ratios,
             ring_locked_radius: 1,
+            peer_selection: self.peer_selection,
         }
     }
 }
@@ -491,7 +495,10 @@ struct Stats {
     /// `MemberUp`s handled, and how many put the peer straight into eager.
     member_ups: u64,
     member_ups_eager: u64,
+    member_downs: u64,
     indegree: Vec<IndegreeSample>,
+    /// Per node, the sum of its sampled in-degrees and the sample count.
+    indegree_by_node: Vec<(usize, u32)>,
     landings: Vec<Landing>,
     /// µs from a restart to the node's first delivery.
     catchup_us: Vec<u64>,
@@ -970,6 +977,7 @@ impl Sim {
                         self.believed_down[observer as usize].insert(subject);
                         let before = self.overlay(observer);
                         self.states[observer as usize].peer_down(&subject, &mut self.runtime);
+                        self.stats.member_downs += 1;
                         self.record_overlay_churn(observer, before);
                         self.drain(observer);
                     }
@@ -1068,8 +1076,14 @@ impl Sim {
                         .last()
                         .is_none_or(|&t| self.now >= t + recent)
             })
-            .map(|i| indegree[i])
             .collect();
+        self.stats.indegree_by_node.resize(n, (0, 0));
+        for &i in &regular {
+            let (sum, samples) = &mut self.stats.indegree_by_node[i];
+            *sum += indegree[i];
+            *samples += 1;
+        }
+        let regular: Vec<usize> = regular.into_iter().map(|i| indegree[i]).collect();
         self.stats.indegree.push(IndegreeSample {
             max: regular.iter().copied().max().unwrap_or(0),
             mean: regular.iter().sum::<usize>() as f64 / regular.len().max(1) as f64,
@@ -1249,7 +1263,7 @@ impl Sim {
 
         Report {
             label: format!(
-                "n={} num_eager={} eager={}/{}/{} rtt_aware={} loss={:.1}% seed={}",
+                "n={} num_eager={} eager={}/{}/{} rtt_aware={} loss={:.1}% seed={} selection={:?}",
                 self.params.n,
                 self.params.num_eager,
                 self.params.eager_ratios.near_pct,
@@ -1258,6 +1272,7 @@ impl Sim {
                 self.params.rtt_aware,
                 self.params.loss * 100.0,
                 self.params.seed,
+                self.params.peer_selection,
             ),
             expected,
             delivered,
@@ -1322,11 +1337,18 @@ impl Sim {
             overlay_churn_eager: stats.overlay_churn_eager,
             overlay_churn_lazy: stats.overlay_churn_lazy,
             tick_churn: stats.tick_churn,
+            membership_changes: stats.member_ups + stats.member_downs,
             settled_delivered,
             settled_expected,
             indegree_max: samples.iter().map(|s| s.max).max().unwrap_or(0),
             indegree_mean: samples.iter().map(|s| s.mean).sum::<f64>()
                 / samples.len().max(1) as f64,
+            indegree_top_mean: stats
+                .indegree_by_node
+                .iter()
+                .filter(|(_, samples)| *samples > 0)
+                .map(|&(sum, samples)| sum as f64 / samples as f64)
+                .fold(0.0, f64::max),
             up_eager_pct: stats.member_ups_eager as f64 / stats.member_ups.max(1) as f64 * 100.0,
             landings: stats.landings.len(),
             landing_eager: stats.landings.iter().map(|l| l.eager).sum::<usize>() as f64 / landings,
@@ -1441,6 +1463,8 @@ struct ChurnReport {
     overlay_churn_eager: u64,
     overlay_churn_lazy: u64,
     tick_churn: u64,
+    /// `peer_up` and `peer_down` calls, summed over observers.
+    membership_changes: u64,
     /// Delivery to the recipients that were up, and seen by every observer,
     /// around the send: no restart within `detection_delay_max` before or
     /// after it. A restarted node misses what is sent before its observers
@@ -1453,6 +1477,9 @@ struct ChurnReport {
     /// the sample maxima and mean of the sample means.
     indegree_max: usize,
     indegree_mean: f64,
+    /// The highest in-degree of one node averaged over its samples: near
+    /// `indegree_max` if the same node stays the most popular.
+    indegree_top_mean: f64,
     /// Share of `MemberUp`s that put the peer straight into eager.
     up_eager_pct: f64,
     /// Mean `Landing` over all returns.
@@ -2697,25 +2724,35 @@ fn run_churn(mut sim: Sim) -> Report {
     report
 }
 
+const SELECTIONS: [PeerSelection; 3] = [
+    PeerSelection::FullRebalance,
+    PeerSelection::Hrw,
+    PeerSelection::IncrementalRandom,
+];
+
 /// One row per run. `churn e/l` counts the eager and lazy entries changed
-/// by `peer_up`, `peer_down` and the tick, `/rebuild` the entries the tick
-/// changed per full rebuild, `up-eager%` the share of `MemberUp`s that
-/// made the returning node eager, and `land e/l/k` where it sits once
-/// every observer saw it.
+/// by `peer_up`, `peer_down` and the tick, `total` their sum, `tick` the
+/// part the tick changed, `/rebuild` the tick's part per full rebuild,
+/// `/change` the total per `peer_up` or `peer_down` call, `indeg
+/// max/mean/top` the in-degree (`top` is `indegree_top_mean`), `up-eager%`
+/// the share of `MemberUp`s that made the returning node eager, and `land
+/// e/l/k` where it sits once every observer saw it.
 fn print_churn_table(title: &str, rows: &[(String, Report)]) {
     println!("\n=== {title} ===");
     println!(
-        "{:>5} {:>9} {:>6} {:>6} {:>8} {:>13} {:>8} {:>6} {:>6} {:>14} {:>9} {:>12} {:>11}",
+        "{:>22} {:>9} {:>6} {:>8} {:>13} {:>6} {:>6} {:>8} {:>7} {:>6} {:>6} {:>18} {:>9} {:>12} {:>11}",
         "run",
         "settled%",
         "p99ms",
-        "ticks",
         "rebuilds",
         "churn e/l",
+        "total",
+        "tick",
         "/rebuild",
+        "/change",
         "prune",
         "graft",
-        "indeg max/mean",
+        "indeg max/mean/top",
         "up-eager%",
         "land e/l/k",
         "catchup ms",
@@ -2723,9 +2760,14 @@ fn print_churn_table(title: &str, rows: &[(String, Report)]) {
     let dash = || "-".to_string();
     for (run, r) in rows {
         let c = &r.churn;
+        let total = c.overlay_churn_eager + c.overlay_churn_lazy;
         let per_rebuild = match c.rebuilds {
             0 => dash(),
             rebuilds => format!("{:.1}", c.tick_churn as f64 / rebuilds as f64),
+        };
+        let per_change = match c.membership_changes {
+            0 => dash(),
+            changes => format!("{:.2}", total as f64 / changes as f64),
         };
         let (up_eager, landing, catchup) = match c.landings {
             0 => (dash(), dash(), dash()),
@@ -2739,17 +2781,22 @@ fn print_churn_table(title: &str, rows: &[(String, Report)]) {
             ),
         };
         println!(
-            "{:>5} {:>9.4} {:>6} {:>6} {:>8} {:>13} {:>8} {:>6} {:>6} {:>14} {:>9} {:>12} {:>11}",
+            "{:>22} {:>9.4} {:>6} {:>8} {:>13} {:>6} {:>6} {:>8} {:>7} {:>6} {:>6} {:>18} {:>9} {:>12} {:>11}",
             run,
             c.settled_delivery_pct(),
             r.lat_p99_ms,
-            c.maintenance_runs,
             c.rebuilds,
             format!("{}/{}", c.overlay_churn_eager, c.overlay_churn_lazy),
+            total,
+            c.tick_churn,
             per_rebuild,
+            per_change,
             r.sent_prune,
             r.sent_graft,
-            format!("{}/{:.1}", c.indegree_max, c.indegree_mean),
+            format!(
+                "{}/{:.1}/{:.1}",
+                c.indegree_max, c.indegree_mean, c.indegree_top_mean
+            ),
             up_eager,
             landing,
             catchup,
@@ -2758,13 +2805,16 @@ fn print_churn_table(title: &str, rows: &[(String, Report)]) {
 }
 
 /// One node restarts every 15 s under sustained traffic, with the agent's
-/// 60 s maintenance tick. The longer runs are the ignored tests below.
+/// 60 s maintenance tick, for each peer selection. The longer runs are the
+/// ignored tests below.
 #[test]
 fn sim_small_flapper_maintenance() {
     const N: usize = 100;
     let duration = Duration::from_secs(60);
-    let run = || {
-        let mut sim = Sim::new(Params::new(N, 5).with_churn_traffic(15, duration));
+    let run = |selection| {
+        let mut params = Params::new(N, 5).with_churn_traffic(15, duration);
+        params.peer_selection = selection;
+        let mut sim = Sim::new(params);
         let flapper = sim.rng.random_range(0..N as NId);
         schedule_flapper(
             &mut sim,
@@ -2775,48 +2825,65 @@ fn sim_small_flapper_maintenance() {
         );
         run_churn(sim)
     };
-    let rows = [("42".to_string(), run())];
+    let rows: Vec<_> = SELECTIONS
+        .into_iter()
+        .map(|selection| (format!("{selection:?} 42"), run(selection)))
+        .collect();
     print_churn_table(
         "one node restarting every 15 s (n=100, 60 s, 15 msg/s)",
         &rows,
     );
-    let report = &rows[0].1;
-    let churn = &report.churn;
 
-    assert_eq!(report.flapped, 1);
-    assert_eq!(churn.member_events, 8);
-    assert_eq!(churn.landings, 4);
-    // every node that never restarts ticks once in its first interval
-    assert!(
-        churn.maintenance_runs >= N as u64 - 1,
-        "maintenance tick did not run"
-    );
-    assert!(churn.rebuilds > 0, "maintenance tick never rebuilt");
-    assert_eq!(
-        churn.settled_delivered, churn.settled_expected,
-        "a settled node missed a message"
-    );
-    assert!(
-        churn.indegree_max < N / 4,
-        "eager in-degree {} of a node that did not restart",
-        churn.indegree_max
-    );
+    let per_change = |c: &ChurnReport| {
+        (c.overlay_churn_eager + c.overlay_churn_lazy) as f64 / c.membership_changes as f64
+    };
+    let current = &rows[0].1.churn;
+    for (selection, (_, report)) in SELECTIONS.into_iter().zip(&rows) {
+        let churn = &report.churn;
+        assert_eq!(report.flapped, 1);
+        assert_eq!(churn.member_events, 8);
+        assert_eq!(churn.landings, 4);
+        // every node that never restarts ticks once in its first interval
+        assert!(
+            churn.maintenance_runs >= N as u64 - 1,
+            "{selection:?}: maintenance tick did not run"
+        );
+        assert_eq!(
+            churn.settled_delivered, churn.settled_expected,
+            "{selection:?}: a settled node missed a message"
+        );
+        assert!(
+            churn.indegree_max < N / 4,
+            "{selection:?}: eager in-degree {} of a node that did not restart",
+            churn.indegree_max
+        );
+        if selection == PeerSelection::FullRebalance {
+            assert!(churn.rebuilds > 0, "maintenance tick never rebuilt");
+        } else {
+            assert_eq!(churn.rebuilds, 0, "{selection:?} rebuilt the sets");
+            assert!(
+                per_change(churn) < per_change(current),
+                "{selection:?} changed as many entries as the full rebuilds"
+            );
+        }
+    }
 
     // The same seed must give the same run, or numbers from different
-    // runs cannot be compared.
-    let again = run();
+    // runs cannot be compared. Checked on the strategy that draws most.
+    let again = run(PeerSelection::IncrementalRandom);
     let counters = |r: &Report| {
         (
             r.sent_gossip,
             r.sent_prune,
             r.sent_graft,
             r.duplicates,
-            r.churn.rebuilds,
+            r.churn.overlay_churn_eager,
+            r.churn.overlay_churn_lazy,
         )
     };
     assert_eq!(
         counters(&again),
-        counters(report),
+        counters(&rows[2].1),
         "same seed, different run"
     );
 }
@@ -2828,22 +2895,26 @@ fn sim_small_flapper_maintenance() {
 fn sim_flapper_200() {
     const N: usize = 200;
     let duration = Duration::from_secs(240);
-    // same traffic without restarts, for the PRUNE/GRAFT baseline
-    let calm = run_churn(Sim::new(Params::new(N, 5).with_churn_traffic(50, duration)));
-    let mut rows = vec![("calm".to_string(), calm)];
-    for seed in 42..45 {
+    let mut rows = Vec::new();
+    for selection in SELECTIONS {
         let mut params = Params::new(N, 5).with_churn_traffic(50, duration);
-        params.seed = seed;
-        let mut sim = Sim::new(params);
-        let flapper = sim.rng.random_range(0..N as NId);
-        schedule_flapper(
-            &mut sim,
-            flapper,
-            Duration::from_secs(10),
-            Duration::from_secs(20),
-            duration,
-        );
-        rows.push((seed.to_string(), run_churn(sim)));
+        params.peer_selection = selection;
+        // same traffic without restarts, for the PRUNE/GRAFT baseline
+        let calm = run_churn(Sim::new(params.clone()));
+        rows.push((format!("{selection:?} calm"), calm));
+        for seed in 42..45 {
+            params.seed = seed;
+            let mut sim = Sim::new(params.clone());
+            let flapper = sim.rng.random_range(0..N as NId);
+            schedule_flapper(
+                &mut sim,
+                flapper,
+                Duration::from_secs(10),
+                Duration::from_secs(20),
+                duration,
+            );
+            rows.push((format!("{selection:?} {seed}"), run_churn(sim)));
+        }
     }
     print_churn_table(
         "one node restarting every 20 s (n=200, 240 s, 50 msg/s)",
@@ -2859,17 +2930,20 @@ fn sim_rolling_restart_200() {
     const N: usize = 200;
     let duration = Duration::from_secs(240);
     let mut rows = Vec::new();
-    for seed in 42..45 {
-        let mut params = Params::new(N, 5).with_churn_traffic(50, duration);
-        params.seed = seed;
-        let mut sim = Sim::new(params);
-        let mut order: Vec<NId> = (0..N as NId).collect();
-        order.shuffle(&mut sim.rng);
-        for (i, node) in order.into_iter().enumerate() {
-            let at = Duration::from_secs(10 + i as u64);
-            sim.schedule_restart(at, node, RESTART_DOWNTIME);
+    for selection in SELECTIONS {
+        for seed in 42..45 {
+            let mut params = Params::new(N, 5).with_churn_traffic(50, duration);
+            params.peer_selection = selection;
+            params.seed = seed;
+            let mut sim = Sim::new(params);
+            let mut order: Vec<NId> = (0..N as NId).collect();
+            order.shuffle(&mut sim.rng);
+            for (i, node) in order.into_iter().enumerate() {
+                let at = Duration::from_secs(10 + i as u64);
+                sim.schedule_restart(at, node, RESTART_DOWNTIME);
+            }
+            rows.push((format!("{selection:?} {seed}"), run_churn(sim)));
         }
-        rows.push((seed.to_string(), run_churn(sim)));
     }
     print_churn_table(
         "rolling restart, one node per second (n=200, 240 s, 50 msg/s)",
@@ -2885,19 +2959,23 @@ fn sim_rolling_restart_200() {
 fn sim_rare_restarts_500() {
     const N: usize = 500;
     let duration = Duration::from_secs(600);
-    let calm = run_churn(Sim::new(Params::new(N, 5).with_churn_traffic(10, duration)));
-    let mut rows = vec![("calm".to_string(), calm)];
-    for seed in 42..45 {
+    let mut rows = Vec::new();
+    for selection in SELECTIONS {
         let mut params = Params::new(N, 5).with_churn_traffic(10, duration);
-        params.seed = seed;
-        let mut sim = Sim::new(params);
-        let mut nodes: Vec<NId> = (0..N as NId).collect();
-        nodes.shuffle(&mut sim.rng);
-        for (i, &node) in nodes.iter().take(4).enumerate() {
-            let at = Duration::from_secs(30 + 150 * i as u64);
-            sim.schedule_restart(at, node, RESTART_DOWNTIME);
+        params.peer_selection = selection;
+        let calm = run_churn(Sim::new(params.clone()));
+        rows.push((format!("{selection:?} calm"), calm));
+        for seed in 42..45 {
+            params.seed = seed;
+            let mut sim = Sim::new(params.clone());
+            let mut nodes: Vec<NId> = (0..N as NId).collect();
+            nodes.shuffle(&mut sim.rng);
+            for (i, &node) in nodes.iter().take(4).enumerate() {
+                let at = Duration::from_secs(30 + 150 * i as u64);
+                sim.schedule_restart(at, node, RESTART_DOWNTIME);
+            }
+            rows.push((format!("{selection:?} {seed}"), run_churn(sim)));
         }
-        rows.push((seed.to_string(), run_churn(sim)));
     }
     print_churn_table(
         "four restarts of different nodes 150 s apart (n=500, 600 s, 10 msg/s)",

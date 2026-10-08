@@ -366,6 +366,7 @@ pub async fn spawn_plumtree_loop(
         prune_throttle: plumtree_config.prune_throttle_secs.map(Duration::from_secs),
         eager_ratios: plumtree_config.eager_ratios,
         ring_locked_radius: plumtree_config.ring_locked_radius,
+        peer_selection: plum_foca::PeerSelection::FullRebalance,
     };
 
     plumtree_loop(
