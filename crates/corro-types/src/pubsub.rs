@@ -269,6 +269,7 @@ struct InnerMatcherHandle {
     hash: String,
     pool: sqlite_pool::RusqlitePool,
     parsed: ParsedSelect,
+    reactive_table_columns: IndexMap<String, HashSet<String>>,
     col_names: Vec<ColumnName>,
     cancel: CancellationToken,
     changes_tx: mpsc::Sender<MatchCandidates>,
@@ -366,8 +367,7 @@ impl Handle for MatcherHandle {
         // don't consider changes that don't have both the table + col in the matcher query
         if !self
             .inner
-            .parsed
-            .table_columns
+            .reactive_table_columns
             .get(change.table.as_str())
             .map(|cols| change.column.is_crsql_sentinel() || cols.contains(change.column.as_str()))
             .unwrap_or_default()
@@ -606,6 +606,8 @@ pub struct Matcher {
     pub cached_statements: HashMap<String, MatcherStmt>,
     pub pks: IndexMap<String, Vec<String>>,
     pub parsed: ParsedSelect,
+    reactive_table_columns: IndexMap<String, HashSet<String>>,
+    subquery_trigger_tables: IndexSet<String>,
     pub evt_tx: mpsc::Sender<QueryEvent>,
     pub col_names: Vec<ColumnName>,
     pub last_rowid: u64,
@@ -693,6 +695,16 @@ impl Matcher {
 
         if parsed.table_columns.is_empty() {
             return Err(MatcherError::TableRequired);
+        }
+
+        let subquery_trigger_tables = parsed.subquery_trigger_tables(schema);
+        let subquery_table_columns = parsed.subquery_table_columns(schema);
+        let mut reactive_table_columns = parsed.table_columns.clone();
+        for (table, columns) in &subquery_table_columns {
+            reactive_table_columns
+                .entry(table.clone())
+                .or_default()
+                .extend(columns.iter().cloned());
         }
 
         let mut statements = HashMap::new();
@@ -850,7 +862,7 @@ impl Matcher {
 
         // metrics counters
         let mut counter_map = HashMap::new();
-        for table in parsed.table_columns.keys() {
+        for table in reactive_table_columns.keys() {
             counter_map.insert(table.clone(), HandleMetrics{
                 matched_count: counter!("corro.subs.changes.matched.count", "sql_hash" => sql_hash.clone(), "table" => table.to_string()),
             });
@@ -867,6 +879,7 @@ impl Matcher {
                     .create_pool()
                     .expect("could not build pool, this can't fail because we specified a runtime"),
                 parsed: parsed.clone(),
+                reactive_table_columns: reactive_table_columns.clone(),
                 col_names: col_names.clone(),
                 cancel: cancel.clone(),
                 last_change_rx,
@@ -892,6 +905,8 @@ impl Matcher {
             cached_statements: statements,
             pks,
             parsed,
+            reactive_table_columns,
+            subquery_trigger_tables,
             evt_tx,
             col_names,
             last_rowid: 0,
@@ -1071,7 +1086,7 @@ impl Matcher {
             }
             trace!("created query indexes");
 
-            for (table, columns) in matcher.parsed.table_columns.iter() {
+            for (table, columns) in matcher.reactive_table_columns.iter() {
                 tx.execute(
                     r#"INSERT INTO columns ("table", cid) VALUES (?, '-1')"#,
                     [table.as_str()],
@@ -1531,51 +1546,61 @@ impl Matcher {
             return Ok(());
         }
 
+        let full_recompute_table = candidates
+            .keys()
+            .find(|table| self.subquery_trigger_tables.contains(table.as_str()))
+            .cloned();
+
         trace!(
             "got some candidates! {:?}",
             candidates.keys().collect::<Vec<_>>()
         );
 
-        let tx = self.conn.transaction()?;
-        for (table, pks) in candidates {
-            let pks = pks
-                .iter()
-                .map(|(pk, _)| unpack_columns(pk))
-                .collect::<Result<Vec<Vec<SqliteValueRef>>, _>>()?;
+        if let Some(table) = &full_recompute_table {
+            tables.insert(table.clone());
+        } else {
+            let tx = self.conn.transaction()?;
+            for (table, pks) in candidates {
+                let pks = pks
+                    .iter()
+                    .map(|(pk, _)| unpack_columns(pk))
+                    .collect::<Result<Vec<Vec<SqliteValueRef>>, _>>()?;
 
-            let tmp_table_name = format!("temp_{table}");
-            if tables.insert(table.clone()) {
-                // create a temporary table to mix and match the data
-                tx.prepare_cached(
-                    // TODO: cache the statement's string somewhere, it's always the same!
-                    // NOTE: this can't be an actual CREATE TEMP TABLE or it won't be visible
-                    //       from the state db
-                    &format!(
-                        "CREATE TABLE IF NOT EXISTS {tmp_table_name} ({})",
-                        self.pks
-                            .get(table.as_str())
-                            .ok_or_else(|| MatcherError::MissingPrimaryKeys)?
-                            .to_vec()
+                let tmp_table_name = format!("temp_{table}");
+                if tables.insert(table.clone()) {
+                    // create a temporary table to mix and match the data
+                    tx.prepare_cached(
+                        // TODO: cache the statement's string somewhere, it's always the same!
+                        // NOTE: this can't be an actual CREATE TEMP TABLE or it won't be visible
+                        //       from the state db
+                        &format!(
+                            "CREATE TABLE IF NOT EXISTS {tmp_table_name} ({})",
+                            self.pks
+                                .get(table.as_str())
+                                .ok_or_else(|| MatcherError::MissingPrimaryKeys)?
+                                .to_vec()
+                                .join(",")
+                        ),
+                    )?
+                    .execute(())?;
+                }
+
+                for pks in pks {
+                    tx.prepare_cached(&format!(
+                        "INSERT INTO {tmp_table_name} VALUES ({})",
+                        (0..pks.len())
+                            .map(|_i| "coalesce(?, \"\")")
+                            .collect::<Vec<_>>()
                             .join(",")
-                    ),
-                )?
-                .execute(())?;
+                    ))?
+                    .execute(params_from_iter(pks))?;
+                }
             }
 
-            for pks in pks {
-                tx.prepare_cached(&format!(
-                    "INSERT INTO {tmp_table_name} VALUES ({})",
-                    (0..pks.len())
-                        .map(|_i| "coalesce(?, \"\")")
-                        .collect::<Vec<_>>()
-                        .join(",")
-                ))?
-                .execute(params_from_iter(pks))?;
-            }
+            // commit so the temporary PK tables are visible to the state connection
+            tx.commit()?;
+            trace!("committed temp pk tables");
         }
-        // commit so it is visible to the other db!
-        tx.commit()?;
-        trace!("committed temp pk tables");
 
         let mut query_cols = vec![];
 
@@ -1592,6 +1617,22 @@ impl Matcher {
             all_cols.push(col_name.clone());
             query_cols.push(col_name);
         }
+
+        let full_recompute_stmt = full_recompute_table.as_ref().map(|table| {
+            let mut new_query = Cmd::Stmt(self.query.clone()).to_string();
+            new_query.pop();
+
+            debug!(
+                sub_id = %self.id,
+                %table,
+                "fully recomputing subscription for subquery dependency"
+            );
+
+            MatcherStmt {
+                new_query,
+                temp_query: format!("SELECT {} FROM query", all_cols.join(",")),
+            }
+        });
 
         // start a new tx
         let tx = self.conn.transaction()?;
@@ -1617,12 +1658,15 @@ impl Matcher {
 
             for table in tables.iter() {
                 let start = Instant::now();
-                let stmt = match self.cached_statements.get(table.as_str()) {
+                let stmt = match &full_recompute_stmt {
                     Some(stmt) => stmt,
-                    None => {
-                        warn!(sub_id = %self.id, "no statements pre-computed for table {table}");
-                        continue;
-                    }
+                    None => match self.cached_statements.get(table.as_str()) {
+                        Some(stmt) => stmt,
+                        None => {
+                            warn!(sub_id = %self.id, "no statements pre-computed for table {table}");
+                            continue;
+                        }
+                    },
                 };
 
                 trace!("SELECT SQL: {}", stmt.new_query);
@@ -1775,12 +1819,14 @@ impl Matcher {
                 histogram!("corro.subs.changes.processing.table.duration.seconds", "sql_hash" => self.hash.clone(), "table" => table.0.to_string()).record(elapsed);
             }
 
-            // clean up temporary tables immediately
-            for table in tables {
-                // TODO: reduce mistakes by computing this table name once
-                tx.prepare_cached(&format!("DELETE FROM temp_{table}",))?
-                    .execute(())?;
-                trace!("cleaned up temp_{table}");
+            if full_recompute_stmt.is_none() {
+                // clean up temporary tables immediately
+                for table in tables {
+                    // TODO: reduce mistakes by computing this table name once
+                    tx.prepare_cached(&format!("DELETE FROM temp_{table}",))?
+                        .execute(())?;
+                    trace!("cleaned up temp_{table}");
+                }
             }
         }
 
@@ -1848,9 +1894,65 @@ fn interrupt_deadline_guard(conn: &Connection, dur: Duration) -> DropGuard {
 #[derive(Debug, Default, Clone)]
 pub struct ParsedSelect {
     table_columns: IndexMap<String, HashSet<String>>,
+    local_tables: HashSet<String>,
     aliases: HashMap<String, String>,
     pub columns: Vec<ResultColumn>,
     children: Vec<ParsedSelect>,
+}
+
+impl ParsedSelect {
+    fn subquery_trigger_tables(&self, schema: &Schema) -> IndexSet<String> {
+        let mut tables = IndexSet::new();
+
+        for child in &self.children {
+            child.collect_trigger_tables(schema, &mut tables);
+        }
+
+        tables
+    }
+
+    fn collect_trigger_tables(&self, schema: &Schema, tables: &mut IndexSet<String>) {
+        for table in &self.local_tables {
+            if schema.tables.contains_key(table) {
+                tables.insert(table.clone());
+            }
+        }
+
+        for child in &self.children {
+            child.collect_trigger_tables(schema, tables);
+        }
+    }
+
+    fn subquery_table_columns(&self, schema: &Schema) -> IndexMap<String, HashSet<String>> {
+        let mut table_columns = IndexMap::new();
+
+        for child in &self.children {
+            child.collect_table_columns(schema, &mut table_columns);
+        }
+
+        table_columns
+    }
+
+    fn collect_table_columns(
+        &self,
+        schema: &Schema,
+        table_columns: &mut IndexMap<String, HashSet<String>>,
+    ) {
+        for (table, columns) in &self.table_columns {
+            // Unaliased correlated outer references are schema-table entries too.
+            // They contribute reactive columns but not full-recompute triggers.
+            if schema.tables.contains_key(table) {
+                table_columns
+                    .entry(table.clone())
+                    .or_default()
+                    .extend(columns.iter().cloned());
+            }
+        }
+
+        for child in &self.children {
+            child.collect_table_columns(schema, table_columns);
+        }
+    }
 }
 
 fn extract_select_columns(select: &Select, schema: &Schema) -> Result<ParsedSelect, MatcherError> {
@@ -1874,6 +1976,7 @@ fn extract_select_columns(select: &Select, schema: &Schema) -> Result<ParsedSele
                                 } else if let Some(ref alias) = name.alias {
                                     parsed.aliases.insert(alias.0.clone(), name.name.0.clone());
                                 }
+                                parsed.local_tables.insert(name.name.0.clone());
                                 parsed.table_columns.entry(name.name.0.clone()).or_default();
                                 Some(&name.name)
                             } else {
@@ -1905,6 +2008,7 @@ fn extract_select_columns(select: &Select, schema: &Schema) -> Result<ParsedSele
                                 } else if let Some(ref alias) = name.alias {
                                     parsed.aliases.insert(alias.0.clone(), name.name.0.clone());
                                 }
+                                parsed.local_tables.insert(name.name.0.clone());
                                 parsed.table_columns.entry(name.name.0.clone()).or_default();
                                 &name.name
                             }
@@ -2572,6 +2676,86 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_subquery_triggers_exclude_unaliased_outer_references() {
+        let schema = parse_sql(
+            "
+                CREATE TABLE services (
+                    id INTEGER NOT NULL PRIMARY KEY
+                );
+                CREATE TABLE health_checks (
+                    id INTEGER NOT NULL PRIMARY KEY,
+                    service_id INTEGER NOT NULL,
+                    threshold INTEGER NOT NULL
+                );
+                CREATE TABLE check_labels (
+                    id INTEGER NOT NULL PRIMARY KEY,
+                    health_check_id INTEGER NOT NULL,
+                    value INTEGER NOT NULL
+                );
+            ",
+        )
+        .unwrap();
+        let sql = "
+            SELECT services.id
+            FROM services
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM health_checks
+                WHERE health_checks.service_id = services.id
+                  AND EXISTS (
+                      SELECT 1
+                      FROM check_labels AS l
+                      WHERE l.health_check_id = health_checks.id
+                        AND l.value < health_checks.threshold
+                  )
+            )
+        ";
+        let mut parser = Parser::new(sql.as_bytes());
+        let Cmd::Stmt(Stmt::Select(select)) = parser.next().unwrap().unwrap() else {
+            panic!("expected SELECT statement");
+        };
+
+        let parsed = extract_select_columns(&select, &schema).unwrap();
+        assert_eq!(parsed.children.len(), 1);
+        assert!(parsed.children[0].table_columns.contains_key("services"));
+        assert_eq!(parsed.children[0].children.len(), 1);
+        assert!(parsed.children[0].children[0]
+            .table_columns
+            .contains_key("health_checks"));
+
+        let subquery_trigger_tables = parsed.subquery_trigger_tables(&schema);
+        assert_eq!(
+            subquery_trigger_tables
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec!["health_checks", "check_labels"]
+        );
+        assert!(!subquery_trigger_tables.contains("services"));
+
+        let subquery_table_columns = parsed.subquery_table_columns(&schema);
+        assert_eq!(
+            subquery_table_columns.get("services"),
+            Some(&HashSet::from(["id".to_owned()]))
+        );
+        assert_eq!(
+            subquery_table_columns.get("health_checks"),
+            Some(&HashSet::from([
+                "id".to_owned(),
+                "service_id".to_owned(),
+                "threshold".to_owned(),
+            ]))
+        );
+        assert_eq!(
+            subquery_table_columns.get("check_labels"),
+            Some(&HashSet::from([
+                "health_check_id".to_owned(),
+                "value".to_owned(),
+            ]))
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn test_matcher() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
         _ = tracing_subscriber::fmt::try_init();
@@ -2619,6 +2803,105 @@ mod tests {
         tripwire_tx.send(()).await.ok();
         tripwire_worker.await;
         wait_for_all_pending_handles().await;
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn test_correlated_not_exists_reacts_to_child_insert(
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
+        _ = tracing_subscriber::fmt::try_init();
+        let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
+        let schema_sql = "
+            CREATE TABLE services (
+                id INTEGER NOT NULL PRIMARY KEY
+            );
+            CREATE TABLE health_checks (
+                id INTEGER NOT NULL PRIMARY KEY,
+                service_id INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'unknown'
+            );
+        ";
+        let mut schema = parse_sql(schema_sql)?;
+        let sql = "
+            SELECT s.id
+            FROM services AS s
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM health_checks AS h
+                WHERE h.service_id = s.id
+                  AND h.status != 'passing'
+              )
+        ";
+        let subs = SubsManager::default();
+        let tmpdir = TempDir::new(tempfile::tempdir()?);
+        let db_path = tmpdir.path().join("test.db");
+        let subscriptions_path: Utf8PathBuf =
+            tmpdir.path().join("subs").display().to_string().into();
+        let pool = SplitPool::create(db_path, Arc::new(Semaphore::new(1)), -1048576).await?;
+        let clock = Arc::new(uhlc::HLC::default());
+        let mut conn = pool.write_priority().await?;
+
+        setup_conn(&conn)?;
+        migrate(clock, &mut conn)?;
+        let tx = conn.transaction()?;
+        apply_schema(&tx, &Schema::default(), &mut schema)?;
+        tx.commit()?;
+
+        let tx = conn.transaction()?;
+        tx.execute("INSERT INTO services (id) VALUES (1)", ())?;
+        tx.commit()?;
+
+        let (handle, created) = subs.get_or_insert(
+            sql,
+            subscriptions_path.as_path(),
+            &schema,
+            &pool,
+            tripwire.clone(),
+        )?;
+        let mut rx = created
+            .expect("new query should create a subscription")
+            .evt_rx;
+
+        assert!(matches!(rx.recv().await, Some(QueryEvent::Columns(_))));
+        assert_eq!(
+            rx.recv().await,
+            Some(QueryEvent::Row(RowId(1), vec![1_i64.into()]))
+        );
+        assert!(matches!(
+            rx.recv().await,
+            Some(QueryEvent::EndOfQuery { .. })
+        ));
+
+        let tx = conn.transaction()?;
+        tx.execute(
+            "INSERT INTO health_checks (id, service_id, status) VALUES (1, 1, 'failing')",
+            (),
+        )?;
+        tx.commit()?;
+        let db_version = conn.query_row("SELECT crsql_db_version()", (), |row| row.get(0))?;
+        filter_changes_from_db(&handle, &conn, None, db_version)?;
+
+        let event = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await;
+
+        handle.cleanup().await;
+        subs.remove(&handle.id());
+        tripwire_tx.send(()).await.ok();
+        tripwire_worker.await;
+        wait_for_all_pending_handles().await;
+
+        let event = event
+            .expect("child-table change did not produce a subscription event")
+            .expect("subscription event channel closed");
+        assert_eq!(
+            event,
+            QueryEvent::Change(
+                ChangeType::Delete,
+                RowId(1),
+                vec![1_i64.into()],
+                ChangeId(1),
+            )
+        );
 
         Ok(())
     }
