@@ -702,6 +702,7 @@ struct HandleChangesState {
     buf_cost: usize,
     current_batch_size: usize,
     processing_task: Option<JoinHandle<Result<(), corro_types::agent::ChangeError>>>,
+    inflight_batch: Option<Vec<(ChangeV1, ChangeSource, Instant)>>,
     max_wait: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
     drop_log_count: u64,
 
@@ -734,6 +735,7 @@ impl HandleChangesState {
             buf_cost: 0,
             current_batch_size: min_batch_size,
             processing_task: None,
+            inflight_batch: None,
             max_wait: Some(Box::pin(tokio::time::sleep(timeout_duration))),
             halved_at: None,
             min_batch_size,
@@ -744,6 +746,15 @@ impl HandleChangesState {
             tx_timeout,
             max_queue_len,
             drop_log_count: 0,
+        }
+    }
+
+    /// Requeue a failed batch to the front of the queue to preserve version order
+    fn requeue_batch(&mut self, batch: Vec<(ChangeV1, ChangeSource, Instant)>) {
+        for (change, src, queued_at) in batch.into_iter().rev() {
+            let cost = change.processing_cost();
+            self.buf_cost += cost;
+            self.queue.push_front((change, src, queued_at));
         }
     }
 
@@ -815,6 +826,7 @@ impl HandleChangesState {
 
         let agent_clone = agent.clone();
         let bookie_clone = bookie.clone();
+        self.inflight_batch = Some(batch.clone());
         self.processing_task = Some(tokio::spawn(process_multiple_changes(
             agent_clone,
             bookie_clone,
@@ -834,6 +846,8 @@ impl HandleChangesState {
         bookie: &Bookie,
         result: Result<Result<(), corro_types::agent::ChangeError>, tokio::task::JoinError>,
     ) {
+        let inflight = self.inflight_batch.take();
+
         // Handle task result
         match result {
             Ok(Ok(())) => {
@@ -848,7 +862,6 @@ impl HandleChangesState {
                 }
 
                 // Check for memory errors and emergency reduce batch size
-                // TODO: requeue the changes
                 if e.is_oom_error() || e.is_interrupt_error() {
                     if self.current_batch_size == self.min_batch_size {
                         error!(?e, current_batch_size = %self.current_batch_size, min_batch_size = %self.min_batch_size, "batch too large for the database to process, but already at min_batch_size — min_batch_size may be too large or transaction timeout may be misconfigured");
@@ -858,6 +871,14 @@ impl HandleChangesState {
                     self.current_batch_size =
                         (self.current_batch_size / 2).max(self.min_batch_size);
                     self.halved_at = Some(Instant::now());
+
+                    if let Some(failed_batch) = inflight {
+                        warn!(
+                            count = failed_batch.len(),
+                            "requeueing failed batch of changes due to transient database error"
+                        );
+                        self.requeue_batch(failed_batch);
+                    }
                 }
             }
             Err(ref e) => {
@@ -2223,6 +2244,129 @@ mod tests {
             "after grace period, calculate_batch_size must be free to inflate (got {inflated}, current {})",
             state.current_batch_size,
         );
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn test_failed_batch_is_requeued_and_retried() -> eyre::Result<()> {
+        _ = tracing_subscriber::fmt::try_init();
+        let (tripwire, _tripwire_worker, _tripwire_tx) = Tripwire::new_simple();
+        let dir = tempfile::tempdir()?;
+
+        let mut config = Config::builder()
+            .db_path(dir.path().join("corrosion.db").display().to_string())
+            .gossip_addr("127.0.0.1:0".parse()?)
+            .api_addr("127.0.0.1:0".parse()?)
+            .build()?;
+
+        config.perf.apply_queue_min_batch_size = 10;
+        config.perf.apply_queue_step_base = 25;
+        config.perf.apply_queue_max_batch_size = 16000;
+        config.perf.apply_queue_batch_threshold_ratio = 0.8;
+        config.perf.apply_queue_timeout = 10;
+        config.perf.processing_queue_len = 50000;
+
+        let (agent, _agent_options) = setup(config.clone(), tripwire.clone()).await?;
+
+        execute_schema(&agent, vec![TEST_SCHEMA.to_owned()]).await?;
+
+        let other_actor = ActorId(uuid::Uuid::new_v4());
+        let bookie = Bookie::new(Default::default());
+
+        let mut state = HandleChangesState::new(
+            config.perf.apply_queue_min_batch_size,
+            config.perf.apply_queue_step_base,
+            config.perf.apply_queue_max_batch_size,
+            config.perf.apply_queue_batch_threshold_ratio,
+            Duration::from_millis(config.perf.apply_queue_timeout as u64),
+            Duration::from_secs(config.perf.sql_tx_timeout as u64),
+            config.perf.processing_queue_len,
+        );
+
+        let create_change = |version: u64| -> ChangeV1 {
+            let crsql_row = Change {
+                table: TableName("tests".into()),
+                pk: pack_columns(&vec![(version as i64).into()]).unwrap(),
+                cid: ColumnName("text".into()),
+                val: "test value".into(),
+                col_version: 1,
+                db_version: CrsqlDbVersion(version),
+                seq: CrsqlSeq(0),
+                site_id: other_actor.to_bytes(),
+                cl: 1,
+            };
+            ChangeV1 {
+                actor_id: other_actor,
+                changeset: Changeset::Full {
+                    version: CrsqlDbVersion(version),
+                    changes: vec![crsql_row],
+                    seqs: dbsr!(0, 0),
+                    last_seq: CrsqlSeq(0),
+                    ts: agent.clock().new_timestamp().into(),
+                },
+            }
+        };
+
+        // Enqueue 50 changes directly into state.queue without triggering auto-spawn.
+        for v in 1..=50 {
+            let change = create_change(v);
+            let cost = change.processing_cost();
+            state.queue.push_back((change, ChangeSource::Sync, Instant::now()));
+            state.buf_cost += cost;
+        }
+
+        assert_eq!(state.queue.len(), 50);
+        assert_eq!(state.buf_cost, 50);
+        state.current_batch_size = 50;
+
+        // Drain and spawn the batch of 50 changes
+        let spawned = state.drain_and_spawn(&agent, &bookie, 50, "test-initial");
+        assert_eq!(spawned, Some(50));
+        assert_eq!(state.queue.len(), 0);
+        assert_eq!(state.buf_cost, 0);
+        assert!(state.processing_task.is_some());
+        assert!(state.inflight_batch.is_some());
+        assert_eq!(state.inflight_batch.as_ref().unwrap().len(), 50);
+
+        // Abort the background task and simulate SQLite timeout / interrupt error
+        let task = state.processing_task.take().unwrap();
+        task.abort();
+        state.handle_task_completion(&agent, &bookie, Ok(Err(synthetic_interrupt_error())));
+
+        // Verification 1: Batch size was halved from 50 to 25
+        assert_eq!(state.current_batch_size, 25);
+        assert!(state.in_grace_period());
+
+        // Verification 2: The failed batch was requeued without data loss!
+        // Because buf_cost (50) >= batch_threshold (25 * 0.8 = 20),
+        // handle_task_completion immediately spawned a new task for current_batch_size (25).
+        // That leaves 25 in the queue, and 25 currently in flight!
+        assert_eq!(state.buf_cost, 25);
+        assert_eq!(state.queue.len(), 25);
+        assert!(state.processing_task.is_some());
+        assert!(state.inflight_batch.is_some());
+
+        let inflight = state.inflight_batch.as_ref().unwrap();
+        assert_eq!(inflight.len(), 25);
+
+        // Verification 3: Version ordering is strictly preserved.
+        // In-flight batch contains versions 1..=25 in order
+        for (i, (change, _, _)) in inflight.iter().enumerate() {
+            let expected_version = (i + 1) as u64;
+            assert_eq!(change.changeset.max_db_version(), Some(CrsqlDbVersion(expected_version)));
+        }
+
+        // Remaining queue contains versions 26..=50 in order
+        for (i, (change, _, _)) in state.queue.iter().enumerate() {
+            let expected_version = (i + 26) as u64;
+            assert_eq!(change.changeset.max_db_version(), Some(CrsqlDbVersion(expected_version)));
+        }
+
+        // Clean up the spawned task
+        if let Some(task) = state.processing_task.take() {
+            task.abort();
+        }
 
         Ok(())
     }
