@@ -118,6 +118,23 @@ apply_queue_step_base               = 500
 apply_queue_batch_threshold_ratio   = 0.9
 ```
 
+## HTTP stream batching
+
+#### `stream_flush_timeout`
+
+How long, in **milliseconds**, to batch events before sending them to an HTTP client. Defaults to `10` ms. Applies to `/v1/subscriptions`, `/v1/subscriptions/{id}`, and `/v1/updates/{table}`.
+
+The first event starts the timer. Later events do not restart it. Corrosion sends the batch when the timer expires or the buffer reaches 64 KiB.
+
+A longer wait can combine more events into each send, but clients receive those events later. Set `0` to send without waiting. A slow client can still delay a send.
+
+Idle streams wait for events or disconnection without running this timer. This setting does not change SQLite transactions or replication between agents.
+
+```toml
+[perf]
+stream_flush_timeout = 10 # milliseconds
+```
+
 ## Synchronization
 
 #### `min_sync_backoff` / `max_sync_backoff`
