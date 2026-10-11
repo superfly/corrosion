@@ -195,6 +195,16 @@ pub async fn process_sub_channel(
             }
         };
 
+        // Do not broadcast initial snapshot events (Columns, Row, EndOfQuery) to sub_tx.
+        // The broadcast channel is reserved for change events and errors.
+        // Initial snapshots are sent per-subscriber directly via mpsc in catch_up_sub.
+        if matches!(
+            query_evt,
+            QueryEvent::Columns(_) | QueryEvent::Row(_, _) | QueryEvent::EndOfQuery { .. }
+        ) {
+            continue;
+        }
+
         let is_still_active = match make_query_event_bytes(&mut buf, &query_evt) {
             Ok(b) => tx.send(b).is_ok(),
             Err(e) => {
@@ -635,21 +645,16 @@ pub async fn upsert_sub(
 
         let (sub_tx, sub_rx) = broadcast::channel(10240);
 
-        tokio::spawn(forward_sub_to_sender(
-            handle.clone(),
-            sub_rx,
-            tx,
-            params.skip_rows,
-        ));
-
         bcast_write.insert(handle.id(), sub_tx.clone());
 
         tokio::spawn(process_sub_channel(
             subs.clone(),
             handle.id(),
-            sub_tx,
+            sub_tx.clone(),
             created.evt_rx,
         ));
+
+        tokio::spawn(catch_up_sub(handle.clone(), params, sub_rx, tx));
 
         Ok(handle.id())
     } else {
@@ -1928,6 +1933,37 @@ mod tests {
         }
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_process_sub_channel_filters_initial_rows() {
+        let subs = SubsManager::default();
+        let id = Uuid::new_v4();
+        // A very small broadcast channel of capacity 2
+        let (sub_tx, mut sub_rx) = broadcast::channel(2);
+        let (evt_tx, evt_rx) = mpsc::channel(100);
+
+        tokio::spawn(process_sub_channel(subs, id, sub_tx, evt_rx));
+
+        // Send many initial snapshot events (Columns, Row, EndOfQuery).
+        // Before the fix, sending more than capacity (2) would overflow the broadcast channel.
+        evt_tx.send(QueryEvent::Columns(vec![])).await.unwrap();
+        for i in 1..=50 {
+            evt_tx.send(QueryEvent::Row(RowId(i), vec![])).await.unwrap();
+        }
+        evt_tx.send(QueryEvent::EndOfQuery { time: 0.1, change_id: Some(ChangeId(0)) }).await.unwrap();
+
+        // Now send a real Change event
+        evt_tx.send(QueryEvent::Change(ChangeType::Insert, RowId(1), vec![], ChangeId(1))).await.unwrap();
+
+        // sub_rx should NOT have lagged or received snapshot rows;
+        // it should directly receive the Change event!
+        let (bytes, meta) = sub_rx.recv().await.unwrap();
+        assert_eq!(meta, QueryEventMeta::Change(ChangeId(1)));
+        assert!(!bytes.is_empty());
+
+        // sub_rx should now be empty (no pending snapshot events)
+        assert!(sub_rx.try_recv().is_err());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
