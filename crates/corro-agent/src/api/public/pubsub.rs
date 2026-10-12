@@ -2086,12 +2086,15 @@ mod tests {
                 NotifyEvent::Notify(ChangeType::Delete, pk) => {
                     assert_eq!(pk, vec!["service-id-5".into()]);
                     // check that we dont get an update after
-                    assert!(tokio::time::timeout(
-                        Duration::from_secs(2),
-                        notify_rows.recv::<NotifyEvent>()
-                    )
-                    .await
-                    .is_err());
+                    // recv errors out on its own RECV_TIMEOUT when nothing arrives
+                    assert!(!matches!(
+                        tokio::time::timeout(
+                            Duration::from_secs(3),
+                            notify_rows.recv::<NotifyEvent>()
+                        )
+                        .await,
+                        Ok(Some(Ok(_)))
+                    ));
                 }
                 _ => panic!("expected notify event"),
             }
