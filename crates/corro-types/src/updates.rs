@@ -283,8 +283,7 @@ const MAX_CACHE_ENTRIES: usize = 2000;
 const KEEP_CACHE_ENTRIES: usize = 1000;
 
 /// Merges candidates into the pending buffer, skipping changes older than what
-/// we've already seen for a pk. Recently changed pks are moved to the back and
-/// the oldest entries are evicted once the buffer is full.
+/// we've already seen for a pk, and evicts the oldest entries once the buffer is full.
 /// Returns the number of evicted entries.
 fn buffer_candidates(
     buf: &mut PendingChanges,
@@ -305,9 +304,7 @@ fn buffer_candidates(
                 }
             }
 
-            let key = (table.clone(), pk);
-            buf.shift_remove(&key);
-            buf.insert(key, cl);
+            buf.insert((table.clone(), pk), cl);
         }
     }
 
@@ -624,23 +621,23 @@ mod tests {
         let all = candidates(&table, (0..MAX_PENDING_CHANGES as u32).map(|pk| (pk, 1)));
         assert_eq!(buffer_candidates(&mut buf, &mut cl_cache, all), 0);
 
-        // touching pk 0 again moves it to the back, older cls are ignored
-        let touch = candidates(&table, [(0, 3)]);
+        // a newer cl replaces the buffered one, older cls are ignored
+        let touch = candidates(&table, [(5, 3)]);
         assert_eq!(buffer_candidates(&mut buf, &mut cl_cache, touch), 0);
-        let stale = candidates(&table, [(0, 2)]);
+        let stale = candidates(&table, [(5, 2)]);
         assert_eq!(buffer_candidates(&mut buf, &mut cl_cache, stale), 0);
-        assert_eq!(buf.get(&key(0)), Some(&3));
+        assert_eq!(buf.get(&key(5)), Some(&3));
 
-        // overflowing evicts the oldest untouched pks first
+        // overflowing evicts the oldest pks first
         let new_pk = MAX_PENDING_CHANGES as u32;
         let extra = candidates(&table, [(new_pk, 1), (new_pk + 1, 1)]);
         assert_eq!(buffer_candidates(&mut buf, &mut cl_cache, extra), 2);
 
         assert_eq!(buf.len(), MAX_PENDING_CHANGES);
-        assert_eq!(buf.get(&key(0)), Some(&3));
+        assert!(!buf.contains_key(&key(0)));
         assert!(!buf.contains_key(&key(1)));
-        assert!(!buf.contains_key(&key(2)));
-        assert!(buf.contains_key(&key(3)));
+        assert!(buf.contains_key(&key(2)));
+        assert_eq!(buf.get(&key(5)), Some(&3));
         assert_eq!(buf.last(), Some((&key(new_pk + 1), &1)));
         assert!(cl_cache.len() <= MAX_CACHE_ENTRIES);
     }
