@@ -69,8 +69,12 @@ pub struct MatcherCreated {
 const SUB_EVENT_CHANNEL_CAP: usize = 512;
 
 impl Manager<MatcherHandle> for SubsManager {
-    fn trait_type(&self) -> String {
-        "subs".to_string()
+    fn trait_type(&self) -> &'static str {
+        "subs"
+    }
+
+    fn fallible(&self) -> bool {
+        false
     }
 
     fn get(&self, id: &Uuid) -> Option<MatcherHandle> {
