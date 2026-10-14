@@ -11,7 +11,7 @@ use corro_types::{
 use metrics::counter;
 use plum_foca::{GossipMsg, Payload};
 use speedy::Readable;
-use tokio::sync::mpsc::error::TrySendError;
+use tokio::sync::{mpsc::error::TrySendError, Semaphore};
 use tokio_stream::StreamExt;
 use tokio_util::codec::{FramedRead, LengthDelimitedCodec};
 use tracing::{debug, error, trace, warn};
@@ -21,6 +21,15 @@ use crate::agent::util::should_log_pow_10;
 
 static LOG_COUNTER: AtomicU64 = AtomicU64::new(0);
 static DROP_LOG_COUNTER: AtomicU64 = AtomicU64::new(0);
+static REJECT_LOG_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Max uni streams being processed at once, across all connections.
+/// Streams arriving at the cap are stopped instead of queued.
+const MAX_INFLIGHT_UNI_STREAMS: usize = 2_000;
+static UNI_STREAM_PERMITS: Semaphore = Semaphore::const_new(MAX_INFLIGHT_UNI_STREAMS);
+
+/// Application error code sent with STOP_SENDING when we're over capacity.
+const UNI_STREAM_OVERLOADED: quinn::VarInt = quinn::VarInt::from_u32(1);
 
 /// Spawn a task that accepts unidirectional broadcast streams, then
 /// spawns another task for each incoming stream to handle.
@@ -36,7 +45,7 @@ pub fn spawn_unipayload_handler(tripwire: &Tripwire, conn: &quinn::Connection, a
         let mut tripwire = tripwire.clone();
         async move {
             loop {
-                let rx = tokio::select! {
+                let mut rx = tokio::select! {
                     rx_res = conn.accept_uni() => match rx_res {
                         Ok(rx) => rx,
                         Err(e) => {
@@ -52,6 +61,21 @@ pub fn spawn_unipayload_handler(tripwire: &Tripwire, conn: &quinn::Connection, a
 
                 counter!("corro.peer.stream.accept.total", "type" => "uni").increment(1);
 
+                let permit = match UNI_STREAM_PERMITS.try_acquire() {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        counter!("corro.peer.stream.rejected.total", "type" => "uni").increment(1);
+                        if let Some(n) = should_log_pow_10(&REJECT_LOG_COUNTER) {
+                            warn!(
+                                remote_addr = %conn.remote_address(),
+                                "too many in-flight uni streams ({MAX_INFLIGHT_UNI_STREAMS}), stopping stream (log count: {n})"
+                            );
+                        }
+                        let _ = rx.stop(UNI_STREAM_OVERLOADED);
+                        continue;
+                    }
+                };
+
                 trace!(
                     "accepted a unidirectional stream from {}",
                     conn.remote_address()
@@ -65,6 +89,8 @@ pub fn spawn_unipayload_handler(tripwire: &Tripwire, conn: &quinn::Connection, a
                     let tx_plumtree = tx_plumtree.clone();
                     let broadcast_method = broadcast_method;
                     async move {
+                        // held until this stream is fully processed
+                        let _permit = permit;
                         let mut framed = FramedRead::new(
                             rx,
                             LengthDelimitedCodec::builder()
