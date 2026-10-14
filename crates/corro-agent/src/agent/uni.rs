@@ -159,6 +159,8 @@ pub fn spawn_unipayload_handler(tripwire: &Tripwire, conn: &quinn::Connection, a
                                                         BroadcastMethod::Plumtree => {
                                                             let msg_type: &'static str =
                                                                 (&wire_msg).into();
+                                                            // use try_send so we don't block if the channel is full
+                                                            // syncs and duplicate broadcast would recover droped changes
                                                             match tx_plumtree.try_send(
                                                                 PlumtreeInput::Wire(wire_msg),
                                                             ) {
