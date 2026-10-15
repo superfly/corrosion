@@ -1,4 +1,8 @@
-use std::{iter::Peekable, ops::DerefMut};
+use std::{
+    collections::BTreeMap,
+    iter::Peekable,
+    ops::{DerefMut, RangeInclusive},
+};
 
 use antithesis_sdk::{assert_always, assert_unreachable};
 pub use corro_api_types::SqliteValue;
@@ -373,40 +377,60 @@ where
 
 pub const MAX_CHANGES_BYTE_SIZE: usize = 8 * 1024;
 
-/// Chunked iterator for packed V2 packed changes.
+/// Chunks packed V2 rows into contiguous checked query ranges.
 ///
-/// Like `ChunkedChanges` but for `PackedChange` entries. Uses `max_seq`
-/// (extracted from packed seq blob) for `CrsqlSeqRange` metadata.
-/// Does NOT sort or filter — relies on cr-sqlite's `ORDER BY seq` and
-/// pushed `seq` constraints in the source query.
+/// Rows whose minimum is left of the query may be staged until their in-range
+/// sequence interval is safe to emit in order. Input must be ordered by min_seq.
 pub struct ChunkedPackedChanges<I: Iterator> {
-    iter: Peekable<I>,
+    iter: I,
     changes: PackedChangesetPerTable,
-    last_pushed_seq: CrsqlSeq,
-    last_start_seq: CrsqlSeq,
-    last_seq: CrsqlSeq,
+    queried_range: CrsqlSeqRange,
+    // Gate: max in-range seq seen in emitted/buffered rows + 1 (starts at queried_range.start()).
+    safe_start: CrsqlSeq,
+    // Previous packed row's min_seq, to verify ORDER BY min_seq.
+    last_row_min_seq: Option<CrsqlSeq>,
+    // Only left-overhang rows (change.min_seq < queried_range.start()), keyed by in-range min_seq.
+    pending: BTreeMap<CrsqlSeq, ReadyRow>,
+    // Current row from iter with change.min_seq >= queried_range.start().
+    current_row: Option<ReadyRow>,
+    // Current chunk's advertised (start, end) range and max in-range seq.
+    chunk_range: Option<(CrsqlSeq, CrsqlSeq)>,
+    chunk_max: Option<CrsqlSeq>,
     max_buf_size: usize,
     buffered_size: usize,
-    seen_seqs: RangeInclusiveSet<CrsqlSeq>,
-    saw_change: bool,
+    // Exact sequence values seen across the iterator, for duplicate detection.
+    all_seen_seqs: RangeInclusiveSet<CrsqlSeq>,
+    input_done: bool,
     done: bool,
+}
+
+struct ReadyRow {
+    change: PackedChange,
+    row_min: CrsqlSeq,
+    row_cont: CrsqlSeq,
+    row_max: CrsqlSeq,
 }
 
 impl<I> ChunkedPackedChanges<I>
 where
     I: Iterator,
 {
-    pub fn new(iter: I, start_seq: CrsqlSeq, last_seq: CrsqlSeq, max_buf_size: usize) -> Self {
+    /// `checked_range` is the source-authoritative interval queried.
+    pub fn new(iter: I, checked_range: CrsqlSeqRange, max_buf_size: usize) -> Self {
         Self {
-            iter: iter.peekable(),
+            iter,
             changes: Default::default(),
-            last_pushed_seq: CrsqlSeq(0),
-            last_start_seq: start_seq,
-            last_seq,
+            queried_range: checked_range,
+            safe_start: checked_range.start(),
+            last_row_min_seq: None,
+            pending: BTreeMap::new(),
+            current_row: None,
+            chunk_range: None,
+            chunk_max: None,
             max_buf_size,
             buffered_size: 0,
-            seen_seqs: RangeInclusiveSet::new(),
-            saw_change: false,
+            all_seen_seqs: RangeInclusiveSet::new(),
+            input_done: false,
             done: false,
         }
     }
@@ -447,107 +471,227 @@ where
 
         self.buffered_size = 0;
 
-        loop {
-            trace!("chunking through packed rows iterator");
-            match self.iter.next() {
-                Some(Ok(change)) => {
-                    trace!("got packed change: {change:?}");
+        let q_start = self.queried_range.start();
+        let q_end = self.queried_range.end();
 
-                    let sequence_values = match PackedChange::sequence_values(&change.seq) {
-                        Ok(values) => values,
-                        Err(error) => {
-                            assert_unreachable!(
-                                "packed sequence values must decode successfully",
-                                &json!({ "error": error })
-                            );
-                            self.changes = PackedChangesetPerTable::default();
-                            self.done = true;
-                            return Some(Err(sequence_error(format!(
-                                "invalid packed sequence values: {error}"
-                            ))));
-                        }
-                    };
-                    let mut change_seqs = RangeInclusiveSet::new();
-                    for seq in sequence_values {
-                        let seq_range = seq..=seq;
-                        if self.seen_seqs.overlapping(&seq_range).next().is_some()
-                            || change_seqs.overlapping(&seq_range).next().is_some()
-                        {
-                            assert_unreachable!(
-                                "packed changes must not contain duplicate sequence values",
+        loop {
+            while self.current_row.is_none() && !self.input_done {
+                match self.iter.next() {
+                    Some(Ok(change)) => {
+                        if let Some(last_row_min_seq) = self.last_row_min_seq {
+                            assert_always!(
+                                change.min_seq > last_row_min_seq,
+                                "packed changes must be ordered by strictly increasing min_seq",
                                 &json!({
-                                    "sequence": seq.0,
-                                    "last_pushed_seq": self.last_pushed_seq.0,
+                                    "last_row_min_seq": last_row_min_seq.0,
+                                    "change_min_seq": change.min_seq.0,
+                                })
+                            );
+                            if change.min_seq <= last_row_min_seq {
+                                self.changes = PackedChangesetPerTable::default();
+                                self.done = true;
+                                return Some(Err(sequence_error(format!(
+                                    "packed changes are not ordered by min_seq: previous={}, current={}",
+                                    last_row_min_seq.0, change.min_seq.0
+                                ))));
+                            }
+                        }
+                        self.last_row_min_seq = Some(change.min_seq);
+
+                        if change.min_seq > change.max_seq {
+                            assert_unreachable!(
+                                "packed change sequence range must not be inverted",
+                                &json!({
+                                    "min_seq": change.min_seq.0,
+                                    "max_seq": change.max_seq.0,
                                 })
                             );
                             self.changes = PackedChangesetPerTable::default();
                             self.done = true;
                             return Some(Err(sequence_error(format!(
-                                "packed change contains duplicate sequence value: {}",
-                                seq.0
+                                "packed change has inverted sequence range: min_seq={}, max_seq={}",
+                                change.min_seq.0, change.max_seq.0
                             ))));
                         }
-                        change_seqs.insert(seq_range);
-                    }
-                    self.seen_seqs.extend(change_seqs);
 
-                    if change.min_seq > change.max_seq {
-                        assert_unreachable!(
-                            "packed change sequence range must not be inverted",
-                            &json!({
-                                "min_seq": change.min_seq.0,
-                                "max_seq": change.max_seq.0,
-                            })
-                        );
+                        let sequence_values = match PackedChange::sequence_values(&change.seq) {
+                            Ok(values) => values,
+                            Err(error) => {
+                                assert_unreachable!(
+                                    "packed sequence values must decode successfully",
+                                    &json!({ "error": error })
+                                );
+                                self.changes = PackedChangesetPerTable::default();
+                                self.done = true;
+                                return Some(Err(sequence_error(format!(
+                                    "invalid packed sequence values: {error}"
+                                ))));
+                            }
+                        };
+                        let mut change_seqs = RangeInclusiveSet::new();
+                        for seq in sequence_values {
+                            let seq_range = seq..=seq;
+                            if change_seqs.overlapping(&seq_range).next().is_some() {
+                                assert_unreachable!(
+                                    "packed changes must not contain duplicate sequence values",
+                                    &json!({
+                                        "sequence": seq.0,
+                                    })
+                                );
+                                self.changes = PackedChangesetPerTable::default();
+                                self.done = true;
+                                return Some(Err(sequence_error(format!(
+                                    "packed change contains duplicate sequence value: {}",
+                                    seq.0
+                                ))));
+                            }
+                            change_seqs.insert(seq_range);
+                        }
+
+                        if change.min_seq >= q_end {
+                            self.input_done = true;
+                        }
+
+                        let queried_range = RangeInclusive::from(self.queried_range);
+                        let in_range: Vec<_> =
+                            change_seqs.overlapping(&queried_range).cloned().collect();
+                        if in_range.is_empty() {
+                            continue;
+                        }
+
+                        for range in change_seqs.iter() {
+                            if self.all_seen_seqs.overlapping(range).next().is_some() {
+                                assert_unreachable!(
+                                    "packed changes must not contain duplicate sequence values",
+                                    &json!({
+                                        "duplicate_range": format!("{range:?}"),
+                                        "seen_sequences": self.all_seen_seqs.len(),
+                                    })
+                                );
+                                self.changes = PackedChangesetPerTable::default();
+                                self.done = true;
+                                return Some(Err(sequence_error(format!(
+                                    "packed change contains duplicate sequence values: {range:?}"
+                                ))));
+                            }
+                        }
+
+                        self.all_seen_seqs.extend(change_seqs.iter().cloned());
+                        let row = ReadyRow {
+                            change,
+                            row_min: *in_range.first().unwrap().start(),
+                            row_cont: *in_range.first().unwrap().end(),
+                            row_max: *in_range.last().unwrap().end(),
+                        };
+
+                        if row.change.min_seq < q_start {
+                            self.pending.insert(row.row_min, row);
+                        } else {
+                            self.current_row = Some(row);
+                        }
+                    }
+                    None => self.input_done = true,
+                    Some(Err(e)) => {
                         self.changes = PackedChangesetPerTable::default();
                         self.done = true;
-                        return Some(Err(sequence_error(format!(
-                            "packed change has inverted sequence range: min_seq={}, max_seq={}",
-                            change.min_seq.0, change.max_seq.0
-                        ))));
+                        return Some(Err(e));
                     }
-
-                    self.saw_change = true;
-                    self.last_pushed_seq = self.last_pushed_seq.max(change.max_seq);
-
-                    let size = self.changes.insert(change);
-                    self.buffered_size += size;
-
-                    let can_split = self.buffered_size >= self.max_buf_size
-                        && self.last_pushed_seq < self.last_seq
-                        && self.iter.peek().is_some_and(|next| {
-                            next.as_ref()
-                                .map(|next| next.min_seq > self.last_pushed_seq)
-                                .unwrap_or(false)
-                        });
-                    if can_split {
-                        let start_seq = self.last_start_seq;
-                        self.last_start_seq = self.last_pushed_seq + 1;
-
-                        return Some(Ok((
-                            self.changes.drain(),
-                            CrsqlSeqRange::new(start_seq, self.last_pushed_seq),
-                        )));
-                    }
-                }
-                None => {
-                    trace!("no more packed changes to iterate on");
-                    break;
-                }
-                Some(Err(e)) => {
-                    self.changes = PackedChangesetPerTable::default();
-                    self.done = true;
-                    return Some(Err(e));
                 }
             }
+
+            let next_row = match (self.pending.first_key_value(), &self.current_row) {
+                (Some((&pending_min, pending_row)), Some(cur)) if pending_min < cur.row_min => {
+                    Some((true, pending_row))
+                }
+                (_, Some(cur)) => Some((false, cur)),
+                (Some((_, pending_row)), None) => Some((true, pending_row)),
+                (None, None) => None,
+            };
+
+            if let Some((from_pending, row)) = next_row {
+                if !self.can_merge_into_chunk(row) {
+                    return Some(Ok(self.emit_current_chunk()));
+                }
+
+                let row = if from_pending {
+                    self.pending.pop_first().unwrap().1
+                } else {
+                    self.current_row.take().unwrap()
+                };
+                self.add_to_chunk(row);
+                if self.buffered_size >= self.max_buf_size {
+                    return Some(Ok(self.emit_current_chunk()));
+                }
+                continue;
+            }
+
+            if self.chunk_range.is_some() {
+                return Some(Ok(self.emit_current_chunk()));
+            }
+
+            self.done = true;
+            if self.safe_start <= q_end {
+                let start = self.safe_start;
+                self.safe_start = CrsqlSeq(q_end.0.saturating_add(1));
+                return Some(Ok((
+                    PackedChangesetPerTable::default(),
+                    CrsqlSeqRange::new(start, q_end),
+                )));
+            }
+            return None;
         }
+    }
+}
 
-        self.done = true;
+impl<I: Iterator> ChunkedPackedChanges<I> {
+    fn can_merge_into_chunk(&self, row: &ReadyRow) -> bool {
+        let Some((_start, end)) = self.chunk_range else {
+            return true;
+        };
+        let next_after_end = CrsqlSeq(end.0.saturating_add(1));
+        next_after_end >= self.safe_start || row.row_min <= next_after_end
+    }
 
-        Some(Ok((
-            self.changes.clone(),
-            CrsqlSeqRange::new(self.last_start_seq, self.last_seq),
-        )))
+    fn add_to_chunk(&mut self, row: ReadyRow) {
+        let size = self.changes.insert(row.change);
+        self.buffered_size += size;
+        match &mut self.chunk_range {
+            None => {
+                let start = if row.row_min >= self.safe_start {
+                    self.safe_start
+                } else {
+                    row.row_min
+                };
+                self.chunk_range = Some((start, row.row_cont));
+            }
+            Some((_start, end)) => {
+                *end = (*end).max(row.row_cont);
+            }
+        }
+        self.chunk_max = Some(
+            self.chunk_max
+                .map_or(row.row_max, |max_seq| max_seq.max(row.row_max)),
+        );
+    }
+
+    fn emit_current_chunk(&mut self) -> (PackedChangesetPerTable, CrsqlSeqRange) {
+        let (start, mut end) = self
+            .chunk_range
+            .take()
+            .expect("chunk_range must be present");
+        let chunk_max = self.chunk_max.take().unwrap_or(end);
+        let is_last = self.input_done && self.pending.is_empty() && self.current_row.is_none();
+        if is_last && CrsqlSeq(end.0.saturating_add(1)) >= self.safe_start {
+            end = self.queried_range.end();
+        }
+        self.safe_start = self
+            .safe_start
+            .max(CrsqlSeq(end.max(chunk_max).0.saturating_add(1)));
+        self.buffered_size = 0;
+        if is_last && self.safe_start > self.queried_range.end() {
+            self.done = true;
+        }
+        (self.changes.drain(), CrsqlSeqRange::new(start, end))
     }
 }
 
@@ -823,12 +967,31 @@ mod tests {
 
     #[test]
     fn test_packed_chunker_empty() {
-        let mut chunker =
-            ChunkedPackedChanges::new(vec![].into_iter(), CrsqlSeq(0), CrsqlSeq(100), 50);
+        let mut chunker = ChunkedPackedChanges::new(vec![].into_iter(), dbsr!(0, 100), 50);
         assert_eq!(
             chunker.next(),
             Some(Ok((PackedChangesetPerTable::default(), dbsr!(0, 100))))
         );
+        assert_eq!(chunker.next(), None);
+    }
+
+    #[test]
+    fn test_packed_chunker_emits_checked_tail_without_lookahead() {
+        let change = PackedChange {
+            table: TableName("tests".into()),
+            pk: vec![1],
+            seq: SqliteValue::Integer(0),
+            min_seq: CrsqlSeq(0),
+            max_seq: CrsqlSeq(0),
+            ..Default::default()
+        };
+        let mut chunker = ChunkedPackedChanges::new(vec![Ok(change)].into_iter(), dbsr!(0, 2), 1);
+
+        let data = chunker.next().unwrap().unwrap();
+        assert_eq!(data.1, dbsr!(0, 0));
+        let checked_tail = chunker.next().unwrap().unwrap();
+        assert!(checked_tail.0.is_empty());
+        assert_eq!(checked_tail.1, dbsr!(1, 2));
         assert_eq!(chunker.next(), None);
     }
 
@@ -853,8 +1016,7 @@ mod tests {
                 .map(Ok)
                 .collect::<Vec<_>>()
                 .into_iter(),
-            CrsqlSeq(0),
-            CrsqlSeq(4),
+            dbsr!(0, 4),
             100000, // large enough to send all
         );
 
@@ -864,47 +1026,301 @@ mod tests {
     }
 
     #[test]
-    fn test_packed_chunker_keeps_overlapping_ranges_together() {
-        let changes = [(1, 50), (2, 49), (51, 51)].into_iter().enumerate().map(
-            |(index, (min_seq, max_seq))| PackedChange {
-                table: TableName("tests".into()),
-                pk: vec![index as u8],
-                seq: SqliteValue::Integer(max_seq),
-                max_seq: CrsqlSeq(max_seq as u64),
-                min_seq: CrsqlSeq(min_seq as u64),
-                ..Default::default()
-            },
-        );
+    fn test_packed_chunker_preserves_contiguous_checked_ranges_for_packed_rows() {
+        let changes = [
+            (vec![2, 10, 13], 10, 13),
+            (vec![1, 11], 11, 11),
+            (vec![1, 12], 12, 12),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, (seq, min_seq, max_seq))| PackedChange {
+            table: TableName("tests".into()),
+            pk: vec![index as u8],
+            seq: SqliteValue::Blob(seq.into()),
+            max_seq: CrsqlSeq(max_seq as u64),
+            min_seq: CrsqlSeq(min_seq as u64),
+            ..Default::default()
+        });
         let mut chunker = ChunkedPackedChanges::new(
             changes.map(Ok).collect::<Vec<_>>().into_iter(),
-            CrsqlSeq(0),
-            CrsqlSeq(51),
+            dbsr!(10, 12),
             1,
         );
 
         let first = chunker.next().unwrap().unwrap();
-        assert_eq!(first.1, dbsr!(0, 50));
+        assert_eq!(first.1, dbsr!(10, 10));
         let second = chunker.next().unwrap().unwrap();
-        assert_eq!(second.1, dbsr!(51, 51));
+        assert_eq!(second.1, dbsr!(11, 11));
+        let third = chunker.next().unwrap().unwrap();
+        assert_eq!(third.1, dbsr!(12, 12));
+        assert_eq!(chunker.next(), None);
+    }
+
+    #[test]
+    fn test_packed_chunker_stages_left_overhang_and_emits_consecutive_prefix() {
+        let changes = [
+            (vec![2, 1, 20], 1, 20),
+            (vec![2, 7, 14], 7, 14),
+            (vec![3, 10, 11, 13], 10, 13),
+            (vec![1, 12], 12, 12),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, (seq, min_seq, max_seq))| PackedChange {
+            table: TableName(
+                ["false_positive", "overhang", "seq_10_11_13", "seq_12"][index].into(),
+            ),
+            pk: vec![index as u8],
+            seq: SqliteValue::Blob(seq.into()),
+            max_seq: CrsqlSeq(max_seq),
+            min_seq: CrsqlSeq(min_seq),
+            ..Default::default()
+        });
+        let mut chunker = ChunkedPackedChanges::new(
+            changes.map(Ok).collect::<Vec<_>>().into_iter(),
+            dbsr!(10, 15),
+            1,
+        );
+
+        let first = chunker.next().unwrap().unwrap();
+        assert_eq!(first.1, dbsr!(10, 11));
+        assert_eq!(first.0.count().get("seq_10_11_13"), Some(&1));
+        assert!(!first.0.count().contains_key("false_positive"));
+        let second = chunker.next().unwrap().unwrap();
+        assert_eq!(second.1, dbsr!(12, 12));
+        assert_eq!(second.0.count().get("seq_12"), Some(&1));
+        assert!(!second.0.count().contains_key("false_positive"));
+        let third = chunker.next().unwrap().unwrap();
+        assert_eq!(third.1, dbsr!(14, 15));
+        assert_eq!(third.0.count().get("overhang"), Some(&1));
+        assert!(!third.0.count().contains_key("false_positive"));
+        assert_eq!(chunker.next(), None);
+    }
+
+    #[test]
+    fn test_packed_chunker_stages_left_overhang_before_two_in_range_rows() {
+        let changes = [
+            (vec![2, 1, 20], 1, 20),
+            (vec![2, 7, 13], 7, 13),
+            (vec![2, 10, 12], 10, 12),
+            (vec![1, 11], 11, 11),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, (seq, min_seq, max_seq))| PackedChange {
+            table: TableName(["false_positive", "overhang", "seq_10_12", "seq_11"][index].into()),
+            pk: vec![index as u8],
+            seq: SqliteValue::Blob(seq.into()),
+            max_seq: CrsqlSeq(max_seq),
+            min_seq: CrsqlSeq(min_seq),
+            ..Default::default()
+        });
+        let mut chunker = ChunkedPackedChanges::new(
+            changes.map(Ok).collect::<Vec<_>>().into_iter(),
+            dbsr!(10, 15),
+            1,
+        );
+
+        let first = chunker.next().unwrap().unwrap();
+        assert_eq!(first.1, dbsr!(10, 10));
+        assert_eq!(first.0.count().get("seq_10_12"), Some(&1));
+        assert!(!first.0.count().contains_key("false_positive"));
+        let second = chunker.next().unwrap().unwrap();
+        assert_eq!(second.1, dbsr!(11, 11));
+        assert_eq!(second.0.count().get("seq_11"), Some(&1));
+        assert!(!second.0.count().contains_key("false_positive"));
+        let third = chunker.next().unwrap().unwrap();
+        assert_eq!(third.1, dbsr!(13, 15));
+        assert_eq!(third.0.count().get("overhang"), Some(&1));
+        assert!(!third.0.count().contains_key("false_positive"));
+        assert_eq!(chunker.next(), None);
+    }
+
+    #[test]
+    fn test_packed_chunker_emits_checked_query_prefix_and_packed_extras() {
+        let changes = [(vec![3, 0, 4, 5], 0, 5), (vec![1, 3], 3, 3)]
+            .into_iter()
+            .enumerate()
+            .map(|(index, (seq, min_seq, max_seq))| PackedChange {
+                table: TableName("tests".into()),
+                pk: vec![index as u8],
+                seq: SqliteValue::Blob(seq.into()),
+                val: SqliteValue::Text(if index == 0 {
+                    "large packed value".repeat(20).into()
+                } else {
+                    "x".into()
+                }),
+                max_seq: CrsqlSeq(max_seq),
+                min_seq: CrsqlSeq(min_seq),
+                ..Default::default()
+            });
+        let mut chunker = ChunkedPackedChanges::new(
+            changes.map(Ok).collect::<Vec<_>>().into_iter(),
+            dbsr!(0, 10),
+            100,
+        );
+
+        let first = chunker.next().unwrap().unwrap();
+        assert_eq!(first.1, dbsr!(0, 0));
+        assert_eq!(first.0.count().get("tests"), Some(&1));
+        let second = chunker.next().unwrap().unwrap();
+        assert_eq!(second.1, dbsr!(3, 3));
+        assert_eq!(second.0.count().get("tests"), Some(&1));
+        let third = chunker.next().unwrap().unwrap();
+        assert_eq!(third.1, dbsr!(6, 10));
+        assert!(third.0.is_empty());
+        assert_eq!(chunker.next(), None);
+    }
+
+    #[test]
+    fn test_packed_chunker_drops_min_max_false_positives() {
+        let changes = [
+            (vec![2, 1, 20], 1, 20), // Envelope overlaps [10, 11], exact seqs do not.
+            (vec![2, 10, 22], 10, 22),
+            (vec![1, 11], 11, 11),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, (seq, min_seq, max_seq))| PackedChange {
+            table: TableName("tests".into()),
+            pk: vec![index as u8],
+            seq: SqliteValue::Blob(seq.into()),
+            max_seq: CrsqlSeq(max_seq),
+            min_seq: CrsqlSeq(min_seq),
+            ..Default::default()
+        });
+        let mut chunker = ChunkedPackedChanges::new(
+            changes.map(Ok).collect::<Vec<_>>().into_iter(),
+            dbsr!(10, 15),
+            usize::MAX,
+        );
+
+        let (changes, seqs) = chunker.next().unwrap().unwrap();
+        assert_eq!(changes.count().get("tests"), Some(&2));
+        assert_eq!(seqs, dbsr!(10, 15));
+        assert_eq!(chunker.next(), None);
+    }
+
+    #[test]
+    fn test_packed_chunker_single_chunk_when_not_overflowing_and_splits_around_emitted_overhang() {
+        // 1. If we never overflow max_buf_size, even out-of-order overhangs stay in one chunk.
+        let changes = [(vec![2, 10, 12], 10, 12), (vec![1, 14], 14, 14)]
+            .into_iter()
+            .enumerate()
+            .map(|(index, (seq, min_seq, max_seq))| PackedChange {
+                table: TableName(["seq_10_12", "seq_14"][index].into()),
+                pk: vec![index as u8],
+                seq: SqliteValue::Blob(seq.into()),
+                max_seq: CrsqlSeq(max_seq),
+                min_seq: CrsqlSeq(min_seq),
+                ..Default::default()
+            });
+        let mut chunker = ChunkedPackedChanges::new(
+            changes.map(Ok).collect::<Vec<_>>().into_iter(),
+            dbsr!(10, 15),
+            usize::MAX,
+        );
+
+        let single = chunker.next().unwrap().unwrap();
+        assert_eq!(single.1, dbsr!(10, 15));
+        assert_eq!(single.0.count().get("seq_10_12"), Some(&1));
+        assert_eq!(single.0.count().get("seq_14"), Some(&1));
+        assert_eq!(chunker.next(), None);
+
+        // 2. If Chunk 1 overflows with {9, 12}, Chunk 2 ({11}) must split before {14}
+        // so it doesn't claim 12 was in Chunk 2.
+        let changes = [
+            (vec![2, 9, 12], 9, 12, "large".repeat(30)),
+            (vec![1, 11], 11, 11, "x".to_string()),
+            (vec![1, 14], 14, 14, "y".to_string()),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, (seq, min_seq, max_seq, val))| PackedChange {
+            table: TableName(["seq_9_12", "seq_11", "seq_14"][index].into()),
+            pk: vec![index as u8],
+            seq: SqliteValue::Blob(seq.into()),
+            val: SqliteValue::Text(val.into()),
+            max_seq: CrsqlSeq(max_seq),
+            min_seq: CrsqlSeq(min_seq),
+            ..Default::default()
+        });
+        let mut chunker = ChunkedPackedChanges::new(
+            changes.map(Ok).collect::<Vec<_>>().into_iter(),
+            dbsr!(9, 15),
+            100,
+        );
+
+        let first = chunker.next().unwrap().unwrap();
+        assert_eq!(first.1, dbsr!(9, 9));
+        assert_eq!(first.0.count().get("seq_9_12"), Some(&1));
+        let second = chunker.next().unwrap().unwrap();
+        assert_eq!(second.1, dbsr!(11, 11));
+        assert_eq!(second.0.count().get("seq_11"), Some(&1));
+        let third = chunker.next().unwrap().unwrap();
+        assert_eq!(third.1, dbsr!(13, 15));
+        assert_eq!(third.0.count().get("seq_14"), Some(&1));
+        assert_eq!(chunker.next(), None);
+    }
+
+    #[test]
+    fn test_packed_chunker_rejects_nonmonotonic_min_seq_rows() {
+        let make_change = |seq| PackedChange {
+            table: TableName("tests".into()),
+            pk: vec![seq as u8],
+            seq: SqliteValue::Integer(seq as i64),
+            min_seq: CrsqlSeq(seq),
+            max_seq: CrsqlSeq(seq),
+            ..Default::default()
+        };
+        let mut chunker = ChunkedPackedChanges::new(
+            vec![Ok(make_change(2)), Ok(make_change(1))].into_iter(),
+            dbsr!(0, 3),
+            1,
+        );
+
+        let first = chunker.next().unwrap().unwrap();
+        assert_eq!(first.1, dbsr!(0, 2));
+        let error = chunker.next().unwrap().unwrap_err().to_string();
+        assert!(error.contains("not ordered by min_seq"));
+        assert_eq!(chunker.next(), None);
+    }
+
+    #[test]
+    fn test_packed_chunker_stops_when_checked_range_is_exhausted() {
+        let change = PackedChange {
+            table: TableName("tests".into()),
+            pk: vec![1],
+            seq: SqliteValue::Integer(0),
+            min_seq: CrsqlSeq(0),
+            max_seq: CrsqlSeq(0),
+            ..Default::default()
+        };
+        let mut chunker = ChunkedPackedChanges::new(
+            vec![Ok(change), Err(rusqlite::Error::InvalidQuery)].into_iter(),
+            dbsr!(0, 0),
+            usize::MAX,
+        );
+
+        let chunk = chunker.next().unwrap().unwrap();
+        assert!(!chunk.0.is_empty());
+        assert_eq!(chunk.1, dbsr!(0, 0));
         assert_eq!(chunker.next(), None);
     }
 
     #[test]
     fn test_packed_chunker_rejects_duplicate_terminal_sequences() {
-        let changes = [0, 1, 2, 2].into_iter().map(|max_seq| PackedChange {
+        let change = PackedChange {
             table: TableName("tests".into()),
-            pk: vec![max_seq as u8],
-            seq: SqliteValue::Integer(max_seq),
-            max_seq: CrsqlSeq(max_seq as u64),
-            min_seq: CrsqlSeq(max_seq as u64),
+            pk: vec![1],
+            seq: SqliteValue::Blob(vec![2, 2, 2].into()),
+            max_seq: CrsqlSeq(2),
+            min_seq: CrsqlSeq(2),
             ..Default::default()
-        });
-        let mut chunker = ChunkedPackedChanges::new(
-            changes.map(Ok).collect::<Vec<_>>().into_iter(),
-            CrsqlSeq(0),
-            CrsqlSeq(2),
-            100_000,
-        );
+        };
+        let mut chunker =
+            ChunkedPackedChanges::new(vec![Ok(change)].into_iter(), dbsr!(0, 2), 100_000);
 
         let error = chunker.next().unwrap().unwrap_err().to_string();
         assert!(error.contains("duplicate sequence value"));
@@ -921,12 +1337,8 @@ mod tests {
             min_seq: CrsqlSeq(3),
             ..Default::default()
         };
-        let mut chunker = ChunkedPackedChanges::new(
-            vec![Ok(change)].into_iter(),
-            CrsqlSeq(0),
-            CrsqlSeq(2),
-            100_000,
-        );
+        let mut chunker =
+            ChunkedPackedChanges::new(vec![Ok(change)].into_iter(), dbsr!(0, 2), 100_000);
 
         let error = chunker.next().unwrap().unwrap_err().to_string();
         assert!(error.contains("inverted sequence range"));
@@ -943,8 +1355,7 @@ mod tests {
         };
         let mut chunker = ChunkedPackedChanges::new(
             vec![Ok(change), Err(rusqlite::Error::InvalidQuery)].into_iter(),
-            CrsqlSeq(0),
-            CrsqlSeq(1),
+            dbsr!(0, 1),
             100_000,
         );
 
@@ -994,10 +1405,10 @@ mod tests {
             val: SqliteValue::Text("hello".into()),
             col_version: SqliteValue::Integer(1),
             db_version: CrsqlDbVersion(1),
-            seq: SqliteValue::Integer(0),
+            seq: SqliteValue::Blob(vec![2, 0, 2].into()),
             site_id: [0xBB; 16],
             cl: 1,
-            max_seq: CrsqlSeq(0),
+            max_seq: CrsqlSeq(2),
             min_seq: CrsqlSeq(0),
         });
 
@@ -1005,13 +1416,19 @@ mod tests {
             actor_id: ActorId(Uuid::nil()),
             version: CrsqlDbVersion(1),
             changes: packed,
-            last_seq: CrsqlSeq(0),
-            seqs: dbsr!(0, 0),
+            last_seq: CrsqlSeq(2),
+            seqs: dbsr!(0, 2),
             ts: Timestamp::from(12345u64),
         };
 
         let bytes = changeset.write_to_vec().unwrap();
         let back = Changeset::read_from_buffer(&bytes).unwrap();
         assert_eq!(changeset, back);
+        assert!(changeset.is_complete());
+
+        let id = changeset.id();
+        let bytes = id.write_to_vec().unwrap();
+        let back = crate::broadcast::ChangesetId::read_from_buffer(&bytes).unwrap();
+        assert_eq!(id, back);
     }
 }

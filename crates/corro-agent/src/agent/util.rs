@@ -809,16 +809,36 @@ pub fn process_single_version<T: Deref<Target = rusqlite::Connection> + Committa
     let sp = tx.savepoint()?;
     let mut changes_per_table = BTreeMap::new();
     let is_complete = changeset.is_complete();
+    let is_packed = matches!(&changeset, Changeset::FullV2Packed { .. });
     let (known, changeset) = if let Some(packed_parts) = changeset.into_packed_parts() {
         if packed_parts.changes.is_empty() {
-            // empty changeset
-            (
-                KnownDbVersion::Cleared,
-                Changeset::Empty {
-                    versions,
-                    ts: Some(Timestamp::from(agent.clock().new_timestamp())),
-                },
-            )
+            if is_packed {
+                // A sync response can certify a checked range with no surviving
+                // clock rows (cr-sqlite is history-free). Preserve that coverage
+                // in partial bookkeeping so it can complete any earlier buffered
+                // chunks, or clear the version if it is already complete.
+                let known = process_incomplete_version(&sp, actor_id, &packed_parts)?;
+                (
+                    known,
+                    Changeset::FullV2Packed {
+                        actor_id,
+                        version: packed_parts.version,
+                        changes: corro_types::broadcast::PackedChangesetPerTable::default(),
+                        last_seq: packed_parts.last_seq,
+                        seqs: packed_parts.seqs,
+                        ts: packed_parts.ts,
+                    },
+                )
+            } else {
+                // Legacy empty changesets represent empty versions.
+                (
+                    KnownDbVersion::Cleared,
+                    Changeset::Empty {
+                        versions,
+                        ts: Some(Timestamp::from(agent.clock().new_timestamp())),
+                    },
+                )
+            }
         } else if is_complete {
             // complete changeset — apply directly to crsql_changes
             let (known, changeset, table) =
@@ -1265,6 +1285,11 @@ pub async fn process_multiple_changes(
     let mut seen = HashSet::new();
     let mut unknown_changes: BTreeMap<ActorId, (Booked, Vec<_>)> = BTreeMap::new();
     for (change, src, queued_at) in changes {
+        if let Err(error) = change.validate() {
+            warn!(actor_id = %change.actor_id, %error, "skipping change with an invalid range");
+            continue;
+        }
+
         histogram!("corro.agent.changes.queued.seconds").record(queued_at.elapsed());
         let versions = change.versions();
         let seqs = change.seqs();
@@ -1375,7 +1400,9 @@ pub async fn process_multiple_changes(
                 }
 
                 // optimizing this, insert later!
-                let known = if change.is_complete() && change.is_empty() {
+                let is_empty_version = change.is_empty()
+                    && !matches!(&change.changeset, Changeset::FullV2Packed { .. });
+                let known = if change.is_complete() && is_empty_version {
                     process_empty_version(&tx, change.actor_id, &max, change.versions()).map_err(
                         |e| ChangeError::Rusqlite {
                             source: e,
@@ -1385,13 +1412,6 @@ pub async fn process_multiple_changes(
                     )?;
                     KnownDbVersion::Cleared
                 } else {
-                    if let Some(seqs) = change.seqs() {
-                        if seqs.end() < seqs.start() {
-                            warn!(%actor_id, versions = ?change.versions(), "received an invalid change, seqs start is greater than seqs end: {seqs:?}");
-                            continue;
-                        }
-                    }
-
                     let (known, changeset) = {
                         match process_single_version(&agent, &mut tx, change) {
                             Ok(res) => {
