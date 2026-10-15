@@ -11,6 +11,7 @@ use corro_types::{
 use metrics::counter;
 use plum_foca::{GossipMsg, Payload};
 use speedy::Readable;
+use tokio::sync::{mpsc::error::TrySendError, Semaphore};
 use tokio_stream::StreamExt;
 use tokio_util::codec::{FramedRead, LengthDelimitedCodec};
 use tracing::{debug, error, trace, warn};
@@ -19,6 +20,16 @@ use tripwire::Tripwire;
 use crate::agent::util::should_log_pow_10;
 
 static LOG_COUNTER: AtomicU64 = AtomicU64::new(0);
+static DROP_LOG_COUNTER: AtomicU64 = AtomicU64::new(0);
+static REJECT_LOG_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Max uni streams being processed at once, across all connections.
+/// Streams arriving at the cap are stopped instead of queued.
+const MAX_INFLIGHT_UNI_STREAMS: usize = 2_000;
+static UNI_STREAM_PERMITS: Semaphore = Semaphore::const_new(MAX_INFLIGHT_UNI_STREAMS);
+
+/// Application error code sent with STOP_SENDING when we're over capacity.
+const UNI_STREAM_OVERLOADED: quinn::VarInt = quinn::VarInt::from_u32(1);
 
 /// Spawn a task that accepts unidirectional broadcast streams, then
 /// spawns another task for each incoming stream to handle.
@@ -34,7 +45,7 @@ pub fn spawn_unipayload_handler(tripwire: &Tripwire, conn: &quinn::Connection, a
         let mut tripwire = tripwire.clone();
         async move {
             loop {
-                let rx = tokio::select! {
+                let mut rx = tokio::select! {
                     rx_res = conn.accept_uni() => match rx_res {
                         Ok(rx) => rx,
                         Err(e) => {
@@ -50,6 +61,21 @@ pub fn spawn_unipayload_handler(tripwire: &Tripwire, conn: &quinn::Connection, a
 
                 counter!("corro.peer.stream.accept.total", "type" => "uni").increment(1);
 
+                let permit = match UNI_STREAM_PERMITS.try_acquire() {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        counter!("corro.peer.stream.rejected.total", "type" => "uni").increment(1);
+                        if let Some(n) = should_log_pow_10(&REJECT_LOG_COUNTER) {
+                            warn!(
+                                remote_addr = %conn.remote_address(),
+                                "too many in-flight uni streams ({MAX_INFLIGHT_UNI_STREAMS}), stopping stream (log count: {n})"
+                            );
+                        }
+                        let _ = rx.stop(UNI_STREAM_OVERLOADED);
+                        continue;
+                    }
+                };
+
                 trace!(
                     "accepted a unidirectional stream from {}",
                     conn.remote_address()
@@ -63,6 +89,8 @@ pub fn spawn_unipayload_handler(tripwire: &Tripwire, conn: &quinn::Connection, a
                     let tx_plumtree = tx_plumtree.clone();
                     let broadcast_method = broadcast_method;
                     async move {
+                        // held until this stream is fully processed
+                        let _permit = permit;
                         let mut framed = FramedRead::new(
                             rx,
                             LengthDelimitedCodec::builder()
@@ -117,7 +145,6 @@ pub fn spawn_unipayload_handler(tripwire: &Tripwire, conn: &quinn::Connection, a
                                                     if cluster_id != payload_cluster_id {
                                                         continue;
                                                     }
-                                                    let tx = tx_plumtree.clone();
 
                                                     match broadcast_method {
                                                         // route gossips if we are using broadcast method
@@ -156,13 +183,29 @@ pub fn spawn_unipayload_handler(tripwire: &Tripwire, conn: &quinn::Connection, a
                                                             }
                                                         }
                                                         BroadcastMethod::Plumtree => {
-                                                            if let Err(e) = tx
-                                                                .send(PlumtreeInput::Wire(wire_msg))
-                                                                .await
-                                                            {
-                                                                error!(
-                                                                    "could not route Plumtree msg: {e}"
-                                                                );
+                                                            let msg_type: &'static str =
+                                                                (&wire_msg).into();
+                                                            // use try_send so we don't block if the channel is full
+                                                            // syncs and duplicate broadcast would recover droped changes
+                                                            match tx_plumtree.try_send(
+                                                                PlumtreeInput::Wire(wire_msg),
+                                                            ) {
+                                                                Ok(()) => {}
+                                                                Err(TrySendError::Full(_)) => {
+                                                                    counter!("corro.peer.stream.uni.dropped", "channel" => "plumtree", "msg_type" => msg_type).increment(1);
+                                                                    if let Some(n) =
+                                                                        should_log_pow_10(
+                                                                            &DROP_LOG_COUNTER,
+                                                                        )
+                                                                    {
+                                                                        warn!(msg_type, "plumtree channel full, dropped message (log count: {n})");
+                                                                    }
+                                                                }
+                                                                Err(TrySendError::Closed(_)) => {
+                                                                    error!(
+                                                                        "could not route Plumtree msg: channel closed"
+                                                                    );
+                                                                }
                                                             }
                                                         }
                                                     }
@@ -198,21 +241,38 @@ pub fn spawn_unipayload_handler(tripwire: &Tripwire, conn: &quinn::Connection, a
                                         sender: id.actor_id,
                                         payload: PlumtreePayload { id, bcast },
                                     });
-                                    if let Err(e) =
-                                        tx_plumtree.send(PlumtreeInput::Wire(wire)).await
-                                    {
-                                        error!(
-                                            "could not route legacy gossip change to plumtree: {e}"
-                                        );
-                                        return;
+                                    let msg_type: &'static str = (&wire).into();
+                                    match tx_plumtree.try_send(PlumtreeInput::Wire(wire)) {
+                                        Ok(()) => {}
+                                        Err(TrySendError::Full(_)) => {
+                                            counter!("corro.peer.stream.uni.dropped", "channel" => "plumtree", "msg_type" => msg_type).increment(1);
+                                            if let Some(n) = should_log_pow_10(&DROP_LOG_COUNTER) {
+                                                warn!(msg_type, "plumtree channel full, dropped legacy gossip change (log count: {n})");
+                                            }
+                                        }
+                                        Err(TrySendError::Closed(_)) => {
+                                            error!(
+                                                "could not route legacy gossip change to plumtree: channel closed"
+                                            );
+                                            return;
+                                        }
                                     }
                                 }
                             }
                             BroadcastMethod::Gossip => {
                                 for change in changes.into_iter().rev() {
-                                    if let Err(e) = tx_changes.send(change).await {
-                                        error!("could not send change for processing: {e}");
-                                        return;
+                                    match tx_changes.try_send(change) {
+                                        Ok(()) => {}
+                                        Err(TrySendError::Full(_)) => {
+                                            counter!("corro.peer.stream.uni.dropped", "channel" => "changes", "msg_type" => "change").increment(1);
+                                            if let Some(n) = should_log_pow_10(&DROP_LOG_COUNTER) {
+                                                warn!("changes channel full, dropped broadcast change (log count: {n})");
+                                            }
+                                        }
+                                        Err(TrySendError::Closed(_)) => {
+                                            error!("could not send change for processing: channel closed");
+                                            return;
+                                        }
                                     }
                                 }
                             }
