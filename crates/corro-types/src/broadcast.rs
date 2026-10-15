@@ -425,6 +425,7 @@ pub enum Changeset {
         version: CrsqlDbVersion,
         changes: PackedChangesetPerTable,
         last_seq: CrsqlSeq,
+        // The contiguous queried range this packed response has checked.
         seqs: CrsqlSeqRange,
         ts: Timestamp,
     },
@@ -1182,8 +1183,11 @@ pub async fn broadcast_changes(
 
         if is_packed {
             let rows = prepped.query_map([db_version], row_to_packed_change)?;
-            let chunked =
-                ChunkedPackedChanges::new(rows, CrsqlSeq(0), last_seq, MAX_CHANGES_BYTE_SIZE);
+            let chunked = ChunkedPackedChanges::new(
+                rows,
+                CrsqlSeqRange::new(CrsqlSeq(0), last_seq),
+                MAX_CHANGES_BYTE_SIZE,
+            );
             for changes_seqs in chunked {
                 match changes_seqs {
                     Ok((changes, seqs)) => {
@@ -1311,6 +1315,30 @@ mod tests {
                 ts: Timestamp::zero(),
             },
         }
+    }
+
+    #[test]
+    fn validates_packed_sequence_range() {
+        let actor_id = ActorId(Uuid::new_v4());
+        let change = ChangeV1 {
+            actor_id,
+            changeset: Changeset::FullV2Packed {
+                actor_id,
+                version: CrsqlDbVersion(1),
+                changes: PackedChangesetPerTable::default(),
+                last_seq: CrsqlSeq(13),
+                seqs: CrsqlSeqRange::new(CrsqlSeq(13), CrsqlSeq(12)),
+                ts: Timestamp::zero(),
+            },
+        };
+
+        assert_eq!(
+            change.validate().unwrap_err(),
+            ChangeValidationError::InvertedSeqs {
+                start: CrsqlSeq(13),
+                end: CrsqlSeq(12),
+            }
+        );
     }
 
     #[test]
