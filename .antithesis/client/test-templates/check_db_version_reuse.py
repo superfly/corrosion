@@ -38,7 +38,7 @@ def main():
                 f"""
                 SELECT site_id, db_version, COUNT(*)
                 FROM (
-                    SELECT DISTINCT site_id db_version, ts
+                    SELECT DISTINCT site_id, db_version, ts
                     FROM {qi(table)}
                 )
                 GROUP BY site_id, db_version
@@ -46,8 +46,8 @@ def main():
                 """
             ).fetchall()
             errors.extend(
-                f"{table}: db_version {db_version} has {timestamp_count} timestamps"
-                for db_version, timestamp_count in rows
+                f"{table}: site_id {site_id} db_version {db_version} has {timestamp_count} timestamps"
+                for site_id, db_version, timestamp_count in rows
             )
     finally:
         conn.close()

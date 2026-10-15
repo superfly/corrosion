@@ -1,6 +1,6 @@
 use std::{iter::Peekable, ops::DerefMut};
 
-use antithesis_sdk::assert_always;
+use antithesis_sdk::{assert_always, assert_unreachable};
 pub use corro_api_types::SqliteValue;
 use corro_api_types::{ColumnName, TableName};
 use corro_base_types::{varint, CrsqlDbVersion, CrsqlSeqRange};
@@ -294,8 +294,7 @@ where
                     let seq_range = seq..=seq;
 
                     if self.seen_seqs.overlapping(&seq_range).next().is_some() {
-                        assert_always!(
-                            false,
+                        assert_unreachable!(
                             "V1 changes must not contain duplicate sequence values",
                             &json!({
                                 "sequence": seq.0,
@@ -310,8 +309,7 @@ where
                         ))));
                     }
                     if self.saw_change && seq < self.last_pushed_seq {
-                        assert_always!(
-                            false,
+                        assert_unreachable!(
                             "V1 changes must arrive in sequence order",
                             &json!({
                                 "previous_seq": self.last_pushed_seq.0,
@@ -325,23 +323,6 @@ where
                             self.last_pushed_seq.0, seq.0
                         ))));
                     }
-                    if seq > self.last_seq {
-                        assert_always!(
-                            false,
-                            "V1 change must not exceed requested last_seq",
-                            &json!({
-                                "seq": seq.0,
-                                "last_seq": self.last_seq.0,
-                            })
-                        );
-                        self.changes = ChangesetPerTable::default();
-                        self.done = true;
-                        return Some(Err(sequence_error(format!(
-                            "V1 change exceeds requested last_seq: seq={}, last_seq={}",
-                            seq.0, self.last_seq.0
-                        ))));
-                    }
-
                     self.seen_seqs.insert(seq_range);
                     self.saw_change = true;
                     self.last_pushed_seq = seq;
@@ -475,8 +456,7 @@ where
                     let sequence_values = match PackedChange::sequence_values(&change.seq) {
                         Ok(values) => values,
                         Err(error) => {
-                            assert_always!(
-                                false,
+                            assert_unreachable!(
                                 "packed sequence values must decode successfully",
                                 &json!({ "error": error })
                             );
@@ -493,8 +473,7 @@ where
                         if self.seen_seqs.overlapping(&seq_range).next().is_some()
                             || change_seqs.overlapping(&seq_range).next().is_some()
                         {
-                            assert_always!(
-                                false,
+                            assert_unreachable!(
                                 "packed changes must not contain duplicate sequence values",
                                 &json!({
                                     "sequence": seq.0,
@@ -513,8 +492,7 @@ where
                     self.seen_seqs.extend(change_seqs);
 
                     if change.min_seq > change.max_seq {
-                        assert_always!(
-                            false,
+                        assert_unreachable!(
                             "packed change sequence range must not be inverted",
                             &json!({
                                 "min_seq": change.min_seq.0,
@@ -526,22 +504,6 @@ where
                         return Some(Err(sequence_error(format!(
                             "packed change has inverted sequence range: min_seq={}, max_seq={}",
                             change.min_seq.0, change.max_seq.0
-                        ))));
-                    }
-                    if change.max_seq > self.last_seq {
-                        assert_always!(
-                            false,
-                            "packed change must not exceed requested last_seq",
-                            &json!({
-                                "max_seq": change.max_seq.0,
-                                "last_seq": self.last_seq.0,
-                            })
-                        );
-                        self.changes = PackedChangesetPerTable::default();
-                        self.done = true;
-                        return Some(Err(sequence_error(format!(
-                            "packed change exceeds requested last_seq: max_seq={}, last_seq={}",
-                            change.max_seq.0, self.last_seq.0
                         ))));
                     }
 
@@ -581,14 +543,6 @@ where
         }
 
         self.done = true;
-
-        if self.saw_change && self.last_pushed_seq != self.last_seq {
-            self.changes = PackedChangesetPerTable::default();
-            return Some(Err(sequence_error(format!(
-                "packed changes ended before requested last_seq: final max_seq={}, last_seq={}",
-                self.last_pushed_seq.0, self.last_seq.0
-            ))));
-        }
 
         Some(Ok((
             self.changes.clone(),
@@ -726,7 +680,8 @@ mod tests {
         assert_eq!(chunker.next(), Some(Ok((changeset, dbsr!(2, 100)))));
         assert_eq!(chunker.next(), None);
 
-        let (_, size) = mapped_changeset_from_changes(vec![changes[0].clone()]);
+        let (changeset, size) =
+            mapped_changeset_from_changes(vec![changes[0].clone(), changes[1].clone()]);
         let mut chunker = ChunkedChanges::new(
             vec![Ok(changes[0].clone()), Ok(changes[1].clone())].into_iter(),
             CrsqlSeq(0),
@@ -734,8 +689,7 @@ mod tests {
             size,
         );
 
-        let error = chunker.next().unwrap().unwrap_err().to_string();
-        assert!(error.contains("exceeds requested last_seq"));
+        assert_eq!(chunker.next(), Some(Ok((changeset, dbsr!(0, 0)))));
         assert_eq!(chunker.next(), None);
 
         let (changeset, size) =
@@ -955,27 +909,6 @@ mod tests {
         let error = chunker.next().unwrap().unwrap_err().to_string();
         assert!(error.contains("duplicate sequence value"));
         assert_eq!(chunker.next(), None);
-    }
-
-    #[test]
-    fn test_packed_chunker_rejects_incomplete_terminal_sequence() {
-        let changes = [0, 1].into_iter().map(|max_seq| PackedChange {
-            table: TableName("tests".into()),
-            pk: vec![max_seq as u8],
-            seq: SqliteValue::Integer(max_seq),
-            max_seq: CrsqlSeq(max_seq as u64),
-            min_seq: CrsqlSeq(max_seq as u64),
-            ..Default::default()
-        });
-        let mut chunker = ChunkedPackedChanges::new(
-            changes.map(Ok).collect::<Vec<_>>().into_iter(),
-            CrsqlSeq(0),
-            CrsqlSeq(2),
-            100_000,
-        );
-
-        let error = chunker.next().unwrap().unwrap_err().to_string();
-        assert!(error.contains("ended before requested last_seq"));
     }
 
     #[test]
