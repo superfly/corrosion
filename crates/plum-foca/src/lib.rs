@@ -440,14 +440,14 @@ pub struct PlumtreeState<
     config: Config,
 
     /// Peers on the spanning tree: they get full `Gossip` payloads (push).
-    eager_peers: HashSet<N>,
+    eager_peers: IndexSet<N>,
     /// Lazy peers only get `IHave` digests (lazy push).
     lazy_peers: IndexSet<N>,
     /// Every peer we know about, eager or lazy; drives.
-    known_peers: HashSet<N>,
+    known_peers: IndexSet<N>,
     /// Eager peers pinned to the tree because they are our ring neighbors
     /// within `Config::ring_locked_radius`; they are never pruned.
-    ring_locked: HashSet<N>,
+    ring_locked: IndexSet<N>,
     /// Per-per rtt information.
     peer_topology: HashMap<N, RttInfo>,
     /// Candidate topology change awaiting confirmation
@@ -463,6 +463,9 @@ pub struct PlumtreeState<
     /// Recently-delivered payloads, kept so we can answer inbound `Graft`s.
     cache: PayloadCache<I, P>,
     /// PRNG for random peer selection (seedable for deterministic tests).
+    /// The peer sets are `IndexSet`s so that their iteration order, which
+    /// decides what this RNG picks and the order of sends, depends only on
+    /// the sequence of inserts and removes, not on the hasher.
     rng: SmallRng,
     /// Rate-limits outbound `Prune`s per peer to avoid flapping links.
     prune_throttle: PruneThrottle<N>,
@@ -491,10 +494,10 @@ impl<I: MessageId<NodeId = N>, P: Payload<MessageId = I, NodeId = N>, N: NodeId,
         Self {
             local_id,
             config,
-            eager_peers: HashSet::new(),
+            eager_peers: IndexSet::new(),
             lazy_peers: IndexSet::new(),
-            known_peers: HashSet::new(),
-            ring_locked: HashSet::new(),
+            known_peers: IndexSet::new(),
+            ring_locked: IndexSet::new(),
             peer_topology: HashMap::new(),
             pending_topology: HashMap::new(),
             lazy_queue: Vec::new(),
@@ -508,7 +511,7 @@ impl<I: MessageId<NodeId = N>, P: Payload<MessageId = I, NodeId = N>, N: NodeId,
         }
     }
 
-    pub fn ring_locked_peers(&self) -> &HashSet<N> {
+    pub fn ring_locked_peers(&self) -> &IndexSet<N> {
         &self.ring_locked
     }
 
@@ -516,7 +519,7 @@ impl<I: MessageId<NodeId = N>, P: Payload<MessageId = I, NodeId = N>, N: NodeId,
         self.seen.contains(id)
     }
 
-    pub fn eager_peers(&self) -> &HashSet<N> {
+    pub fn eager_peers(&self) -> &IndexSet<N> {
         &self.eager_peers
     }
 
@@ -524,7 +527,7 @@ impl<I: MessageId<NodeId = N>, P: Payload<MessageId = I, NodeId = N>, N: NodeId,
         &self.lazy_peers
     }
 
-    pub fn known_peers(&self) -> &HashSet<N> {
+    pub fn known_peers(&self) -> &IndexSet<N> {
         &self.known_peers
     }
 
@@ -1140,10 +1143,10 @@ impl<I: MessageId<NodeId = N>, P: Payload<MessageId = I, NodeId = N>, N: NodeId,
     /// Removes the peer from the overlay. `peer_topology` is left alone:
     /// it is the RTT cache consulted when the peer comes back.
     pub fn peer_down(&mut self, peer: &N, _rt: &mut impl Runtime<I, P, N>) {
-        let was_eager = self.eager_peers.remove(peer);
+        let was_eager = self.eager_peers.swap_remove(peer);
         let was_lazy = self.lazy_peers.swap_remove(peer);
-        self.known_peers.remove(peer);
-        self.ring_locked.remove(peer);
+        self.known_peers.swap_remove(peer);
+        self.ring_locked.swap_remove(peer);
         self.pending_topology.remove(peer);
         let fanout_changed = self.maybe_recompute_fanout();
         if was_eager || was_lazy || fanout_changed {
@@ -1357,7 +1360,7 @@ impl<I: MessageId<NodeId = N>, P: Payload<MessageId = I, NodeId = N>, N: NodeId,
             return;
         }
 
-        let was_eager = self.eager_peers.remove(peer);
+        let was_eager = self.eager_peers.swap_remove(peer);
         if was_eager {
             rt.notify(Notification::PeerDroppedFromEager(peer));
         }
@@ -1715,7 +1718,7 @@ mod tests {
         let rand_eager = *s
             .eager_peers()
             .iter()
-            .find(|p| !s.ring_locked_peers().contains(p))
+            .find(|p| !s.ring_locked_peers().contains(*p))
             .unwrap();
         s.handle_prune(
             PruneMsg {
@@ -2551,11 +2554,11 @@ mod tests {
     fn reconcile_relocks_ring_neighbors_after_departure() {
         // local id 0, sorted ring 0,1,2,3: neighbors are 1 and 3.
         let (mut s, mut rt) = reconciled(&THREE);
-        assert_eq!(s.ring_locked, HashSet::from([1, 3]));
+        assert_eq!(s.ring_locked, IndexSet::from([1, 3]));
 
         s.update_peer_topology(snapshot(&THREE[..2]), &mut rt);
 
-        assert_eq!(s.ring_locked, HashSet::from([1, 2]));
+        assert_eq!(s.ring_locked, IndexSet::from([1, 2]));
         assert!(s.eager_peers.contains(&2));
     }
 
