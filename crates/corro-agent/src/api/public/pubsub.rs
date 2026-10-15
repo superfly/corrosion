@@ -2137,7 +2137,7 @@ mod tests {
                 version: CrsqlDbVersion(1),
                 changes,
                 last_seq: CrsqlSeq(1),
-                seqs: CrsqlSeqRange::new(CrsqlSeq(seq), CrsqlSeq(seq)),
+                seqs: vec![CrsqlSeqRange::new(CrsqlSeq(seq), CrsqlSeq(seq))],
                 ts: Timestamp::from(1),
             }
         };

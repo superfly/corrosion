@@ -79,6 +79,12 @@ pub enum ChangesetId {
     Empty {
         versions: CrsqlDbVersionRange,
     },
+    FullV2Packed {
+        version: CrsqlDbVersion,
+        // Exact coverage; packed changes may contain disjoint sequence ranges.
+        seqs: Vec<CrsqlSeqRange>,
+        last_seq: CrsqlSeq,
+    },
 }
 
 /// Plumtree gossip payload. Carries a stable message id for the protocol and
@@ -343,12 +349,14 @@ impl ChangeV1 {
             Changeset::Full { .. } | Changeset::FullV2 { .. } | Changeset::FullV2Packed { .. } => {}
         }
 
-        if let Some(seqs) = self.seqs() {
-            if seqs.start() > seqs.end() {
-                return Err(ChangeValidationError::InvertedSeqs {
-                    start: seqs.start(),
-                    end: seqs.end(),
-                });
+        if let Some(seqs) = self.sequence_ranges() {
+            for seqs in seqs {
+                if seqs.start() > seqs.end() {
+                    return Err(ChangeValidationError::InvertedSeqs {
+                        start: seqs.start(),
+                        end: seqs.end(),
+                    });
+                }
             }
         }
 
@@ -425,7 +433,8 @@ pub enum Changeset {
         version: CrsqlDbVersion,
         changes: PackedChangesetPerTable,
         last_seq: CrsqlSeq,
-        seqs: CrsqlSeqRange,
+        // Exact coverage; unlike V1/V2 changesets this need not be contiguous.
+        seqs: Vec<CrsqlSeqRange>,
         ts: Timestamp,
     },
 }
@@ -586,6 +595,15 @@ impl Deref for PackedChangesetPerTable {
 }
 
 impl Changeset {
+    /// Exact sequence coverage. Packed changesets may cover disjoint ranges.
+    pub fn sequence_ranges(&self) -> Option<Vec<CrsqlSeqRange>> {
+        match self {
+            Changeset::Empty { .. } | Changeset::EmptySet { .. } => None,
+            Changeset::Full { seqs, .. } | Changeset::FullV2 { seqs, .. } => Some(vec![*seqs]),
+            Changeset::FullV2Packed { seqs, .. } => Some(seqs.clone()),
+        }
+    }
+
     #[inline]
     pub fn versions(&self) -> CrsqlDbVersionRange {
         match self {
@@ -625,13 +643,11 @@ impl Changeset {
 
     #[inline]
     pub fn seqs(&self) -> Option<CrsqlSeqRange> {
-        match self {
-            Changeset::Empty { .. } => None,
-            Changeset::EmptySet { .. } => None,
-            Changeset::Full { seqs, .. } => Some(*seqs),
-            Changeset::FullV2 { seqs, .. } => Some(*seqs),
-            Changeset::FullV2Packed { seqs, .. } => Some(*seqs),
-        }
+        let ranges = self.sequence_ranges()?;
+        Some(CrsqlSeqRange::new(
+            ranges.first()?.start(),
+            ranges.last()?.end(),
+        ))
     }
 
     pub fn last_seq(&self) -> Option<CrsqlSeq> {
@@ -655,7 +671,9 @@ impl Changeset {
                 seqs.start_int() == 0 && seqs.end_int() == last_seq.0
             }
             Changeset::FullV2Packed { seqs, last_seq, .. } => {
-                seqs.start_int() == 0 && seqs.end_int() == last_seq.0
+                let mut covered = rangemap::RangeInclusiveSet::new();
+                covered.extend(seqs.iter().map(Into::into));
+                covered.gaps(&(CrsqlSeq(0)..=*last_seq)).next().is_none()
             }
         }
     }
@@ -754,7 +772,7 @@ impl Changeset {
                     actor_id,
                     version,
                     changes: packed_changes,
-                    seqs,
+                    seqs: vec![seqs],
                     last_seq,
                     ts,
                 })
@@ -797,7 +815,7 @@ impl Changeset {
                     actor_id,
                     version,
                     changes: packed_changes,
-                    seqs,
+                    seqs: vec![seqs],
                     last_seq,
                     ts,
                 })
@@ -873,15 +891,19 @@ impl Changeset {
                 seqs,
                 last_seq,
                 ..
-            }
-            | Changeset::FullV2Packed {
+            } => ChangesetId::Full {
+                version: *version,
+                seqs: *seqs,
+                last_seq: *last_seq,
+            },
+            Changeset::FullV2Packed {
                 version,
                 seqs,
                 last_seq,
                 ..
-            } => ChangesetId::Full {
+            } => ChangesetId::FullV2Packed {
                 version: *version,
-                seqs: *seqs,
+                seqs: seqs.clone(),
                 last_seq: *last_seq,
             },
             Changeset::Empty { versions, .. } => ChangesetId::Empty {
@@ -901,7 +923,7 @@ pub struct PackedChangesetParts {
     pub actor_id: ActorId,
     pub version: CrsqlDbVersion,
     pub changes: Vec<PackedChange>,
-    pub seqs: CrsqlSeqRange,
+    pub seqs: Vec<CrsqlSeqRange>,
     pub last_seq: CrsqlSeq,
     pub ts: Timestamp,
 }
@@ -1182,8 +1204,11 @@ pub async fn broadcast_changes(
 
         if is_packed {
             let rows = prepped.query_map([db_version], row_to_packed_change)?;
-            let chunked =
-                ChunkedPackedChanges::new(rows, CrsqlSeq(0), last_seq, MAX_CHANGES_BYTE_SIZE);
+            let chunked = ChunkedPackedChanges::new(
+                rows,
+                CrsqlSeqRange::new(CrsqlSeq(0), last_seq),
+                MAX_CHANGES_BYTE_SIZE,
+            );
             for changes_seqs in chunked {
                 match changes_seqs {
                     Ok((changes, seqs)) => {
@@ -1311,6 +1336,33 @@ mod tests {
                 ts: Timestamp::zero(),
             },
         }
+    }
+
+    #[test]
+    fn validates_each_packed_sequence_range() {
+        let actor_id = ActorId(Uuid::new_v4());
+        let change = ChangeV1 {
+            actor_id,
+            changeset: Changeset::FullV2Packed {
+                actor_id,
+                version: CrsqlDbVersion(1),
+                changes: PackedChangesetPerTable::default(),
+                last_seq: CrsqlSeq(13),
+                seqs: vec![
+                    CrsqlSeqRange::new(CrsqlSeq(10), CrsqlSeq(10)),
+                    CrsqlSeqRange::new(CrsqlSeq(13), CrsqlSeq(12)),
+                ],
+                ts: Timestamp::zero(),
+            },
+        };
+
+        assert_eq!(
+            change.validate().unwrap_err(),
+            ChangeValidationError::InvertedSeqs {
+                start: CrsqlSeq(13),
+                end: CrsqlSeq(12),
+            }
+        );
     }
 
     #[test]

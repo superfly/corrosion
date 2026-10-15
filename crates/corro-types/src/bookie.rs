@@ -237,6 +237,17 @@ impl BookedVersions {
                 .unwrap_or(!self.partials.contains_key(&version))
     }
 
+    pub fn contains_ranges(&self, version: CrsqlDbVersion, seqs: &[CrsqlSeqRange]) -> bool {
+        self.contains_version(&version)
+            && seqs.iter().all(|range| match self.partials.get(&version) {
+                Some(partial) => {
+                    let range = RangeInclusive::from(*range);
+                    partial.seqs.gaps(&range).next().is_none()
+                }
+                None => true,
+            })
+    }
+
     #[inline]
     pub fn contains_all(
         &self,
@@ -244,6 +255,17 @@ impl BookedVersions {
         seqs: Option<CrsqlSeqRange>,
     ) -> bool {
         versions.into().all(|version| self.contains(version, seqs))
+    }
+
+    pub fn contains_all_ranges(
+        &self,
+        versions: impl Into<CrsqlDbVersionRange>,
+        seqs: Option<&[CrsqlSeqRange]>,
+    ) -> bool {
+        versions.into().all(|version| match seqs {
+            Some(seqs) => self.contains_ranges(version, seqs),
+            None => self.contains_version(&version),
+        })
     }
 
     pub fn last(&self) -> Option<CrsqlDbVersion> {

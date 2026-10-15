@@ -40,7 +40,7 @@ use corro_types::{
         PartialVersion,
     },
     api::{ColumnName, TableName},
-    base::{CrsqlDbVersion, CrsqlDbVersionRange, CrsqlSeq},
+    base::{CrsqlDbVersion, CrsqlDbVersionRange, CrsqlSeq, CrsqlSeqRange},
     bookie::BookieDbParams,
     broadcast::{ChangeSource, ChangeV1, Changeset, FocaCmd, FocaInput, PackedChangesetParts},
     change::Change,
@@ -809,16 +809,36 @@ pub fn process_single_version<T: Deref<Target = rusqlite::Connection> + Committa
     let sp = tx.savepoint()?;
     let mut changes_per_table = BTreeMap::new();
     let is_complete = changeset.is_complete();
+    let is_packed = matches!(&changeset, Changeset::FullV2Packed { .. });
     let (known, changeset) = if let Some(packed_parts) = changeset.into_packed_parts() {
         if packed_parts.changes.is_empty() {
-            // empty changeset
-            (
-                KnownDbVersion::Cleared,
-                Changeset::Empty {
-                    versions,
-                    ts: Some(Timestamp::from(agent.clock().new_timestamp())),
-                },
-            )
+            if is_packed {
+                // A sync response can certify a checked range with no surviving
+                // clock rows (cr-sqlite is history-free). Preserve that coverage
+                // in partial bookkeeping so it can complete any earlier buffered
+                // chunks, or clear the version if it is already complete.
+                let known = process_incomplete_version(&sp, actor_id, &packed_parts)?;
+                (
+                    known,
+                    Changeset::FullV2Packed {
+                        actor_id,
+                        version: packed_parts.version,
+                        changes: corro_types::broadcast::PackedChangesetPerTable::default(),
+                        last_seq: packed_parts.last_seq,
+                        seqs: packed_parts.seqs,
+                        ts: packed_parts.ts,
+                    },
+                )
+            } else {
+                // Legacy empty changesets represent empty versions.
+                (
+                    KnownDbVersion::Cleared,
+                    Changeset::Empty {
+                        versions,
+                        ts: Some(Timestamp::from(agent.clock().new_timestamp())),
+                    },
+                )
+            }
         } else if is_complete {
             // complete changeset — apply directly to crsql_changes
             let (known, changeset, table) =
@@ -1265,16 +1285,24 @@ pub async fn process_multiple_changes(
     let mut seen = HashSet::new();
     let mut unknown_changes: BTreeMap<ActorId, (Booked, Vec<_>)> = BTreeMap::new();
     for (change, src, queued_at) in changes {
+        if let Err(error) = change.validate() {
+            warn!(actor_id = %change.actor_id, %error, "skipping change with an invalid range");
+            continue;
+        }
+
         histogram!("corro.agent.changes.queued.seconds").record(queued_at.elapsed());
         let versions = change.versions();
-        let seqs = change.seqs();
+        let seqs = change.sequence_ranges();
 
         if !seen.insert((change.actor_id, versions, seqs)) {
             continue;
         }
 
         let booked = bookie.ensure(change.actor_id);
-        if booked.read().contains_all(change.versions(), change.seqs()) {
+        if booked
+            .read()
+            .contains_all_ranges(change.versions(), change.sequence_ranges().as_deref())
+        {
             continue;
         }
 
@@ -1349,8 +1377,10 @@ pub async fn process_multiple_changes(
 
             for (change, src) in changes {
                 trace!("handling a single changeset: {change:?}");
-                let seqs = change.seqs();
-                if booked_write.contains_all(change.versions(), change.seqs()) {
+                let seqs = change.sequence_ranges();
+                if booked_write
+                    .contains_all_ranges(change.versions(), change.sequence_ranges().as_deref())
+                {
                     trace!("previously unknown versions are now deemed known, aborting inserts");
                     continue;
                 }
@@ -1358,12 +1388,12 @@ pub async fn process_multiple_changes(
                 let versions = change.versions();
 
                 // check if we've seen this version here...
-                if versions.clone().all(|version| match seqs {
-                    Some(mut check_seqs) => match seen.get(&version) {
+                if versions.clone().all(|version| match &seqs {
+                    Some(check_seqs) => match seen.get(&version) {
                         Some(maybe_partial) => match maybe_partial {
-                            Some(PartialVersion { seqs, .. }) => {
-                                check_seqs.all(|seq| seqs.contains(&seq))
-                            }
+                            Some(PartialVersion { seqs, .. }) => check_seqs
+                                .iter()
+                                .all(|range| seqs.gaps(&(*range).into()).next().is_none()),
                             // other kind of known version
                             None => true,
                         },
@@ -1375,7 +1405,9 @@ pub async fn process_multiple_changes(
                 }
 
                 // optimizing this, insert later!
-                let known = if change.is_complete() && change.is_empty() {
+                let is_empty_version = change.is_empty()
+                    && !matches!(&change.changeset, Changeset::FullV2Packed { .. });
+                let known = if change.is_complete() && is_empty_version {
                     process_empty_version(&tx, change.actor_id, &max, change.versions()).map_err(
                         |e| ChangeError::Rusqlite {
                             source: e,
@@ -1385,13 +1417,6 @@ pub async fn process_multiple_changes(
                     )?;
                     KnownDbVersion::Cleared
                 } else {
-                    if let Some(seqs) = change.seqs() {
-                        if seqs.end() < seqs.start() {
-                            warn!(%actor_id, versions = ?change.versions(), "received an invalid change, seqs start is greater than seqs end: {seqs:?}");
-                            continue;
-                        }
-                    }
-
                     let (known, changeset) = {
                         match process_single_version(&agent, &mut tx, change) {
                             Ok(res) => {
@@ -1696,7 +1721,7 @@ pub fn process_incomplete_version<T: Deref<Target = rusqlite::Connection> + Comm
     }
 
     Ok(KnownDbVersion::Partial(PartialVersion {
-        seqs: RangeInclusiveSet::from_iter([(*seqs).into()]),
+        seqs: RangeInclusiveSet::from_iter(seqs.iter().map(|range| RangeInclusive::from(*range))),
         last_seq: *last_seq,
         ts: *ts,
     }))
@@ -1723,7 +1748,11 @@ pub fn process_complete_version<T: Deref<Target = rusqlite::Connection> + Commit
 
     debug!(%actor_id, %version, "complete change, applying right away! seqs: {seqs:?}, last_seq: {last_seq}, changes len: {len}, db version: {version}");
 
-    debug_assert!(len <= seqs.len(), "change from actor {actor_id} version {version} has len {len} but seqs range is {seqs:?} and last_seq is {last_seq}");
+    let covered_seq_count: usize = seqs.iter().map(CrsqlSeqRange::len).sum();
+    debug_assert!(
+        len <= covered_seq_count,
+        "change from actor {actor_id} version {version} has len {len} but seqs are {seqs:?} and last_seq is {last_seq}"
+    );
 
     // Insert all the changes in a single statement
     // This will return a non zero rowid only if the change impacted the database
@@ -1832,7 +1861,7 @@ pub fn process_complete_version<T: Deref<Target = rusqlite::Connection> + Commit
                 Changeset::Full {
                     version,
                     changes,
-                    seqs,
+                    seqs: CrsqlSeqRange::new(CrsqlSeq(0), last_seq),
                     last_seq,
                     ts,
                 },

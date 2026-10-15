@@ -262,7 +262,7 @@ async fn generate_changesets(
                     actor_id,
                     version,
                     changes: packed_changes,
-                    seqs: (CrsqlSeq(0)..=last_seq).into(),
+                    seqs: vec![(CrsqlSeq(0)..=last_seq).into()],
                     last_seq,
                     ts: timestamp,
                 }

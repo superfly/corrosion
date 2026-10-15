@@ -1080,10 +1080,13 @@ pub async fn handle_changes(
         }
 
         // Skip changes we've already seen recently in the seen cache
-        if let Some(mut seqs) = change.seqs() {
+        if let Some(seqs) = change.sequence_ranges() {
             let v = change.versions().start();
             if let Some(seen_seqs) = seen.get(&(change.actor_id, v)) {
-                if seqs.all(|seq| seen_seqs.contains(&seq)) {
+                if seqs
+                    .iter()
+                    .all(|range| seen_seqs.gaps(&(*range).into()).next().is_none())
+                {
                     if matches!(src, ChangeSource::Broadcast) {
                         counter!("corro.broadcast.duplicate.count", "from" => "cache").increment(1);
                     }
@@ -1123,7 +1126,10 @@ pub async fn handle_changes(
         // Skip changes we've already seen in the bookie
         let booked = bookie.get(&change.actor_id);
         if let Some(booked) = booked {
-            if booked.read().contains_all(change.versions(), change.seqs()) {
+            if booked
+                .read()
+                .contains_all_ranges(change.versions(), change.sequence_ranges().as_deref())
+            {
                 trace!("already seen, stop disseminating");
                 if matches!(src, ChangeSource::Broadcast) {
                     counter!("corro.broadcast.duplicate.count", "from" => "bookie").increment(1);
@@ -1141,8 +1147,10 @@ pub async fn handle_changes(
         while let Some(dropped_change) = state.maybe_drop_old_change() {
             for v in dropped_change.versions() {
                 if let Entry::Occupied(mut entry) = seen.entry((dropped_change.actor_id, v)) {
-                    if let Some(seqs) = dropped_change.seqs() {
-                        entry.get_mut().remove(seqs.into());
+                    if let Some(seqs) = dropped_change.sequence_ranges() {
+                        for seqs in seqs {
+                            entry.get_mut().remove(seqs.into());
+                        }
                     } else {
                         entry.swap_remove_entry();
                     }
@@ -1154,8 +1162,8 @@ pub async fn handle_changes(
         // this will only run once for a non-empty changeset
         for v in change.versions() {
             let entry = seen.entry((change.actor_id, v)).or_default();
-            if let Some(seqs) = change.seqs() {
-                entry.extend([seqs.into()]);
+            if let Some(seqs) = change.sequence_ranges() {
+                entry.extend(seqs.into_iter().map(Into::into));
             }
         }
 

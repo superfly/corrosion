@@ -62,6 +62,51 @@ impl ChangeSeenStore {
             bookie,
         }
     }
+
+    fn observe_full(
+        &mut self,
+        actor_id: ActorId,
+        version: CrsqlDbVersion,
+        seqs: impl IntoIterator<Item = RangeInclusive<CrsqlSeq>>,
+        last_seq: CrsqlSeq,
+    ) -> Option<u32> {
+        let incoming = RangeInclusiveSet::from_iter(seqs);
+        match self.entries.entry((actor_id, version)) {
+            indexmap::map::Entry::Vacant(entry) => {
+                entry.insert(SeenEntry {
+                    seqs: Some(incoming),
+                    last_seq: Some(last_seq),
+                    duplicate_count: 0,
+                });
+                None
+            }
+            indexmap::map::Entry::Occupied(mut entry) => {
+                let entry = entry.get_mut();
+                if entry.seqs.is_none() {
+                    entry.duplicate_count += 1;
+                    return Some(entry.duplicate_count);
+                }
+
+                let stored = entry.seqs.as_mut().unwrap();
+                let already_seen = incoming
+                    .iter()
+                    .all(|range| stored.gaps(range).next().is_none());
+                if already_seen {
+                    let full = CrsqlSeq(0)..=last_seq;
+                    if stored.gaps(&full).next().is_some() {
+                        counter!("corro.plumtree.partial.duplicate").increment(1);
+                        return Some(0);
+                    }
+
+                    entry.duplicate_count += 1;
+                    return Some(entry.duplicate_count);
+                }
+
+                stored.extend(incoming);
+                None
+            }
+        }
+    }
 }
 
 impl SeenStore<ChangeId> for ChangeSeenStore {
@@ -90,48 +135,17 @@ impl SeenStore<ChangeId> for ChangeSeenStore {
                 version,
                 seqs,
                 last_seq,
-            } => match self.entries.entry((actor_id, *version)) {
-                indexmap::map::Entry::Vacant(e) => {
-                    let incoming = RangeInclusiveSet::from_iter([RangeInclusive::from(*seqs)]);
-                    e.insert(SeenEntry {
-                        seqs: Some(incoming),
-                        last_seq: Some(*last_seq),
-                        duplicate_count: 0,
-                    });
-
-                    None
-                }
-                indexmap::map::Entry::Occupied(mut e) => {
-                    let entry = e.get_mut();
-
-                    if entry.seqs.is_none() {
-                        entry.duplicate_count += 1;
-                        return Some(entry.duplicate_count);
-                    }
-
-                    let incoming = RangeInclusive::from(*seqs);
-                    let stored = entry.seqs.as_mut().unwrap();
-
-                    if stored.gaps(&incoming).next().is_none() {
-                        // we already seen this seqs, increase duplicate count if change is complete
-                        let full = CrsqlSeq(0)..=*last_seq;
-                        let is_complete = stored.gaps(&full).next().is_none();
-
-                        // if we seen this partial change, but we are still incomplete, return zero duplicates.
-                        // We don't want partials to cause a prune while we are in the middle of receiving the change.
-                        if !is_complete {
-                            counter!("corro.plumtree.partial.duplicate").increment(1);
-                            return Some(0);
-                        }
-
-                        entry.duplicate_count += 1;
-                        return Some(entry.duplicate_count);
-                    }
-
-                    stored.insert(incoming);
-                    None
-                }
-            },
+            } => self.observe_full(actor_id, *version, [RangeInclusive::from(*seqs)], *last_seq),
+            ChangesetId::FullV2Packed {
+                version,
+                seqs,
+                last_seq,
+            } => self.observe_full(
+                actor_id,
+                *version,
+                seqs.iter().map(RangeInclusive::from),
+                *last_seq,
+            ),
             // Empty changesets are actually not used rn
             ChangesetId::Empty { versions } => {
                 let min_seen = versions
@@ -182,6 +196,9 @@ impl ChangeSeenStore {
             let bookedr = booked.read();
             match &id.changeset_id {
                 ChangesetId::Full { version, seqs, .. } => bookedr.contains(*version, Some(*seqs)),
+                ChangesetId::FullV2Packed { version, seqs, .. } => {
+                    bookedr.contains_ranges(*version, seqs)
+                }
                 ChangesetId::Empty { versions, .. } => versions
                     .clone()
                     .all(|version| bookedr.contains(version, None)),
@@ -192,6 +209,9 @@ impl ChangeSeenStore {
     fn has_cache_entry(&self, id: &ChangeId) -> bool {
         match &id.changeset_id {
             ChangesetId::Full { version, .. } => {
+                self.entries.contains_key(&(id.actor_id, *version))
+            }
+            ChangesetId::FullV2Packed { version, .. } => {
                 self.entries.contains_key(&(id.actor_id, *version))
             }
             ChangesetId::Empty { versions, .. } => versions
@@ -214,6 +234,21 @@ impl ChangeSeenStore {
                     .map(|old_seqs| {
                         let incoming = RangeInclusive::from(*seqs);
                         old_seqs.gaps(&incoming).count() == 0
+                    })
+                    .unwrap_or(false)
+            }
+            ChangesetId::FullV2Packed { version, seqs, .. } => {
+                let entry = self.entries.get(&(actor_id, *version));
+                let Some(entry) = entry else {
+                    return false;
+                };
+                entry
+                    .seqs
+                    .as_ref()
+                    .map(|old_seqs| {
+                        seqs.iter().all(|seqs| {
+                            old_seqs.gaps(&RangeInclusive::from(*seqs)).next().is_none()
+                        })
                     })
                     .unwrap_or(false)
             }
@@ -1085,6 +1120,41 @@ mod tests {
 
         // After seeding, a second gossip for the same change is a real duplicate.
         assert_eq!(store.observe(booked_id, round), Some(1));
+    }
+
+    #[test]
+    fn packed_seen_store_tracks_disjoint_sequence_ranges() {
+        let actor_id = ActorId(uuid::Uuid::new_v4());
+        let bookie = Bookie::new(Default::default());
+        let mut store = ChangeSeenStore::new(100, bookie);
+        let round: plum_foca::Round = 0;
+        let packed_id = ChangeId {
+            actor_id,
+            changeset_id: ChangesetId::FullV2Packed {
+                version: CrsqlDbVersion(1),
+                seqs: vec![
+                    CrsqlSeqRange::new(CrsqlSeq(0), CrsqlSeq(0)),
+                    CrsqlSeqRange::new(CrsqlSeq(2), CrsqlSeq(2)),
+                ],
+                last_seq: CrsqlSeq(2),
+            },
+        };
+
+        assert_eq!(store.observe(packed_id.clone(), round), None);
+        assert_eq!(store.observe(packed_id.clone(), round), Some(0));
+        assert!(!store.contains_local(&full_change_id(actor_id, 1, 0, 2, 2)));
+
+        let missing = ChangeId {
+            actor_id,
+            changeset_id: ChangesetId::FullV2Packed {
+                version: CrsqlDbVersion(1),
+                seqs: vec![CrsqlSeqRange::new(CrsqlSeq(1), CrsqlSeq(1))],
+                last_seq: CrsqlSeq(2),
+            },
+        };
+        assert_eq!(store.observe(missing, round), None);
+        assert!(store.contains_local(&full_change_id(actor_id, 1, 0, 2, 2)));
+        assert_eq!(store.observe(packed_id, round), Some(1));
     }
 
     fn pending(round: Round, kind: ShedKind, tag: u8) -> PendingPlumtreeSend {

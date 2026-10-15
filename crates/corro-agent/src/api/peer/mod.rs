@@ -475,8 +475,7 @@ fn handle_need(
                         sender,
                         ChunkedPackedChanges::new(
                             rows,
-                            CrsqlSeq(0),
-                            last_seq,
+                            CrsqlSeqRange::new(CrsqlSeq(0), last_seq),
                             MAX_CHANGES_BYTES_PER_MESSAGE,
                         ),
                         actor_id,
@@ -569,7 +568,7 @@ fn handle_need(
                                     AND db_version = :db_version
                                     AND max_seq >= :start_seq
                                     AND min_seq <= :end_seq
-                                ORDER BY seq ASC
+                                ORDER BY min_seq ASC
                             "#,
                         )?;
 
@@ -588,8 +587,7 @@ fn handle_need(
                                 sender,
                                 ChunkedPackedChanges::new(
                                     rows,
-                                    start_seq,
-                                    end_seq,
+                                    CrsqlSeqRange::new(start_seq, end_seq),
                                     MAX_CHANGES_BYTES_PER_MESSAGE,
                                 ),
                                 actor_id,
@@ -679,8 +677,7 @@ fn handle_need(
                                 sender,
                                 ChunkedPackedChanges::new(
                                     rows,
-                                    range_needed.start(),
-                                    range_needed.end(),
+                                    range_needed,
                                     MAX_CHANGES_BYTES_PER_MESSAGE,
                                 ),
                                 actor_id,
@@ -806,9 +803,8 @@ fn handle_need(
                                 // (BLOB vs INTEGER) is always false. The min_seq/max_seq
                                 // columns are scalar INTEGERs extracted at insert time,
                                 // so the overlap query works for both V1 and V2.
-                                // This is an over-approximation (a packed row may not
-                                // contain every seq in [min_seq, max_seq]), but the
-                                // receiver deduplicates via ON CONFLICT DO NOTHING.
+                                // This is an over-approximation. The packed chunker
+                                // filters rows by their exact seq values before sending.
                                 let mut prepped = tx.prepare_cached(
                                     r#"
                                     SELECT "table", pk, cid, val, col_version, db_version, seq, site_id, cl
@@ -817,7 +813,7 @@ fn handle_need(
                                             AND db_version = :version
                                             AND max_seq >= :start_seq
                                             AND min_seq <= :end_seq
-                                        ORDER BY seq ASC
+                                        ORDER BY min_seq ASC
                                     "#,
                             )?;
 
@@ -836,8 +832,7 @@ fn handle_need(
                                         sender,
                                         ChunkedPackedChanges::new(
                                             rows,
-                                            start_seq,
-                                            end_seq,
+                                            CrsqlSeqRange::new(start_seq, end_seq),
                                             MAX_CHANGES_BYTES_PER_MESSAGE,
                                         ),
                                         actor_id,
@@ -980,7 +975,7 @@ fn send_packed_change_chunks<I: Iterator<Item = rusqlite::Result<PackedChange>>>
                 let chunk_rows: usize = changes.count().values().sum();
                 total_rows_sent += chunk_rows;
 
-                if changes.is_empty() && seqs.start() == CrsqlSeq(0) && seqs.end() == last_seq {
+                if changes.is_empty() && seqs.is_empty() {
                     warn!(%actor_id, %version, "got an empty packed changes we should've had");
                     return Ok(());
                 } else {
@@ -1583,10 +1578,10 @@ pub async fn parallel_sync(
                                 .increment(changes_len as u64);
 
                             debug!(
-                               "handling versions: {:?}, actor_id: {:?}, seqs: {:?}, len: {changes_len} (is_empty: {}, is_complete: {}) from {actor_id}",
+                                "handling versions: {:?}, actor_id: {:?}, seqs: {:?}, len: {changes_len} (is_empty: {}, is_complete: {}) from {actor_id}",
                                 change.versions(),
                                 change.actor_id,
-                                change.seqs(),
+                                change.sequence_ranges(),
                                 change.is_empty(),
                                 change.is_complete()
                             );

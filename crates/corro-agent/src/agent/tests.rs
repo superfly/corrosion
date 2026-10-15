@@ -38,14 +38,14 @@ use corro_types::{
     actor::{ActorId, MemberId},
     api::{ExecResponse, ExecResult, Statement},
     base::{dbsr, dbsri, dbvri, CrsqlDbVersion, CrsqlDbVersionRange, CrsqlSeq, CrsqlSeqRange},
-    broadcast::{ChangeSource, ChangeV1, Changeset},
+    broadcast::{ChangeSource, ChangeV1, Changeset, PackedChangesetPerTable, Timestamp},
     config::{Config, CrsqliteConfig},
     sync::generate_sync,
 };
 use corro_types::{
     agent::Agent,
     api::{ColumnName, TableName},
-    change::row_to_change,
+    change::{row_to_change, ChunkedPackedChanges, PackedChange, SqliteValue},
     pubsub::pack_columns,
     sqlite::CrConn,
 };
@@ -1139,6 +1139,189 @@ async fn v2_tombstones_can_be_inserted_into_buffered_changes() -> eyre::Result<(
 
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn v2_packed_out_of_order_sequences_preserve_missing_gaps() -> eyre::Result<()> {
+    _ = tracing_subscriber::fmt::try_init();
+
+    let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
+    let source = launch_test_agent_v2(|conf| conf.build(), tripwire.clone()).await?;
+    let target = launch_test_agent_v2(|conf| conf.build(), tripwire.clone()).await?;
+    let actor_id = source.agent.actor_id();
+    let version = CrsqlDbVersion(1);
+    let last_seq = CrsqlSeq(13);
+
+    let packed_change = |pk: u8, seqs: Vec<u8>| {
+        let mut packed_seqs = vec![seqs.len() as u8];
+        packed_seqs.extend(seqs);
+        let seq = SqliteValue::Blob(packed_seqs.into());
+        let (min_seq, max_seq) = PackedChange::compute_min_max_seq(&seq);
+        PackedChange {
+            table: TableName("tests3".into()),
+            pk: vec![pk],
+            cid: SqliteValue::Text("text".into()),
+            val: SqliteValue::Text("packed".into()),
+            col_version: SqliteValue::Integer(1),
+            db_version: version,
+            seq,
+            site_id: actor_id.to_bytes(),
+            cl: 1,
+            min_seq,
+            max_seq,
+        }
+    };
+
+    let make_change = |changes: PackedChangesetPerTable, seqs| ChangeV1 {
+        actor_id,
+        changeset: Changeset::FullV2Packed {
+            actor_id,
+            version,
+            changes,
+            seqs,
+            last_seq,
+            ts: Timestamp::from(1),
+        },
+    };
+
+    // The target already has 0..=9. It requests 10..=11; the source's first
+    // packed row overlaps that request but also carries sequence 13.
+    let mut seed = PackedChangesetPerTable::default();
+    seed.insert(packed_change(0, (0..=9).collect()));
+    process_multiple_changes(
+        target.agent.clone(),
+        target.bookie.clone(),
+        vec![(
+            make_change(seed, vec![dbsr!(0, 9)]),
+            ChangeSource::Sync,
+            Instant::now(),
+        )],
+        Duration::from_secs(60),
+    )
+    .await?;
+
+    let source_rows = [
+        packed_change(10, vec![10, 13]),
+        packed_change(11, vec![11]),
+        packed_change(12, vec![12]),
+    ];
+    let requested_start = CrsqlSeq(10);
+    let requested_end = CrsqlSeq(11);
+    let response_rows = source_rows
+        .into_iter()
+        .filter(|change| change.max_seq >= requested_start && change.min_seq <= requested_end)
+        .map(Ok);
+    let mut chunks = ChunkedPackedChanges::new(response_rows, dbsr!(10, 11), 1);
+
+    let (first_changes, first_seqs) = chunks.next().unwrap()?;
+    assert_eq!(first_seqs, vec![dbsr!(10, 10), dbsr!(13, 13)]);
+    let (second_changes, second_seqs) = chunks.next().unwrap()?;
+    assert_eq!(second_seqs, vec![dbsr!(11, 11)]);
+    assert!(
+        chunks.next().is_none(),
+        "seq 12 is outside the requested range"
+    );
+
+    for (changes, seqs) in [(first_changes, first_seqs), (second_changes, second_seqs)] {
+        process_multiple_changes(
+            target.agent.clone(),
+            target.bookie.clone(),
+            vec![(
+                make_change(changes, seqs),
+                ChangeSource::Sync,
+                Instant::now(),
+            )],
+            Duration::from_secs(60),
+        )
+        .await?;
+    }
+
+    let sync = generate_sync(&target.bookie, target.agent.actor_id()).await;
+    let missing = sync
+        .partial_need
+        .get(&actor_id)
+        .and_then(|versions| versions.get(&version))
+        .expect("target should continue requesting the missing sequence");
+    assert_eq!(missing, &vec![dbsr!(12, 12).into()]);
+
+    tripwire_tx.send(()).await.ok();
+    tripwire_worker.await;
+    wait_for_all_pending_handles().await;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn v2_packed_empty_checked_range_updates_partial_bookkeeping() -> eyre::Result<()> {
+    _ = tracing_subscriber::fmt::try_init();
+
+    let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
+    let source = launch_test_agent_v2(|conf| conf.build(), tripwire.clone()).await?;
+    let target = launch_test_agent_v2(|conf| conf.build(), tripwire.clone()).await?;
+    let actor_id = source.agent.actor_id();
+    let version = CrsqlDbVersion(1);
+
+    let checked_only = ChangeV1 {
+        actor_id,
+        changeset: Changeset::FullV2Packed {
+            actor_id,
+            version,
+            changes: PackedChangesetPerTable::default(),
+            seqs: vec![dbsr!(0, 11)],
+            last_seq: CrsqlSeq(13),
+            ts: Timestamp::from(1),
+        },
+    };
+    process_multiple_changes(
+        target.agent.clone(),
+        target.bookie.clone(),
+        vec![(checked_only, ChangeSource::Sync, Instant::now())],
+        Duration::from_secs(60),
+    )
+    .await?;
+
+    let sync = generate_sync(&target.bookie, target.agent.actor_id()).await;
+    let missing = sync
+        .partial_need
+        .get(&actor_id)
+        .and_then(|versions| versions.get(&version))
+        .expect("checked-only response must leave the remaining seqs needed");
+    assert_eq!(missing, &vec![dbsr!(12, 13).into()]);
+
+    let final_checked_only = ChangeV1 {
+        actor_id,
+        changeset: Changeset::FullV2Packed {
+            actor_id,
+            version,
+            changes: PackedChangesetPerTable::default(),
+            seqs: vec![dbsr!(12, 13)],
+            last_seq: CrsqlSeq(13),
+            ts: Timestamp::from(1),
+        },
+    };
+    process_multiple_changes(
+        target.agent.clone(),
+        target.bookie.clone(),
+        vec![(final_checked_only, ChangeSource::Sync, Instant::now())],
+        Duration::from_secs(60),
+    )
+    .await?;
+
+    let sync = generate_sync(&target.bookie, target.agent.actor_id()).await;
+    assert!(
+        sync.partial_need
+            .get(&actor_id)
+            .and_then(|versions| versions.get(&version))
+            .is_none(),
+        "a complete checked range should clear the partial version"
+    );
+
+    tripwire_tx.send(()).await.ok();
+    tripwire_worker.await;
+    wait_for_all_pending_handles().await;
+
+    Ok(())
+}
+
 /// V1-only test: verifies that a change with a nonexistent column causes the
 /// entire version to be rejected. In V2 mode, cr-sqlite handles column
 /// validation differently (via __crsql_v2_col_map integer IDs) and may not
@@ -1545,7 +1728,7 @@ async fn get_rows(
                             actor_id: agent.actor_id(),
                             version,
                             changes: packed_changeset,
-                            seqs: seqs.into(),
+                            seqs: vec![seqs.into()],
                             last_seq: CrsqlSeq(last),
                             ts: agent.clock().new_timestamp().into(),
                         },
