@@ -193,7 +193,7 @@ impl SqliteValueWrap {
             SqliteValue::Null => "null".into(),
             SqliteValue::Integer(i) => i.to_string(),
             SqliteValue::Real(f) => f.to_string(),
-            SqliteValue::Text(t) => enquote::enquote('"', t),
+            SqliteValue::Text(t) => corro_utils::enquote::enquote('"', t),
             SqliteValue::Blob(b) => hex::encode(b.as_slice()),
         }
     }
