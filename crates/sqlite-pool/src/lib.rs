@@ -101,9 +101,14 @@ where
 
     async fn recycle(
         &self,
-        _conn: &mut Self::Type,
+        conn: &mut Self::Type,
         _: &Metrics,
     ) -> managed::RecycleResult<Self::Error> {
+        if !conn.conn().is_autocommit() {
+            return Err(managed::RecycleError::message(
+                "connection has an active transaction",
+            ));
+        }
         let _ = self.recycle_count.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
