@@ -214,8 +214,7 @@ mod tests {
                         let pool = pool.clone();
                         async move {
                             let conn = pool.get().await?;
-                            block_in_place(|| {
-                                conn.prepare_cached(
+                            block_in_place(|| { conn.prepare_cached(
                                     "INSERT INTO foo (a, b) VALUES (random(), random())",
                                 )?
                                 .execute(())?;
