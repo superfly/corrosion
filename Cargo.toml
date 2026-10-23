@@ -76,6 +76,7 @@ serde_with = "2.3.2"
 smallvec = { version = "1.11.0", features = ["serde", "write", "union"] }
 speedy = { version = "0.8.7", features = ["uuid", "smallvec", "indexmap", "indexmap_v2" ], package = "speedy" }
 sqlite3-parser = "0.12.0"
+stateright = "0.31.0"
 strum = { version = "0.24.1", features = ["derive"] }
 tempfile = "3.5.0"
 thiserror = "1.0.40"
