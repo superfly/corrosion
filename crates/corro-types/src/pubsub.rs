@@ -1853,8 +1853,56 @@ pub struct ParsedSelect {
     children: Vec<ParsedSelect>,
 }
 
+pub(crate) fn is_aggregate_function(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "avg"
+            | "count"
+            | "group_concat"
+            | "max"
+            | "min"
+            | "string_agg"
+            | "sum"
+            | "total"
+            | "json_group_array"
+            | "json_group_object"
+    )
+}
+
 fn extract_select_columns(select: &Select, schema: &Schema) -> Result<ParsedSelect, MatcherError> {
     let mut parsed = ParsedSelect::default();
+
+    if let OneSelect::Select {
+        ref group_by,
+        ref window_clause,
+        ..
+    } = select.body.select
+    {
+        if group_by.is_some() {
+            return Err(MatcherError::GroupByUnsupported);
+        }
+        if window_clause.is_some() {
+            return Err(MatcherError::WindowClauseUnsupported);
+        }
+    }
+
+    if let Some(ref compounds) = select.body.compounds {
+        for compound in compounds.iter() {
+            if let OneSelect::Select {
+                ref group_by,
+                ref window_clause,
+                ..
+            } = compound.select
+            {
+                if group_by.is_some() {
+                    return Err(MatcherError::GroupByUnsupported);
+                }
+                if window_clause.is_some() {
+                    return Err(MatcherError::WindowClauseUnsupported);
+                }
+            }
+        }
+    }
 
     if let OneSelect::Select {
         ref from,
@@ -2090,7 +2138,15 @@ fn extract_expr_columns(
                 .children
                 .push(extract_select_columns(select, schema)?);
         }
-        Expr::FunctionCall { args, .. } => {
+        Expr::FunctionCall {
+            name,
+            args,
+            filter_over,
+            ..
+        } => {
+            if is_aggregate_function(&name.0) || filter_over.is_some() {
+                return Err(MatcherError::AggregateFunctionUnsupported(name.0.clone()));
+            }
             if let Some(args) = args {
                 for expr in args.iter() {
                     extract_expr_columns(expr, schema, parsed)?;
@@ -2137,8 +2193,13 @@ fn extract_expr_columns(
             extract_expr_columns(expr, schema, parsed)?;
         }
 
+        Expr::FunctionCallStar { name, filter_over } => {
+            if is_aggregate_function(&name.0) || filter_over.is_some() {
+                return Err(MatcherError::AggregateFunctionUnsupported(name.0.clone()));
+            }
+        }
+
         // no column names in there...
-        // Expr::FunctionCallStar { name, filter_over } => todo!(),
         // Expr::Id(_) => todo!(),
         // Expr::Literal(_) => todo!(),
         // Expr::Raise(_, _) => todo!(),
@@ -2296,6 +2357,12 @@ pub enum MatcherError {
     NotRunning,
     #[error("subscription restore is missing SQL query")]
     MissingSql,
+    #[error("aggregate functions are not supported in subscription queries: {0}")]
+    AggregateFunctionUnsupported(String),
+    #[error("GROUP BY clause is not supported in subscription queries")]
+    GroupByUnsupported,
+    #[error("WINDOW clause is not supported in subscription queries")]
+    WindowClauseUnsupported,
 }
 
 impl MatcherError {
@@ -3202,5 +3269,110 @@ mod tests {
             error!(sub_id = %matcher.inner.id, "could not send candidates to matcher: {e}");
         }
         Ok(())
+    }
+
+    #[test]
+    fn test_matcher_rejects_aggregations() {
+        let schema_sql = "
+            CREATE TABLE tests (
+                id INTEGER NOT NULL PRIMARY KEY,
+                val INTEGER NOT NULL DEFAULT 0,
+                name TEXT NOT NULL DEFAULT ''
+            );
+        ";
+        let schema = parse_sql(schema_sql).unwrap();
+
+        let check_sql = |sql: &str| -> Result<ParsedSelect, MatcherError> {
+            let mut parser = Parser::new(sql.as_bytes());
+            match parser.next()?.ok_or(MatcherError::StatementRequired)? {
+                Cmd::Stmt(Stmt::Select(ref select)) => extract_select_columns(select, &schema),
+                _ => Err(MatcherError::UnsupportedStatement),
+            }
+        };
+
+        // Aggregates in SELECT list
+        assert!(matches!(
+            check_sql("SELECT count(*) FROM tests;"),
+            Err(MatcherError::AggregateFunctionUnsupported(func)) if func.eq_ignore_ascii_case("count")
+        ));
+        assert!(matches!(
+            check_sql("SELECT COUNT(id) FROM tests;"),
+            Err(MatcherError::AggregateFunctionUnsupported(func)) if func.eq_ignore_ascii_case("count")
+        ));
+        assert!(matches!(
+            check_sql("SELECT sum(val) FROM tests;"),
+            Err(MatcherError::AggregateFunctionUnsupported(func)) if func.eq_ignore_ascii_case("sum")
+        ));
+        assert!(matches!(
+            check_sql("SELECT avg(val) FROM tests;"),
+            Err(MatcherError::AggregateFunctionUnsupported(func)) if func.eq_ignore_ascii_case("avg")
+        ));
+        assert!(matches!(
+            check_sql("SELECT min(val) FROM tests;"),
+            Err(MatcherError::AggregateFunctionUnsupported(func)) if func.eq_ignore_ascii_case("min")
+        ));
+        assert!(matches!(
+            check_sql("SELECT max(val) FROM tests;"),
+            Err(MatcherError::AggregateFunctionUnsupported(func)) if func.eq_ignore_ascii_case("max")
+        ));
+        assert!(matches!(
+            check_sql("SELECT total(val) FROM tests;"),
+            Err(MatcherError::AggregateFunctionUnsupported(func)) if func.eq_ignore_ascii_case("total")
+        ));
+        assert!(matches!(
+            check_sql("SELECT group_concat(name) FROM tests;"),
+            Err(MatcherError::AggregateFunctionUnsupported(func)) if func.eq_ignore_ascii_case("group_concat")
+        ));
+        assert!(matches!(
+            check_sql("SELECT string_agg(name, ',') FROM tests;"),
+            Err(MatcherError::AggregateFunctionUnsupported(func)) if func.eq_ignore_ascii_case("string_agg")
+        ));
+        assert!(matches!(
+            check_sql("SELECT json_group_array(val) FROM tests;"),
+            Err(MatcherError::AggregateFunctionUnsupported(func)) if func.eq_ignore_ascii_case("json_group_array")
+        ));
+        assert!(matches!(
+            check_sql("SELECT json_group_object(name, val) FROM tests;"),
+            Err(MatcherError::AggregateFunctionUnsupported(func)) if func.eq_ignore_ascii_case("json_group_object")
+        ));
+
+        // Aggregates in subqueries
+        assert!(matches!(
+            check_sql("SELECT id FROM tests WHERE (SELECT count(*) FROM tests) > 0;"),
+            Err(MatcherError::AggregateFunctionUnsupported(func)) if func.eq_ignore_ascii_case("count")
+        ));
+
+        // Window / filter functions
+        assert!(matches!(
+            check_sql("SELECT row_number() OVER () FROM tests;"),
+            Err(MatcherError::AggregateFunctionUnsupported(func)) if func.eq_ignore_ascii_case("row_number")
+        ));
+
+        // GROUP BY clause
+        assert!(matches!(
+            check_sql("SELECT id FROM tests GROUP BY id;"),
+            Err(MatcherError::GroupByUnsupported)
+        ));
+        assert!(matches!(
+            check_sql("SELECT id FROM tests GROUP BY id HAVING id > 0;"),
+            Err(MatcherError::GroupByUnsupported)
+        ));
+
+        // WINDOW clause
+        assert!(matches!(
+            check_sql("SELECT id FROM tests WINDOW w AS ();"),
+            Err(MatcherError::WindowClauseUnsupported)
+        ));
+
+        // Compound queries with GROUP BY
+        assert!(matches!(
+            check_sql("SELECT id FROM tests UNION ALL SELECT id FROM tests GROUP BY id;"),
+            Err(MatcherError::GroupByUnsupported)
+        ));
+
+        // Valid non-aggregate queries and scalar functions should succeed
+        assert!(check_sql("SELECT id, val, name FROM tests;").is_ok());
+        assert!(check_sql("SELECT * FROM tests WHERE val > 10;").is_ok());
+        assert!(check_sql("SELECT lower(name), abs(val), coalesce(name, '') FROM tests;").is_ok());
     }
 }
