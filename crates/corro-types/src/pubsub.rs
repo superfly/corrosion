@@ -606,6 +606,7 @@ pub struct Matcher {
     pub cached_statements: HashMap<String, MatcherStmt>,
     pub pks: IndexMap<String, Vec<String>>,
     pub parsed: ParsedSelect,
+    left_join_tables: IndexSet<String>,
     pub evt_tx: mpsc::Sender<QueryEvent>,
     pub col_names: Vec<ColumnName>,
     pub last_rowid: u64,
@@ -696,6 +697,7 @@ impl Matcher {
         }
 
         let mut statements = HashMap::new();
+        let mut left_join_tables = IndexSet::new();
 
         let mut pks = IndexMap::default();
 
@@ -776,18 +778,17 @@ impl Matcher {
                         Some(FromClause {
                             joins: Some(joins), ..
                         }) if idx > 0 => {
-                            // Replace LEFT JOIN with INNER join if the target is the joined table
+                            // Changes from the nullable side cannot be reconciled by child PK.
                             if let Some(JoinedSelectTable {
                                 operator:
                                     JoinOperator::TypedJoin {
-                                        join_type:
-                                            join_type @ Some(JoinType::LeftOuter | JoinType::Left),
+                                        join_type: Some(JoinType::LeftOuter | JoinType::Left),
                                         ..
                                     },
                                 ..
-                            }) = joins.get_mut(idx - 1)
+                            }) = joins.get(idx - 1)
                             {
-                                *join_type = Some(JoinType::Inner);
+                                left_join_tables.insert(tbl_name.clone());
                             };
 
                             // Remove all custom INDEXED BY clauses for the table as the most efficient
@@ -892,6 +893,7 @@ impl Matcher {
             cached_statements: statements,
             pks,
             parsed,
+            left_join_tables,
             evt_tx,
             col_names,
             last_rowid: 0,
@@ -1531,51 +1533,64 @@ impl Matcher {
             return Ok(());
         }
 
+        // A cached row from the nullable side of a LEFT JOIN has no child PK.
+        // A child-PK slice therefore cannot include rows that appear or disappear
+        // as the join changes, so reconcile the complete subscription result.
+        let full_recompute_table = candidates
+            .keys()
+            .find(|table| self.left_join_tables.contains(table.as_str()))
+            .cloned();
+
         trace!(
             "got some candidates! {:?}",
             candidates.keys().collect::<Vec<_>>()
         );
 
-        let tx = self.conn.transaction()?;
-        for (table, pks) in candidates {
-            let pks = pks
-                .iter()
-                .map(|(pk, _)| unpack_columns(pk))
-                .collect::<Result<Vec<Vec<SqliteValueRef>>, _>>()?;
+        if let Some(table) = &full_recompute_table {
+            tables.insert(table.clone());
+        } else {
+            let tx = self.conn.transaction()?;
+            for (table, pks) in candidates {
+                let pks = pks
+                    .iter()
+                    .map(|(pk, _)| unpack_columns(pk))
+                    .collect::<Result<Vec<Vec<SqliteValueRef>>, _>>()?;
 
-            let tmp_table_name = format!("temp_{table}");
-            if tables.insert(table.clone()) {
-                // create a temporary table to mix and match the data
-                tx.prepare_cached(
-                    // TODO: cache the statement's string somewhere, it's always the same!
-                    // NOTE: this can't be an actual CREATE TEMP TABLE or it won't be visible
-                    //       from the state db
-                    &format!(
-                        "CREATE TABLE IF NOT EXISTS {tmp_table_name} ({})",
-                        self.pks
-                            .get(table.as_str())
-                            .ok_or_else(|| MatcherError::MissingPrimaryKeys)?
-                            .to_vec()
+                let tmp_table_name = format!("temp_{table}");
+                if tables.insert(table.clone()) {
+                    // create a temporary table to mix and match the data
+                    tx.prepare_cached(
+                        // TODO: cache the statement's string somewhere, it's always the same!
+                        // NOTE: this can't be an actual CREATE TEMP TABLE or it won't be visible
+                        //       from the state db
+                        &format!(
+                            "CREATE TABLE IF NOT EXISTS {tmp_table_name} ({})",
+                            self.pks
+                                .get(table.as_str())
+                                .ok_or_else(|| MatcherError::MissingPrimaryKeys)?
+                                .to_vec()
+                                .join(",")
+                        ),
+                    )?
+                    .execute(())?;
+                }
+
+                for pks in pks {
+                    tx.prepare_cached(&format!(
+                        "INSERT INTO {tmp_table_name} VALUES ({})",
+                        (0..pks.len())
+                            .map(|_i| "coalesce(?, \"\")")
+                            .collect::<Vec<_>>()
                             .join(",")
-                    ),
-                )?
-                .execute(())?;
+                    ))?
+                    .execute(params_from_iter(pks))?;
+                }
             }
 
-            for pks in pks {
-                tx.prepare_cached(&format!(
-                    "INSERT INTO {tmp_table_name} VALUES ({})",
-                    (0..pks.len())
-                        .map(|_i| "coalesce(?, \"\")")
-                        .collect::<Vec<_>>()
-                        .join(",")
-                ))?
-                .execute(params_from_iter(pks))?;
-            }
+            // commit so the temporary PK tables are visible to the state connection
+            tx.commit()?;
+            trace!("committed temp pk tables");
         }
-        // commit so it is visible to the other db!
-        tx.commit()?;
-        trace!("committed temp pk tables");
 
         let mut query_cols = vec![];
 
@@ -1592,6 +1607,22 @@ impl Matcher {
             all_cols.push(col_name.clone());
             query_cols.push(col_name);
         }
+
+        let full_recompute_stmt = full_recompute_table.as_ref().map(|table| {
+            let mut new_query = Cmd::Stmt(self.query.clone()).to_string();
+            new_query.pop();
+
+            debug!(
+                sub_id = %self.id,
+                %table,
+                "fully recomputing subscription for left join dependency"
+            );
+
+            MatcherStmt {
+                new_query,
+                temp_query: format!("SELECT {} FROM query", all_cols.join(",")),
+            }
+        });
 
         // start a new tx
         let tx = self.conn.transaction()?;
@@ -1617,12 +1648,15 @@ impl Matcher {
 
             for table in tables.iter() {
                 let start = Instant::now();
-                let stmt = match self.cached_statements.get(table.as_str()) {
+                let stmt = match &full_recompute_stmt {
                     Some(stmt) => stmt,
-                    None => {
-                        warn!(sub_id = %self.id, "no statements pre-computed for table {table}");
-                        continue;
-                    }
+                    None => match self.cached_statements.get(table.as_str()) {
+                        Some(stmt) => stmt,
+                        None => {
+                            warn!(sub_id = %self.id, "no statements pre-computed for table {table}");
+                            continue;
+                        }
+                    },
                 };
 
                 trace!("SELECT SQL: {}", stmt.new_query);
@@ -1775,12 +1809,14 @@ impl Matcher {
                 histogram!("corro.subs.changes.processing.table.duration.seconds", "sql_hash" => self.hash.clone(), "table" => table.0.to_string()).record(elapsed);
             }
 
-            // clean up temporary tables immediately
-            for table in tables {
-                // TODO: reduce mistakes by computing this table name once
-                tx.prepare_cached(&format!("DELETE FROM temp_{table}",))?
-                    .execute(())?;
-                trace!("cleaned up temp_{table}");
+            if full_recompute_stmt.is_none() {
+                // clean up temporary tables immediately
+                for table in tables {
+                    // TODO: reduce mistakes by computing this table name once
+                    tx.prepare_cached(&format!("DELETE FROM temp_{table}",))?
+                        .execute(())?;
+                    trace!("cleaned up temp_{table}");
+                }
             }
         }
 
@@ -2619,6 +2655,102 @@ mod tests {
         tripwire_tx.send(()).await.ok();
         tripwire_worker.await;
         wait_for_all_pending_handles().await;
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn test_left_anti_join_reacts_to_child_insert(
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
+        _ = tracing_subscriber::fmt::try_init();
+        let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
+        let schema_sql = "
+            CREATE TABLE services (
+                id INTEGER NOT NULL PRIMARY KEY
+            );
+            CREATE TABLE health_checks (
+                id INTEGER NOT NULL PRIMARY KEY,
+                service_id INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'unknown'
+            );
+        ";
+        let mut schema = parse_sql(schema_sql)?;
+        let sql = "
+            SELECT s.id
+            FROM services AS s
+            LEFT JOIN health_checks AS h
+              ON h.service_id = s.id AND h.status != 'passing'
+            WHERE h.id IS NULL
+        ";
+        let subs = SubsManager::default();
+        let tmpdir = TempDir::new(tempfile::tempdir()?);
+        let db_path = tmpdir.path().join("test.db");
+        let subscriptions_path: Utf8PathBuf =
+            tmpdir.path().join("subs").display().to_string().into();
+        let pool = SplitPool::create(db_path, Arc::new(Semaphore::new(1)), -1048576).await?;
+        let clock = Arc::new(uhlc::HLC::default());
+        let mut conn = pool.write_priority().await?;
+
+        setup_conn(&conn)?;
+        migrate(clock, &mut conn)?;
+        let tx = conn.transaction()?;
+        apply_schema(&tx, &Schema::default(), &mut schema)?;
+        tx.commit()?;
+
+        let tx = conn.transaction()?;
+        tx.execute("INSERT INTO services (id) VALUES (1)", ())?;
+        tx.commit()?;
+
+        let (handle, created) = subs.get_or_insert(
+            sql,
+            subscriptions_path.as_path(),
+            &schema,
+            &pool,
+            tripwire.clone(),
+        )?;
+        let mut rx = created
+            .expect("new query should create a subscription")
+            .evt_rx;
+
+        assert!(matches!(rx.recv().await, Some(QueryEvent::Columns(_))));
+        assert_eq!(
+            rx.recv().await,
+            Some(QueryEvent::Row(RowId(1), vec![1_i64.into()]))
+        );
+        assert!(matches!(
+            rx.recv().await,
+            Some(QueryEvent::EndOfQuery { .. })
+        ));
+
+        let tx = conn.transaction()?;
+        tx.execute(
+            "INSERT INTO health_checks (id, service_id, status) VALUES (1, 1, 'failing')",
+            (),
+        )?;
+        tx.commit()?;
+        let db_version = conn.query_row("SELECT crsql_db_version()", (), |row| row.get(0))?;
+        filter_changes_from_db(&handle, &conn, None, db_version)?;
+
+        let event = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await;
+
+        handle.cleanup().await;
+        subs.remove(&handle.id());
+        tripwire_tx.send(()).await.ok();
+        tripwire_worker.await;
+        wait_for_all_pending_handles().await;
+
+        let event = event
+            .expect("child-table change did not produce a subscription event")
+            .expect("subscription event channel closed");
+        assert_eq!(
+            event,
+            QueryEvent::Change(
+                ChangeType::Delete,
+                RowId(1),
+                vec![1_i64.into()],
+                ChangeId(1),
+            )
+        );
 
         Ok(())
     }
