@@ -63,8 +63,8 @@ impl BodySender {
     }
 
     #[inline]
-    pub fn is_closed(&self) -> bool {
-        self.tx_frame.is_closed()
+    pub async fn closed(&self) {
+        self.tx_frame.closed().await;
     }
 }
 
