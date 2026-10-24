@@ -23,7 +23,7 @@ use camino::Utf8Path;
 use corro_types::{
     actor::{Actor, ActorId},
     agent::{Agent, Bookie, SplitPool},
-    base::CrsqlSeq,
+    base::{CrsqlDbVersion, CrsqlDbVersionRange, CrsqlSeq},
     broadcast::{BroadcastV1, ChangeSource, ChangeV1, FocaInput, PlumtreeUpdates},
     channel::CorroReceiver,
     config::BroadcastMethod,
@@ -702,6 +702,8 @@ struct HandleChangesState {
     buf_cost: usize,
     current_batch_size: usize,
     processing_task: Option<JoinHandle<Result<(), corro_types::agent::ChangeError>>>,
+    processing_batch: Vec<(ActorId, CrsqlDbVersionRange)>,
+    seen: IndexMap<(ActorId, CrsqlDbVersion), RangeInclusiveSet<CrsqlSeq>>,
     max_wait: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
     drop_log_count: u64,
 
@@ -734,6 +736,8 @@ impl HandleChangesState {
             buf_cost: 0,
             current_batch_size: min_batch_size,
             processing_task: None,
+            processing_batch: Vec::new(),
+            seen: IndexMap::new(),
             max_wait: Some(Box::pin(tokio::time::sleep(timeout_duration))),
             halved_at: None,
             min_batch_size,
@@ -813,6 +817,11 @@ impl HandleChangesState {
 
         debug!(count = %batch_cost, reason = %reason, batch_size = %self.current_batch_size, "spawning batch processing task");
 
+        self.processing_batch = batch
+            .iter()
+            .map(|(change, _, _)| (change.actor_id, change.versions()))
+            .collect();
+
         let agent_clone = agent.clone();
         let bookie_clone = bookie.clone();
         self.processing_task = Some(tokio::spawn(process_multiple_changes(
@@ -834,6 +843,8 @@ impl HandleChangesState {
         bookie: &Bookie,
         result: Result<Result<(), corro_types::agent::ChangeError>, tokio::task::JoinError>,
     ) {
+        let batch = std::mem::take(&mut self.processing_batch);
+
         // Handle task result
         match result {
             Ok(Ok(())) => {
@@ -841,6 +852,7 @@ impl HandleChangesState {
             }
             Ok(Err(ref e)) => {
                 error!("error processing batch: {e}");
+                self.forget_dropped_batch(batch);
 
                 if let Some(issue) = e.fatal_db_issue() {
                     error!("fatal DB issue detected: {issue}");
@@ -862,6 +874,7 @@ impl HandleChangesState {
             }
             Err(ref e) => {
                 error!("batch processing task panicked: {e}");
+                self.forget_dropped_batch(batch);
             }
         }
 
@@ -888,6 +901,15 @@ impl HandleChangesState {
         } else {
             // NO - not enough changes yet, start timeout
             self.max_wait = Some(Box::pin(tokio::time::sleep(self.timeout_duration)));
+        }
+    }
+
+    fn forget_dropped_batch(&mut self, batch: Vec<(ActorId, CrsqlDbVersionRange)>) {
+        for (actor_id, versions) in batch {
+            for v in versions {
+                // the whole entry, not just the seqs: an empty changeset is filtered on the key alone
+                self.seen.swap_remove(&(actor_id, v));
+            }
         }
     }
 
@@ -951,6 +973,15 @@ impl HandleChangesState {
         change: ChangeV1,
         src: ChangeSource,
     ) {
+        // Register the new change in the seen cache
+        // this will only run once for a non-empty changeset
+        for v in change.versions() {
+            let entry = self.seen.entry((change.actor_id, v)).or_default();
+            if let Some(seqs) = change.seqs() {
+                entry.extend([seqs.into()]);
+            }
+        }
+
         let cost = change.processing_cost();
         self.queue.push_back((change, src, Instant::now()));
         self.buf_cost += cost;
@@ -1018,7 +1049,6 @@ pub async fn handle_changes(
     } else {
         0
     };
-    let mut seen: IndexMap<_, RangeInclusiveSet<CrsqlSeq>> = IndexMap::new();
     let mut maintenance_interval = tokio::time::interval(maintenance_duration);
     maintenance_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
@@ -1034,8 +1064,8 @@ pub async fn handle_changes(
                 gauge!("corro.agent.changes.processing.jobs").set(if state.processing_task.is_some() { 1.0 } else { 0.0 });
                 metrics_tracker.observe_queue_size(state.queue.len() as u64);
 
-                if seen.len() > max_seen_cache_len {
-                    seen.drain(..seen.len() - keep_seen_cache_size);
+                if state.seen.len() > max_seen_cache_len {
+                    state.seen.drain(..state.seen.len() - keep_seen_cache_size);
                 }
 
                 continue;
@@ -1082,7 +1112,7 @@ pub async fn handle_changes(
         // Skip changes we've already seen recently in the seen cache
         if let Some(mut seqs) = change.seqs() {
             let v = change.versions().start();
-            if let Some(seen_seqs) = seen.get(&(change.actor_id, v)) {
+            if let Some(seen_seqs) = state.seen.get(&(change.actor_id, v)) {
                 if seqs.all(|seq| seen_seqs.contains(&seq)) {
                     if matches!(src, ChangeSource::Broadcast) {
                         counter!("corro.broadcast.duplicate.count", "from" => "cache").increment(1);
@@ -1092,7 +1122,7 @@ pub async fn handle_changes(
             }
         } else if change
             .versions()
-            .all(|v| seen.contains_key(&(change.actor_id, v)))
+            .all(|v| state.seen.contains_key(&(change.actor_id, v)))
         {
             if matches!(src, ChangeSource::Broadcast) {
                 counter!("corro.broadcast.duplicate.count", "from" => "cache").increment(1);
@@ -1140,22 +1170,13 @@ pub async fn handle_changes(
         // If we need to drop an old change, drop it from the seen cache aswell
         while let Some(dropped_change) = state.maybe_drop_old_change() {
             for v in dropped_change.versions() {
-                if let Entry::Occupied(mut entry) = seen.entry((dropped_change.actor_id, v)) {
+                if let Entry::Occupied(mut entry) = state.seen.entry((dropped_change.actor_id, v)) {
                     if let Some(seqs) = dropped_change.seqs() {
                         entry.get_mut().remove(seqs.into());
                     } else {
                         entry.swap_remove_entry();
                     }
                 };
-            }
-        }
-
-        // Register the new change in the seen cache
-        // this will only run once for a non-empty changeset
-        for v in change.versions() {
-            let entry = seen.entry((change.actor_id, v)).or_default();
-            if let Some(seqs) = change.seqs() {
-                entry.extend([seqs.into()]);
             }
         }
 
@@ -1293,8 +1314,8 @@ mod tests {
     use corro_tests::TEST_SCHEMA;
     use corro_types::api::{ColumnName, TableName};
     use corro_types::{
-        agent::ChangeError,
-        base::{dbsr, dbvr, CrsqlDbVersion},
+        agent::{ChangeError, PoolError},
+        base::{dbsr, dbvr},
         broadcast::Changeset,
         change::Change,
         config::Config,
@@ -2075,6 +2096,108 @@ mod tests {
         // Waiting will reset the grace period
         tokio::time::sleep(Duration::from_millis(400)).await;
         assert!(!state.in_grace_period());
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn test_dropped_batch_is_forgotten_by_seen_cache() -> eyre::Result<()> {
+        _ = tracing_subscriber::fmt::try_init();
+        let (tripwire, _tripwire_worker, _tripwire_tx) = Tripwire::new_simple();
+        let dir = tempfile::tempdir()?;
+
+        let mut config = Config::builder()
+            .db_path(dir.path().join("corrosion.db").display().to_string())
+            .gossip_addr("127.0.0.1:0".parse()?)
+            .api_addr("127.0.0.1:0".parse()?)
+            .build()?;
+        config.perf.apply_queue_min_batch_size = 1;
+        config.perf.apply_queue_step_base = 0;
+        config.perf.apply_queue_batch_threshold_ratio = 1.0;
+        config.perf.processing_queue_len = 50000;
+
+        let (agent, _agent_options) = setup(config.clone(), tripwire.clone()).await?;
+        execute_schema(&agent, vec![TEST_SCHEMA.to_owned()]).await?;
+
+        let _stall_every_batch = agent.write_permit().await?;
+
+        let bookie = Bookie::new(Default::default());
+        let mut state = HandleChangesState::new(
+            config.perf.apply_queue_min_batch_size,
+            config.perf.apply_queue_step_base,
+            config.perf.apply_queue_max_batch_size,
+            config.perf.apply_queue_batch_threshold_ratio,
+            Duration::from_millis(config.perf.apply_queue_timeout as u64),
+            Duration::from_millis(200),
+            config.perf.processing_queue_len,
+        );
+
+        let actor = ActorId(uuid::Uuid::new_v4());
+        let partial = |version: u64| ChangeV1 {
+            actor_id: actor,
+            changeset: Changeset::Full {
+                version: CrsqlDbVersion(version),
+                changes: vec![Change {
+                    table: TableName("tests".into()),
+                    pk: pack_columns(&vec![(version as i64).into()]).unwrap(),
+                    cid: ColumnName("text".into()),
+                    val: "partial".into(),
+                    col_version: 1,
+                    db_version: CrsqlDbVersion(version),
+                    seq: CrsqlSeq(0),
+                    site_id: actor.to_bytes(),
+                    cl: 1,
+                }],
+                seqs: dbsr!(0, 0),
+                last_seq: CrsqlSeq(9),
+                ts: agent.clock().new_timestamp().into(),
+            },
+        };
+        let seen = |state: &HandleChangesState, version: u64| {
+            state.seen.contains_key(&(actor, CrsqlDbVersion(version)))
+        };
+        let timed_out = || {
+            Ok(Err(ChangeError::Pool(PoolError::TimedOut {
+                op: "acquiring write semaphore".into(),
+            })))
+        };
+
+        state.handle_new_change(&agent, &bookie, partial(1), ChangeSource::Sync);
+        assert!(state.processing_task.is_some(), "one change spawns a batch");
+        assert!(seen(&state, 1));
+        state.processing_task.take().unwrap().abort();
+        state.handle_task_completion(&agent, &bookie, timed_out());
+        assert!(
+            !seen(&state, 1),
+            "a batch that timed out on the write permit stayed in the seen cache, \
+             so every redelivery of it would be dropped"
+        );
+
+        state.handle_new_change(&agent, &bookie, partial(2), ChangeSource::Sync);
+        let panicked = tokio::spawn(async { panic!("batch panicked") })
+            .await
+            .unwrap_err();
+        state.processing_task.take().unwrap().abort();
+        state.handle_task_completion(&agent, &bookie, Err(panicked));
+        assert!(!seen(&state, 2), "a batch whose task panicked stayed seen");
+
+        state.handle_new_change(&agent, &bookie, partial(3), ChangeSource::Sync);
+        state.processing_task.take().unwrap().abort();
+        state.handle_task_completion(&agent, &bookie, Ok(Ok(())));
+        assert!(seen(&state, 3), "an applied batch stays seen");
+
+        state.handle_new_change(&agent, &bookie, partial(4), ChangeSource::Sync);
+        state.handle_new_change(&agent, &bookie, partial(5), ChangeSource::Sync);
+        state.processing_task.take().unwrap().abort();
+        state.handle_task_completion(&agent, &bookie, timed_out());
+        assert!(!seen(&state, 4));
+        assert!(
+            seen(&state, 5),
+            "the batch spawned on completion was forgotten"
+        );
+        state.processing_task.take().unwrap().abort();
+        state.handle_task_completion(&agent, &bookie, timed_out());
+        assert!(!seen(&state, 5));
 
         Ok(())
     }
