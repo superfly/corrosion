@@ -43,7 +43,7 @@ use corro_types::{
     base::{CrsqlDbVersion, CrsqlDbVersionRange, CrsqlSeq},
     bookie::BookieDbParams,
     broadcast::{ChangeSource, ChangeV1, Changeset, FocaCmd, FocaInput, PackedChangesetParts},
-    change::Change,
+    change::{Change, PackedChange},
     channel::CorroReceiver,
     config::AuthzConfig,
     pubsub::SubsManager,
@@ -1661,6 +1661,19 @@ pub fn process_incomplete_version<T: Deref<Target = rusqlite::Connection> + Comm
     } = parts;
 
     let mut changes_per_table = BTreeMap::new();
+    // Packed rows can carry actual changes outside the range they checked.
+    let mut received_seqs = RangeInclusiveSet::from_iter([(*seqs).into()]);
+    for change in changes {
+        let sequences = PackedChange::sequence_values(&change.seq).map_err(|error| {
+            rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                error,
+            )))
+        })?;
+        for seq in sequences {
+            received_seqs.insert(seq..=seq);
+        }
+    }
 
     debug!(%actor_id, %version, "incomplete change, seqs: {seqs:?}, last_seq: {last_seq:?}, len: {}", changes.len());
     assert_sometimes!(true, "Corrosion processes incomplete changes");
@@ -1716,7 +1729,7 @@ pub fn process_incomplete_version<T: Deref<Target = rusqlite::Connection> + Comm
     }
 
     Ok(KnownDbVersion::Partial(PartialVersion {
-        seqs: RangeInclusiveSet::from_iter([(*seqs).into()]),
+        seqs: received_seqs,
         last_seq: *last_seq,
         ts: *ts,
     }))

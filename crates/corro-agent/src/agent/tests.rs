@@ -1141,7 +1141,7 @@ async fn v2_tombstones_can_be_inserted_into_buffered_changes() -> eyre::Result<(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-async fn v2_packed_out_of_order_sequences_preserve_missing_gaps() -> eyre::Result<()> {
+async fn v2_packed_overhang_sequences_are_marked_received() -> eyre::Result<()> {
     _ = tracing_subscriber::fmt::try_init();
 
     let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
@@ -1183,8 +1183,9 @@ async fn v2_packed_out_of_order_sequences_preserve_missing_gaps() -> eyre::Resul
         },
     };
 
-    // The target already has 0..=9. It requests 10..=11; the source's first
-    // packed row overlaps that request but also carries sequence 13.
+    // The target already has 0..=9. It requests 10..=11; the first packed row
+    // also delivers sequence 13. Only the undelivered sequence 12 should remain
+    // in the next sync request.
     let mut seed = PackedChangesetPerTable::default();
     seed.insert(packed_change(0, (0..=9).collect()));
     process_multiple_changes(
@@ -1240,8 +1241,8 @@ async fn v2_packed_out_of_order_sequences_preserve_missing_gaps() -> eyre::Resul
         .partial_need
         .get(&actor_id)
         .and_then(|versions| versions.get(&version))
-        .expect("target should continue requesting the missing sequence");
-    assert_eq!(missing, &vec![dbsr!(12, 13).into()]);
+        .expect("the unchecked sequence should still be requested");
+    assert_eq!(missing, &vec![dbsr!(12, 12).into()]);
 
     tripwire_tx.send(()).await.ok();
     tripwire_worker.await;
