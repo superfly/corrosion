@@ -923,7 +923,7 @@ enum Command {
 
     /// Print version and build information
     Version,
-    
+
     /// Crsqlite metadata migration commands (read-only)
     #[command(subcommand)]
     Migrate(MigrateCommand),
