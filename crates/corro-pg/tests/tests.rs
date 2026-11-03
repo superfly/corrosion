@@ -967,6 +967,63 @@ async fn test_pg_ast_rollback_handling() {
         .unwrap();
     assert_eq!(row.get::<_, i64>(0), 0);
 
+    // Keep the statement before the savepoint and drop the one after it.
+    client.batch_execute("BEGIN").await.unwrap();
+    client
+        .execute("INSERT INTO kitchensink (id) VALUES (10)", &[])
+        .await
+        .unwrap();
+    client.batch_execute("SAVEPOINT sp").await.unwrap();
+    client
+        .execute("INSERT INTO kitchensink (id) VALUES (11)", &[])
+        .await
+        .unwrap();
+    client
+        .batch_execute("ROLLBACK TO SAVEPOINT sp")
+        .await
+        .unwrap();
+    client.batch_execute("RELEASE SAVEPOINT sp").await.unwrap();
+    client.batch_execute("COMMIT").await.unwrap();
+
+    let row = client
+        .query_one("SELECT COUNT(*) FROM kitchensink WHERE id = 10", &[])
+        .await
+        .unwrap();
+    assert_eq!(row.get::<_, i64>(0), 1);
+    let row = client
+        .query_one("SELECT COUNT(*) FROM kitchensink WHERE id = 11", &[])
+        .await
+        .unwrap();
+    assert_eq!(row.get::<_, i64>(0), 0);
+
+    // A failed statement inside the savepoint must not abort the rest of the tx.
+    client.execute("BEGIN", &[]).await.unwrap();
+    client
+        .execute("INSERT INTO kitchensink (id) VALUES (20)", &[])
+        .await
+        .unwrap();
+    client.execute("SAVEPOINT sp2", &[]).await.unwrap();
+    client
+        .execute("INSERT INTO kitchensink (id) VALUES (20)", &[])
+        .await
+        .unwrap_err();
+    client
+        .execute("ROLLBACK TO SAVEPOINT sp2", &[])
+        .await
+        .unwrap();
+    client
+        .execute("INSERT INTO kitchensink (id) VALUES (21)", &[])
+        .await
+        .unwrap();
+    client.execute("RELEASE SAVEPOINT sp2", &[]).await.unwrap();
+    client.execute("COMMIT", &[]).await.unwrap();
+
+    let row = client
+        .query_one("SELECT COUNT(*) FROM kitchensink WHERE id IN (20, 21)", &[])
+        .await
+        .unwrap();
+    assert_eq!(row.get::<_, i64>(0), 2);
+
     tripwire_tx.send(()).await.ok();
     tripwire_worker.await;
     wait_for_all_pending_handles().await;

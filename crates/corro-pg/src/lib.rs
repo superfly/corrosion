@@ -279,6 +279,25 @@ impl ParsedCmd {
         )
     }
 
+    /// `ROLLBACK TO SAVEPOINT` undoes part of the transaction. A full
+    /// `ROLLBACK` ends it.
+    pub fn is_savepoint_rollback(&self) -> bool {
+        matches!(
+            self,
+            ParsedCmd::Sqlite(Cmd::Stmt(Stmt::Rollback {
+                savepoint_name: Some(_),
+                ..
+            })) | ParsedCmd::Postgres(PgStatement::Rollback {
+                savepoint: Some(_),
+                ..
+            })
+        )
+    }
+
+    pub fn is_full_rollback(&self) -> bool {
+        self.is_rollback() && !self.is_savepoint_rollback()
+    }
+
     pub fn is_pg(&self) -> bool {
         matches!(self, ParsedCmd::Postgres(_))
     }
@@ -1468,6 +1487,12 @@ impl TxState {
         } = self
         {
             *failed = true;
+        }
+    }
+
+    fn clear_failed(&mut self) {
+        if let TxState::Started { failed, .. } = self {
+            *failed = false;
         }
     }
 
@@ -2831,7 +2856,7 @@ pub async fn start(
 
                                             trace!("parsed cmd: {parsed_cmd:#?}");
 
-                                            let sql_to_prepare = if parsed_cmd.is_rollback() {
+                                            let sql_to_prepare = if parsed_cmd.is_full_rollback() {
                                                 "ROLLBACK"
                                             } else if parsed_cmd.is_commit() {
                                                 "COMMIT"
@@ -3167,7 +3192,7 @@ pub async fn start(
                                             cmd,
                                             ..
                                         }) => {
-                                            let sql_to_prepare = if cmd.is_rollback() {
+                                            let sql_to_prepare = if cmd.is_full_rollback() {
                                                 "ROLLBACK"
                                             } else if cmd.is_commit() {
                                                 "COMMIT"
@@ -4033,7 +4058,7 @@ impl<'conn> Session<'conn> {
         } else if cmd.is_commit() {
             self.commit_tx()?;
             0
-        } else if cmd.is_rollback() {
+        } else if cmd.is_full_rollback() {
             self.rollback_tx()?;
             0
         } else {
@@ -4111,6 +4136,10 @@ impl<'conn> Session<'conn> {
             count
         };
 
+        if cmd.is_savepoint_rollback() {
+            self.tx_state.clear_failed();
+        }
+
         back_tx
             .blocking_send(
                 (
@@ -4177,7 +4206,7 @@ impl<'conn> Session<'conn> {
 
         if cmd.is_commit() {
             self.commit_tx()?;
-        } else if cmd.is_rollback() {
+        } else if cmd.is_full_rollback() {
             self.rollback_tx()?;
         } else if cmd.is_begin() {
             debug!("cmd is BEGIN");
@@ -4502,6 +4531,10 @@ impl<'conn> Session<'conn> {
             if opened_implicit_tx {
                 self.commit_tx()?;
             }
+        }
+
+        if cmd.is_savepoint_rollback() {
+            self.tx_state.clear_failed();
         }
 
         trace!("done w/ rows, computing tag: {tag:?}");

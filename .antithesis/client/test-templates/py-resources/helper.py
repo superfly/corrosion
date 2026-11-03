@@ -1,8 +1,11 @@
 import json
 import pg8000.dbapi
 import requests
+import socket
 import string
+import struct
 import random
+import threading
 import time
 from antithesis.assertions import (
     reachable,
@@ -24,18 +27,152 @@ def get_db_connection(host, port):
     )
 
 
-def execute_psql(conn, sql_command, params=None):
-    cursor = conn.cursor()
+# Rows with this name prefix are written only to be rolled back. A persisted
+# row means crsqlite kept a change that the transaction discarded.
+ROLLED_BACK_PREFIX = "corro_rb_"
+
+# Long enough that a 1s server timeout or a cancel hits it, short enough that
+# a missed interrupt does not hold the write lock for long.
+SLOW_READ = (
+    "WITH RECURSIVE c(i) AS ("
+    "SELECT 1 UNION ALL SELECT i + 1 FROM c LIMIT 10000000"
+    ") SELECT max(i) FROM c"
+)
+
+def pick_tx_mode():
+    # Commit stays the common path so the workload still makes progress.
+    return random_choice(
+        ["commit"] * 8
+        + ["partial_rollback", "partial_rollback"]
+        + ["rollback", "rollback"]
+        + ["interrupt"]
+    )
+
+def note_tx_mode(mode, protocol):
+    details = {"mode": mode, "protocol": protocol}
+    sometimes(mode == "commit", "Clients commit pg and http transactions", details)
+    sometimes(
+        mode == "partial_rollback",
+        "Clients roll back some statements and commit others",
+        details,
+    )
+    sometimes(mode == "rollback", "Clients roll back pg and http transactions", details)
+    sometimes(mode == "interrupt", "Clients interrupt pg and http transactions", details)
+
+def rolled_back_insert():
+    return f"INSERT INTO teams (name) VALUES ('{ROLLED_BACK_PREFIX}{random_name()}')"
+
+def _exec(cursor, sql_command, params=None):
     if params:
         cursor.execute(sql_command, params)
     else:
         cursor.execute(sql_command)
-    conn.commit()
-    cursor.close()
+
+def _cancel_pg(conn):
+    key = getattr(conn, "_backend_key_data", None)
+    sock = getattr(conn, "_usock", None)
+    if not key or len(key) < 8 or sock is None:
+        return
+    pid, secret = struct.unpack("!ii", key[:8])
+    try:
+        peer = sock.getpeername()
+    except OSError as e:
+        print(f"pg cancel skipped: {e}")
+        return
+    try:
+        with socket.create_connection(peer, timeout=5) as cancel_sock:
+            # Postgres CancelRequest: length, cancel code, backend pid, secret.
+            cancel_sock.sendall(struct.pack("!iiii", 16, 80877102, pid, secret))
+    except OSError as e:
+        print(f"pg cancel failed: {e}")
+
+def _interrupt_pg(conn, cursor):
+    def run():
+        try:
+            cursor.execute(SLOW_READ)
+        except Exception as e:
+            print(f"interrupted pg statement: {e}")
+
+    worker = threading.Thread(target=run)
+    worker.start()
+    time.sleep(0.2)
+    _cancel_pg(conn)
+    worker.join(timeout=10)
+    if worker.is_alive():
+        try:
+            conn._usock.close()
+        except Exception:
+            pass
+        worker.join(timeout=5)
+
+def execute_psql(conn, sql_command, params=None):
+    mode = pick_tx_mode()
+    note_tx_mode(mode, "pg")
+    cursor = conn.cursor()
+    try:
+        _exec(cursor, sql_command, params)
+        if mode == "commit":
+            conn.commit()
+        elif mode == "rollback":
+            _exec(cursor, rolled_back_insert())
+            conn.rollback()
+        elif mode == "partial_rollback":
+            # The caller's statement stays. The sentinel insert is discarded.
+            cursor.execute("SAVEPOINT corro_sp")
+            _exec(cursor, rolled_back_insert())
+            cursor.execute("ROLLBACK TO SAVEPOINT corro_sp")
+            cursor.execute("RELEASE SAVEPOINT corro_sp")
+            conn.commit()
+        else:
+            _interrupt_pg(conn, cursor)
+            try:
+                conn.rollback()
+            except Exception as e:
+                print(f"pg rollback after interrupt failed: {e}")
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+    finally:
+        cursor.close()
 
 def execute_sql(address, sql_command):
+    mode = pick_tx_mode()
+    note_tx_mode(mode, "http")
     headers = {'Content-Type': 'application/json'}
-    result = requests.post(f"http://{address}/v1/transactions", headers=headers, json=[sql_command])
+    url = f"http://{address}/v1/transactions"
+    expect_ok = True
+    if mode == "partial_rollback":
+        statements = [
+            sql_command,
+            "SAVEPOINT corro_sp",
+            rolled_back_insert(),
+            "ROLLBACK TO SAVEPOINT corro_sp",
+            "RELEASE SAVEPOINT corro_sp",
+        ]
+    elif mode == "rollback":
+        # A later statement error aborts the whole HTTP transaction.
+        statements = [sql_command, rolled_back_insert(), "SELECT * FROM __corro_force_rollback"]
+        expect_ok = False
+    elif mode == "interrupt":
+        url += "?timeout=1"
+        statements = [sql_command, SLOW_READ]
+        expect_ok = False
+    else:
+        statements = [sql_command]
+
+    try:
+        result = requests.post(url, headers=headers, json=statements, timeout=20)
+    except requests.RequestException as e:
+        print(f"{mode} transaction request failed for {address}: {e}")
+        if expect_ok:
+            raise
+        return
+
+    if not expect_ok:
+        print(f"{mode} transaction finished with status {result.status_code} for {address}")
+        return
+
     sometimes(result.status_code == 200, "Clients can make successful transactions to corrosion", {"status_code": result.status_code})
     if result.status_code != 200:
         raise Exception(f"Unexpected status code: {result.status_code} - {result.text} {result.request.body} for {address}")
