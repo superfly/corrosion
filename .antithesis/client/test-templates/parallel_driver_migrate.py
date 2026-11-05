@@ -31,9 +31,13 @@ bookkeeping, etc.) will find bugs while this driver slowly transitions nodes.
 
 Rollback: a node in dual-write (2,*,*) can be rolled back to (1,1,1) via
 rollback_v1. This is randomly attempted to test the rollback path.
+
+If a run explicitly sets any CORRO_*_VERSION environment variable, this
+workload leaves all version settings untouched.
 """
 import argparse
 import json
+import os
 import subprocess
 import sys
 
@@ -187,6 +191,20 @@ def classify_node(status):
     return "unknown"
 
 
+def explicit_version_settings():
+    """Return version settings pinned by the Antithesis run environment."""
+    env_names = (
+        "CORRO_METADATA_WRITE_VERSION",
+        "CORRO_METADATA_USE_VERSION",
+        "CORRO_SYNC_LOG_VERSION",
+    )
+    return {
+        name: value
+        for name in env_names
+        if (value := os.environ.get(name, "").strip())
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Incrementally migrate corrosion nodes to V2 metadata format"
@@ -199,6 +217,14 @@ def main():
     args = parser.parse_args()
     if args.addrs is None:
         args.addrs = ["corrosion1:8080", "corrosion2:8080", "corrosion3:8080"]
+
+    pinned_settings = explicit_version_settings()
+    if pinned_settings:
+        print(
+            "Explicit metadata version settings are configured; "
+            f"migration driver will not change any versions: {pinned_settings}"
+        )
+        return
 
     # Gather status of all nodes
     nodes = {}  # addr -> (status_dict, classification)
