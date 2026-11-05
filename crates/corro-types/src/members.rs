@@ -161,13 +161,13 @@ impl Members {
         let actor_id = actor.id();
 
         if actor.member_id() != self.member_id {
-            info!(
-                "Removing member, {actor_id:?} has member_id {:?} but and our member_id is {:?}",
-                actor.member_id(),
-                self.member_id
-            );
             let removed = self.states.remove(&actor_id);
             if let Some(member) = &removed {
+                info!(
+                    "Removing member, {actor_id:?} has member_id {:?} but and our member_id is {:?}",
+                    actor.member_id(),
+                    self.member_id
+                );
                 if self.by_addr.get(&member.addr) == Some(&actor_id) {
                     self.by_addr.remove(&member.addr);
                 }

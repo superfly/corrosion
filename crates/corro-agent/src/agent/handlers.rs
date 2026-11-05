@@ -257,6 +257,8 @@ pub fn spawn_swim_announcer(agent: &Agent, gossip_addr: SocketAddr, tripwire: Tr
             let timer = tokio::time::sleep(Duration::new(0, 0));
             tokio::pin!(timer);
 
+            let allow_mixed_ip = agent.config().gossip.allow_mixed_ip;
+
             loop {
                 tokio::select! {
                     _ = &mut tripwire => {
@@ -269,6 +271,7 @@ pub fn spawn_swim_announcer(agent: &Agent, gossip_addr: SocketAddr, tripwire: Tr
                 match bootstrap::generate_bootstrap(
                     agent.config().gossip.bootstrap.as_slice(),
                     gossip_addr,
+                    allow_mixed_ip,
                     agent.pool(),
                 )
                 .await

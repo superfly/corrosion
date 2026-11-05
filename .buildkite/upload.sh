@@ -10,6 +10,7 @@ buildkite-agent artifact download 'builds/*.tar.gz' ./builds
 BUILD_NAME="${BUILDKITE_BRANCH//[^a-zA-Z0-9-]/--}"
 
 # upload
+aws s3 cp builds/corrosion.tar.gz ${UPLOAD_BUCKET_PATH}/${BUILD_NAME}/${BUILDKITE_COMMIT}.tar.gz --region us-east-2 &
 aws s3 cp builds/corrosion.tar.gz ${UPLOAD_BUCKET_PATH}/${BUILD_NAME}-${BUILDKITE_COMMIT:0:8}.tar.gz --region us-east-2 &
 wait
 

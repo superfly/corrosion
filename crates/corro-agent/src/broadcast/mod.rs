@@ -1026,7 +1026,7 @@ fn foca_state_is_active(state: &foca::State) -> bool {
     matches!(*state, foca::State::Alive | foca::State::Suspect)
 }
 
-const QUIC_SHORT_HEADER_OVERHEAD: u16 = 13;
+const QUIC_SHORT_HEADER_OVERHEAD: u16 = 30;
 
 fn make_foca_config(cluster_size: NonZeroU32, max_mtu: Option<u16>) -> foca::Config {
     let mut config = foca::Config::new_wan(cluster_size);

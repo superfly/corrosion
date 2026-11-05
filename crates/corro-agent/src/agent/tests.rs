@@ -1706,7 +1706,7 @@ async fn test_schema_change_retries_all_fully_buffered_partials() -> eyre::Resul
         .api_addr("127.0.0.1:0".parse()?)
         .build()?;
 
-    config.perf.partial_retry_backoff = 60 * 60;
+    config.perf.partial_retries = 3;
 
     let (agent, opts) = setup(config, tripwire.clone()).await?;
     let bookie = agent.bookie().clone();

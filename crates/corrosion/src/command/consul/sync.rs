@@ -1,4 +1,4 @@
-use consul_client::{AgentCheck, AgentService, Client};
+use consul_client::{AgentCheck, AgentService, Client, ConsulCheckStatus};
 use corro_api_types::ColumnType;
 use corro_client::CorrosionClient;
 use corro_types::{api::Statement, config::ConsulConfig};
@@ -301,7 +301,7 @@ async fn update_hashes(
     for check in checks {
         if check_hashes.get(&check.id).is_none() {
             info!("inserting hash for check: {}", check.id);
-            let hash = hash_check(&check);
+            let hash = hash_check(&check, check_directives(&check).as_ref());
             statements.push(Statement::WithParams(
                 "INSERT OR REPLACE INTO __corro_consul_checks ( id, hash ) VALUES (?, ?)".into(),
                 vec![check.id.clone().into(), hash.to_be_bytes().to_vec().into()],
@@ -336,7 +336,13 @@ async fn update_hashes(
 
 #[derive(Debug, Serialize, Deserialize)]
 struct ConsulCheckNotesDirectives {
-    hash_include: Vec<ConsulCheckField>,
+    /// Present only when the check explicitly chooses which fields participate
+    /// in the hash. Missing means the default: hash status, not output.
+    #[serde(default)]
+    hash_include: Option<Vec<ConsulCheckField>>,
+    /// When set, a `critical` status is stored as `warning`.
+    #[serde(default)]
+    critical_as_warning: bool,
 }
 
 #[derive(Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
@@ -364,30 +370,46 @@ pub fn hash_service(svc: &AgentService) -> u64 {
     hasher.finish()
 }
 
-pub fn hash_check(check: &AgentCheck) -> u64 {
+fn check_directives(check: &AgentCheck) -> Option<ConsulCheckNotesDirectives> {
+    check
+        .notes
+        .as_deref()
+        .and_then(|notes| serde_json::from_str::<ConsulCheckNotesDirectives>(notes).ok())
+}
+
+/// Rewrites the check according to its notes directives. Must run before
+/// hashing so the hash matches what gets stored.
+fn apply_check_directives(check: &mut AgentCheck, notes: Option<&ConsulCheckNotesDirectives>) {
+    if check.status == ConsulCheckStatus::Critical
+        && notes.is_some_and(|notes| notes.critical_as_warning)
+    {
+        check.status = ConsulCheckStatus::Warning;
+    }
+}
+
+fn hash_check(check: &AgentCheck, notes: Option<&ConsulCheckNotesDirectives>) -> u64 {
     let mut hasher = seahash::SeaHasher::new();
     hasher.write(check.service_name.as_bytes());
     hasher.write(check.service_id.as_bytes());
-    if let Some(notes) = check
-        .notes
-        .as_ref()
-        .and_then(|notes| serde_json::from_str::<ConsulCheckNotesDirectives>(notes).ok())
-    {
-        for field in notes.hash_include {
-            match field {
-                ConsulCheckField::Status => {
-                    trace!("hashing status: '{}'", check.status.as_str());
-                    hasher.write(check.status.as_str().as_bytes());
-                }
-                ConsulCheckField::Output => {
-                    trace!("hashing output: '{}'", check.output);
-                    hasher.write(check.output.as_bytes());
+    match notes.and_then(|notes| notes.hash_include.as_ref()) {
+        Some(fields) => {
+            for field in fields {
+                match field {
+                    ConsulCheckField::Status => {
+                        trace!("hashing status: '{}'", check.status.as_str());
+                        hasher.write(check.status.as_str().as_bytes());
+                    }
+                    ConsulCheckField::Output => {
+                        trace!("hashing output: '{}'", check.output);
+                        hasher.write(check.output.as_bytes());
+                    }
                 }
             }
         }
-    } else {
-        trace!("no special notes");
-        hasher.write(check.status.as_str().as_bytes());
+        None => {
+            trace!("no special notes");
+            hasher.write(check.status.as_str().as_bytes());
+        }
     }
     hasher.finish()
 }
@@ -532,8 +554,10 @@ fn update_checks(
 
     {
         for (id, old_hash) in hashes.iter() {
-            if let Some(check) = checks.remove(id) {
-                let hash = hash_check(&check);
+            if let Some(mut check) = checks.remove(id) {
+                let notes = check_directives(&check);
+                apply_check_directives(&mut check, notes.as_ref());
+                let hash = hash_check(&check, notes.as_ref());
                 if skip_hash_check || *old_hash != hash {
                     info!("updating check '{id}'");
 
@@ -547,9 +571,11 @@ fn update_checks(
     }
 
     // new checks
-    for (id, check) in checks {
+    for (id, mut check) in checks {
         info!("upserting check '{id}'");
-        let hash = hash_check(&check);
+        let notes = check_directives(&check);
+        apply_check_directives(&mut check, notes.as_ref());
+        let hash = hash_check(&check, notes.as_ref());
         ops.push(ConsulCheckOp::Upsert { check, hash });
     }
 
@@ -746,6 +772,100 @@ mod tests {
     use spawn::wait_for_all_pending_handles;
     use tokio::time::sleep;
     use tripwire::Tripwire;
+
+    fn sample_check(id: &str, status: ConsulCheckStatus, notes: Option<&str>) -> AgentCheck {
+        AgentCheck {
+            id: id.into(),
+            name: id.into(),
+            status,
+            output: "out".into(),
+            service_id: "svc".into(),
+            service_name: "svc".into(),
+            notes: notes.map(str::to_string),
+        }
+    }
+
+    fn upserted_statuses(ops: Vec<ConsulCheckOp>) -> HashMap<String, ConsulCheckStatus> {
+        ops.into_iter()
+            .filter_map(|op| match op {
+                ConsulCheckOp::Upsert { check, .. } => Some((check.id, check.status)),
+                ConsulCheckOp::Delete { .. } => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn critical_as_warning_rewrites_only_critical_checks() {
+        let checks = HashMap::from([
+            (
+                "crit".into(),
+                sample_check(
+                    "crit",
+                    ConsulCheckStatus::Critical,
+                    Some(r#"{"critical_as_warning":true}"#),
+                ),
+            ),
+            (
+                "pass".into(),
+                sample_check(
+                    "pass",
+                    ConsulCheckStatus::Passing,
+                    Some(r#"{"critical_as_warning":true}"#),
+                ),
+            ),
+            (
+                "plain".into(),
+                sample_check("plain", ConsulCheckStatus::Critical, None),
+            ),
+        ]);
+
+        let statuses = upserted_statuses(update_checks(checks, &HashMap::new(), false));
+
+        assert_eq!(statuses["crit"], ConsulCheckStatus::Warning);
+        assert_eq!(statuses["pass"], ConsulCheckStatus::Passing);
+        assert_eq!(statuses["plain"], ConsulCheckStatus::Critical);
+    }
+
+    #[test]
+    fn critical_as_warning_hash_follows_the_rewritten_status() {
+        let flagged = sample_check(
+            "crit",
+            ConsulCheckStatus::Critical,
+            Some(r#"{"critical_as_warning":true}"#),
+        );
+        let ops = update_checks(
+            HashMap::from([("crit".into(), flagged)]),
+            &HashMap::new(),
+            false,
+        );
+        let warning_hash = match &ops[0] {
+            ConsulCheckOp::Upsert { check, hash } => {
+                assert_eq!(check.status, ConsulCheckStatus::Warning);
+                *hash
+            }
+            ConsulCheckOp::Delete { .. } => panic!("expected upsert"),
+        };
+
+        let flagged = sample_check(
+            "crit",
+            ConsulCheckStatus::Critical,
+            Some(r#"{"critical_as_warning":true}"#),
+        );
+        let ops = update_checks(
+            HashMap::from([("crit".into(), flagged)]),
+            &HashMap::from([("crit".into(), warning_hash)]),
+            false,
+        );
+        assert!(ops.is_empty());
+
+        let cleared = sample_check("crit", ConsulCheckStatus::Critical, None);
+        let ops = update_checks(
+            HashMap::from([("crit".into(), cleared)]),
+            &HashMap::from([("crit".into(), warning_hash)]),
+            false,
+        );
+        assert_eq!(upserted_statuses(ops)["crit"], ConsulCheckStatus::Critical);
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn basic_operations() -> eyre::Result<()> {

@@ -70,7 +70,7 @@ fn main() {
     {
         Some(dir) => dir,
         None => {
-            eprintln!("FAILED: either pass `--statedir` or set 'CORRO_DEVCLUSTER_STATE_DIR' environment variable!");
+            eprintln!("FAILED: either pass `--schemadir` or set 'CORRO_DEVCLUSTER_SCHEMA_DIR' environment variable!");
             std::process::exit(1);
         }
     };

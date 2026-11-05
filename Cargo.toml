@@ -58,8 +58,8 @@ opentelemetry_sdk = { version = "0.30.0", features = ["experimental_trace_batch_
 opentelemetry-semantic-conventions = { version = "0.30.0", features = ["semconv_experimental"] }
 parking_lot = { version = "0.12.1", features = ["arc_lock"] }
 pin-project-lite = "0.2.9"
-quinn = "0.11"
-quinn-proto = "0.11"
+quinn = "0.11.12"
+quinn-proto = "0.11.18"
 quinn-plaintext = "0.3.0"
 quoted-string = "0.6.1"
 rand = { version = "0.9", features = ["small_rng"] }
@@ -124,10 +124,3 @@ codegen-units = 16
 opt-level = 2
 
 [workspace.lints.clippy]
-
-[patch.crates-io]
-# branch: superfly/expose-rtt-latest-min
-quinn = { git = "https://github.com/somtochiama/quinn", rev = "ed052b9aac0ab803a4c8838b9a21034aa919dcbc" } 
-quinn-proto = { git = "https://github.com/somtochiama/quinn", rev = "ed052b9aac0ab803a4c8838b9a21034aa919dcbc" }
-quinn-udp = { git = "https://github.com/somtochiama/quinn", rev = "ed052b9aac0ab803a4c8838b9a21034aa919dcbc" }
-

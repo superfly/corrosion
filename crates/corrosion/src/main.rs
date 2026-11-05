@@ -7,7 +7,7 @@ use std::{
 use admin::AdminConn;
 // use antithesis_sdk::assert_sometimes;
 use camino::Utf8PathBuf;
-use clap::{Parser, Subcommand};
+use clap::{error::ErrorKind, CommandFactory, Parser, Subcommand};
 use command::{
     tls::{generate_ca, generate_client_cert, generate_server_cert},
     tpl::TemplateFlags,
@@ -41,7 +41,8 @@ use uuid::Uuid;
 pub mod admin;
 pub mod command;
 
-pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+pub const VERSION: &str = env!("CORRO_VERSION");
+pub const GIT_SHA: &str = env!("CORRO_GIT_SHA");
 
 pub static CONFIG: OnceCell<Config> = OnceCell::new();
 pub static API_CLIENT: OnceCell<CorrosionApiClient> = OnceCell::new();
@@ -51,9 +52,9 @@ build_info::build_info!(pub fn version);
 #[global_allocator]
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-fn init_tracing(cli: &Cli) -> Result<Option<TracingHandle>, ConfigError> {
+fn init_tracing(cli: &Cli, command: &Command) -> Result<Option<TracingHandle>, ConfigError> {
     let mut tracing_handle = None;
-    if matches!(cli.command, Command::Agent) {
+    if matches!(command, Command::Agent) {
         let config = cli.config()?;
 
         let directives: String = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into());
@@ -172,10 +173,13 @@ async fn vacuum_into(db_path: &Path, destination: &str) -> eyre::Result<PathBuf>
     Ok(destination_path)
 }
 
-async fn process_cli(cli: Cli) -> eyre::Result<()> {
-    let tracing_handle = init_tracing(&cli)?;
+async fn process_cli(mut cli: Cli) -> eyre::Result<()> {
+    let command = cli.command.take().expect("command validated in main");
+    let tracing_handle = init_tracing(&cli, &command)?;
 
-    match &cli.command {
+    match &command {
+        // handled in main() before the tokio runtime is built
+        Command::Version => unreachable!(),
         Command::Agent => {
             command::agent::run(cli.config()?, &cli.config_path, tracing_handle).await?
         }
@@ -685,6 +689,26 @@ async fn process_cli(cli: Cli) -> eyre::Result<()> {
 fn main() {
     let cli: Cli = Cli::parse();
 
+    if cli.version_hash {
+        println!("{GIT_SHA}");
+        return;
+    }
+
+    match &cli.command {
+        Some(Command::Version) => {
+            let info = version();
+            println!("{info}");
+            println!("{}", info.compiler);
+            println!("target: {}", info.target);
+            println!("built: {}", info.timestamp);
+            return;
+        }
+        None => Cli::command()
+            .error(ErrorKind::MissingSubcommand, "a subcommand is required")
+            .exit(),
+        _ => {}
+    }
+
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .worker_threads(8)
@@ -718,8 +742,12 @@ struct Cli {
     #[arg(long, global = true)]
     admin_path: Option<Utf8PathBuf>,
 
+    /// Print the git commit hash this binary was built from
+    #[arg(long = "version-hash")]
+    version_hash: bool,
+
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 impl Cli {
@@ -865,6 +893,9 @@ enum Command {
     /// Plumtree broadcast overlay commands
     #[command(subcommand)]
     Plumtree(PlumtreeCommand),
+
+    /// Print version and build information
+    Version,
 }
 
 #[derive(Subcommand)]

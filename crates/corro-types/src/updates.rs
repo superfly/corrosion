@@ -6,7 +6,7 @@ use crate::schema::Schema;
 use antithesis_sdk::assert_sometimes;
 use async_trait::async_trait;
 use corro_api_types::sqlite::ChangeType;
-use corro_api_types::{ColumnName, NotifyEvent, SqliteValueRef, TableName};
+use corro_api_types::{ColumnName, NotifyEvent, TableName};
 use corro_base_types::CrsqlDbVersion;
 use indexmap::{map::Entry, IndexMap};
 use metrics::{counter, histogram, Counter};
@@ -18,7 +18,7 @@ use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
-use tokio::task::block_in_place;
+use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tokio_util::sync::{CancellationToken, WaitForCancellationFuture};
 use tracing::{debug, error, info, trace, warn};
@@ -257,7 +257,14 @@ impl UpdateHandle {
                 },
             }),
         };
-        spawn_counted(batch_candidates(id, cancel, evt_tx, changes_rx, tripwire));
+        spawn_counted(batch_candidates(
+            id,
+            tbl_name.to_owned(),
+            cancel,
+            evt_tx,
+            changes_rx,
+            tripwire,
+        ));
         Ok(handle)
     }
 
@@ -267,45 +274,52 @@ impl UpdateHandle {
     }
 }
 
-fn handle_candidates(
-    evt_tx: mpsc::Sender<NotifyEvent>,
+type PendingChanges = IndexMap<(TableName, Vec<u8>), i64>;
+
+// max number of distinct pks buffered for an updates client. When exceeded,
+// the oldest pending changes are dropped in favor of newer ones.
+const MAX_PENDING_CHANGES: usize = 3000;
+const MAX_CACHE_ENTRIES: usize = 2000;
+const KEEP_CACHE_ENTRIES: usize = 1000;
+
+/// Merges candidates into the pending buffer, skipping changes older than what
+/// we've already seen for a pk, and evicts the oldest entries once the buffer is full.
+/// Returns the number of evicted entries.
+fn buffer_candidates(
+    buf: &mut PendingChanges,
+    cl_cache: &mut PendingChanges,
     candidates: MatchCandidates,
-) -> Result<(), MatcherError> {
-    if candidates.is_empty() {
-        return Ok(());
-    }
-
-    trace!(
-        "got some candidates for updates! {:?}",
-        candidates.keys().collect::<Vec<_>>()
-    );
-
-    for (_, pks) in candidates {
-        let pks = pks
-            .iter()
-            .map(|(pk, cl)| unpack_columns(pk).map(|x| (x, *cl)))
-            .collect::<Result<Vec<(Vec<SqliteValueRef>, i64)>, _>>()?;
-
-        for (pk, cl) in pks {
-            let mut change_type = ChangeType::Update;
-            if cl % 2 == 0 {
-                change_type = ChangeType::Delete
+) -> usize {
+    for (table, pk_map) in candidates {
+        for (pk, cl) in pk_map {
+            match cl_cache.entry((table.clone(), pk.clone())) {
+                Entry::Occupied(mut o) => {
+                    if *o.get() > cl {
+                        continue;
+                    }
+                    o.insert(cl);
+                }
+                Entry::Vacant(v) => {
+                    v.insert(cl);
+                }
             }
-            if let Err(e) = evt_tx.blocking_send(NotifyEvent::Notify(
-                change_type,
-                pk.iter().map(|x| x.to_owned()).collect::<Vec<_>>(),
-            )) {
-                debug!("could not send back row to matcher sub sender: {e}");
-                return Err(MatcherError::EventReceiverClosed);
-            }
+
+            buf.insert((table.clone(), pk), cl);
         }
     }
 
-    Ok(())
+    if cl_cache.len() > MAX_CACHE_ENTRIES {
+        *cl_cache = cl_cache.split_off(cl_cache.len() - KEEP_CACHE_ENTRIES);
+    }
+
+    let overflow = buf.len().saturating_sub(MAX_PENDING_CHANGES);
+    buf.drain(..overflow);
+    overflow
 }
 
 async fn batch_candidates(
     id: Uuid,
+    table: String,
     cancel: CancellationToken,
     evt_tx: mpsc::Sender<NotifyEvent>,
     mut changes_rx: mpsc::Receiver<MatchCandidates>,
@@ -313,8 +327,6 @@ async fn batch_candidates(
 ) {
     const PROCESS_CHANGES_THRESHOLD: usize = 1000;
     const PROCESS_BUFFER_DEADLINE: Duration = Duration::from_millis(600);
-    const MAX_CACHE_ENTRIES: usize = 2000;
-    const KEEP_CACHE_ENTRIES: usize = 1000;
 
     // small cache to ensure we don't send an older update when changes to the same pk
     // are made in quick succession. Changes aren't sent in order, and there's just one situation where this
@@ -322,18 +334,23 @@ async fn batch_candidates(
     // get sent in reverse order. so the client might delete a key that's actually present in the db.
     //
     // (TODO: maybe we could send the cl to the client? or read from db?)
-    let mut cl_cache: IndexMap<(TableName, Vec<u8>), i64> = IndexMap::new();
+    let mut cl_cache = PendingChanges::new();
 
     info!(sub_id = %id, "Starting loop to receive candidates from updates");
 
-    let mut buf = MatchCandidates::new();
-    let mut buf_count = 0;
+    let dropped_count = counter!("corro.updates.changes.dropped.count", "table" => table);
+
+    let mut buf = PendingChanges::new();
+
+    // sending to the client happens in a separate task so we can keep draining
+    // changes_rx (and drop old changes) while waiting on a slow receiver
+    let mut send_task: Option<(Instant, JoinHandle<Result<(), MatcherError>>)> = None;
 
     // max duration of aggregating candidates
     let process_changes_deadline = tokio::time::sleep(PROCESS_BUFFER_DEADLINE);
     tokio::pin!(process_changes_deadline);
 
-    let mut process = false;
+    let mut deadline_hit = false;
     loop {
         tokio::select! {
             biased;
@@ -341,77 +358,78 @@ async fn batch_candidates(
                 info!(sub_id = %id, "Acknowledged updates cancellation, breaking loop.");
                 break;
             }
-            Some(candidates) = changes_rx.recv() => {
-                trace!(sub_id = %id, "updates got candidates: {candidates:?}");
-                for (table, pk_map) in  candidates {
-                    let buffed = buf.entry(table.clone()).or_default();
-
-                    for (pk, cl) in pk_map {
-                        let e = cl_cache.entry((table.clone(), pk.clone()));
-                        match e {
-                            Entry::Occupied(mut o) => {
-                                if *o.get() > cl {
-                                    continue;
-                                }
-                                o.insert(cl);
-                            }
-                            Entry::Vacant(v) => {
-                                v.insert(cl);
-                            }
-                        }
-
-                        buffed.insert(pk, cl);
-                        buf_count += 1;
+            res = async { (&mut send_task.as_mut().unwrap().1).await }, if send_task.is_some() => {
+                let (start, _) = send_task.take().unwrap();
+                match res {
+                    Ok(Ok(())) => {}
+                    Ok(Err(MatcherError::EventReceiverClosed)) => break,
+                    Ok(Err(e)) => {
+                        error!(sub_id = %id, "could not handle change: {e}");
+                        break;
+                    }
+                    Err(e) => {
+                        error!(sub_id = %id, "updates send task failed: {e}");
+                        break;
                     }
                 }
-
-                if cl_cache.len() > MAX_CACHE_ENTRIES {
-                    cl_cache = cl_cache.split_off(cl_cache.len() - KEEP_CACHE_ENTRIES);
-                }
-
-                if buf_count >= PROCESS_CHANGES_THRESHOLD {
-                   process = true
+                histogram!("corro.updates.changes.processing.duration.seconds", "table" => id.to_string()).record(start.elapsed());
+            }
+            Some(candidates) = changes_rx.recv() => {
+                trace!(sub_id = %id, "updates got candidates: {candidates:?}");
+                let dropped = buffer_candidates(&mut buf, &mut cl_cache, candidates);
+                if dropped > 0 {
+                    warn!(sub_id = %id, "updates buffer is full, dropped {dropped} oldest pending changes");
+                    dropped_count.increment(dropped as u64);
                 }
             },
             _ = process_changes_deadline.as_mut() => {
                 process_changes_deadline
                     .as_mut()
                     .reset(Instant::now() + PROCESS_BUFFER_DEADLINE);
-                if buf_count != 0 {
-                    process = true
-                }
+                deadline_hit = !buf.is_empty();
             },
             _ = &mut tripwire => {
                 trace!(sub_id = %id, "tripped batch_candidates, returning");
-                return;
+                break;
             }
             else => {
-                return;
+                break;
             }
         }
 
-        if process {
-            let start = Instant::now();
-
-            if let Err(e) =
-                block_in_place(|| handle_candidates(evt_tx.clone(), std::mem::take(&mut buf)))
-            {
-                if !matches!(e, MatcherError::EventReceiverClosed) {
-                    error!(sub_id = %id, "could not handle change: {e}");
+        if send_task.is_none() && (deadline_hit || buf.len() >= PROCESS_CHANGES_THRESHOLD) {
+            let changes = std::mem::take(&mut buf);
+            let evt_tx = evt_tx.clone();
+            let task = tokio::spawn(async move {
+                for ((_, pk), cl) in changes {
+                    let pk = unpack_columns(&pk)?
+                        .iter()
+                        .map(|x| x.to_owned())
+                        .collect::<Vec<_>>();
+                    let change_type = if cl % 2 == 0 {
+                        ChangeType::Delete
+                    } else {
+                        ChangeType::Update
+                    };
+                    if let Err(e) = evt_tx.send(NotifyEvent::Notify(change_type, pk)).await {
+                        debug!("could not send back row to matcher sub sender: {e}");
+                        return Err(MatcherError::EventReceiverClosed);
+                    }
                 }
-                break;
-            }
-            let elapsed = start.elapsed();
-
-            histogram!("corro.updates.changes.processing.duration.seconds", "table" => id.to_string()).record(elapsed);
-
-            buf_count = 0;
+                Ok(())
+            });
+            send_task = Some((Instant::now(), task));
+            deadline_hit = false;
 
             // reset the deadline
             process_changes_deadline
                 .as_mut()
                 .reset(Instant::now() + PROCESS_BUFFER_DEADLINE);
         }
+    }
+
+    if let Some((_, task)) = send_task {
+        task.abort();
     }
 
     debug!(id = %id, "update loop is done");
@@ -577,4 +595,50 @@ where
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn candidates(table: &TableName, pks: impl IntoIterator<Item = (u32, i64)>) -> MatchCandidates {
+        [(
+            table.clone(),
+            pks.into_iter()
+                .map(|(pk, cl)| (pk.to_be_bytes().to_vec(), cl))
+                .collect(),
+        )]
+        .into()
+    }
+
+    #[test]
+    fn buffer_candidates_favors_newer_changes() {
+        let table: TableName = "tests".into();
+        let key = |pk: u32| (table.clone(), pk.to_be_bytes().to_vec());
+        let mut buf = PendingChanges::new();
+        let mut cl_cache = PendingChanges::new();
+
+        let all = candidates(&table, (0..MAX_PENDING_CHANGES as u32).map(|pk| (pk, 1)));
+        assert_eq!(buffer_candidates(&mut buf, &mut cl_cache, all), 0);
+
+        // a newer cl replaces the buffered one, older cls are ignored
+        let touch = candidates(&table, [(5, 3)]);
+        assert_eq!(buffer_candidates(&mut buf, &mut cl_cache, touch), 0);
+        let stale = candidates(&table, [(5, 2)]);
+        assert_eq!(buffer_candidates(&mut buf, &mut cl_cache, stale), 0);
+        assert_eq!(buf.get(&key(5)), Some(&3));
+
+        // overflowing evicts the oldest pks first
+        let new_pk = MAX_PENDING_CHANGES as u32;
+        let extra = candidates(&table, [(new_pk, 1), (new_pk + 1, 1)]);
+        assert_eq!(buffer_candidates(&mut buf, &mut cl_cache, extra), 2);
+
+        assert_eq!(buf.len(), MAX_PENDING_CHANGES);
+        assert!(!buf.contains_key(&key(0)));
+        assert!(!buf.contains_key(&key(1)));
+        assert!(buf.contains_key(&key(2)));
+        assert_eq!(buf.get(&key(5)), Some(&3));
+        assert_eq!(buf.last(), Some((&key(new_pk + 1), &1)));
+        assert!(cl_cache.len() <= MAX_CACHE_ENTRIES);
+    }
 }
