@@ -69,4 +69,4 @@ build-info-build = { workspace = true }
 corro-tests = { path = "../corro-tests" }
 
 [features]
-running_in_antithesis = ["antithesis_sdk/full"]
+running_in_antithesis = ["antithesis_sdk/full", "corro-agent/running_in_antithesis", "corro-api-types/running_in_antithesis"]

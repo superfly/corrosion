@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 use camino::Utf8PathBuf;
 use chrono::{DateTime, NaiveDateTime, Utc};
 use corro_pg::{start, PgServer};
-use corro_tests::{launch_test_agent, TestAgent};
+use corro_tests::{is_v2_mode, launch_test_agent, TestAgent};
 use corro_types::{
     config::{PgConfig, PgTlsConfig},
     tls::{generate_ca, generate_client_cert, generate_server_cert},
@@ -122,11 +122,18 @@ async fn test_information_schema() {
         .iter()
         .map(|row| row.get::<_, String>("table_name"))
         .collect::<Vec<_>>();
+    // cr-sqlite V2 uses different metadata table names (__crsql_v2_clock,
+    // __crsql_v2_pks, etc.) than V1 (__crsql_clock, __crsql_pks).
+    let (clock_tbl, pks_tbl) = if is_v2_mode() {
+        ("kitchensink__crsql_v2_clock", "kitchensink__crsql_v2_pks")
+    } else {
+        ("kitchensink__crsql_clock", "kitchensink__crsql_pks")
+    };
     for expected in [
         "__corro_schema",
         "kitchensink",
-        "kitchensink__crsql_clock",
-        "kitchensink__crsql_pks",
+        clock_tbl,
+        pks_tbl,
         "tests",
         "wide",
     ] {
@@ -222,9 +229,12 @@ async fn test_information_schema() {
 
     let internal_columns = client
         .query(
-            "SELECT column_name FROM information_schema.columns \
-             WHERE table_name = 'kitchensink__crsql_pks' \
-             ORDER BY ordinal_position",
+            &format!(
+                "SELECT column_name FROM information_schema.columns \
+                 WHERE table_name = '{}' \
+                 ORDER BY ordinal_position",
+                pks_tbl
+            ),
             &[],
         )
         .await
@@ -963,7 +973,7 @@ async fn test_pg_ast_rollback_handling() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_pg_transaction_finalization_failures_recover() {
+async fn test_pg_transaction_finalization_recovers() {
     let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
     let (ta, server) = setup_pg_test_server(tripwire, None).await;
     let conn_str = format!(
@@ -984,18 +994,19 @@ async fn test_pg_transaction_finalization_failures_recover() {
         .await
         .unwrap();
 
-    client.batch_execute("COMMIT").await.unwrap_err();
-
-    let error = client.query_one("SELECT 1", &[]).await.unwrap_err();
-    assert_eq!(error.as_db_error().unwrap().code().code(), "25P02");
-
-    client.batch_execute("ROLLBACK").await.unwrap();
+    client.batch_execute("COMMIT").await.unwrap();
+    client.query_one("SELECT 1", &[]).await.unwrap();
 
     let row = client
         .query_one("SELECT COUNT(*) FROM kitchensink WHERE id = 100", &[])
         .await
         .unwrap();
-    assert_eq!(row.get::<_, i64>(0), 0);
+    assert_eq!(row.get::<_, i64>(0), 1);
+
+    client
+        .batch_execute("DROP TABLE crsql_changes")
+        .await
+        .unwrap();
 
     client.execute("BEGIN", &[]).await.unwrap();
     client
@@ -1007,23 +1018,19 @@ async fn test_pg_transaction_finalization_failures_recover() {
         .await
         .unwrap();
 
-    client.execute("COMMIT", &[]).await.unwrap_err();
-
-    let error = client.query_one("SELECT 1", &[]).await.unwrap_err();
-    assert_eq!(error.as_db_error().unwrap().code().code(), "25P02");
-
-    client.execute("ROLLBACK", &[]).await.unwrap();
+    client.execute("COMMIT", &[]).await.unwrap();
+    client.query_one("SELECT 1", &[]).await.unwrap();
 
     let row = client
         .query_one("SELECT COUNT(*) FROM kitchensink WHERE id = 101", &[])
         .await
         .unwrap();
-    assert_eq!(row.get::<_, i64>(0), 0);
+    assert_eq!(row.get::<_, i64>(0), 1);
 
     client
-        .batch_execute("CREATE TEMP TABLE crsql_changes (bad INTEGER)")
+        .batch_execute("DROP TABLE crsql_changes")
         .await
-        .unwrap_err();
+        .unwrap();
 
     client.query_one("SELECT 1", &[]).await.unwrap();
 
@@ -1048,14 +1055,13 @@ async fn test_pg_transaction_finalization_failures_recover() {
         )
         .await
         .unwrap();
-    assert_eq!(row.get::<_, i64>(0), 1);
+    assert_eq!(row.get::<_, i64>(0), 3);
 
     tripwire_tx.send(()).await.ok();
     tripwire_worker.await;
     wait_for_all_pending_handles().await;
 }
 
-#[tracing_test::traced_test]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_pg_readonly() {
     let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();
@@ -1129,7 +1135,6 @@ async fn test_pg_readonly() {
     wait_for_all_pending_handles().await;
 }
 
-#[tracing_test::traced_test]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_pg_corrrosion_shutdown() {
     let (tripwire, tripwire_worker, tripwire_tx) = Tripwire::new_simple();

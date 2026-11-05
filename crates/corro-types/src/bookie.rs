@@ -437,7 +437,8 @@ impl BookedVersions {
         let mut completed = Vec::new();
         for (version, partial) in partials {
             let merged = self.insert_partial(version, partial);
-            if merged.is_complete() {
+            let is_complete = merged.is_complete();
+            if is_complete {
                 completed.push(version);
             }
         }
@@ -1116,7 +1117,7 @@ mod tests {
     fn test_load_all_from_conn() -> rusqlite::Result<()> {
         _ = tracing_subscriber::fmt::try_init();
 
-        let conn = new_conn()?;
+        let mut conn = new_conn()?;
         // The local node's own site_id is stored at ordinal=0 in crsql_site_id.
         let local_actor_id: ActorId = conn.query_row(
             "SELECT site_id FROM crsql_site_id WHERE ordinal = 0",
@@ -1126,11 +1127,19 @@ mod tests {
 
         // Create a cr-sqlite tracked table and insert a row so that crsql_db_versions
         // records a db_version for the local actor. This lets us verify that max is loaded.
-        conn.execute_batch(
-            "CREATE TABLE test_dummy (id INTEGER NOT NULL PRIMARY KEY, val TEXT);
-             SELECT crsql_as_crr('test_dummy');",
-        )?;
-        conn.execute("INSERT INTO test_dummy (id, val) VALUES (1, 'hello')", [])?;
+        {
+            let tx = conn.immediate_transaction()?;
+            tx.execute_batch(
+                "CREATE TABLE test_dummy (id INTEGER NOT NULL PRIMARY KEY, val TEXT);
+                 SELECT crsql_as_crr('test_dummy');",
+            )?;
+            tx.commit()?;
+        }
+        {
+            let tx = conn.immediate_transaction()?;
+            tx.execute("INSERT INTO test_dummy (id, val) VALUES (1, 'hello')", [])?;
+            tx.commit()?;
+        }
         let expected_max: CrsqlDbVersion = conn.query_row(
             "SELECT db_version FROM crsql_db_versions WHERE site_id = crsql_site_id()",
             [],
@@ -1227,6 +1236,7 @@ mod tests {
     fn new_conn() -> rusqlite::Result<CrConn> {
         let mut conn = CrConn::init(Connection::open_in_memory()?)?;
         setup_conn(&conn)?;
+        conn.execute_batch("SELECT crsql_config_set('default-ts', 1)")?;
         let clock = Arc::new(uhlc::HLC::default());
         migrate(clock, &mut conn)?;
         Ok(conn)

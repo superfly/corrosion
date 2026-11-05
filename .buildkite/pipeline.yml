@@ -15,6 +15,30 @@ steps:
     agents:
       queue: "high-concurrency"
 
+  - label: "✅ Test (V2 3,2,2 - V2-only + packed)"
+    priority: 80
+    key: test-v2-3-2-2
+    env:
+      CORRO_METADATA_WRITE_VERSION: "3"
+      CORRO_METADATA_USE_VERSION: "2"
+      CORRO_SYNC_LOG_VERSION: "2"
+    commands:
+      - .buildkite/run-in-docker.sh .buildkite/test.sh
+    agents:
+      queue: "high-concurrency"
+
+  - label: "✅ Test (V2 2,2,2 - dual-write + packed)"
+    priority: 80
+    key: test-v2-2-2-2
+    env:
+      CORRO_METADATA_WRITE_VERSION: "2"
+      CORRO_METADATA_USE_VERSION: "2"
+      CORRO_SYNC_LOG_VERSION: "2"
+    commands:
+      - .buildkite/run-in-docker.sh .buildkite/test.sh
+    agents:
+      queue: "high-concurrency"
+
   - label: "🔨 Build"
     priority: 70
     key: build
@@ -30,4 +54,4 @@ steps:
     key: upload
     commands:
       - .buildkite/upload.sh
-    depends_on: [test, build]
+    depends_on: [test, test-v2-3-2-2, test-v2-2-2-2, build]
