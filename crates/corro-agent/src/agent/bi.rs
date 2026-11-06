@@ -55,6 +55,7 @@ pub fn spawn_bipayload_handler(
             tokio::spawn({
                 let agent = agent.clone();
                 let bookie = bookie.clone();
+                let conn = conn.clone();
                 async move {
                     let mut framed = FramedRead::new(
                         rx,
@@ -101,6 +102,7 @@ pub fn spawn_bipayload_handler(
                                                             cluster_id,
                                                             framed,
                                                             tx,
+                                                            &conn,
                                                         )
                                                         .await
                                                         {
