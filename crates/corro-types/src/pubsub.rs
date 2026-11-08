@@ -487,15 +487,18 @@ impl MatcherHandle {
     ) -> rusqlite::Result<ChangeId> {
         self.wait_for_running_state();
 
-        let mut prepped = conn.prepare_cached("SELECT COALESCE(MIN(id), 0) FROM changes")?;
-        let min_change_id: u64 = prepped.query_row([], |row| row.get(0))?;
+        let mut prepped =
+            conn.prepare_cached("SELECT COALESCE(MIN(id), 0), COALESCE(MAX(id), 0) FROM changes")?;
+        let (min_change_id, max_change_id): (u64, ChangeId) =
+            prepped.query_row([], |row| Ok((row.get(0)?, row.get(1)?)))?;
 
         // return error if we've cleared changes after the received change id
-        if since.0 + 1 < min_change_id {
+        if since.0.saturating_add(1) < min_change_id {
             return Err(rusqlite::Error::ModuleError(format!(
                 "subscription already deleted older changes, min change id: {min_change_id}",
             )));
         }
+        let since = cmp::min(since, max_change_id);
 
         let mut query_cols = vec![];
         for i in 0..(self.parsed_columns().len()) {
@@ -508,8 +511,6 @@ impl MatcherHandle {
 
         let col_count = prepped.column_count();
 
-        let mut max_change_id = since;
-
         let mut rows = prepped.query([since])?;
 
         loop {
@@ -519,9 +520,6 @@ impl MatcherHandle {
             };
 
             let change_id: ChangeId = row.get(0)?;
-            if change_id.0 > max_change_id.0 {
-                max_change_id = change_id;
-            }
 
             if let Err(e) = tx.blocking_send(QueryEvent::Change(
                 row.get(1)?,
@@ -1595,6 +1593,8 @@ impl Matcher {
 
         // start a new tx
         let tx = self.conn.transaction()?;
+        let mut pending_events = Vec::new();
+        let mut last_change_id = None;
 
         // ensure drop and recreate
         tx.execute_batch(&format!(
@@ -1748,18 +1748,15 @@ impl Matcher {
 
                                 trace!("got change id: {change_id}");
 
+                                last_change_id = Some(change_id);
                                 if !skip_send {
-                                    if let Err(e) = self.evt_tx.blocking_send(QueryEvent::Change(
+                                    pending_events.push(QueryEvent::Change(
                                         change_type,
                                         rowid,
                                         cells,
                                         change_id,
-                                    )) {
-                                        warn!("could not send back row to matcher sub sender: {e}");
-                                        return Err(MatcherError::EventReceiverClosed);
-                                    }
+                                    ));
                                 }
-                                _ = self.last_change_tx.send(change_id);
                             }
                             Err(e) => {
                                 error!("could not deserialize row's cells: {e}");
@@ -1785,6 +1782,16 @@ impl Matcher {
         }
 
         tx.commit()?;
+
+        if let Some(change_id) = last_change_id {
+            _ = self.last_change_tx.send(change_id);
+        }
+        for event in pending_events {
+            if let Err(e) = self.evt_tx.blocking_send(event) {
+                warn!("could not send back row to matcher sub sender: {e}");
+                return Err(MatcherError::EventReceiverClosed);
+            }
+        }
 
         trace!("committed!");
 
