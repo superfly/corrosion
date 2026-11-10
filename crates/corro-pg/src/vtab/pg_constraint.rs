@@ -1,8 +1,6 @@
 use std::{marker::PhantomData, os::raw::c_int, sync::Arc};
 
-use rusqlite::vtab::{
-    sqlite3_vtab, sqlite3_vtab_cursor, Filters, IndexInfo, VTab, VTabConnection, VTabCursor,
-};
+use rusqlite::vtab::{sqlite3_vtab, sqlite3_vtab_cursor, Filters, VTabCursor};
 
 /// Entry in the `pg_constraint` catalog.
 pub struct PgConstraintEntry {
@@ -143,63 +141,32 @@ pub struct PgConstraintTable {
     entries: Arc<Vec<PgConstraintEntry>>,
 }
 
-unsafe impl<'vtab> VTab<'vtab> for PgConstraintTable {
-    type Aux = Arc<Vec<PgConstraintEntry>>;
-    type Cursor = PgConstraintTableCursor<'vtab>;
-
-    fn connect(
-        _: &mut VTabConnection,
-        aux: Option<&Arc<Vec<PgConstraintEntry>>>,
-        args: &[&[u8]],
-    ) -> rusqlite::Result<(String, PgConstraintTable)> {
-        let vtab = PgConstraintTable {
-            base: sqlite3_vtab::default(),
-            entries: aux.unwrap().clone(),
-        };
-        let table_name = std::str::from_utf8(args[0]).map_err(rusqlite::Error::Utf8Error)?;
-
-        Ok((
-            format!(
-                "CREATE TABLE {table_name} (
-                    oid            INTEGER,
-                    conname        TEXT,
-                    connamespace   INTEGER,
-                    conrelid       INTEGER,
-                    contype        TEXT,
-                    conindid       INTEGER,
-                    confrelid      INTEGER,
-                    confupdtype    TEXT,
-                    confdeltype    TEXT,
-                    confmatchtype  TEXT,
-                    conislocal     INTEGER,
-                    coninhcount    INTEGER,
-                    connoinherit   INTEGER,
-                    conkey         TEXT,
-                    confkey        TEXT,
-                    conpfeqop      TEXT,
-                    conppeqop      TEXT,
-                    conffeqop      TEXT,
-                    conexclop      TEXT,
-                    conbin         TEXT,
-                    consrc         TEXT
-                )"
-            ),
-            vtab,
-        ))
-    }
-
-    fn best_index(&self, info: &mut IndexInfo) -> rusqlite::Result<()> {
-        info.set_estimated_cost(1.);
-        Ok(())
-    }
-
-    fn open(&'vtab mut self) -> rusqlite::Result<PgConstraintTableCursor<'vtab>> {
-        Ok(PgConstraintTableCursor {
-            entries: self.entries.as_slice(),
-            ..Default::default()
-        })
-    }
-}
+crate::pg_mod!(
+    PgConstraintTable,
+    PgConstraintTableCursor,
+    PgConstraintEntry,
+    "oid            INTEGER,
+conname        TEXT,
+connamespace   INTEGER,
+conrelid       INTEGER,
+contype        TEXT,
+conindid       INTEGER,
+confrelid      INTEGER,
+confupdtype    TEXT,
+confdeltype    TEXT,
+confmatchtype  TEXT,
+conislocal     INTEGER,
+coninhcount    INTEGER,
+connoinherit   INTEGER,
+conkey         TEXT,
+confkey        TEXT,
+conpfeqop      TEXT,
+conppeqop      TEXT,
+conffeqop      TEXT,
+conexclop      TEXT,
+conbin         TEXT,
+consrc         TEXT"
+);
 
 #[derive(Default)]
 #[repr(C)]
@@ -233,19 +200,19 @@ unsafe impl VTabCursor for PgConstraintTableCursor<'_> {
     fn column(&self, ctx: &mut rusqlite::vtab::Context, col: c_int) -> rusqlite::Result<()> {
         if let Some(entry) = self.entries.get(self.row_id as usize) {
             match col {
-                0 => ctx.set_result(&entry.oid),               // oid
+                0 => ctx.set_result(entry.oid),                // oid
                 1 => ctx.set_result(&entry.conname),           // conname
-                2 => ctx.set_result(&entry.connamespace),      // connamespace
-                3 => ctx.set_result(&entry.conrelid),          // conrelid
-                4 => ctx.set_result(&entry.contype),           // contype
-                5 => ctx.set_result(&entry.conindid),          // conindid
-                6 => ctx.set_result(&0i64),                    // confrelid (no FKs)
+                2 => ctx.set_result(entry.connamespace),       // connamespace
+                3 => ctx.set_result(entry.conrelid),           // conrelid
+                4 => ctx.set_result(entry.contype),            // contype
+                5 => ctx.set_result(entry.conindid),           // conindid
+                6 => ctx.set_result(0i64),                     // confrelid (no FKs)
                 7 => ctx.set_result(&Option::<String>::None),  // confupdtype
                 8 => ctx.set_result(&Option::<String>::None),  // confdeltype
                 9 => ctx.set_result(&Option::<String>::None),  // confmatchtype
-                10 => ctx.set_result(&1i64),                   // conislocal
-                11 => ctx.set_result(&0i64),                   // coninhcount
-                12 => ctx.set_result(&1i64),                   // connoinherit
+                10 => ctx.set_result(1i64),                    // conislocal
+                11 => ctx.set_result(0i64),                    // coninhcount
+                12 => ctx.set_result(1i64),                    // connoinherit
                 13 => ctx.set_result(&entry.conkey),           // conkey
                 14 => ctx.set_result(&Option::<String>::None), // confkey
                 15 => ctx.set_result(&Option::<String>::None), // conpfeqop

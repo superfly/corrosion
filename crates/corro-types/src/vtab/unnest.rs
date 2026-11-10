@@ -13,20 +13,20 @@
 //! fn example(db: &Connection) -> Result<()> {
 //!     // Load the unnest module
 //!     db.create_module("unnest", eponymous_only_module::<UnnestTab>(), None)?;
-//!     
+//!
 //!     let arr1 = Rc::new(vec![Value::from(1i64), Value::from(2i64), Value::from(3i64)]);
 //!     let arr2 = Rc::new(vec![
 //!         Value::from(String::from("a")),
 //!         Value::from(String::from("b")),
 //!         Value::from(String::from("c")),
 //!     ]);
-//!     
+//!
 //!     // Query with multiple arrays - like PostgreSQL's unnest(array1, array2)
 //!     let mut stmt = db.prepare("SELECT * FROM unnest(?1, ?2);")?;
 //!     let rows = stmt.query_map([arr1, arr2], |row| {
 //!         Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
 //!     })?;
-//!     
+//!
 //!     for row in rows {
 //!         let (num, text) = row?;
 //!         println!("{}, {}", num, text);
@@ -53,11 +53,11 @@ const ARRAY_TYPE: *const c_char = c"rarray".as_ptr();
 // Maximum number of arrays supported
 const MAX_ARRAYS: usize = 32;
 lazy_static::lazy_static! {
-    static ref UNNEST_SCHEMA: String =
+    static ref UNNEST_SCHEMA: std::ffi::CString = std::ffi::CString::new(
         format!("CREATE TABLE x({}, {})",
             (0..MAX_ARRAYS).map(|i| format!("value{i}")).collect::<Vec<_>>().join(", "),
             (0..MAX_ARRAYS).map(|i| format!("ptr{i} hidden")).collect::<Vec<_>>().join(", ")
-        );
+        )).unwrap();
 }
 
 /// Extension trait to access the private `get_array` method on `Values`
@@ -119,16 +119,19 @@ unsafe impl<'vtab> VTab<'vtab> for UnnestTab {
 
     fn connect(
         _: &mut VTabConnection,
-        _aux: Option<&()>,
+        _aux: Option<&Self::Aux>,
+        _module_name: &[u8],
+        _database_name: &[u8],
+        _table_name: &[u8],
         _args: &[&[u8]],
-    ) -> Result<(String, Self)> {
+    ) -> Result<(std::borrow::Cow<'static, std::ffi::CStr>, Self)> {
         let vtab = Self {
             base: ffi::sqlite3_vtab::default(),
         };
-        Ok((UNNEST_SCHEMA.clone(), vtab))
+        Ok((std::borrow::Cow::Borrowed(&UNNEST_SCHEMA), vtab))
     }
 
-    fn best_index(&self, info: &mut IndexInfo) -> Result<()> {
+    fn best_index(&self, info: &mut IndexInfo) -> Result<bool> {
         let mut array_arguments_count: i32 = 0;
 
         for (constraint, mut constraint_usage) in info.constraints_and_usages() {
@@ -158,13 +161,17 @@ unsafe impl<'vtab> VTab<'vtab> for UnnestTab {
             info.set_estimated_rows(0);
             info.set_idx_num(NO_ARRAYS_INDEX); // FAILURE
         }
-        Ok(())
+        Ok(array_arguments_count > 0)
     }
 
     fn open(&mut self) -> Result<UnnestTabCursor<'_>> {
         Ok(UnnestTabCursor::new())
     }
 }
+
+/// Module for `UnnestTab`
+pub const UNNEST_MODULE: &rusqlite::vtab::Module<UnnestTab> =
+    &rusqlite::vtab::Module::eponymous_only_module();
 
 /// A cursor for the Unnest virtual table
 #[repr(C)]
@@ -270,17 +277,16 @@ unsafe impl VTabCursor for UnnestTabCursor<'_> {
 #[cfg(test)]
 mod test {
     use rusqlite::types::Value;
-    use rusqlite::vtab::eponymous_only_module;
     use rusqlite::Result;
 
-    use crate::vtab::unnest::UnnestTab;
+    use super::UNNEST_MODULE;
     use rusqlite::Connection;
     use std::rc::Rc;
 
     #[test]
     fn test_unnest_single_array() -> Result<()> {
         let db = Connection::open_in_memory()?;
-        db.create_module("unnest", eponymous_only_module::<UnnestTab>(), None)?;
+        db.create_module("unnest", UNNEST_MODULE, None)?;
 
         let v = vec![1i64, 2, 3, 4];
         let values: Vec<Value> = v.into_iter().map(Value::from).collect();
@@ -298,7 +304,7 @@ mod test {
     #[test]
     fn test_unnest_multiple_arrays_same_length() -> Result<()> {
         let db = Connection::open_in_memory()?;
-        db.create_module("unnest", eponymous_only_module::<UnnestTab>(), None)?;
+        db.create_module("unnest", UNNEST_MODULE, None)?;
 
         let arr1 = Rc::new(vec![
             Value::from(1i64),
@@ -332,7 +338,7 @@ mod test {
     #[test]
     fn test_unnest_multiple_arrays_different_lengths() -> Result<()> {
         let db = Connection::open_in_memory()?;
-        db.create_module("unnest", eponymous_only_module::<UnnestTab>(), None)?;
+        db.create_module("unnest", UNNEST_MODULE, None)?;
 
         let arr1 = Rc::new(vec![Value::from(1i64), Value::from(2i64)]);
         let arr2 = Rc::new(vec![
@@ -367,7 +373,7 @@ mod test {
     #[test]
     fn test_unnest_three_arrays() -> Result<()> {
         let db = Connection::open_in_memory()?;
-        db.create_module("unnest", eponymous_only_module::<UnnestTab>(), None)?;
+        db.create_module("unnest", UNNEST_MODULE, None)?;
 
         let arr1 = Rc::new(vec![Value::from(1i64), Value::from(2i64)]);
         let arr2 = Rc::new(vec![
@@ -403,7 +409,7 @@ mod test {
     #[test]
     fn test_unnest_empty_array() -> Result<()> {
         let db = Connection::open_in_memory()?;
-        db.create_module("unnest", eponymous_only_module::<UnnestTab>(), None)?;
+        db.create_module("unnest", UNNEST_MODULE, None)?;
 
         let arr1: Rc<Vec<Value>> = Rc::new(vec![]);
 

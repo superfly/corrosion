@@ -1,8 +1,6 @@
 use std::{marker::PhantomData, os::raw::c_int};
 
-use rusqlite::vtab::{
-    sqlite3_vtab, sqlite3_vtab_cursor, Filters, IndexInfo, VTab, VTabConnection, VTabCursor,
-};
+use rusqlite::vtab::{sqlite3_vtab, sqlite3_vtab_cursor, Filters, VTabCursor};
 
 /// PostgreSQL access method entries.  SQLite only uses btree, so we expose
 /// a single row matching PostgreSQL's built-in btree AM (OID 403).
@@ -13,46 +11,14 @@ pub struct PgAmTable {
     base: sqlite3_vtab,
 }
 
-unsafe impl<'vtab> VTab<'vtab> for PgAmTable {
-    type Aux = ();
-    type Cursor = PgAmTableCursor<'vtab>;
-
-    fn connect(
-        _: &mut VTabConnection,
-        _aux: Option<&()>,
-        args: &[&[u8]],
-    ) -> rusqlite::Result<(String, PgAmTable)> {
-        let vtab = PgAmTable {
-            base: sqlite3_vtab::default(),
-        };
-        let table_name = std::str::from_utf8(args[0]).map_err(rusqlite::Error::Utf8Error)?;
-
-        Ok((
-            format!(
-                "CREATE TABLE {table_name} (
-                    oid        INTEGER,
-                    amname     TEXT,
-                    amhandler  INTEGER,
-                    amtype     TEXT
-                )"
-            ),
-            vtab,
-        ))
-    }
-
-    fn best_index(&self, info: &mut IndexInfo) -> rusqlite::Result<()> {
-        info.set_estimated_cost(1.);
-        Ok(())
-    }
-
-    fn open(&'vtab mut self) -> rusqlite::Result<PgAmTableCursor<'vtab>> {
-        Ok(PgAmTableCursor {
-            base: sqlite3_vtab_cursor::default(),
-            row_id: 0,
-            _phantom: PhantomData,
-        })
-    }
-}
+crate::pg_mod!(
+    PgAmTable,
+    PgAmTableCursor,
+    "oid        INTEGER,
+amname     TEXT,
+amhandler  INTEGER,
+amtype     TEXT"
+);
 
 #[derive(Default)]
 #[repr(C)]
@@ -87,8 +53,8 @@ unsafe impl VTabCursor for PgAmTableCursor<'_> {
             match col {
                 0 => ctx.set_result(oid),
                 1 => ctx.set_result(amname),
-                2 => ctx.set_result(&Option::<i64>::None), // amhandler
-                3 => ctx.set_result(&"i"),                 // amtype: index
+                2 => ctx.set_result(Option::<i64>::None), // amhandler
+                3 => ctx.set_result("i"),                 // amtype: index
                 _ => Err(rusqlite::Error::InvalidColumnIndex(col as usize)),
             }
         } else {

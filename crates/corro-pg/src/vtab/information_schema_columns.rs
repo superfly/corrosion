@@ -1,8 +1,6 @@
 use std::{marker::PhantomData, os::raw::c_int, sync::Arc};
 
-use rusqlite::vtab::{
-    sqlite3_vtab, sqlite3_vtab_cursor, Filters, IndexInfo, VTab, VTabConnection, VTabCursor,
-};
+use rusqlite::vtab::{sqlite3_vtab, sqlite3_vtab_cursor, Filters, VTabCursor};
 
 pub struct InformationSchemaColumn {
     pub(crate) table_name: String,
@@ -205,89 +203,58 @@ pub fn load_information_schema_columns(
 pub struct InformationSchemaColumnsTable {
     /// Base class. Must be first
     base: sqlite3_vtab,
-    columns: Arc<Vec<InformationSchemaColumn>>,
+    entries: Arc<Vec<InformationSchemaColumn>>,
 }
 
-unsafe impl<'vtab> VTab<'vtab> for InformationSchemaColumnsTable {
-    type Aux = Arc<Vec<InformationSchemaColumn>>;
-    type Cursor = InformationSchemaColumnsCursor<'vtab>;
-
-    fn connect(
-        _: &mut VTabConnection,
-        aux: Option<&Arc<Vec<InformationSchemaColumn>>>,
-        args: &[&[u8]],
-    ) -> rusqlite::Result<(String, InformationSchemaColumnsTable)> {
-        let vtab = InformationSchemaColumnsTable {
-            base: sqlite3_vtab::default(),
-            columns: aux.unwrap().clone(),
-        };
-        let table_name = std::str::from_utf8(args[0]).map_err(rusqlite::Error::Utf8Error)?;
-
-        Ok((
-            format!(
-                "CREATE TABLE {table_name} (
-                    table_catalog            TEXT,
-                    table_schema             TEXT,
-                    table_name               TEXT,
-                    column_name              TEXT,
-                    ordinal_position         INTEGER,
-                    column_default           TEXT,
-                    is_nullable              TEXT,
-                    data_type                TEXT,
-                    character_maximum_length INTEGER,
-                    character_octet_length   INTEGER,
-                    numeric_precision        INTEGER,
-                    numeric_precision_radix  INTEGER,
-                    numeric_scale            INTEGER,
-                    datetime_precision       INTEGER,
-                    interval_type            TEXT,
-                    interval_precision       INTEGER,
-                    character_set_catalog    TEXT,
-                    character_set_schema     TEXT,
-                    character_set_name       TEXT,
-                    collation_catalog        TEXT,
-                    collation_schema         TEXT,
-                    collation_name           TEXT,
-                    domain_catalog           TEXT,
-                    domain_schema            TEXT,
-                    domain_name              TEXT,
-                    udt_catalog              TEXT,
-                    udt_schema               TEXT,
-                    udt_name                 TEXT,
-                    scope_catalog            TEXT,
-                    scope_schema             TEXT,
-                    scope_name               TEXT,
-                    maximum_cardinality      INTEGER,
-                    dtd_identifier           TEXT,
-                    is_self_referencing      TEXT,
-                    is_identity              TEXT,
-                    identity_generation      TEXT,
-                    identity_start           TEXT,
-                    identity_increment       TEXT,
-                    identity_maximum         TEXT,
-                    identity_minimum         TEXT,
-                    identity_cycle           TEXT,
-                    is_generated             TEXT,
-                    generation_expression    TEXT,
-                    is_updatable             TEXT
-                )"
-            ),
-            vtab,
-        ))
-    }
-
-    fn best_index(&self, info: &mut IndexInfo) -> rusqlite::Result<()> {
-        info.set_estimated_cost(1.);
-        Ok(())
-    }
-
-    fn open(&'vtab mut self) -> rusqlite::Result<InformationSchemaColumnsCursor<'vtab>> {
-        Ok(InformationSchemaColumnsCursor {
-            columns: self.columns.as_slice(),
-            ..Default::default()
-        })
-    }
-}
+crate::pg_mod!(
+    InformationSchemaColumnsTable,
+    InformationSchemaColumnsCursor,
+    InformationSchemaColumn,
+    "table_catalog            TEXT,
+    table_schema             TEXT,
+    table_name               TEXT,
+    column_name              TEXT,
+    ordinal_position         INTEGER,
+    column_default           TEXT,
+    is_nullable              TEXT,
+    data_type                TEXT,
+    character_maximum_length INTEGER,
+    character_octet_length   INTEGER,
+    numeric_precision        INTEGER,
+    numeric_precision_radix  INTEGER,
+    numeric_scale            INTEGER,
+    datetime_precision       INTEGER,
+    interval_type            TEXT,
+    interval_precision       INTEGER,
+    character_set_catalog    TEXT,
+    character_set_schema     TEXT,
+    character_set_name       TEXT,
+    collation_catalog        TEXT,
+    collation_schema         TEXT,
+    collation_name           TEXT,
+    domain_catalog           TEXT,
+    domain_schema            TEXT,
+    domain_name              TEXT,
+    udt_catalog              TEXT,
+    udt_schema               TEXT,
+    udt_name                 TEXT,
+    scope_catalog            TEXT,
+    scope_schema             TEXT,
+    scope_name               TEXT,
+    maximum_cardinality      INTEGER,
+    dtd_identifier           TEXT,
+    is_self_referencing      TEXT,
+    is_identity              TEXT,
+    identity_generation      TEXT,
+    identity_start           TEXT,
+    identity_increment       TEXT,
+    identity_maximum         TEXT,
+    identity_minimum         TEXT,
+    identity_cycle           TEXT,
+    is_generated             TEXT,
+    generation_expression    TEXT,
+    is_updatable             TEXT"
+);
 
 #[derive(Default)]
 #[repr(C)]
@@ -295,7 +262,7 @@ pub struct InformationSchemaColumnsCursor<'vtab> {
     /// Base class. Must be first
     base: sqlite3_vtab_cursor,
     row_id: i64,
-    columns: &'vtab [InformationSchemaColumn],
+    entries: &'vtab [InformationSchemaColumn],
     phantom: PhantomData<&'vtab InformationSchemaColumnsTable>,
 }
 
@@ -316,39 +283,39 @@ unsafe impl VTabCursor for InformationSchemaColumnsCursor<'_> {
     }
 
     fn eof(&self) -> bool {
-        self.row_id >= self.columns.len() as i64
+        self.row_id >= self.entries.len() as i64
     }
 
     fn column(&self, ctx: &mut rusqlite::vtab::Context, col: c_int) -> rusqlite::Result<()> {
-        if let Some(column) = self.columns.get(self.row_id as usize) {
+        if let Some(column) = self.entries.get(self.row_id as usize) {
             match col {
-                0 => ctx.set_result(&"state"),
-                1 => ctx.set_result(&"main"),
+                0 => ctx.set_result("state"),
+                1 => ctx.set_result("main"),
                 2 => ctx.set_result(&column.table_name),
                 3 => ctx.set_result(&column.column_name),
-                4 => ctx.set_result(&column.ordinal_position),
+                4 => ctx.set_result(column.ordinal_position),
                 5 => ctx.set_result(&column.column_default),
-                6 => ctx.set_result(&if column.nullable { "YES" } else { "NO" }),
+                6 => ctx.set_result(if column.nullable { "YES" } else { "NO" }),
                 7 => ctx.set_result(&column.data_type),
-                8 => ctx.set_result(&column.character_maximum_length),
-                9 => ctx.set_result(&column.character_octet_length),
-                10 => ctx.set_result(&column.numeric_precision),
-                11 => ctx.set_result(&column.numeric_precision_radix),
-                12 => ctx.set_result(&column.numeric_scale),
-                13 => ctx.set_result(&column.datetime_precision),
+                8 => ctx.set_result(column.character_maximum_length),
+                9 => ctx.set_result(column.character_octet_length),
+                10 => ctx.set_result(column.numeric_precision),
+                11 => ctx.set_result(column.numeric_precision_radix),
+                12 => ctx.set_result(column.numeric_scale),
+                13 => ctx.set_result(column.datetime_precision),
                 14 => ctx.set_result(&Option::<String>::None),
-                15 => ctx.set_result(&Option::<i64>::None),
+                15 => ctx.set_result(Option::<i64>::None),
                 16..=24 | 28..=30 => ctx.set_result(&Option::<String>::None),
-                25 => ctx.set_result(&"state"),
-                26 => ctx.set_result(&"pg_catalog"),
+                25 => ctx.set_result("state"),
+                26 => ctx.set_result("pg_catalog"),
                 27 => ctx.set_result(&column.udt_name),
-                31 => ctx.set_result(&Option::<i64>::None),
+                31 => ctx.set_result(Option::<i64>::None),
                 32 => ctx.set_result(&column.dtd_identifier),
-                33 | 34 => ctx.set_result(&"NO"),
+                33 | 34 => ctx.set_result("NO"),
                 35..=40 => ctx.set_result(&Option::<String>::None),
-                41 => ctx.set_result(&if column.generated { "ALWAYS" } else { "NEVER" }),
+                41 => ctx.set_result(if column.generated { "ALWAYS" } else { "NEVER" }),
                 42 => ctx.set_result(&Option::<String>::None),
-                43 => ctx.set_result(&"YES"),
+                43 => ctx.set_result("YES"),
                 _ => Err(rusqlite::Error::InvalidColumnIndex(col as usize)),
             }
         } else {

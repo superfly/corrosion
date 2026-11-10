@@ -17,7 +17,6 @@ use rangemap::RangeInclusiveSet;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use sqlite_pool::SqliteConn;
 use tokio::{
     runtime::Handle,
     sync::{oneshot, Semaphore},
@@ -772,17 +771,17 @@ impl SplitPool {
 
     #[tracing::instrument(skip(self), level = "debug")]
     pub fn dedicated(&self) -> rusqlite::Result<Connection> {
-        let conn = rusqlite::Connection::open(&self.0.path)?;
+        let mut conn = rusqlite::Connection::open(&self.0.path)?;
         setup_conn(&conn)?;
-        trace_heavy_queries(&conn)?;
+        trace_heavy_queries(&mut conn)?;
         Ok(conn)
     }
 
     #[tracing::instrument(skip(self), level = "debug")]
     pub fn client_dedicated(&self) -> rusqlite::Result<CrConn> {
         let conn = rusqlite::Connection::open(&self.0.path)?;
-        let cr_conn = rusqlite_to_crsqlite_write(conn, self.0.cache_size_kib)?;
-        trace_heavy_queries(cr_conn.conn())?;
+        let mut cr_conn = rusqlite_to_crsqlite_write(conn, self.0.cache_size_kib)?;
+        trace_heavy_queries(&mut cr_conn)?;
         Ok(cr_conn)
     }
 
@@ -792,8 +791,8 @@ impl SplitPool {
             &self.0.path,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
-        let cr_conn = rusqlite_to_crsqlite(conn)?;
-        trace_heavy_queries(cr_conn.conn())?;
+        let mut cr_conn = rusqlite_to_crsqlite(conn)?;
+        trace_heavy_queries(&mut cr_conn)?;
         Ok(cr_conn)
     }
 

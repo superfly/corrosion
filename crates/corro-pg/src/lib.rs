@@ -56,7 +56,6 @@ use rusqlite::{
     ffi::SQLITE_CONSTRAINT_UNIQUE,
     functions::{Aggregate, Context as SqliteCtx, FunctionFlags},
     types::ValueRef,
-    vtab::eponymous_only_module,
     Connection, Statement,
 };
 use rustls::ServerConfig;
@@ -117,6 +116,86 @@ use crate::{
         pg_type::PgTypeTable,
     },
 };
+
+#[doc(hidden)]
+#[macro_export]
+macro_rules! pg_mod {
+    ($module:ty, $cursor:ident, $aux:ty, $table:literal) => {
+        unsafe impl<'vtab> rusqlite::vtab::VTab<'vtab> for $module {
+            type Aux = std::sync::Arc<Vec<$aux>>;
+            type Cursor = $cursor<'vtab>;
+
+            fn connect(
+                _: &mut rusqlite::vtab::VTabConnection,
+                aux: Option<&Self::Aux>,
+                _module_name: &[u8],
+                _database_name: &[u8],
+                table_name: &[u8],
+                _args: &[&[u8]],
+            ) -> rusqlite::Result<(std::borrow::Cow<'static, std::ffi::CStr>, Self)> {
+                let vtab = Self {
+                    base: sqlite3_vtab::default(),
+                    entries: aux.unwrap().clone(),
+                };
+
+                let table_name = std::str::from_utf8(table_name)?;
+                let table =
+                    std::ffi::CString::new(format!("CREATE TABLE {table_name} (\n{}\n)", $table))
+                        .unwrap();
+
+                Ok((table.into(), vtab))
+            }
+
+            fn best_index(&self, info: &mut rusqlite::vtab::IndexInfo) -> rusqlite::Result<bool> {
+                info.set_estimated_cost(1.);
+                Ok(true)
+            }
+
+            fn open(&'vtab mut self) -> rusqlite::Result<Self::Cursor> {
+                Ok($cursor {
+                    entries: self.entries.as_slice(),
+                    ..Default::default()
+                })
+            }
+        }
+    };
+
+    ($module:ty, $cursor:ident, $table:literal) => {
+        unsafe impl<'vtab> rusqlite::vtab::VTab<'vtab> for $module {
+            type Aux = ();
+            type Cursor = $cursor<'vtab>;
+
+            fn connect(
+                _: &mut rusqlite::vtab::VTabConnection,
+                _aux: Option<&Self::Aux>,
+                _module_name: &[u8],
+                _database_name: &[u8],
+                table_name: &[u8],
+                _args: &[&[u8]],
+            ) -> rusqlite::Result<(std::borrow::Cow<'static, std::ffi::CStr>, Self)> {
+                let vtab = Self {
+                    base: sqlite3_vtab::default(),
+                };
+
+                let table_name = std::str::from_utf8(table_name)?;
+                let table =
+                    std::ffi::CString::new(format!("CREATE TABLE {table_name} (\n{}\n)", $table))
+                        .unwrap();
+
+                Ok((table.into(), vtab))
+            }
+
+            fn best_index(&self, info: &mut rusqlite::vtab::IndexInfo) -> rusqlite::Result<bool> {
+                info.set_estimated_cost(1.);
+                Ok(true)
+            }
+
+            fn open(&'vtab mut self) -> rusqlite::Result<Self::Cursor> {
+                Ok($cursor::default())
+            }
+        }
+    };
+}
 
 type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
@@ -2013,66 +2092,85 @@ pub async fn start(
                         let triggers = Arc::new(load_information_schema_triggers(&conn)?);
                         let table_names = Arc::new(table_names);
 
+                        use rusqlite::vtab::Module;
+
+                        const PG_DB: &Module<PgDatabaseTable> = &Module::eponymous_only_module();
+                        const PG_TYPE: &Module<PgTypeTable> = &Module::eponymous_only_module();
+                        const PG_RANGE: &Module<PgRangeTable> = &Module::eponymous_only_module();
+                        const PG_NAMESPACE: &Module<PgNamespaceTable> = &Module::eponymous_only_module();
+                        const PG_CLASS: &Module<PgClassTable> = &Module::eponymous_only_module();
+                        const PG_ATTRIBUTE: &Module<PgAttributeTable> = &Module::eponymous_only_module();
+                        const INFO_TABLES: &Module<InformationSchemaTablesTable> = &Module::eponymous_only_module();
+                        const INFO_COLUMNS: &Module<InformationSchemaColumnsTable> = &Module::eponymous_only_module();
+                        const INFO_CONSTRAINTS: &Module<InformationSchemaTableConstraintsTable> = &Module::eponymous_only_module();
+                        const INFO_USAGE: &Module<InformationSchemaKeyColumnUsageTable> = &Module::eponymous_only_module();
+                        const INFO_TRIGGERS: &Module<InformationSchemaTriggersTable> = &Module::eponymous_only_module();
+                        const PG_INDEX: &Module<PgIndexTable> = &Module::eponymous_only_module();
+                        const PG_CONSTRAINT: &Module<PgConstraintTable> = &Module::eponymous_only_module();
+                        const PG_AM: &Module<PgAmTable> = &Module::eponymous_only_module();
+                        const PG_PROC: &Module<PgProcTable> = &Module::eponymous_only_module();
+                        const PG_LANGUAGE: &Module<PgLanguageTable> = &Module::eponymous_only_module();
+
                         conn.create_module(
                             "pg_database",
-                            eponymous_only_module::<PgDatabaseTable>(),
+                            PG_DB,
                             Some(dbs),
                         )?;
                         conn.create_module(
                             "pg_type",
-                            eponymous_only_module::<PgTypeTable>(),
+                            PG_TYPE,
                             None,
                         )?;
                         conn.create_module(
                             "pg_range",
-                            eponymous_only_module::<PgRangeTable>(),
+                            PG_RANGE,
                             None,
                         )?;
                         conn.create_module(
                             "pg_namespace",
-                            eponymous_only_module::<PgNamespaceTable>(),
+                            PG_NAMESPACE,
                             None,
                         )?;
                         conn.create_module(
                             "pg_class",
-                            eponymous_only_module::<PgClassTable>(),
+                            PG_CLASS,
                             Some(pg_class_entries),
                         )?;
                         conn.create_module(
                             "pg_attribute",
-                            eponymous_only_module::<PgAttributeTable>(),
+                            PG_ATTRIBUTE,
                             Some(pg_attributes),
                         )?;
                         conn.create_module(
                             "tables",
-                            eponymous_only_module::<InformationSchemaTablesTable>(),
+                            INFO_TABLES,
                             Some(table_names.clone()),
                         )?;
                         conn.create_module(
                             "columns",
-                            eponymous_only_module::<InformationSchemaColumnsTable>(),
+                            INFO_COLUMNS,
                             Some(columns),
                         )?;
                         conn.create_module(
                             "table_constraints",
-                            eponymous_only_module::<InformationSchemaTableConstraintsTable>(),
+                            INFO_CONSTRAINTS,
                             Some(table_constraints),
                         )?;
                         conn.create_module(
                             "key_column_usage",
-                            eponymous_only_module::<InformationSchemaKeyColumnUsageTable>(),
+                            INFO_USAGE,
                             Some(key_column_usage),
                         )?;
                         conn.create_module(
                             "triggers",
-                            eponymous_only_module::<InformationSchemaTriggersTable>(),
+                            INFO_TRIGGERS,
                             Some(triggers),
                         )?;
 
                         // pg_index — populated from sqlite_master indexes.
                         conn.create_module(
                             "pg_index",
-                            eponymous_only_module::<PgIndexTable>(),
+                            PG_INDEX,
                             Some(pg_index_entries),
                         )?;
 
@@ -2085,7 +2183,7 @@ pub async fn start(
                         )?);
                         conn.create_module(
                             "pg_constraint",
-                            eponymous_only_module::<PgConstraintTable>(),
+                            PG_CONSTRAINT,
                             Some(pg_constraint_entries.clone()),
                         )?;
 
@@ -2122,84 +2220,86 @@ pub async fn start(
                         // pg_am — SQLite only uses btree (OID 403).
                         conn.create_module(
                             "pg_am",
-                            eponymous_only_module::<PgAmTable>(),
+                            PG_AM,
                             None,
                         )?;
                         // pg_proc — populated from pragma_function_list().
                         let pg_proc_entries = Arc::new(load_pg_proc_entries(&conn)?);
                         conn.create_module(
                             "pg_proc",
-                            eponymous_only_module::<PgProcTable>(),
+                            PG_PROC,
                             Some(pg_proc_entries),
                         )?;
                         // pg_language — static list of languages (internal, c, sql).
                         let pg_language_entries = Arc::new(load_pg_language_entries());
                         conn.create_module(
                             "pg_language",
-                            eponymous_only_module::<PgLanguageTable>(),
+                            PG_LANGUAGE,
                             Some(pg_language_entries),
                         )?;
                         // Empty catalog tables that are referenced in JOINs
                         // but not yet populated.  Returning empty lets tools
                         // degrade gracefully.
+                        const EMPTY: &Module<EmptyCatalogTable> = &Module::eponymous_only_module();
+
                         conn.create_module(
                             "pg_extension",
-                            eponymous_only_module::<EmptyCatalogTable>(),
+                            EMPTY,
                             Some(PG_EXTENSION_DDL),
                         )?;
                         conn.create_module(
                             "pg_statio_user_tables",
-                            eponymous_only_module::<EmptyCatalogTable>(),
+                            EMPTY,
                             Some(PG_STATIO_USER_TABLES_DDL),
                         )?;
                         conn.create_module(
                             "pg_description",
-                            eponymous_only_module::<EmptyCatalogTable>(),
+                            EMPTY,
                             Some(PG_DESCRIPTION_DDL),
                         )?;
                         conn.create_module(
                             "pg_shdescription",
-                            eponymous_only_module::<EmptyCatalogTable>(),
+                            EMPTY,
                             Some(PG_SHDESCRIPTION_DDL),
                         )?;
                         conn.create_module(
                             "pg_attrdef",
-                            eponymous_only_module::<EmptyCatalogTable>(),
+                            EMPTY,
                             Some(PG_ATTRDEF_DDL),
                         )?;
                         conn.create_module(
                             "pg_trigger",
-                            eponymous_only_module::<EmptyCatalogTable>(),
+                            EMPTY,
                             Some(PG_TRIGGER_DDL),
                         )?;
                         conn.create_module(
                             "pg_depend",
-                            eponymous_only_module::<EmptyCatalogTable>(),
+                            EMPTY,
                             Some(PG_DEPEND_DDL),
                         )?;
                         conn.create_module(
                             "pg_inherits",
-                            eponymous_only_module::<EmptyCatalogTable>(),
+                            EMPTY,
                             Some(PG_INHERITS_DDL),
                         )?;
                         conn.create_module(
                             "pg_available_extensions",
-                            eponymous_only_module::<EmptyCatalogTable>(),
+                            EMPTY,
                             Some(PG_AVAILABLE_EXTENSIONS_DDL),
                         )?;
                         conn.create_module(
                             "pg_conversion",
-                            eponymous_only_module::<EmptyCatalogTable>(),
+                            EMPTY,
                             Some(PG_CONVERSION_DDL),
                         )?;
                         conn.create_module(
                             "pg_opclass",
-                            eponymous_only_module::<EmptyCatalogTable>(),
+                            EMPTY,
                             Some(PG_OPCLASS_DDL),
                         )?;
                         conn.create_module(
                             "pg_opfamily",
-                            eponymous_only_module::<EmptyCatalogTable>(),
+                            EMPTY,
                             Some(PG_OPFAMILY_DDL),
                         )?;
 
@@ -5653,7 +5753,7 @@ fn field_types(
     }
 
     let mut fields = vec![];
-    for (i, col) in prepped.columns().iter().enumerate() {
+    for (i, col) in prepped.columns().enumerate() {
         let col_name = col.name();
         let col_type = match field_type_overrides.remove(col_name) {
             Some(t) => t,

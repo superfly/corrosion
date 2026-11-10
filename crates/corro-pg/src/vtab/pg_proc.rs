@@ -1,8 +1,6 @@
 use std::{marker::PhantomData, os::raw::c_int, sync::Arc};
 
-use rusqlite::vtab::{
-    sqlite3_vtab, sqlite3_vtab_cursor, Filters, IndexInfo, VTab, VTabConnection, VTabCursor,
-};
+use rusqlite::vtab::{sqlite3_vtab, sqlite3_vtab_cursor, Filters, VTabCursor};
 
 /// Entry in the `pg_proc` catalog representing a function.
 pub struct PgProcEntry {
@@ -92,68 +90,37 @@ pub struct PgProcTable {
     entries: Arc<Vec<PgProcEntry>>,
 }
 
-unsafe impl<'vtab> VTab<'vtab> for PgProcTable {
-    type Aux = Arc<Vec<PgProcEntry>>;
-    type Cursor = PgProcCursor<'vtab>;
-
-    fn connect(
-        _: &mut VTabConnection,
-        aux: Option<&Arc<Vec<PgProcEntry>>>,
-        args: &[&[u8]],
-    ) -> rusqlite::Result<(String, PgProcTable)> {
-        let vtab = PgProcTable {
-            base: sqlite3_vtab::default(),
-            entries: aux.unwrap().clone(),
-        };
-        let table_name = std::str::from_utf8(args[0]).map_err(rusqlite::Error::Utf8Error)?;
-
-        Ok((
-            format!(
-                "CREATE TABLE {table_name} (
-                    oid              INTEGER,
-                    proname          TEXT,
-                    pronamespace     INTEGER,
-                    proowner         INTEGER,
-                    prolang          INTEGER,
-                    procost          REAL,
-                    prorows          REAL,
-                    provariadic      INTEGER,
-                    prosupport       INTEGER,
-                    prokind          TEXT,
-                    prosecdef        INTEGER,
-                    proleakproof     INTEGER,
-                    proisstrict      INTEGER,
-                    proretset        INTEGER,
-                    provolatile      TEXT,
-                    proparallel      TEXT,
-                    proisagg         INTEGER,
-                    proiswindow      INTEGER,
-                    pronargs         INTEGER,
-                    prorettype       INTEGER,
-                    proargtypes      TEXT,
-                    proallargtypes   TEXT,
-                    proargmodes      TEXT,
-                    proargnames      TEXT,
-                    prosrc           TEXT,
-                    proconfig        TEXT
-                )"
-            ),
-            vtab,
-        ))
-    }
-
-    fn best_index(&self, info: &mut IndexInfo) -> rusqlite::Result<()> {
-        info.set_estimated_cost(1.);
-        Ok(())
-    }
-
-    fn open(&'vtab mut self) -> rusqlite::Result<PgProcCursor<'vtab>> {
-        Ok(PgProcCursor {
-            entries: self.entries.as_slice(),
-            ..Default::default()
-        })
-    }
-}
+crate::pg_mod!(
+    PgProcTable,
+    PgProcCursor,
+    PgProcEntry,
+    "oid              INTEGER,
+proname          TEXT,
+pronamespace     INTEGER,
+proowner         INTEGER,
+prolang          INTEGER,
+procost          REAL,
+prorows          REAL,
+provariadic      INTEGER,
+prosupport       INTEGER,
+prokind          TEXT,
+prosecdef        INTEGER,
+proleakproof     INTEGER,
+proisstrict      INTEGER,
+proretset        INTEGER,
+provolatile      TEXT,
+proparallel      TEXT,
+proisagg         INTEGER,
+proiswindow      INTEGER,
+pronargs         INTEGER,
+prorettype       INTEGER,
+proargtypes      TEXT,
+proallargtypes   TEXT,
+proargmodes      TEXT,
+proargnames      TEXT,
+prosrc           TEXT,
+proconfig        TEXT"
+);
 
 #[derive(Default)]
 #[repr(C)]
@@ -187,32 +154,32 @@ unsafe impl VTabCursor for PgProcCursor<'_> {
     fn column(&self, ctx: &mut rusqlite::vtab::Context, col: c_int) -> rusqlite::Result<()> {
         if let Some(entry) = self.entries.get(self.row_id as usize) {
             match col {
-                0 => ctx.set_result(&entry.oid),                 // oid
-                1 => ctx.set_result(&entry.proname),             // proname
-                2 => ctx.set_result(&entry.pronamespace),        // pronamespace
-                3 => ctx.set_result(&10i64),                     // proowner (postgres)
-                4 => ctx.set_result(&entry.prolang),             // prolang
-                5 => ctx.set_result(&entry.procost),             // procost
-                6 => ctx.set_result(&0i64),                      // prorows
-                7 => ctx.set_result(&0i64),                      // provariadic
-                8 => ctx.set_result(&0i64),                      // prosupport
-                9 => ctx.set_result(&entry.prokind.to_string()), // prokind
-                10 => ctx.set_result(&0i64),                     // prosecdef
-                11 => ctx.set_result(&0i64),                     // proleakproof
-                12 => ctx.set_result(&1i64),                     // proisstrict
-                13 => ctx.set_result(&if entry.proretset { 1i64 } else { 0i64 }), // proretset
-                14 => ctx.set_result(&entry.provolatile.to_string()), // provolatile
-                15 => ctx.set_result(&"s"),                      // proparallel: safe
-                16 => ctx.set_result(&if entry.proisagg { 1i64 } else { 0i64 }), // proisagg
-                17 => ctx.set_result(&if entry.proiswindow { 1i64 } else { 0i64 }), // proiswindow
-                18 => ctx.set_result(&entry.pronargs),           // pronargs
-                19 => ctx.set_result(&entry.prorettype),         // prorettype
-                20 => ctx.set_result(&entry.proargtypes),        // proargtypes
-                21 => ctx.set_result(&entry.proallargtypes),     // proallargtypes
-                22 => ctx.set_result(&entry.proargmodes),        // proargmodes
-                23 => ctx.set_result(&entry.proargnames),        // proargnames
-                24 => ctx.set_result(&entry.prosrc),             // prosrc
-                25 => ctx.set_result(&Option::<String>::None),   // proconfig
+                0 => ctx.set_result(entry.oid),                 // oid
+                1 => ctx.set_result(&entry.proname),            // proname
+                2 => ctx.set_result(entry.pronamespace),        // pronamespace
+                3 => ctx.set_result(10i64),                     // proowner (postgres)
+                4 => ctx.set_result(entry.prolang),             // prolang
+                5 => ctx.set_result(entry.procost),             // procost
+                6 => ctx.set_result(0i64),                      // prorows
+                7 => ctx.set_result(0i64),                      // provariadic
+                8 => ctx.set_result(0i64),                      // prosupport
+                9 => ctx.set_result(entry.prokind.to_string()), // prokind
+                10 => ctx.set_result(0i64),                     // prosecdef
+                11 => ctx.set_result(0i64),                     // proleakproof
+                12 => ctx.set_result(1i64),                     // proisstrict
+                13 => ctx.set_result(if entry.proretset { 1i64 } else { 0i64 }), // proretset
+                14 => ctx.set_result(entry.provolatile.to_string()), // provolatile
+                15 => ctx.set_result("s"),                      // proparallel: safe
+                16 => ctx.set_result(if entry.proisagg { 1i64 } else { 0i64 }), // proisagg
+                17 => ctx.set_result(if entry.proiswindow { 1i64 } else { 0i64 }), // proiswindow
+                18 => ctx.set_result(entry.pronargs),           // pronargs
+                19 => ctx.set_result(entry.prorettype),         // prorettype
+                20 => ctx.set_result(&entry.proargtypes),       // proargtypes
+                21 => ctx.set_result(&entry.proallargtypes),    // proallargtypes
+                22 => ctx.set_result(&entry.proargmodes),       // proargmodes
+                23 => ctx.set_result(&entry.proargnames),       // proargnames
+                24 => ctx.set_result(&entry.prosrc),            // prosrc
+                25 => ctx.set_result(&Option::<String>::None),  // proconfig
                 _ => Err(rusqlite::Error::InvalidColumnIndex(col as usize)),
             }
         } else {

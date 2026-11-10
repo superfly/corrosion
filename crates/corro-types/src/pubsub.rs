@@ -660,13 +660,12 @@ impl Matcher {
             state_conn
                 .prepare(sql)?
                 .column_names()
-                .into_iter()
                 .map(|s| ColumnName(s.to_compact_string()))
                 .collect()
         };
 
-        let conn = Connection::open(&sub_db_path)?;
-        trace_heavy_queries_subs(&conn)?;
+        let mut conn = Connection::open(&sub_db_path)?;
+        trace_heavy_queries_subs(&mut conn)?;
         conn.execute_batch(
             r#"
                 PRAGMA journal_mode = WAL;
@@ -2981,7 +2980,6 @@ mod tests {
                 let mut prepped = conn.prepare("SELECT * FROM changes").unwrap();
                 let cols = prepped
                     .column_names()
-                    .iter()
                     .map(|s| s.to_string())
                     .collect::<Vec<_>>();
                 let mut rows = prepped.query([]).unwrap();

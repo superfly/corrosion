@@ -1,8 +1,6 @@
 use std::{marker::PhantomData, os::raw::c_int, sync::Arc};
 
-use rusqlite::vtab::{
-    sqlite3_vtab, sqlite3_vtab_cursor, Filters, IndexInfo, VTab, VTabConnection, VTabCursor,
-};
+use rusqlite::vtab::{sqlite3_vtab, sqlite3_vtab_cursor, Filters, VTabCursor};
 
 use super::information_schema_columns::InformationSchemaColumn;
 
@@ -36,51 +34,20 @@ pub struct InformationSchemaKeyColumnUsageTable {
     entries: Arc<Vec<InformationSchemaKeyColumnUsageEntry>>,
 }
 
-unsafe impl<'vtab> VTab<'vtab> for InformationSchemaKeyColumnUsageTable {
-    type Aux = Arc<Vec<InformationSchemaKeyColumnUsageEntry>>;
-    type Cursor = InformationSchemaKeyColumnUsageCursor<'vtab>;
-
-    fn connect(
-        _: &mut VTabConnection,
-        aux: Option<&Arc<Vec<InformationSchemaKeyColumnUsageEntry>>>,
-        args: &[&[u8]],
-    ) -> rusqlite::Result<(String, InformationSchemaKeyColumnUsageTable)> {
-        let vtab = InformationSchemaKeyColumnUsageTable {
-            base: sqlite3_vtab::default(),
-            entries: aux.unwrap().clone(),
-        };
-        let table_name = std::str::from_utf8(args[0]).map_err(rusqlite::Error::Utf8Error)?;
-
-        Ok((
-            format!(
-                "CREATE TABLE {table_name} (
-                    constraint_catalog              TEXT,
-                    constraint_schema               TEXT,
-                    constraint_name                 TEXT,
-                    table_catalog                   TEXT,
-                    table_schema                    TEXT,
-                    table_name                      TEXT,
-                    column_name                     TEXT,
-                    ordinal_position                INTEGER,
-                    position_in_unique_constraint   INTEGER
-                )"
-            ),
-            vtab,
-        ))
-    }
-
-    fn best_index(&self, info: &mut IndexInfo) -> rusqlite::Result<()> {
-        info.set_estimated_cost(1.);
-        Ok(())
-    }
-
-    fn open(&'vtab mut self) -> rusqlite::Result<InformationSchemaKeyColumnUsageCursor<'vtab>> {
-        Ok(InformationSchemaKeyColumnUsageCursor {
-            entries: self.entries.as_slice(),
-            ..Default::default()
-        })
-    }
-}
+crate::pg_mod!(
+    InformationSchemaKeyColumnUsageTable,
+    InformationSchemaKeyColumnUsageCursor,
+    InformationSchemaKeyColumnUsageEntry,
+    "constraint_catalog              TEXT,
+    constraint_schema               TEXT,
+    constraint_name                 TEXT,
+    table_catalog                   TEXT,
+    table_schema                    TEXT,
+    table_name                      TEXT,
+    column_name                     TEXT,
+    ordinal_position                INTEGER,
+    position_in_unique_constraint   INTEGER"
+);
 
 #[derive(Default)]
 #[repr(C)]
@@ -114,13 +81,13 @@ unsafe impl VTabCursor for InformationSchemaKeyColumnUsageCursor<'_> {
     fn column(&self, ctx: &mut rusqlite::vtab::Context, col: c_int) -> rusqlite::Result<()> {
         if let Some(entry) = self.entries.get(self.row_id as usize) {
             match col {
-                0 | 3 => ctx.set_result(&"state"),
-                1 | 4 => ctx.set_result(&"main"),
+                0 | 3 => ctx.set_result("state"),
+                1 | 4 => ctx.set_result("main"),
                 2 => ctx.set_result(&entry.constraint_name),
                 5 => ctx.set_result(&entry.table_name),
                 6 => ctx.set_result(&entry.column_name),
-                7 => ctx.set_result(&entry.ordinal_position),
-                8 => ctx.set_result(&Option::<i64>::None), // position_in_unique_constraint (null for PK)
+                7 => ctx.set_result(entry.ordinal_position),
+                8 => ctx.set_result(Option::<i64>::None), // position_in_unique_constraint (null for PK)
                 _ => Err(rusqlite::Error::InvalidColumnIndex(col as usize)),
             }
         } else {

@@ -336,7 +336,6 @@ async fn build_query_rows_response(
             if let Err(e) = data_tx.blocking_send(QueryEvent::Columns(
                 prepped
                     .columns()
-                    .into_iter()
                     .map(|col| ColumnName(col.name().to_compact_string()))
                     .collect(),
             )) {
