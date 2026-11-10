@@ -326,6 +326,10 @@ where
 
         let io_err = match ready!(self.as_mut().poll_stream(cx)) {
             Some(Err(SubscriptionError::Io(io_err))) => io_err,
+            None if !self.observed_eoq => {
+                return Poll::Ready(Some(Err(SubscriptionError::UnfinishedQuery)));
+            }
+            None => io::Error::new(io::ErrorKind::UnexpectedEof, "subscription body ended"),
             other => {
                 self.backoff_count = 0;
                 return Poll::Ready(other);
@@ -605,5 +609,48 @@ impl Decoder for LinesBytesCodec {
 fn without_carriage_return(s: &mut BytesMut) {
     if let Some(&b'\r') = s.last() {
         s.truncate(s.len() - 1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn empty_subscription(change_id: Option<ChangeId>) -> SubscriptionStream<serde_json::Value> {
+        SubscriptionStream::new(
+            Uuid::new_v4(),
+            None,
+            reqwest::Client::new(),
+            "127.0.0.1:1".parse().unwrap(),
+            reqwest::Body::from(""),
+            change_id,
+        )
+    }
+
+    #[tokio::test]
+    async fn subscription_clean_eof_reconnects() {
+        for change_id in [Some(ChangeId(7)), None] {
+            let mut subscription = empty_subscription(change_id);
+            subscription.observed_eoq = true;
+            let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+
+            assert!(Pin::new(&mut subscription).poll_next(&mut cx).is_pending());
+            assert!(subscription.stream.is_none());
+            assert!(subscription.backoff.is_some());
+            assert_eq!(subscription.last_change_id, change_id);
+            assert_eq!(subscription.backoff_count, 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn subscription_clean_eof_before_eoq_is_unfinished() {
+        let mut subscription = empty_subscription(None);
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+
+        assert!(matches!(
+            Pin::new(&mut subscription).poll_next(&mut cx),
+            Poll::Ready(Some(Err(SubscriptionError::UnfinishedQuery)))
+        ));
+        assert!(subscription.backoff.is_none());
     }
 }
