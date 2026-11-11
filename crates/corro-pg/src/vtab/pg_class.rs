@@ -1,4 +1,4 @@
-use std::{marker::PhantomData, os::raw::c_int, sync::Arc};
+use std::{ffi, marker::PhantomData, os::raw::c_int, sync::Arc};
 
 use rusqlite::vtab::{
     sqlite3_vtab, sqlite3_vtab_cursor, Filters, IndexInfo, VTab, VTabConnection, VTabCursor,
@@ -135,18 +135,21 @@ unsafe impl<'vtab> VTab<'vtab> for PgClassTable {
 
     fn connect(
         _: &mut VTabConnection,
-        aux: Option<&Arc<Vec<PgClassEntry>>>,
-        args: &[&[u8]],
-    ) -> rusqlite::Result<(String, PgClassTable)> {
+        aux: Option<&Self::Aux>,
+        _module_name: &[u8],
+        _database_name: &[u8],
+        table_name: &[u8],
+        _args: &[&[u8]],
+    ) -> rusqlite::Result<(std::borrow::Cow<'static, ffi::CStr>, Self)> {
         let vtab = PgClassTable {
             base: sqlite3_vtab::default(),
             entries: aux.unwrap().clone(),
         };
 
-        let table_name = std::str::from_utf8(args[0]).map_err(rusqlite::Error::Utf8Error)?;
+        let table_name = std::str::from_utf8(table_name)?;
 
         Ok((
-            format!(
+            ffi::CString::new(format!(
                 "CREATE TABLE {table_name} (
                 oid                 INTEGER,
                 relname             TEXT,
@@ -182,14 +185,16 @@ unsafe impl<'vtab> VTab<'vtab> for PgClassTable {
                 reloptions          TEXT,
                 relpartbound        TEXT
 		    )"
-            ),
+            ))
+            .unwrap()
+            .into(),
             vtab,
         ))
     }
 
-    fn best_index(&self, info: &mut IndexInfo) -> rusqlite::Result<()> {
+    fn best_index(&self, info: &mut IndexInfo) -> rusqlite::Result<bool> {
         info.set_estimated_cost(1.);
-        Ok(())
+        Ok(true)
     }
 
     fn open(&'vtab mut self) -> rusqlite::Result<PgClassTableCursor<'vtab>> {
@@ -234,36 +239,36 @@ unsafe impl VTabCursor for PgClassTableCursor<'_> {
         if let Some(entry) = self.entries.get(self.row_id as usize) {
             // 2200 is the OID of the "main" namespace (see pg_namespace.rs).
             match col {
-                0 => ctx.set_result(&entry.oid),               // oid
+                0 => ctx.set_result(entry.oid),                // oid
                 1 => ctx.set_result(&entry.relname),           // relname
-                2 => ctx.set_result(&2200i64),                 // relnamespace -> "main"
-                3 => ctx.set_result(&Option::<i64>::None),     // reltype
-                4 => ctx.set_result(&Option::<i64>::None),     // reloftype
-                5 => ctx.set_result(&10i64),                   // relowner
-                6 => ctx.set_result(&entry.relam),             // relam
-                7 => ctx.set_result(&Option::<i64>::None),     // relfilenode
-                8 => ctx.set_result(&0i64),                    // reltablespace
-                9 => ctx.set_result(&0i64),                    // relpages
-                10 => ctx.set_result(&entry.reltuples),        // reltuples
-                11 => ctx.set_result(&0i64),                   // relallvisible
-                12 => ctx.set_result(&Option::<i64>::None),    // reltoastrelid
-                13 => ctx.set_result(&0i64),                   // relhasindex
-                14 => ctx.set_result(&0i64),                   // relisshared
-                15 => ctx.set_result(&"p"),                    // relpersistence: permanent
-                16 => ctx.set_result(&entry.relkind),          // relkind: 'r' or 'i'
-                17 => ctx.set_result(&entry.relnatts),         // relnatts
-                18 => ctx.set_result(&0i64),                   // relchecks
-                19 => ctx.set_result(&0i64),                   // relhasrules
-                20 => ctx.set_result(&0i64),                   // relhastriggers
-                21 => ctx.set_result(&0i64),                   // relhassubclass
-                22 => ctx.set_result(&0i64),                   // relrowsecurity
-                23 => ctx.set_result(&0i64),                   // relforcerowsecurity
-                24 => ctx.set_result(&1i64),                   // relispopulated
-                25 => ctx.set_result(&"d"),                    // relreplident: default
-                26 => ctx.set_result(&0i64),                   // relispartition
-                27 => ctx.set_result(&Option::<i64>::None),    // relrewrite
-                28 => ctx.set_result(&Option::<i64>::None),    // relfrozenxid
-                29 => ctx.set_result(&Option::<i64>::None),    // relminmxid
+                2 => ctx.set_result(2200i64),                  // relnamespace -> "main"
+                3 => ctx.set_result(Option::<i64>::None),      // reltype
+                4 => ctx.set_result(Option::<i64>::None),      // reloftype
+                5 => ctx.set_result(10i64),                    // relowner
+                6 => ctx.set_result(entry.relam),              // relam
+                7 => ctx.set_result(Option::<i64>::None),      // relfilenode
+                8 => ctx.set_result(0i64),                     // reltablespace
+                9 => ctx.set_result(0i64),                     // relpages
+                10 => ctx.set_result(entry.reltuples),         // reltuples
+                11 => ctx.set_result(0i64),                    // relallvisible
+                12 => ctx.set_result(Option::<i64>::None),     // reltoastrelid
+                13 => ctx.set_result(0i64),                    // relhasindex
+                14 => ctx.set_result(0i64),                    // relisshared
+                15 => ctx.set_result("p"),                     // relpersistence: permanent
+                16 => ctx.set_result(entry.relkind),           // relkind: 'r' or 'i'
+                17 => ctx.set_result(entry.relnatts),          // relnatts
+                18 => ctx.set_result(0i64),                    // relchecks
+                19 => ctx.set_result(0i64),                    // relhasrules
+                20 => ctx.set_result(0i64),                    // relhastriggers
+                21 => ctx.set_result(0i64),                    // relhassubclass
+                22 => ctx.set_result(0i64),                    // relrowsecurity
+                23 => ctx.set_result(0i64),                    // relforcerowsecurity
+                24 => ctx.set_result(1i64),                    // relispopulated
+                25 => ctx.set_result("d"),                     // relreplident: default
+                26 => ctx.set_result(0i64),                    // relispartition
+                27 => ctx.set_result(Option::<i64>::None),     // relrewrite
+                28 => ctx.set_result(Option::<i64>::None),     // relfrozenxid
+                29 => ctx.set_result(Option::<i64>::None),     // relminmxid
                 30 => ctx.set_result(&Option::<String>::None), // relacl
                 31 => ctx.set_result(&Option::<String>::None), // reloptions
                 32 => ctx.set_result(&Option::<String>::None), // relpartbound

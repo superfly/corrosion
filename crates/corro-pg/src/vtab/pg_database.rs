@@ -1,4 +1,4 @@
-use std::{marker::PhantomData, os::raw::c_int, sync::Arc};
+use std::{ffi, marker::PhantomData, os::raw::c_int, sync::Arc};
 
 use rusqlite::vtab::{
     sqlite3_vtab, sqlite3_vtab_cursor, Filters, IndexInfo, VTab, VTabConnection, VTabCursor,
@@ -55,18 +55,21 @@ unsafe impl<'vtab> VTab<'vtab> for PgDatabaseTable {
 
     fn connect(
         _: &mut VTabConnection,
-        aux: Option<&Arc<Vec<PgDatabase>>>,
-        args: &[&[u8]],
-    ) -> rusqlite::Result<(String, PgDatabaseTable)> {
+        aux: Option<&Self::Aux>,
+        _module_name: &[u8],
+        _database_name: &[u8],
+        table_name: &[u8],
+        _args: &[&[u8]],
+    ) -> rusqlite::Result<(std::borrow::Cow<'static, ffi::CStr>, Self)> {
         let vtab = PgDatabaseTable {
             base: sqlite3_vtab::default(),
             databases: aux.unwrap().clone(),
         };
 
-        let table_name = std::str::from_utf8(args[0]).map_err(rusqlite::Error::Utf8Error)?;
+        let table_name = std::str::from_utf8(table_name)?;
 
         Ok((
-            format!(
+            ffi::CString::new(format!(
                 "CREATE TABLE {table_name} (
                 oid           INTEGER,
                 datname       TEXT,
@@ -83,14 +86,16 @@ unsafe impl<'vtab> VTab<'vtab> for PgDatabaseTable {
                 dattablespace INTEGER,
                 datacl        TEXT
 		    )"
-            ),
+            ))
+            .unwrap()
+            .into(),
             vtab,
         ))
     }
 
-    fn best_index(&self, info: &mut IndexInfo) -> rusqlite::Result<()> {
+    fn best_index(&self, info: &mut IndexInfo) -> rusqlite::Result<bool> {
         info.set_estimated_cost(1.);
-        Ok(())
+        Ok(true)
     }
 
     fn open(&'vtab mut self) -> rusqlite::Result<PgDatabaseTableCursor<'vtab>> {
@@ -135,19 +140,19 @@ unsafe impl VTabCursor for PgDatabaseTableCursor<'_> {
     fn column(&self, ctx: &mut rusqlite::vtab::Context, col: c_int) -> rusqlite::Result<()> {
         if let Some(pg_db) = self.databases.get(self.row_id as usize) {
             match col {
-                0 => ctx.set_result(&pg_db.oid),
+                0 => ctx.set_result(pg_db.oid),
                 1 => ctx.set_result(&pg_db.datname),
-                2 => ctx.set_result(&pg_db.datdba),
-                3 => ctx.set_result(&pg_db.encoding),
+                2 => ctx.set_result(pg_db.datdba),
+                3 => ctx.set_result(pg_db.encoding),
                 4 => ctx.set_result(&pg_db.datcollate),
                 5 => ctx.set_result(&pg_db.datctype),
-                6 => ctx.set_result(&pg_db.datistemplate),
-                7 => ctx.set_result(&pg_db.datallowconn),
-                8 => ctx.set_result(&pg_db.datconnlimit),
-                9 => ctx.set_result(&pg_db.datlastsysoid),
-                10 => ctx.set_result(&pg_db.datfrozenxid),
-                11 => ctx.set_result(&pg_db.datminmxid),
-                12 => ctx.set_result(&pg_db.dattablespace),
+                6 => ctx.set_result(pg_db.datistemplate),
+                7 => ctx.set_result(pg_db.datallowconn),
+                8 => ctx.set_result(pg_db.datconnlimit),
+                9 => ctx.set_result(pg_db.datlastsysoid),
+                10 => ctx.set_result(pg_db.datfrozenxid),
+                11 => ctx.set_result(pg_db.datminmxid),
+                12 => ctx.set_result(pg_db.dattablespace),
                 13 => ctx.set_result(&pg_db.datacl),
 
                 _ => Err(rusqlite::Error::InvalidColumnIndex(col as usize)),

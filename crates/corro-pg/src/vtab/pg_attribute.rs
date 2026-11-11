@@ -1,4 +1,4 @@
-use std::{collections::HashMap, marker::PhantomData, os::raw::c_int, sync::Arc};
+use std::{collections::HashMap, ffi, marker::PhantomData, os::raw::c_int, sync::Arc};
 
 use postgres_types::Type;
 use rusqlite::vtab::{
@@ -100,17 +100,20 @@ unsafe impl<'vtab> VTab<'vtab> for PgAttributeTable {
 
     fn connect(
         _: &mut VTabConnection,
-        aux: Option<&Arc<Vec<PgAttribute>>>,
-        args: &[&[u8]],
-    ) -> rusqlite::Result<(String, PgAttributeTable)> {
+        aux: Option<&Self::Aux>,
+        _module_name: &[u8],
+        _database_name: &[u8],
+        table_name: &[u8],
+        _args: &[&[u8]],
+    ) -> rusqlite::Result<(std::borrow::Cow<'static, ffi::CStr>, Self)> {
         let vtab = PgAttributeTable {
             base: sqlite3_vtab::default(),
             attributes: aux.unwrap().clone(),
         };
-        let table_name = std::str::from_utf8(args[0]).map_err(rusqlite::Error::Utf8Error)?;
+        let table_name = std::str::from_utf8(table_name)?;
 
         Ok((
-            format!(
+            ffi::CString::new(format!(
                 "CREATE TABLE {table_name} (
                     attrelid        INTEGER,
                     attname         TEXT,
@@ -137,14 +140,16 @@ unsafe impl<'vtab> VTab<'vtab> for PgAttributeTable {
                     attfdwoptions   TEXT,
                     attmissingval   TEXT
                 )"
-            ),
+            ))
+            .unwrap()
+            .into(),
             vtab,
         ))
     }
 
-    fn best_index(&self, info: &mut IndexInfo) -> rusqlite::Result<()> {
+    fn best_index(&self, info: &mut IndexInfo) -> rusqlite::Result<bool> {
         info.set_estimated_cost(1.);
-        Ok(())
+        Ok(true)
     }
 
     fn open(&'vtab mut self) -> rusqlite::Result<PgAttributeTableCursor<'vtab>> {
@@ -188,34 +193,34 @@ unsafe impl VTabCursor for PgAttributeTableCursor<'_> {
     fn column(&self, ctx: &mut rusqlite::vtab::Context, col: c_int) -> rusqlite::Result<()> {
         if let Some(attr) = self.attributes.get(self.row_id as usize) {
             match col {
-                0 => ctx.set_result(&attr.attrelid),          // attrelid
-                1 => ctx.set_result(&attr.attname),           // attname
-                2 => ctx.set_result(&(attr.atttypid as i64)), // atttypid
-                3 => ctx.set_result(&(attr.attlen as i64)),   // attlen
-                4 => ctx.set_result(&attr.attnum),            // attnum
-                5 => ctx.set_result(&0i64),                   // attndims
-                6 => ctx.set_result(&(-1i64)),                // attcacheoff
-                7 => ctx.set_result(&(-1i64)),                // atttypmod
-                8 => ctx.set_result(&0i64),                   // attbyval
-                9 => ctx.set_result(&"x"),                    // attstorage: EXTENDED
-                10 => ctx.set_result(&"d"),                   // attalign: double
-                11 => ctx.set_result(&attr.attnotnull),       // attnotnull
-                12 => ctx.set_result(&attr.atthasdef),        // atthasdef
-                13 => ctx.set_result(&false),                 // atthasmissing
-                14 => ctx.set_result(&""),                    // attidentity: not identity
+                0 => ctx.set_result(attr.attrelid),        // attrelid
+                1 => ctx.set_result(&attr.attname),        // attname
+                2 => ctx.set_result(attr.atttypid as i64), // atttypid
+                3 => ctx.set_result(attr.attlen as i64),   // attlen
+                4 => ctx.set_result(attr.attnum),          // attnum
+                5 => ctx.set_result(0i64),                 // attndims
+                6 => ctx.set_result(-1i64),                // attcacheoff
+                7 => ctx.set_result(-1i64),                // atttypmod
+                8 => ctx.set_result(0i64),                 // attbyval
+                9 => ctx.set_result("x"),                  // attstorage: EXTENDED
+                10 => ctx.set_result("d"),                 // attalign: double
+                11 => ctx.set_result(attr.attnotnull),     // attnotnull
+                12 => ctx.set_result(attr.atthasdef),      // atthasdef
+                13 => ctx.set_result(false),               // atthasmissing
+                14 => ctx.set_result(""),                  // attidentity: not identity
                 15 => {
                     // attgenerated: 's' for stored, empty string otherwise
                     if attr.attgenerated == '\0' {
-                        ctx.set_result(&"")
+                        ctx.set_result("")
                     } else {
                         let s = attr.attgenerated.to_string();
                         ctx.set_result(&s)
                     }
                 }
-                16 => ctx.set_result(&false), // attisdropped
-                17 => ctx.set_result(&true),  // attislocal
-                18 => ctx.set_result(&0i64),  // attinhcount
-                19 => ctx.set_result(&0i64),  // attcollation
+                16 => ctx.set_result(false), // attisdropped
+                17 => ctx.set_result(true),  // attislocal
+                18 => ctx.set_result(0i64),  // attinhcount
+                19 => ctx.set_result(0i64),  // attcollation
                 20..=23 => ctx.set_result(&Option::<String>::None),
                 _ => Err(rusqlite::Error::InvalidColumnIndex(col as usize)),
             }

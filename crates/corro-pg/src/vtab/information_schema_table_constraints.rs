@@ -1,4 +1,4 @@
-use std::{collections::BTreeSet, marker::PhantomData, os::raw::c_int, sync::Arc};
+use std::{collections::BTreeSet, ffi, marker::PhantomData, os::raw::c_int, sync::Arc};
 
 use rusqlite::vtab::{
     sqlite3_vtab, sqlite3_vtab_cursor, Filters, IndexInfo, VTab, VTabConnection, VTabCursor,
@@ -43,17 +43,20 @@ unsafe impl<'vtab> VTab<'vtab> for InformationSchemaTableConstraintsTable {
 
     fn connect(
         _: &mut VTabConnection,
-        aux: Option<&Arc<Vec<InformationSchemaTableConstraint>>>,
-        args: &[&[u8]],
-    ) -> rusqlite::Result<(String, InformationSchemaTableConstraintsTable)> {
+        aux: Option<&Self::Aux>,
+        _module_name: &[u8],
+        _database_name: &[u8],
+        table_name: &[u8],
+        _args: &[&[u8]],
+    ) -> rusqlite::Result<(std::borrow::Cow<'static, ffi::CStr>, Self)> {
         let vtab = InformationSchemaTableConstraintsTable {
             base: sqlite3_vtab::default(),
             constraints: aux.unwrap().clone(),
         };
-        let table_name = std::str::from_utf8(args[0]).map_err(rusqlite::Error::Utf8Error)?;
+        let table_name = std::str::from_utf8(table_name)?;
 
         Ok((
-            format!(
+            ffi::CString::new(format!(
                 "CREATE TABLE {table_name} (
                     constraint_catalog TEXT,
                     constraint_schema  TEXT,
@@ -66,14 +69,16 @@ unsafe impl<'vtab> VTab<'vtab> for InformationSchemaTableConstraintsTable {
                     initially_deferred TEXT,
                     enforced           TEXT
                 )"
-            ),
+            ))
+            .unwrap()
+            .into(),
             vtab,
         ))
     }
 
-    fn best_index(&self, info: &mut IndexInfo) -> rusqlite::Result<()> {
+    fn best_index(&self, info: &mut IndexInfo) -> rusqlite::Result<bool> {
         info.set_estimated_cost(1.);
-        Ok(())
+        Ok(true)
     }
 
     fn open(&'vtab mut self) -> rusqlite::Result<InformationSchemaTableConstraintsCursor<'vtab>> {
@@ -117,13 +122,13 @@ unsafe impl VTabCursor for InformationSchemaTableConstraintsCursor<'_> {
     fn column(&self, ctx: &mut rusqlite::vtab::Context, col: c_int) -> rusqlite::Result<()> {
         if let Some(constraint) = self.constraints.get(self.row_id as usize) {
             match col {
-                0 | 3 => ctx.set_result(&"state"),
-                1 | 4 => ctx.set_result(&"main"),
+                0 | 3 => ctx.set_result("state"),
+                1 | 4 => ctx.set_result("main"),
                 2 => ctx.set_result(&constraint.constraint_name),
                 5 => ctx.set_result(&constraint.table_name),
-                6 => ctx.set_result(&"PRIMARY KEY"),
-                7 | 8 => ctx.set_result(&"NO"),
-                9 => ctx.set_result(&"YES"),
+                6 => ctx.set_result("PRIMARY KEY"),
+                7 | 8 => ctx.set_result("NO"),
+                9 => ctx.set_result("YES"),
                 _ => Err(rusqlite::Error::InvalidColumnIndex(col as usize)),
             }
         } else {
