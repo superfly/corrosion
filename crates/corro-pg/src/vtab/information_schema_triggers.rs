@@ -1,6 +1,8 @@
-use std::{marker::PhantomData, os::raw::c_int, sync::Arc};
+use std::{ffi, marker::PhantomData, os::raw::c_int, sync::Arc};
 
-use rusqlite::vtab::{sqlite3_vtab, sqlite3_vtab_cursor, Filters, VTabCursor};
+use rusqlite::vtab::{
+    sqlite3_vtab, sqlite3_vtab_cursor, Filters, IndexInfo, VTab, VTabConnection, VTabCursor,
+};
 
 /// A row in `information_schema.triggers`, matching the columns that
 /// TablePlus and similar tools query.
@@ -113,38 +115,74 @@ fn extract_trigger_body(sql: &str) -> String {
 #[repr(C)]
 pub struct InformationSchemaTriggersTable {
     base: sqlite3_vtab,
-    entries: Arc<Vec<InformationSchemaTrigger>>,
+    triggers: Arc<Vec<InformationSchemaTrigger>>,
 }
 
-crate::pg_mod!(
-    InformationSchemaTriggersTable,
-    InformationSchemaTriggersCursor,
-    InformationSchemaTrigger,
-    "trigger_catalog            TEXT,
-    trigger_schema             TEXT,
-    trigger_name               TEXT,
-    event_manipulation         TEXT,
-    event_object_catalog       TEXT,
-    event_object_schema        TEXT,
-    event_object_table         TEXT,
-    action_ordering            INTEGER,
-    action_condition           TEXT,
-    action_statement           TEXT,
-    action_orientation         TEXT,
-    action_timing              TEXT,
-    action_reference_old_table TEXT,
-    action_reference_new_table TEXT,
-    action_reference_old_row   TEXT,
-    action_reference_new_row   TEXT,
-    created                    TEXT"
-);
+unsafe impl<'vtab> VTab<'vtab> for InformationSchemaTriggersTable {
+    type Aux = Arc<Vec<InformationSchemaTrigger>>;
+    type Cursor = InformationSchemaTriggersCursor<'vtab>;
+
+    fn connect(
+        _: &mut VTabConnection,
+        aux: Option<&Self::Aux>,
+        _module_name: &[u8],
+        _database_name: &[u8],
+        table_name: &[u8],
+        _args: &[&[u8]],
+    ) -> rusqlite::Result<(std::borrow::Cow<'static, ffi::CStr>, Self)> {
+        let vtab = InformationSchemaTriggersTable {
+            base: sqlite3_vtab::default(),
+            triggers: aux.unwrap().clone(),
+        };
+        let table_name = std::str::from_utf8(table_name)?;
+
+        Ok((
+            ffi::CString::new(format!(
+                "CREATE TABLE {table_name} (
+                    trigger_catalog            TEXT,
+                    trigger_schema             TEXT,
+                    trigger_name               TEXT,
+                    event_manipulation         TEXT,
+                    event_object_catalog       TEXT,
+                    event_object_schema        TEXT,
+                    event_object_table         TEXT,
+                    action_ordering            INTEGER,
+                    action_condition           TEXT,
+                    action_statement           TEXT,
+                    action_orientation         TEXT,
+                    action_timing              TEXT,
+                    action_reference_old_table TEXT,
+                    action_reference_new_table TEXT,
+                    action_reference_old_row   TEXT,
+                    action_reference_new_row   TEXT,
+                    created                    TEXT
+                )"
+            ))
+            .unwrap()
+            .into(),
+            vtab,
+        ))
+    }
+
+    fn best_index(&self, info: &mut IndexInfo) -> rusqlite::Result<bool> {
+        info.set_estimated_cost(1.);
+        Ok(true)
+    }
+
+    fn open(&'vtab mut self) -> rusqlite::Result<InformationSchemaTriggersCursor<'vtab>> {
+        Ok(InformationSchemaTriggersCursor {
+            triggers: self.triggers.as_slice(),
+            ..Default::default()
+        })
+    }
+}
 
 #[derive(Default)]
 #[repr(C)]
 pub struct InformationSchemaTriggersCursor<'vtab> {
     base: sqlite3_vtab_cursor,
     row_id: i64,
-    entries: &'vtab [InformationSchemaTrigger],
+    triggers: &'vtab [InformationSchemaTrigger],
     phantom: PhantomData<&'vtab InformationSchemaTriggersTable>,
 }
 
@@ -165,11 +203,11 @@ unsafe impl VTabCursor for InformationSchemaTriggersCursor<'_> {
     }
 
     fn eof(&self) -> bool {
-        self.row_id >= self.entries.len() as i64
+        self.row_id >= self.triggers.len() as i64
     }
 
     fn column(&self, ctx: &mut rusqlite::vtab::Context, col: c_int) -> rusqlite::Result<()> {
-        if let Some(trigger) = self.entries.get(self.row_id as usize) {
+        if let Some(trigger) = self.triggers.get(self.row_id as usize) {
             match col {
                 0 => ctx.set_result("state"), // trigger_catalog
                 1 => ctx.set_result("main"),  // trigger_schema

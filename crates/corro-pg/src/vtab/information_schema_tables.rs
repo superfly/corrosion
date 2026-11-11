@@ -1,6 +1,8 @@
-use std::{marker::PhantomData, os::raw::c_int, sync::Arc};
+use std::{ffi, marker::PhantomData, os::raw::c_int, sync::Arc};
 
-use rusqlite::vtab::{sqlite3_vtab, sqlite3_vtab_cursor, Filters, VTabCursor};
+use rusqlite::vtab::{
+    sqlite3_vtab, sqlite3_vtab_cursor, Filters, IndexInfo, VTab, VTabConnection, VTabCursor,
+};
 
 pub fn load_information_schema_table_names(
     conn: &rusqlite::Connection,
@@ -14,26 +16,63 @@ pub fn load_information_schema_table_names(
 pub struct InformationSchemaTablesTable {
     /// Base class. Must be first
     base: sqlite3_vtab,
-    entries: Arc<Vec<String>>,
+    table_names: Arc<Vec<String>>,
 }
 
-crate::pg_mod!(
-    InformationSchemaTablesTable,
-    InformationSchemaTablesCursor,
-    String,
-    "table_catalog                TEXT,
-    table_schema                 TEXT,
-    table_name                   TEXT,
-    table_type                   TEXT,
-    self_referencing_column_name TEXT,
-    reference_generation         TEXT,
-    user_defined_type_catalog    TEXT,
-    user_defined_type_schema     TEXT,
-    user_defined_type_name       TEXT,
-    is_insertable_into            TEXT,
-    is_typed                      TEXT,
-    commit_action                 TEXT"
-);
+unsafe impl<'vtab> VTab<'vtab> for InformationSchemaTablesTable {
+    type Aux = Arc<Vec<String>>;
+    type Cursor = InformationSchemaTablesCursor<'vtab>;
+
+    fn connect(
+        _: &mut VTabConnection,
+        aux: Option<&Self::Aux>,
+        _module_name: &[u8],
+        _database_name: &[u8],
+        table_name: &[u8],
+        _args: &[&[u8]],
+    ) -> rusqlite::Result<(std::borrow::Cow<'static, ffi::CStr>, Self)> {
+        let vtab = InformationSchemaTablesTable {
+            base: sqlite3_vtab::default(),
+            table_names: aux.unwrap().clone(),
+        };
+
+        let table_name = std::str::from_utf8(table_name)?;
+
+        Ok((
+            ffi::CString::new(format!(
+                "CREATE TABLE {table_name} (
+                    table_catalog                TEXT,
+                    table_schema                 TEXT,
+                    table_name                   TEXT,
+                    table_type                   TEXT,
+                    self_referencing_column_name TEXT,
+                    reference_generation         TEXT,
+                    user_defined_type_catalog    TEXT,
+                    user_defined_type_schema     TEXT,
+                    user_defined_type_name       TEXT,
+                    is_insertable_into            TEXT,
+                    is_typed                      TEXT,
+                    commit_action                 TEXT
+                )"
+            ))
+            .unwrap()
+            .into(),
+            vtab,
+        ))
+    }
+
+    fn best_index(&self, info: &mut IndexInfo) -> rusqlite::Result<bool> {
+        info.set_estimated_cost(1.);
+        Ok(true)
+    }
+
+    fn open(&'vtab mut self) -> rusqlite::Result<InformationSchemaTablesCursor<'vtab>> {
+        Ok(InformationSchemaTablesCursor {
+            table_names: self.table_names.as_slice(),
+            ..Default::default()
+        })
+    }
+}
 
 #[derive(Default)]
 #[repr(C)]
@@ -41,7 +80,7 @@ pub struct InformationSchemaTablesCursor<'vtab> {
     /// Base class. Must be first
     base: sqlite3_vtab_cursor,
     row_id: i64,
-    entries: &'vtab [String],
+    table_names: &'vtab [String],
     phantom: PhantomData<&'vtab InformationSchemaTablesTable>,
 }
 
@@ -62,11 +101,11 @@ unsafe impl VTabCursor for InformationSchemaTablesCursor<'_> {
     }
 
     fn eof(&self) -> bool {
-        self.row_id >= self.entries.len() as i64
+        self.row_id >= self.table_names.len() as i64
     }
 
     fn column(&self, ctx: &mut rusqlite::vtab::Context, col: c_int) -> rusqlite::Result<()> {
-        if let Some(table_name) = self.entries.get(self.row_id as usize) {
+        if let Some(table_name) = self.table_names.get(self.row_id as usize) {
             match col {
                 0 => ctx.set_result("state"),
                 1 => ctx.set_result("main"),

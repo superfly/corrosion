@@ -1,6 +1,8 @@
-use std::{marker::PhantomData, os::raw::c_int, sync::Arc};
+use std::{ffi, marker::PhantomData, os::raw::c_int, sync::Arc};
 
-use rusqlite::vtab::{sqlite3_vtab, sqlite3_vtab_cursor, Filters, VTabCursor};
+use rusqlite::vtab::{
+    sqlite3_vtab, sqlite3_vtab_cursor, Filters, IndexInfo, VTab, VTabConnection, VTabCursor,
+};
 
 /// Entry in the `pg_index` catalog representing a single index.
 pub struct PgIndexEntry {
@@ -100,31 +102,67 @@ pub struct PgIndexTable {
     entries: Arc<Vec<PgIndexEntry>>,
 }
 
-crate::pg_mod!(
-    PgIndexTable,
-    PgIndexTableCursor,
-    PgIndexEntry,
-    "indexrelid      INTEGER,
-indrelid        INTEGER,
-indnatts        INTEGER,
-indnkeyatts     INTEGER,
-indisunique     INTEGER,
-indisprimary    INTEGER,
-indisexclusion  INTEGER,
-indimmediate    INTEGER,
-indisclustered  INTEGER,
-indisvalid      INTEGER,
-indcheckxmin    INTEGER,
-indisready      INTEGER,
-indislive       INTEGER,
-indisreplident  INTEGER,
-indkey          TEXT,
-indcollation    TEXT,
-indclass        TEXT,
-indoption       TEXT,
-indexprs        TEXT,
-indpred         TEXT"
-);
+unsafe impl<'vtab> VTab<'vtab> for PgIndexTable {
+    type Aux = Arc<Vec<PgIndexEntry>>;
+    type Cursor = PgIndexTableCursor<'vtab>;
+
+    fn connect(
+        _: &mut VTabConnection,
+        aux: Option<&Self::Aux>,
+        _module_name: &[u8],
+        _database_name: &[u8],
+        table_name: &[u8],
+        _args: &[&[u8]],
+    ) -> rusqlite::Result<(std::borrow::Cow<'static, ffi::CStr>, Self)> {
+        let vtab = PgIndexTable {
+            base: sqlite3_vtab::default(),
+            entries: aux.unwrap().clone(),
+        };
+        let table_name = std::str::from_utf8(table_name)?;
+
+        Ok((
+            ffi::CString::new(format!(
+                "CREATE TABLE {table_name} (
+                    indexrelid      INTEGER,
+                    indrelid        INTEGER,
+                    indnatts        INTEGER,
+                    indnkeyatts     INTEGER,
+                    indisunique     INTEGER,
+                    indisprimary    INTEGER,
+                    indisexclusion  INTEGER,
+                    indimmediate    INTEGER,
+                    indisclustered  INTEGER,
+                    indisvalid      INTEGER,
+                    indcheckxmin    INTEGER,
+                    indisready      INTEGER,
+                    indislive       INTEGER,
+                    indisreplident  INTEGER,
+                    indkey          TEXT,
+                    indcollation    TEXT,
+                    indclass        TEXT,
+                    indoption       TEXT,
+                    indexprs        TEXT,
+                    indpred         TEXT
+                )"
+            ))
+            .unwrap()
+            .into(),
+            vtab,
+        ))
+    }
+
+    fn best_index(&self, info: &mut IndexInfo) -> rusqlite::Result<bool> {
+        info.set_estimated_cost(1.);
+        Ok(true)
+    }
+
+    fn open(&'vtab mut self) -> rusqlite::Result<PgIndexTableCursor<'vtab>> {
+        Ok(PgIndexTableCursor {
+            entries: self.entries.as_slice(),
+            ..Default::default()
+        })
+    }
+}
 
 #[derive(Default)]
 #[repr(C)]

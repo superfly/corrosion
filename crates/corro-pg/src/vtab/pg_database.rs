@@ -1,6 +1,8 @@
-use std::{marker::PhantomData, os::raw::c_int, sync::Arc};
+use std::{ffi, marker::PhantomData, os::raw::c_int, sync::Arc};
 
-use rusqlite::vtab::{sqlite3_vtab, sqlite3_vtab_cursor, Filters, VTabCursor};
+use rusqlite::vtab::{
+    sqlite3_vtab, sqlite3_vtab_cursor, Filters, IndexInfo, VTab, VTabConnection, VTabCursor,
+};
 
 pub struct PgDatabase {
     oid: i64,
@@ -44,28 +46,65 @@ impl PgDatabase {
 pub struct PgDatabaseTable {
     /// Base class. Must be first
     base: sqlite3_vtab,
-    entries: Arc<Vec<PgDatabase>>,
+    databases: Arc<Vec<PgDatabase>>,
 }
 
-crate::pg_mod!(
-    PgDatabaseTable,
-    PgDatabaseTableCursor,
-    PgDatabase,
-    "oid           INTEGER,
-datname       TEXT,
-datdba        INTEGER,
-encoding      INTEGER,
-datcollate    TEXT,
-datctype      TEXT,
-datistemplate INTEGER,
-datallowconn  INTEGER,
-datconnlimit  INTEGER,
-datlastsysoid INTEGER,
-datfrozenxid  INTEGER,
-datminmxid    INTEGER,
-dattablespace INTEGER,
-datacl        TEXT"
-);
+unsafe impl<'vtab> VTab<'vtab> for PgDatabaseTable {
+    type Aux = Arc<Vec<PgDatabase>>;
+    type Cursor = PgDatabaseTableCursor<'vtab>;
+
+    fn connect(
+        _: &mut VTabConnection,
+        aux: Option<&Self::Aux>,
+        _module_name: &[u8],
+        _database_name: &[u8],
+        table_name: &[u8],
+        _args: &[&[u8]],
+    ) -> rusqlite::Result<(std::borrow::Cow<'static, ffi::CStr>, Self)> {
+        let vtab = PgDatabaseTable {
+            base: sqlite3_vtab::default(),
+            databases: aux.unwrap().clone(),
+        };
+
+        let table_name = std::str::from_utf8(table_name)?;
+
+        Ok((
+            ffi::CString::new(format!(
+                "CREATE TABLE {table_name} (
+                oid           INTEGER,
+                datname       TEXT,
+                datdba        INTEGER,
+                encoding      INTEGER,
+                datcollate    TEXT,
+                datctype      TEXT,
+                datistemplate INTEGER,
+                datallowconn  INTEGER,
+                datconnlimit  INTEGER,
+                datlastsysoid INTEGER,
+                datfrozenxid  INTEGER,
+                datminmxid    INTEGER,
+                dattablespace INTEGER,
+                datacl        TEXT
+		    )"
+            ))
+            .unwrap()
+            .into(),
+            vtab,
+        ))
+    }
+
+    fn best_index(&self, info: &mut IndexInfo) -> rusqlite::Result<bool> {
+        info.set_estimated_cost(1.);
+        Ok(true)
+    }
+
+    fn open(&'vtab mut self) -> rusqlite::Result<PgDatabaseTableCursor<'vtab>> {
+        Ok(PgDatabaseTableCursor {
+            databases: self.databases.as_slice(),
+            ..Default::default()
+        })
+    }
+}
 
 #[derive(Default)]
 #[repr(C)]
@@ -74,7 +113,7 @@ pub struct PgDatabaseTableCursor<'vtab> {
     base: sqlite3_vtab_cursor,
     /// The rowid
     row_id: i64,
-    entries: &'vtab [PgDatabase],
+    databases: &'vtab [PgDatabase],
     phantom: PhantomData<&'vtab PgDatabaseTable>,
 }
 
@@ -95,11 +134,11 @@ unsafe impl VTabCursor for PgDatabaseTableCursor<'_> {
     }
 
     fn eof(&self) -> bool {
-        self.row_id >= self.entries.len() as i64
+        self.row_id >= self.databases.len() as i64
     }
 
     fn column(&self, ctx: &mut rusqlite::vtab::Context, col: c_int) -> rusqlite::Result<()> {
-        if let Some(pg_db) = self.entries.get(self.row_id as usize) {
+        if let Some(pg_db) = self.databases.get(self.row_id as usize) {
             match col {
                 0 => ctx.set_result(pg_db.oid),
                 1 => ctx.set_result(&pg_db.datname),

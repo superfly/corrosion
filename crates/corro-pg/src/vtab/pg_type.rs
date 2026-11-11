@@ -1,7 +1,9 @@
-use std::{marker::PhantomData, os::raw::c_int};
+use std::{ffi, marker::PhantomData, os::raw::c_int};
 
 use postgres_types::Type;
-use rusqlite::vtab::{sqlite3_vtab, sqlite3_vtab_cursor, Filters, VTabCursor};
+use rusqlite::vtab::{
+    sqlite3_vtab, sqlite3_vtab_cursor, Filters, IndexInfo, VTab, VTabConnection, VTabCursor,
+};
 
 #[repr(C)]
 pub struct PgTypeTable {
@@ -9,41 +11,77 @@ pub struct PgTypeTable {
     base: sqlite3_vtab,
 }
 
-crate::pg_mod!(
-    PgTypeTable,
-    PgTypeTableCursor,
-    "oid            INTEGER,
-typname        TEXT,
-typnamespace   INTEGER,
-typowner       INTEGER,
-typlen         INTEGER,
-typbyval       INTEGER,
-typtype        TEXT,
-typcategory    TEXT,
-typispreferred INTEGER,
-typisdefined   INTEGER,
-typdelim       TEXT,
-typrelid       INTEGER,
-typelem        INTEGER,
-typarray       INTEGER,
-typinput       TEXT,
-typoutput      TEXT,
-typreceive     TEXT,
-typsend        TEXT,
-typmodin       TEXT,
-typmodout      TEXT,
-typanalyze     TEXT,
-typalign       TEXT,
-typstorage     TEXT,
-typnotnull     INTEGER,
-typbasetype    INTEGER,
-typtypmod      INTEGER,
-typndims       INTEGER,
-typcollation   INTEGER,
-typdefaultbin  TEXT,
-typdefault     TEXT,
-typacl         TEXT"
-);
+unsafe impl<'vtab> VTab<'vtab> for PgTypeTable {
+    type Aux = ();
+    type Cursor = PgTypeTableCursor<'vtab>;
+
+    fn connect(
+        _: &mut VTabConnection,
+        _aux: Option<&Self::Aux>,
+        _module_name: &[u8],
+        _database_name: &[u8],
+        table_name: &[u8],
+        _args: &[&[u8]],
+    ) -> rusqlite::Result<(std::borrow::Cow<'static, ffi::CStr>, Self)> {
+        let vtab = PgTypeTable {
+            base: sqlite3_vtab::default(),
+        };
+
+        let table_name = std::str::from_utf8(table_name)?;
+
+        tracing::debug!("creating table w/ name: {table_name}");
+
+        Ok((
+            ffi::CString::new(format!(
+                "CREATE TABLE {table_name} (
+			oid            INTEGER,
+			typname        TEXT,
+			typnamespace   INTEGER,
+			typowner       INTEGER,
+			typlen         INTEGER,
+			typbyval       INTEGER,
+			typtype        TEXT,
+			typcategory    TEXT,
+			typispreferred INTEGER,
+			typisdefined   INTEGER,
+			typdelim       TEXT,
+			typrelid       INTEGER,
+			typelem        INTEGER,
+			typarray       INTEGER,
+			typinput       TEXT,
+			typoutput      TEXT,
+			typreceive     TEXT,
+			typsend        TEXT,
+			typmodin       TEXT,
+			typmodout      TEXT,
+			typanalyze     TEXT,
+			typalign       TEXT,
+			typstorage     TEXT,
+			typnotnull     INTEGER,
+			typbasetype    INTEGER,
+			typtypmod      INTEGER,
+			typndims       INTEGER,
+			typcollation   INTEGER,
+			typdefaultbin  TEXT,
+			typdefault     TEXT,
+			typacl         TEXT
+		)"
+            ))
+            .unwrap()
+            .into(),
+            vtab,
+        ))
+    }
+
+    fn best_index(&self, info: &mut IndexInfo) -> rusqlite::Result<bool> {
+        info.set_estimated_cost(1.);
+        Ok(true)
+    }
+
+    fn open(&'vtab mut self) -> rusqlite::Result<PgTypeTableCursor<'vtab>> {
+        Ok(PgTypeTableCursor::default())
+    }
+}
 
 #[derive(Default)]
 #[repr(C)]

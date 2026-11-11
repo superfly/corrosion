@@ -1,6 +1,8 @@
-use std::{marker::PhantomData, os::raw::c_int, sync::Arc};
+use std::{ffi, marker::PhantomData, os::raw::c_int, sync::Arc};
 
-use rusqlite::vtab::{sqlite3_vtab, sqlite3_vtab_cursor, Filters, VTabCursor};
+use rusqlite::vtab::{
+    sqlite3_vtab, sqlite3_vtab_cursor, Filters, IndexInfo, VTab, VTabConnection, VTabCursor,
+};
 
 /// Entry in the `pg_constraint` catalog.
 pub struct PgConstraintEntry {
@@ -141,32 +143,68 @@ pub struct PgConstraintTable {
     entries: Arc<Vec<PgConstraintEntry>>,
 }
 
-crate::pg_mod!(
-    PgConstraintTable,
-    PgConstraintTableCursor,
-    PgConstraintEntry,
-    "oid            INTEGER,
-conname        TEXT,
-connamespace   INTEGER,
-conrelid       INTEGER,
-contype        TEXT,
-conindid       INTEGER,
-confrelid      INTEGER,
-confupdtype    TEXT,
-confdeltype    TEXT,
-confmatchtype  TEXT,
-conislocal     INTEGER,
-coninhcount    INTEGER,
-connoinherit   INTEGER,
-conkey         TEXT,
-confkey        TEXT,
-conpfeqop      TEXT,
-conppeqop      TEXT,
-conffeqop      TEXT,
-conexclop      TEXT,
-conbin         TEXT,
-consrc         TEXT"
-);
+unsafe impl<'vtab> VTab<'vtab> for PgConstraintTable {
+    type Aux = Arc<Vec<PgConstraintEntry>>;
+    type Cursor = PgConstraintTableCursor<'vtab>;
+
+    fn connect(
+        _: &mut VTabConnection,
+        aux: Option<&Self::Aux>,
+        _module_name: &[u8],
+        _database_name: &[u8],
+        table_name: &[u8],
+        _args: &[&[u8]],
+    ) -> rusqlite::Result<(std::borrow::Cow<'static, ffi::CStr>, Self)> {
+        let vtab = PgConstraintTable {
+            base: sqlite3_vtab::default(),
+            entries: aux.unwrap().clone(),
+        };
+        let table_name = std::str::from_utf8(table_name)?;
+
+        Ok((
+            ffi::CString::new(format!(
+                "CREATE TABLE {table_name} (
+                    oid            INTEGER,
+                    conname        TEXT,
+                    connamespace   INTEGER,
+                    conrelid       INTEGER,
+                    contype        TEXT,
+                    conindid       INTEGER,
+                    confrelid      INTEGER,
+                    confupdtype    TEXT,
+                    confdeltype    TEXT,
+                    confmatchtype  TEXT,
+                    conislocal     INTEGER,
+                    coninhcount    INTEGER,
+                    connoinherit   INTEGER,
+                    conkey         TEXT,
+                    confkey        TEXT,
+                    conpfeqop      TEXT,
+                    conppeqop      TEXT,
+                    conffeqop      TEXT,
+                    conexclop      TEXT,
+                    conbin         TEXT,
+                    consrc         TEXT
+                )"
+            ))
+            .unwrap()
+            .into(),
+            vtab,
+        ))
+    }
+
+    fn best_index(&self, info: &mut IndexInfo) -> rusqlite::Result<bool> {
+        info.set_estimated_cost(1.);
+        Ok(true)
+    }
+
+    fn open(&'vtab mut self) -> rusqlite::Result<PgConstraintTableCursor<'vtab>> {
+        Ok(PgConstraintTableCursor {
+            entries: self.entries.as_slice(),
+            ..Default::default()
+        })
+    }
+}
 
 #[derive(Default)]
 #[repr(C)]

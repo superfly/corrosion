@@ -1,6 +1,8 @@
-use std::{marker::PhantomData, os::raw::c_int, sync::Arc};
+use std::{ffi, marker::PhantomData, os::raw::c_int, sync::Arc};
 
-use rusqlite::vtab::{sqlite3_vtab, sqlite3_vtab_cursor, Filters, VTabCursor};
+use rusqlite::vtab::{
+    sqlite3_vtab, sqlite3_vtab_cursor, Filters, IndexInfo, VTab, VTabConnection, VTabCursor,
+};
 
 /// Starting OID for user-created objects (matches PostgreSQL's
 /// `FirstNormalObjectId`).
@@ -127,44 +129,81 @@ pub struct PgClassTable {
     entries: Arc<Vec<PgClassEntry>>,
 }
 
-crate::pg_mod!(
-    PgClassTable,
-    PgClassTableCursor,
-    PgClassEntry,
-    "oid                 INTEGER,
-    relname             TEXT,
-    relnamespace        INTEGER,
-    reltype             INTEGER,
-    reloftype           INTEGER,
-    relowner            INTEGER,
-    relam               INTEGER,
-    relfilenode         INTEGER,
-    reltablespace       INTEGER,
-    relpages            INTEGER,
-    reltuples           REAL,
-    relallvisible       INTEGER,
-    reltoastrelid       INTEGER,
-    relhasindex         INTEGER,
-    relisshared         INTEGER,
-    relpersistence      TEXT,
-    relkind             TEXT,
-    relnatts            INTEGER,
-    relchecks           INTEGER,
-    relhasrules         INTEGER,
-    relhastriggers      INTEGER,
-    relhassubclass      INTEGER,
-    relrowsecurity      INTEGER,
-    relforcerowsecurity INTEGER,
-    relispopulated      INTEGER,
-    relreplident        TEXT,
-    relispartition      INTEGER,
-    relrewrite          INTEGER,
-    relfrozenxid        INTEGER,
-    relminmxid          INTEGER,
-    relacl              TEXT,
-    reloptions          TEXT,
-    relpartbound        TEXT"
-);
+unsafe impl<'vtab> VTab<'vtab> for PgClassTable {
+    type Aux = Arc<Vec<PgClassEntry>>;
+    type Cursor = PgClassTableCursor<'vtab>;
+
+    fn connect(
+        _: &mut VTabConnection,
+        aux: Option<&Self::Aux>,
+        _module_name: &[u8],
+        _database_name: &[u8],
+        table_name: &[u8],
+        _args: &[&[u8]],
+    ) -> rusqlite::Result<(std::borrow::Cow<'static, ffi::CStr>, Self)> {
+        let vtab = PgClassTable {
+            base: sqlite3_vtab::default(),
+            entries: aux.unwrap().clone(),
+        };
+
+        let table_name = std::str::from_utf8(table_name)?;
+
+        Ok((
+            ffi::CString::new(format!(
+                "CREATE TABLE {table_name} (
+                oid                 INTEGER,
+                relname             TEXT,
+                relnamespace        INTEGER,
+                reltype             INTEGER,
+                reloftype           INTEGER,
+                relowner            INTEGER,
+                relam               INTEGER,
+                relfilenode         INTEGER,
+                reltablespace       INTEGER,
+                relpages            INTEGER,
+                reltuples           REAL,
+                relallvisible       INTEGER,
+                reltoastrelid       INTEGER,
+                relhasindex         INTEGER,
+                relisshared         INTEGER,
+                relpersistence      TEXT,
+                relkind             TEXT,
+                relnatts            INTEGER,
+                relchecks           INTEGER,
+                relhasrules         INTEGER,
+                relhastriggers      INTEGER,
+                relhassubclass      INTEGER,
+                relrowsecurity      INTEGER,
+                relforcerowsecurity INTEGER,
+                relispopulated      INTEGER,
+                relreplident        TEXT,
+                relispartition      INTEGER,
+                relrewrite          INTEGER,
+                relfrozenxid        INTEGER,
+                relminmxid          INTEGER,
+                relacl              TEXT,
+                reloptions          TEXT,
+                relpartbound        TEXT
+		    )"
+            ))
+            .unwrap()
+            .into(),
+            vtab,
+        ))
+    }
+
+    fn best_index(&self, info: &mut IndexInfo) -> rusqlite::Result<bool> {
+        info.set_estimated_cost(1.);
+        Ok(true)
+    }
+
+    fn open(&'vtab mut self) -> rusqlite::Result<PgClassTableCursor<'vtab>> {
+        Ok(PgClassTableCursor {
+            entries: self.entries.as_slice(),
+            ..Default::default()
+        })
+    }
+}
 
 #[derive(Default)]
 #[repr(C)]

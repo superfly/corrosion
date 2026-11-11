@@ -1,6 +1,8 @@
-use std::{marker::PhantomData, os::raw::c_int, sync::Arc};
+use std::{ffi, marker::PhantomData, os::raw::c_int, sync::Arc};
 
-use rusqlite::vtab::{sqlite3_vtab, sqlite3_vtab_cursor, Filters, VTabCursor};
+use rusqlite::vtab::{
+    sqlite3_vtab, sqlite3_vtab_cursor, Filters, IndexInfo, VTab, VTabConnection, VTabCursor,
+};
 
 /// Entry in the `pg_proc` catalog representing a function.
 pub struct PgProcEntry {
@@ -90,37 +92,73 @@ pub struct PgProcTable {
     entries: Arc<Vec<PgProcEntry>>,
 }
 
-crate::pg_mod!(
-    PgProcTable,
-    PgProcCursor,
-    PgProcEntry,
-    "oid              INTEGER,
-proname          TEXT,
-pronamespace     INTEGER,
-proowner         INTEGER,
-prolang          INTEGER,
-procost          REAL,
-prorows          REAL,
-provariadic      INTEGER,
-prosupport       INTEGER,
-prokind          TEXT,
-prosecdef        INTEGER,
-proleakproof     INTEGER,
-proisstrict      INTEGER,
-proretset        INTEGER,
-provolatile      TEXT,
-proparallel      TEXT,
-proisagg         INTEGER,
-proiswindow      INTEGER,
-pronargs         INTEGER,
-prorettype       INTEGER,
-proargtypes      TEXT,
-proallargtypes   TEXT,
-proargmodes      TEXT,
-proargnames      TEXT,
-prosrc           TEXT,
-proconfig        TEXT"
-);
+unsafe impl<'vtab> VTab<'vtab> for PgProcTable {
+    type Aux = Arc<Vec<PgProcEntry>>;
+    type Cursor = PgProcCursor<'vtab>;
+
+    fn connect(
+        _: &mut VTabConnection,
+        aux: Option<&Self::Aux>,
+        _module_name: &[u8],
+        _database_name: &[u8],
+        table_name: &[u8],
+        _args: &[&[u8]],
+    ) -> rusqlite::Result<(std::borrow::Cow<'static, ffi::CStr>, Self)> {
+        let vtab = PgProcTable {
+            base: sqlite3_vtab::default(),
+            entries: aux.unwrap().clone(),
+        };
+        let table_name = std::str::from_utf8(table_name)?;
+
+        Ok((
+            ffi::CString::new(format!(
+                "CREATE TABLE {table_name} (
+                    oid              INTEGER,
+                    proname          TEXT,
+                    pronamespace     INTEGER,
+                    proowner         INTEGER,
+                    prolang          INTEGER,
+                    procost          REAL,
+                    prorows          REAL,
+                    provariadic      INTEGER,
+                    prosupport       INTEGER,
+                    prokind          TEXT,
+                    prosecdef        INTEGER,
+                    proleakproof     INTEGER,
+                    proisstrict      INTEGER,
+                    proretset        INTEGER,
+                    provolatile      TEXT,
+                    proparallel      TEXT,
+                    proisagg         INTEGER,
+                    proiswindow      INTEGER,
+                    pronargs         INTEGER,
+                    prorettype       INTEGER,
+                    proargtypes      TEXT,
+                    proallargtypes   TEXT,
+                    proargmodes      TEXT,
+                    proargnames      TEXT,
+                    prosrc           TEXT,
+                    proconfig        TEXT
+                )"
+            ))
+            .unwrap()
+            .into(),
+            vtab,
+        ))
+    }
+
+    fn best_index(&self, info: &mut IndexInfo) -> rusqlite::Result<bool> {
+        info.set_estimated_cost(1.);
+        Ok(true)
+    }
+
+    fn open(&'vtab mut self) -> rusqlite::Result<PgProcCursor<'vtab>> {
+        Ok(PgProcCursor {
+            entries: self.entries.as_slice(),
+            ..Default::default()
+        })
+    }
+}
 
 #[derive(Default)]
 #[repr(C)]

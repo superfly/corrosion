@@ -1,7 +1,9 @@
-use std::{collections::HashMap, marker::PhantomData, os::raw::c_int, sync::Arc};
+use std::{collections::HashMap, ffi, marker::PhantomData, os::raw::c_int, sync::Arc};
 
 use postgres_types::Type;
-use rusqlite::vtab::{sqlite3_vtab, sqlite3_vtab_cursor, Filters, VTabCursor};
+use rusqlite::vtab::{
+    sqlite3_vtab, sqlite3_vtab_cursor, Filters, IndexInfo, VTab, VTabConnection, VTabCursor,
+};
 
 use super::information_schema_columns::InformationSchemaColumn;
 use super::pg_class::PgClassEntry;
@@ -89,38 +91,74 @@ pub fn load_pg_attributes(
 pub struct PgAttributeTable {
     /// Base class. Must be first
     base: sqlite3_vtab,
-    entries: Arc<Vec<PgAttribute>>,
+    attributes: Arc<Vec<PgAttribute>>,
 }
 
-crate::pg_mod!(
-    PgAttributeTable,
-    PgAttributeTableCursor,
-    PgAttribute,
-    "attrelid        INTEGER,
-    attname         TEXT,
-    atttypid        INTEGER,
-    attlen          INTEGER,
-    attnum          INTEGER,
-    attndims        INTEGER,
-    attcacheoff     INTEGER,
-    atttypmod       INTEGER,
-    attbyval        INTEGER,
-    attstorage      TEXT,
-    attalign        TEXT,
-    attnotnull      INTEGER,
-    atthasdef       INTEGER,
-    atthasmissing   INTEGER,
-    attidentity     TEXT,
-    attgenerated    TEXT,
-    attisdropped    INTEGER,
-    attislocal      INTEGER,
-    attinhcount     INTEGER,
-    attcollation    INTEGER,
-    attacl          TEXT,
-    attoptions      TEXT,
-    attfdwoptions   TEXT,
-    attmissingval   TEXT"
-);
+unsafe impl<'vtab> VTab<'vtab> for PgAttributeTable {
+    type Aux = Arc<Vec<PgAttribute>>;
+    type Cursor = PgAttributeTableCursor<'vtab>;
+
+    fn connect(
+        _: &mut VTabConnection,
+        aux: Option<&Self::Aux>,
+        _module_name: &[u8],
+        _database_name: &[u8],
+        table_name: &[u8],
+        _args: &[&[u8]],
+    ) -> rusqlite::Result<(std::borrow::Cow<'static, ffi::CStr>, Self)> {
+        let vtab = PgAttributeTable {
+            base: sqlite3_vtab::default(),
+            attributes: aux.unwrap().clone(),
+        };
+        let table_name = std::str::from_utf8(table_name)?;
+
+        Ok((
+            ffi::CString::new(format!(
+                "CREATE TABLE {table_name} (
+                    attrelid        INTEGER,
+                    attname         TEXT,
+                    atttypid        INTEGER,
+                    attlen          INTEGER,
+                    attnum          INTEGER,
+                    attndims        INTEGER,
+                    attcacheoff     INTEGER,
+                    atttypmod       INTEGER,
+                    attbyval        INTEGER,
+                    attstorage      TEXT,
+                    attalign        TEXT,
+                    attnotnull      INTEGER,
+                    atthasdef       INTEGER,
+                    atthasmissing   INTEGER,
+                    attidentity     TEXT,
+                    attgenerated    TEXT,
+                    attisdropped    INTEGER,
+                    attislocal      INTEGER,
+                    attinhcount     INTEGER,
+                    attcollation    INTEGER,
+                    attacl          TEXT,
+                    attoptions      TEXT,
+                    attfdwoptions   TEXT,
+                    attmissingval   TEXT
+                )"
+            ))
+            .unwrap()
+            .into(),
+            vtab,
+        ))
+    }
+
+    fn best_index(&self, info: &mut IndexInfo) -> rusqlite::Result<bool> {
+        info.set_estimated_cost(1.);
+        Ok(true)
+    }
+
+    fn open(&'vtab mut self) -> rusqlite::Result<PgAttributeTableCursor<'vtab>> {
+        Ok(PgAttributeTableCursor {
+            attributes: self.attributes.as_slice(),
+            ..Default::default()
+        })
+    }
+}
 
 #[derive(Default)]
 #[repr(C)]
@@ -128,7 +166,7 @@ pub struct PgAttributeTableCursor<'vtab> {
     /// Base class. Must be first
     base: sqlite3_vtab_cursor,
     row_id: i64,
-    entries: &'vtab [PgAttribute],
+    attributes: &'vtab [PgAttribute],
     phantom: PhantomData<&'vtab PgAttributeTable>,
 }
 
@@ -149,11 +187,11 @@ unsafe impl VTabCursor for PgAttributeTableCursor<'_> {
     }
 
     fn eof(&self) -> bool {
-        self.row_id >= self.entries.len() as i64
+        self.row_id >= self.attributes.len() as i64
     }
 
     fn column(&self, ctx: &mut rusqlite::vtab::Context, col: c_int) -> rusqlite::Result<()> {
-        if let Some(attr) = self.entries.get(self.row_id as usize) {
+        if let Some(attr) = self.attributes.get(self.row_id as usize) {
             match col {
                 0 => ctx.set_result(attr.attrelid),        // attrelid
                 1 => ctx.set_result(&attr.attname),        // attname

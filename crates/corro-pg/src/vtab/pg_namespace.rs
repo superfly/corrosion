@@ -1,6 +1,8 @@
-use std::{marker::PhantomData, os::raw::c_int};
+use std::{ffi, marker::PhantomData, os::raw::c_int};
 
-use rusqlite::vtab::{sqlite3_vtab, sqlite3_vtab_cursor, Filters, VTabCursor};
+use rusqlite::vtab::{
+    sqlite3_vtab, sqlite3_vtab_cursor, Filters, IndexInfo, VTab, VTabConnection, VTabCursor,
+};
 
 const PG_NAMESPACES: &[(i64, &str, i64, &str)] = &[
     (99, "pg_toast", 10, ""),
@@ -15,14 +17,48 @@ pub struct PgNamespaceTable {
     base: sqlite3_vtab,
 }
 
-crate::pg_mod!(
-    PgNamespaceTable,
-    PgNamespaceTableCursor,
-    "oid 	INTEGER,
-nspname  TEXT,
-nspowner INTEGER,
-nspacl   TEXT"
-);
+unsafe impl<'vtab> VTab<'vtab> for PgNamespaceTable {
+    type Aux = ();
+    type Cursor = PgNamespaceTableCursor<'vtab>;
+
+    fn connect(
+        _: &mut VTabConnection,
+        _aux: Option<&Self::Aux>,
+        _module_name: &[u8],
+        _database_name: &[u8],
+        table_name: &[u8],
+        _args: &[&[u8]],
+    ) -> rusqlite::Result<(std::borrow::Cow<'static, ffi::CStr>, Self)> {
+        let vtab = PgNamespaceTable {
+            base: sqlite3_vtab::default(),
+        };
+
+        let table_name = std::str::from_utf8(table_name)?;
+
+        Ok((
+            ffi::CString::new(format!(
+                "CREATE TABLE {table_name} (
+                oid 	INTEGER,
+                nspname  TEXT,
+                nspowner INTEGER,
+                nspacl   TEXT
+            )"
+            ))
+            .unwrap()
+            .into(),
+            vtab,
+        ))
+    }
+
+    fn best_index(&self, info: &mut IndexInfo) -> rusqlite::Result<bool> {
+        info.set_estimated_cost(1.);
+        Ok(true)
+    }
+
+    fn open(&'vtab mut self) -> rusqlite::Result<PgNamespaceTableCursor<'vtab>> {
+        Ok(PgNamespaceTableCursor::default())
+    }
+}
 
 #[derive(Default)]
 #[repr(C)]

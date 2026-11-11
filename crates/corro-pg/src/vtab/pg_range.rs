@@ -1,6 +1,8 @@
-use std::{marker::PhantomData, os::raw::c_int};
+use std::{ffi, marker::PhantomData, os::raw::c_int};
 
-use rusqlite::vtab::{sqlite3_vtab, sqlite3_vtab_cursor, Filters, VTabCursor};
+use rusqlite::vtab::{
+    sqlite3_vtab, sqlite3_vtab_cursor, Filters, IndexInfo, VTab, VTabConnection, VTabCursor,
+};
 
 #[repr(C)]
 pub struct PgRangeTable {
@@ -8,17 +10,51 @@ pub struct PgRangeTable {
     base: sqlite3_vtab,
 }
 
-crate::pg_mod!(
-    PgRangeTable,
-    PgRangeTableCursor,
-    "rngtypid 	INTEGER,
-rngsubtype	INTEGER,
-rngmultitypid	INTEGER,
-rngcollation	INTEGER,
-rngsubopc	INTEGER,
-rngcanonical	TEXT,
-rngsubdiff	TEXT"
-);
+unsafe impl<'vtab> VTab<'vtab> for PgRangeTable {
+    type Aux = ();
+    type Cursor = PgRangeTableCursor<'vtab>;
+
+    fn connect(
+        _: &mut VTabConnection,
+        _aux: Option<&Self::Aux>,
+        _module_name: &[u8],
+        _database_name: &[u8],
+        table_name: &[u8],
+        _args: &[&[u8]],
+    ) -> rusqlite::Result<(std::borrow::Cow<'static, ffi::CStr>, Self)> {
+        let vtab = Self {
+            base: sqlite3_vtab::default(),
+        };
+
+        let table_name = std::str::from_utf8(table_name)?;
+
+        Ok((
+            ffi::CString::new(format!(
+                "CREATE TABLE {table_name} (
+                rngtypid 	INTEGER,
+                rngsubtype	INTEGER,
+                rngmultitypid	INTEGER,
+                rngcollation	INTEGER,
+                rngsubopc	INTEGER,
+                rngcanonical	TEXT,
+                rngsubdiff	TEXT
+            )"
+            ))
+            .unwrap()
+            .into(),
+            vtab,
+        ))
+    }
+
+    fn best_index(&self, info: &mut IndexInfo) -> rusqlite::Result<bool> {
+        info.set_estimated_cost(1.);
+        Ok(true)
+    }
+
+    fn open(&'vtab mut self) -> rusqlite::Result<PgRangeTableCursor<'vtab>> {
+        Ok(PgRangeTableCursor::default())
+    }
+}
 
 #[derive(Default)]
 #[repr(C)]

@@ -1,6 +1,8 @@
-use std::{marker::PhantomData, os::raw::c_int, sync::Arc};
+use std::{ffi, marker::PhantomData, os::raw::c_int, sync::Arc};
 
-use rusqlite::vtab::{sqlite3_vtab, sqlite3_vtab_cursor, Filters, VTabCursor};
+use rusqlite::vtab::{
+    sqlite3_vtab, sqlite3_vtab_cursor, Filters, IndexInfo, VTab, VTabConnection, VTabCursor,
+};
 
 pub struct PgLanguageEntry {
     pub oid: i64,
@@ -30,20 +32,56 @@ pub struct PgLanguageTable {
     entries: Arc<Vec<PgLanguageEntry>>,
 }
 
-crate::pg_mod!(
-    PgLanguageTable,
-    PgLanguageCursor,
-    PgLanguageEntry,
-    "oid       INTEGER,
-lanname   TEXT,
-lanowner  INTEGER,
-lanispl   INTEGER,
-lanpltrusted INTEGER,
-lanplcallfoid INTEGER,
-laninline INTEGER,
-lanvalidator INTEGER,
-lanacl    TEXT"
-);
+unsafe impl<'vtab> VTab<'vtab> for PgLanguageTable {
+    type Aux = Arc<Vec<PgLanguageEntry>>;
+    type Cursor = PgLanguageCursor<'vtab>;
+
+    fn connect(
+        _: &mut VTabConnection,
+        aux: Option<&Self::Aux>,
+        _module_name: &[u8],
+        _database_name: &[u8],
+        table_name: &[u8],
+        _args: &[&[u8]],
+    ) -> rusqlite::Result<(std::borrow::Cow<'static, ffi::CStr>, Self)> {
+        let vtab = PgLanguageTable {
+            base: sqlite3_vtab::default(),
+            entries: aux.unwrap().clone(),
+        };
+        let table_name = std::str::from_utf8(table_name)?;
+
+        Ok((
+            ffi::CString::new(format!(
+                "CREATE TABLE {table_name} (
+                    oid       INTEGER,
+                    lanname   TEXT,
+                    lanowner  INTEGER,
+                    lanispl   INTEGER,
+                    lanpltrusted INTEGER,
+                    lanplcallfoid INTEGER,
+                    laninline INTEGER,
+                    lanvalidator INTEGER,
+                    lanacl    TEXT
+                )"
+            ))
+            .unwrap()
+            .into(),
+            vtab,
+        ))
+    }
+
+    fn best_index(&self, info: &mut IndexInfo) -> rusqlite::Result<bool> {
+        info.set_estimated_cost(1.);
+        Ok(true)
+    }
+
+    fn open(&'vtab mut self) -> rusqlite::Result<PgLanguageCursor<'vtab>> {
+        Ok(PgLanguageCursor {
+            entries: self.entries.as_slice(),
+            ..Default::default()
+        })
+    }
+}
 
 #[derive(Default)]
 #[repr(C)]

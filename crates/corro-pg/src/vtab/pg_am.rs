@@ -1,6 +1,8 @@
-use std::{marker::PhantomData, os::raw::c_int};
+use std::{ffi, marker::PhantomData, os::raw::c_int};
 
-use rusqlite::vtab::{sqlite3_vtab, sqlite3_vtab_cursor, Filters, VTabCursor};
+use rusqlite::vtab::{
+    sqlite3_vtab, sqlite3_vtab_cursor, Filters, IndexInfo, VTab, VTabConnection, VTabCursor,
+};
 
 /// PostgreSQL access method entries.  SQLite only uses btree, so we expose
 /// a single row matching PostgreSQL's built-in btree AM (OID 403).
@@ -11,14 +13,51 @@ pub struct PgAmTable {
     base: sqlite3_vtab,
 }
 
-crate::pg_mod!(
-    PgAmTable,
-    PgAmTableCursor,
-    "oid        INTEGER,
-amname     TEXT,
-amhandler  INTEGER,
-amtype     TEXT"
-);
+unsafe impl<'vtab> VTab<'vtab> for PgAmTable {
+    type Aux = ();
+    type Cursor = PgAmTableCursor<'vtab>;
+
+    fn connect(
+        _: &mut VTabConnection,
+        _aux: Option<&Self::Aux>,
+        _module_name: &[u8],
+        _database_name: &[u8],
+        table_name: &[u8],
+        _args: &[&[u8]],
+    ) -> rusqlite::Result<(std::borrow::Cow<'static, ffi::CStr>, Self)> {
+        let vtab = PgAmTable {
+            base: sqlite3_vtab::default(),
+        };
+        let table_name = std::str::from_utf8(table_name)?;
+
+        Ok((
+            ffi::CString::new(format!(
+                "CREATE TABLE {table_name} (
+                    oid        INTEGER,
+                    amname     TEXT,
+                    amhandler  INTEGER,
+                    amtype     TEXT
+                )"
+            ))
+            .unwrap()
+            .into(),
+            vtab,
+        ))
+    }
+
+    fn best_index(&self, info: &mut IndexInfo) -> rusqlite::Result<bool> {
+        info.set_estimated_cost(1.);
+        Ok(true)
+    }
+
+    fn open(&'vtab mut self) -> rusqlite::Result<PgAmTableCursor<'vtab>> {
+        Ok(PgAmTableCursor {
+            base: sqlite3_vtab_cursor::default(),
+            row_id: 0,
+            _phantom: PhantomData,
+        })
+    }
+}
 
 #[derive(Default)]
 #[repr(C)]
