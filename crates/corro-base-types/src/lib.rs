@@ -555,3 +555,134 @@ mod test {
         ));
     }
 }
+
+/// SQLite varint encoding/decoding, copied from cr-sqlite's `pack_columns.rs`
+/// (gorbak/new-clock-tables branch, cr-sqlite 0.18).
+///
+/// cr-sqlite 0.18 V2 packed format packs `seq` (and other integer columns) as
+/// SQLite varints inside a BLOB. To do seq accounting on the Corrosion side
+/// we need to decode these varints back into `u64`/`i64` values.
+///
+/// SQLite varint format (MSB-first / big-endian):
+///   1-8 bytes: each byte has 7 data bits (high bit = continuation).
+///             The first byte has the most significant bits.
+///             The last byte has the least significant 7 bits (no continuation).
+///   9 bytes:  p[0..7] have 7 data bits each (all with continuation bit set),
+///             p[8] has 8 data bits (the least significant byte, no continuation).
+/// Total capacity: 7*8 + 8 = 64 bits.
+pub mod varint {
+    /// Decode a single SQLite varint from the buffer.
+    /// Returns the value and the number of bytes consumed.
+    pub fn get(buf: &[u8]) -> Result<(u64, usize), VarintError> {
+        if buf.is_empty() {
+            return Err(VarintError::Empty);
+        }
+        let mut result: u64 = 0;
+        let mut i = 0;
+        while i < buf.len() && i < 9 {
+            let byte = buf[i];
+            if i == 8 {
+                // 9th byte uses all 8 bits
+                result = (result << 8) | byte as u64;
+                i += 1;
+                return Ok((result, i));
+            }
+            result = (result << 7) | (byte & 0x7F) as u64;
+            i += 1;
+            if byte & 0x80 == 0 {
+                return Ok((result, i));
+            }
+        }
+        // Buffer exhausted before a non-continuation byte was found.
+        Err(VarintError::Truncated)
+    }
+
+    /// Unpack a blob produced by `crsql_pack_varint_agg` into a `Vec<i64>`.
+    /// Format: `[count:varint, ...varint(value_i)]`. Values are reinterpreted
+    /// from `u64` to `i64` to recover negative numbers (matching
+    /// `crsql_pack_varint_agg_step` which encodes `int64 as u64`).
+    pub fn unpack_i64_vec(data: &[u8]) -> Result<Vec<i64>, VarintError> {
+        let (count, header_len) = get(data)?;
+        let mut buf = &data[header_len..];
+        // Cap allocation against remaining buffer — each varint is at least 1 byte,
+        // so count can never legitimately exceed buf.len().
+        let cap = (count as usize).min(buf.len());
+        let mut out = Vec::with_capacity(cap);
+        for _ in 0..count {
+            let (val, n) = get(buf)?;
+            out.push(val as i64);
+            buf = &buf[n..];
+        }
+        Ok(out)
+    }
+
+    /// Unpack a blob produced by `crsql_pack_varint_agg` into a `Vec<u64>`.
+    /// Format: `[count:varint, ...varint(value_i)]`.
+    pub fn unpack_u64_vec(data: &[u8]) -> Result<Vec<u64>, VarintError> {
+        let (count, header_len) = get(data)?;
+        let mut buf = &data[header_len..];
+        let cap = (count as usize).min(buf.len());
+        let mut out = Vec::with_capacity(cap);
+        for _ in 0..count {
+            let (val, n) = get(buf)?;
+            out.push(val);
+            buf = &buf[n..];
+        }
+        Ok(out)
+    }
+
+    #[derive(Debug, thiserror::Error)]
+    pub enum VarintError {
+        #[error("empty buffer")]
+        Empty,
+        #[error("truncated varint (no terminating byte)")]
+        Truncated,
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn test_varint_single_byte() {
+            for v in 0..0x80u64 {
+                // single-byte varints are just the value itself
+                let buf = [v as u8];
+                let (decoded, n) = get(&buf).unwrap();
+                assert_eq!(decoded, v);
+                assert_eq!(n, 1);
+            }
+        }
+
+        #[test]
+        fn test_varint_two_bytes() {
+            // 128 = 0x81 0x00, 200 = 0x81 0x48, 16383 = 0xFF 0x7F
+            let cases: &[(u64, &[u8])] = &[
+                (128, &[0x81, 0x00]),
+                (200, &[0x81, 0x48]),
+                (16383, &[0xFF, 0x7F]),
+            ];
+            for &(val, expected) in cases {
+                let (decoded, n) = get(expected).unwrap();
+                assert_eq!(decoded, val);
+                assert_eq!(n, expected.len());
+            }
+        }
+
+        #[test]
+        fn test_varint_unpack_vec() {
+            // pack 3 varints: count=3, then 0, 127, 200
+            let mut data = vec![3u8]; // count
+            data.extend_from_slice(&[0]); // 0
+            data.extend_from_slice(&[127]); // 127
+            data.extend_from_slice(&[0x81, 0x48]); // 200
+            let vals = unpack_u64_vec(&data).unwrap();
+            assert_eq!(vals, vec![0, 127, 200]);
+        }
+
+        #[test]
+        fn test_varint_empty() {
+            assert!(matches!(get(&[]), Err(VarintError::Empty)));
+        }
+    }
+}

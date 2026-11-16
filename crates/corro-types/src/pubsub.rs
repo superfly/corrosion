@@ -35,9 +35,9 @@ use tokio::{
     sync::{mpsc, oneshot, watch, AcquireError},
     task::block_in_place,
 };
-use tokio_util::sync::{CancellationToken, DropGuard, WaitForCancellationFuture};
+use tokio_util::sync::{CancellationToken, WaitForCancellationFuture};
 use tracing::{debug, error, info, trace, warn};
-use tripwire::{Outcome, PreemptibleFutureExt, Tripwire};
+use tripwire::Tripwire;
 use uuid::Uuid;
 
 use crate::{
@@ -1401,15 +1401,6 @@ impl Matcher {
             let elapsed = {
                 debug!("select stmt: {stmt_str:?}");
 
-                let mut select = state_tx.prepare(&stmt_str)?;
-                let start = Instant::now();
-                let mut select_rows = {
-                    let _guard = interrupt_deadline_guard(&state_tx, Duration::from_secs(15));
-                    select.query(())?
-                };
-                let elapsed = start.elapsed();
-                info!(sub_id = %self.id, "Initial query done in {elapsed:?}");
-
                 let insert_into = format!(
                     "INSERT INTO query ({}) VALUES ({}) RETURNING __corro_rowid,{}",
                     all_cols.join(","),
@@ -1422,50 +1413,53 @@ impl Matcher {
                 );
                 trace!("insert stmt: {insert_into:?}");
 
+                let mut select = state_tx.prepare(&stmt_str)?;
+                let start = Instant::now();
+                // Collect all rows first to avoid interaction between the state_conn
+                // query iterator and tx.prepare on the subscription DB connection.
+                // In V2 packed mode, cr-sqlite's changes vtab interferes with active
+                // query iterators when new statements are prepared.
+                let rows: Vec<Vec<SqliteValue>> = select
+                    .query_map((), |row| {
+                        let mut vals = Vec::with_capacity(all_cols.len());
+                        for i in 0..all_cols.len() {
+                            vals.push(row.get::<_, SqliteValue>(i)?);
+                        }
+                        Ok(vals)
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                let elapsed = start.elapsed();
+                info!(sub_id = %self.id, "Initial query done in {elapsed:?}, {} rows", rows.len());
+
                 {
                     let mut insert = tx.prepare(&insert_into)?;
 
-                    loop {
-                        match select_rows.next() {
-                            Ok(Some(row)) => {
-                                for i in 0..all_cols.len() {
-                                    insert.raw_bind_parameter(
-                                        i + 1,
-                                        SqliteValueRef::from(row.get_ref(i)?),
-                                    )?;
-                                }
-
-                                let mut rows = insert.raw_query();
-
-                                let row = match rows.next()? {
-                                    Some(row) => row,
-                                    None => continue,
-                                };
-
-                                let rowid = row.get(0)?;
-                                let cells = (1..=query_cols.len())
-                                    .map(|i| row.get::<_, SqliteValue>(i))
-                                    .collect::<rusqlite::Result<Vec<_>>>()?;
-
-                                if let Err(e) = self
-                                    .evt_tx
-                                    .blocking_send(QueryEvent::Row(RowId(rowid), cells))
-                                {
-                                    error!(sub_id = %self.id, "could not send back row: {e}");
-                                    return Err(MatcherError::EventReceiverClosed);
-                                }
-
-                                last_rowid = cmp::max(rowid, last_rowid);
-                            }
-                            Ok(None) => {
-                                info!(sub_id = %self.id, "Done iterating through rows for initial query");
-                                // done!
-                                break;
-                            }
-                            Err(e) => {
-                                return Err(e.into());
-                            }
+                    for row in rows {
+                        for (i, _col) in all_cols.iter().enumerate() {
+                            insert.raw_bind_parameter(i + 1, row[i].as_ref())?;
                         }
+
+                        let mut rows = insert.raw_query();
+
+                        let row = match rows.next()? {
+                            Some(row) => row,
+                            None => continue,
+                        };
+
+                        let rowid = row.get(0)?;
+                        let cells = (1..=query_cols.len())
+                            .map(|i| row.get::<_, SqliteValue>(i))
+                            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+                        if let Err(e) = self
+                            .evt_tx
+                            .blocking_send(QueryEvent::Row(RowId(rowid), cells))
+                        {
+                            error!(sub_id = %self.id, "could not send back row: {e}");
+                            return Err(MatcherError::EventReceiverClosed);
+                        }
+
+                        last_rowid = cmp::max(rowid, last_rowid);
                     }
                 }
 
@@ -1818,31 +1812,6 @@ fn dump_query_plan(
     }
 
     Ok(output)
-}
-
-fn interrupt_deadline_guard(conn: &Connection, dur: Duration) -> DropGuard {
-    let int_handle = conn.get_interrupt_handle();
-    let cancel = CancellationToken::new();
-    tokio::spawn({
-        let cancel = cancel.clone();
-        async move {
-            match tokio::time::sleep(dur)
-                .preemptible(cancel.cancelled())
-                .await
-            {
-                Outcome::Completed(_) => {
-                    warn!("subscription query deadline reached, interrupting!");
-                    int_handle.interrupt();
-                    // no need to send any query event, it should bubble up properly and if not
-                    // then it means the conn was not interrupted in time which is also fine
-                }
-                Outcome::Preempted(_) => {
-                    debug!("deadline was canceled, not interrupting query");
-                }
-            }
-        }
-    });
-    cancel.drop_guard()
 }
 
 #[derive(Debug, Default, Clone)]
@@ -2595,6 +2564,7 @@ mod tests {
         {
             let mut conn = pool.write_priority().await?;
             setup_conn(&conn)?;
+            conn.execute_batch("SELECT crsql_config_set('default-ts', 1)")?;
             migrate(clock, &mut conn)?;
             let tx = conn.transaction()?;
             apply_schema(&tx, &Schema::default(), &mut schema)?;
@@ -2716,6 +2686,8 @@ mod tests {
         let clock = Arc::new(uhlc::HLC::default());
         {
             setup_conn(&conn).unwrap();
+            conn.execute_batch("SELECT crsql_config_set('default-ts', 1)")
+                .unwrap();
             migrate(clock.clone(), &mut conn).unwrap();
             let tx = conn.transaction().unwrap();
             apply_schema(&tx, &Schema::default(), &mut schema).unwrap();
@@ -2753,6 +2725,9 @@ mod tests {
             .expect("could not init crsql");
 
             setup_conn(&conn2).unwrap();
+            conn2
+                .execute_batch("SELECT crsql_config_set('default-ts', 1)")
+                .unwrap();
             migrate(clock.clone(), &mut conn2).unwrap();
 
             {
@@ -2806,6 +2781,9 @@ mod tests {
                 .expect("could not init crconn");
 
         setup_conn(&matcher_conn).unwrap();
+        matcher_conn
+            .execute_batch("SELECT crsql_config_set('default-ts', 1)")
+            .unwrap();
 
         let mut last_change_id = None;
 

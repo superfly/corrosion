@@ -18,6 +18,10 @@ services:
     container_name: corrosion1
     hostname: corrosion1
     image: corrosion:${SHORT_COMMIT}
+    environment:
+      CORRO_METADATA_WRITE_VERSION: "${CORRO_METADATA_WRITE_VERSION}"
+      CORRO_METADATA_USE_VERSION: "${CORRO_METADATA_USE_VERSION}"
+      CORRO_SYNC_LOG_VERSION: "${CORRO_SYNC_LOG_VERSION}"
     volumes:
       - ./volumes/corrosion1:/var/lib/corrosion
 
@@ -25,6 +29,10 @@ services:
     container_name: corrosion2
     hostname: corrosion2
     image: corrosion:${SHORT_COMMIT}
+    environment:
+      CORRO_METADATA_WRITE_VERSION: "${CORRO_METADATA_WRITE_VERSION}"
+      CORRO_METADATA_USE_VERSION: "${CORRO_METADATA_USE_VERSION}"
+      CORRO_SYNC_LOG_VERSION: "${CORRO_SYNC_LOG_VERSION}"
     volumes:
       - ./volumes/corrosion2:/var/lib/corrosion
 
@@ -32,6 +40,10 @@ services:
     container_name: corrosion3
     hostname: corrosion3
     image: corrosion:${SHORT_COMMIT}
+    environment:
+      CORRO_METADATA_WRITE_VERSION: "${CORRO_METADATA_WRITE_VERSION}"
+      CORRO_METADATA_USE_VERSION: "${CORRO_METADATA_USE_VERSION}"
+      CORRO_SYNC_LOG_VERSION: "${CORRO_SYNC_LOG_VERSION}"
     volumes:
       - ./volumes/corrosion3:/var/lib/corrosion 
 
@@ -40,6 +52,10 @@ services:
     hostname: corro-client
     image: corro-client:${SHORT_COMMIT}
     init: true
+    environment:
+      CORRO_METADATA_WRITE_VERSION: "${CORRO_METADATA_WRITE_VERSION}"
+      CORRO_METADATA_USE_VERSION: "${CORRO_METADATA_USE_VERSION}"
+      CORRO_SYNC_LOG_VERSION: "${CORRO_SYNC_LOG_VERSION}"
     volumes:
       - ./volumes/corrosion1:/var/lib/corrosion1
       - ./volumes/corrosion2:/var/lib/corrosion2

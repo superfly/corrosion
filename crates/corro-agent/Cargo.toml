@@ -22,6 +22,7 @@ camino = { workspace = true }
 compact_str = { workspace = true }
 config = { workspace = true }
 corro-types = { path = "../corro-types" }
+corro-api-types = { path = "../corro-api-types" }
 corro-utils = { path = "../corro-utils" }
 eyre = { workspace = true }
 foca = { workspace = true }
@@ -83,3 +84,6 @@ criterion = { version = "0.5", features = ["async_tokio"] }
 [[bench]]
 name = "process_changes"
 harness = false
+
+[features]
+running_in_antithesis = ["corro-api-types/running_in_antithesis"]
