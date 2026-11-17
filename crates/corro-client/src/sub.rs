@@ -93,6 +93,7 @@ pub struct SubscriptionStream<T> {
     client: reqwest::Client,
     api_addr: SocketAddr,
     observed_eoq: bool,
+    terminated: bool,
     last_change_id: Option<ChangeId>,
     stream: Option<FramedBody>,
     backoff: Option<Pin<Box<Sleep>>>,
@@ -110,6 +111,9 @@ pub enum SubscriptionError {
     /// Generic HTTP error encountered while reconnecting.
     #[error(transparent)]
     Http(#[from] http::Error),
+    /// The server rejected a subscription reconnect.
+    #[error("subscription reconnect failed with HTTP {0}")]
+    Status(http::StatusCode),
     /// A frame could not be decoded as a [`TypedQueryEvent`].
     #[error(transparent)]
     Deserialize(#[from] serde_json::Error),
@@ -147,6 +151,7 @@ where
             client,
             api_addr,
             observed_eoq: change_id.is_some(),
+            terminated: false,
             last_change_id: change_id,
             stream: Some(FramedRead::new(
                 StreamReader::new(IoBodyStream { body }),
@@ -275,6 +280,9 @@ where
                 self.response = None;
 
                 return match res {
+                    Ok(res) if !res.status().is_success() => {
+                        Poll::Ready(Err(SubscriptionError::Status(res.status())))
+                    }
                     Ok(res) => Poll::Ready(Ok(FramedRead::new(
                         StreamReader::new(IoBodyStream { body: res.into() }),
                         LinesBytesCodec::default(),
@@ -318,6 +326,10 @@ where
     type Item = Result<TypedQueryEvent<T>, SubscriptionError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if self.terminated {
+            return Poll::Ready(None);
+        }
+
         // first, check if we need to wait for a backoff...
         if let Some(backoff) = self.backoff.as_mut() {
             ready!(backoff.as_mut().poll(cx));
@@ -326,6 +338,17 @@ where
 
         let io_err = match ready!(self.as_mut().poll_stream(cx)) {
             Some(Err(SubscriptionError::Io(io_err))) => io_err,
+            Some(Err(e @ SubscriptionError::Status(_))) => {
+                self.terminated = true;
+                self.stream = None;
+                return Poll::Ready(Some(Err(e)));
+            }
+            None if !self.observed_eoq => {
+                self.terminated = true;
+                self.stream = None;
+                return Poll::Ready(Some(Err(SubscriptionError::UnfinishedQuery)));
+            }
+            None => io::Error::new(io::ErrorKind::UnexpectedEof, "subscription body ended"),
             other => {
                 self.backoff_count = 0;
                 return Poll::Ready(other);
@@ -605,5 +628,82 @@ impl Decoder for LinesBytesCodec {
 fn without_carriage_return(s: &mut BytesMut) {
     if let Some(&b'\r') = s.last() {
         s.truncate(s.len() - 1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn empty_subscription(change_id: Option<ChangeId>) -> SubscriptionStream<serde_json::Value> {
+        SubscriptionStream::new(
+            Uuid::new_v4(),
+            None,
+            reqwest::Client::new(),
+            "127.0.0.1:1".parse().unwrap(),
+            reqwest::Body::from(""),
+            change_id,
+        )
+    }
+
+    #[tokio::test]
+    async fn subscription_clean_eof_reconnects() {
+        for change_id in [Some(ChangeId(7)), None] {
+            let mut subscription = empty_subscription(change_id);
+            subscription.observed_eoq = true;
+            let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+
+            assert!(Pin::new(&mut subscription).poll_next(&mut cx).is_pending());
+            assert!(subscription.stream.is_none());
+            assert!(subscription.backoff.is_some());
+            assert_eq!(subscription.last_change_id, change_id);
+            assert_eq!(subscription.backoff_count, 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn subscription_clean_eof_before_eoq_is_unfinished() {
+        let mut subscription = empty_subscription(None);
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+
+        assert!(matches!(
+            Pin::new(&mut subscription).poll_next(&mut cx),
+            Poll::Ready(Some(Err(SubscriptionError::UnfinishedQuery)))
+        ));
+        assert!(subscription.backoff.is_none());
+        assert!(matches!(
+            Pin::new(&mut subscription).poll_next(&mut cx),
+            Poll::Ready(None)
+        ));
+    }
+
+    #[tokio::test]
+    async fn subscription_clean_eof_rejected_reconnect_terminates() {
+        let mut subscription = empty_subscription(Some(ChangeId(7)));
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        assert!(Pin::new(&mut subscription).poll_next(&mut cx).is_pending());
+
+        // Supply the response to the pending reconnect without network access.
+        subscription.backoff = None;
+        let response = http::Response::builder()
+            .status(http::StatusCode::NOT_FOUND)
+            .body(reqwest::Body::from(
+                "{\"error\":\"subscription not found\"}\n",
+            ))
+            .unwrap();
+        subscription.response = Some(Box::new(futures::future::ready(Ok(response.into()))));
+
+        assert!(matches!(
+            Pin::new(&mut subscription).poll_next(&mut cx),
+            Poll::Ready(Some(Err(SubscriptionError::Status(
+                http::StatusCode::NOT_FOUND
+            ))))
+        ));
+        assert!(matches!(
+            Pin::new(&mut subscription).poll_next(&mut cx),
+            Poll::Ready(None)
+        ));
+        assert!(subscription.response.is_none());
+        assert!(subscription.backoff.is_none());
     }
 }
