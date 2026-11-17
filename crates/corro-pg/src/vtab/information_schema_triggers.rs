@@ -1,4 +1,4 @@
-use std::{marker::PhantomData, os::raw::c_int, sync::Arc};
+use std::{ffi, marker::PhantomData, os::raw::c_int, sync::Arc};
 
 use rusqlite::vtab::{
     sqlite3_vtab, sqlite3_vtab_cursor, Filters, IndexInfo, VTab, VTabConnection, VTabCursor,
@@ -124,17 +124,20 @@ unsafe impl<'vtab> VTab<'vtab> for InformationSchemaTriggersTable {
 
     fn connect(
         _: &mut VTabConnection,
-        aux: Option<&Arc<Vec<InformationSchemaTrigger>>>,
-        args: &[&[u8]],
-    ) -> rusqlite::Result<(String, InformationSchemaTriggersTable)> {
+        aux: Option<&Self::Aux>,
+        _module_name: &[u8],
+        _database_name: &[u8],
+        table_name: &[u8],
+        _args: &[&[u8]],
+    ) -> rusqlite::Result<(std::borrow::Cow<'static, ffi::CStr>, Self)> {
         let vtab = InformationSchemaTriggersTable {
             base: sqlite3_vtab::default(),
             triggers: aux.unwrap().clone(),
         };
-        let table_name = std::str::from_utf8(args[0]).map_err(rusqlite::Error::Utf8Error)?;
+        let table_name = std::str::from_utf8(table_name)?;
 
         Ok((
-            format!(
+            ffi::CString::new(format!(
                 "CREATE TABLE {table_name} (
                     trigger_catalog            TEXT,
                     trigger_schema             TEXT,
@@ -154,14 +157,16 @@ unsafe impl<'vtab> VTab<'vtab> for InformationSchemaTriggersTable {
                     action_reference_new_row   TEXT,
                     created                    TEXT
                 )"
-            ),
+            ))
+            .unwrap()
+            .into(),
             vtab,
         ))
     }
 
-    fn best_index(&self, info: &mut IndexInfo) -> rusqlite::Result<()> {
+    fn best_index(&self, info: &mut IndexInfo) -> rusqlite::Result<bool> {
         info.set_estimated_cost(1.);
-        Ok(())
+        Ok(true)
     }
 
     fn open(&'vtab mut self) -> rusqlite::Result<InformationSchemaTriggersCursor<'vtab>> {
@@ -204,17 +209,17 @@ unsafe impl VTabCursor for InformationSchemaTriggersCursor<'_> {
     fn column(&self, ctx: &mut rusqlite::vtab::Context, col: c_int) -> rusqlite::Result<()> {
         if let Some(trigger) = self.triggers.get(self.row_id as usize) {
             match col {
-                0 => ctx.set_result(&"state"), // trigger_catalog
-                1 => ctx.set_result(&"main"),  // trigger_schema
+                0 => ctx.set_result("state"), // trigger_catalog
+                1 => ctx.set_result("main"),  // trigger_schema
                 2 => ctx.set_result(&trigger.trigger_name),
                 3 => ctx.set_result(&trigger.event_manipulation),
-                4 => ctx.set_result(&"state"), // event_object_catalog
+                4 => ctx.set_result("state"), // event_object_catalog
                 5 => ctx.set_result(&trigger.event_object_schema),
                 6 => ctx.set_result(&trigger.event_object_table),
-                7 => ctx.set_result(&0i64), // action_ordering
+                7 => ctx.set_result(0i64), // action_ordering
                 8 => ctx.set_result(&Option::<String>::None), // action_condition
                 9 => ctx.set_result(&trigger.action_statement),
-                10 => ctx.set_result(&"ROW"), // action_orientation
+                10 => ctx.set_result("ROW"), // action_orientation
                 11 => ctx.set_result(&trigger.action_timing),
                 12 => ctx.set_result(&Option::<String>::None), // action_reference_old_table
                 13 => ctx.set_result(&Option::<String>::None), // action_reference_new_table

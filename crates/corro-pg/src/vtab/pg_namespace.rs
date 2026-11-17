@@ -1,4 +1,4 @@
-use std::{marker::PhantomData, os::raw::c_int};
+use std::{ffi, marker::PhantomData, os::raw::c_int};
 
 use rusqlite::vtab::{
     sqlite3_vtab, sqlite3_vtab_cursor, Filters, IndexInfo, VTab, VTabConnection, VTabCursor,
@@ -23,31 +23,36 @@ unsafe impl<'vtab> VTab<'vtab> for PgNamespaceTable {
 
     fn connect(
         _: &mut VTabConnection,
-        _aux: Option<&()>,
-        args: &[&[u8]],
-    ) -> rusqlite::Result<(String, PgNamespaceTable)> {
+        _aux: Option<&Self::Aux>,
+        _module_name: &[u8],
+        _database_name: &[u8],
+        table_name: &[u8],
+        _args: &[&[u8]],
+    ) -> rusqlite::Result<(std::borrow::Cow<'static, ffi::CStr>, Self)> {
         let vtab = PgNamespaceTable {
             base: sqlite3_vtab::default(),
         };
 
-        let table_name = std::str::from_utf8(args[0]).map_err(rusqlite::Error::Utf8Error)?;
+        let table_name = std::str::from_utf8(table_name)?;
 
         Ok((
-            format!(
+            ffi::CString::new(format!(
                 "CREATE TABLE {table_name} (
                 oid 	INTEGER,
                 nspname  TEXT,
                 nspowner INTEGER,
                 nspacl   TEXT
-		    )",
-            ),
+            )"
+            ))
+            .unwrap()
+            .into(),
             vtab,
         ))
     }
 
-    fn best_index(&self, info: &mut IndexInfo) -> rusqlite::Result<()> {
+    fn best_index(&self, info: &mut IndexInfo) -> rusqlite::Result<bool> {
         info.set_estimated_cost(1.);
-        Ok(())
+        Ok(true)
     }
 
     fn open(&'vtab mut self) -> rusqlite::Result<PgNamespaceTableCursor<'vtab>> {
@@ -88,10 +93,10 @@ unsafe impl VTabCursor for PgNamespaceTableCursor<'_> {
     fn column(&self, ctx: &mut rusqlite::vtab::Context, col: c_int) -> rusqlite::Result<()> {
         if let Some(pg_ns) = PG_NAMESPACES.get(self.row_id as usize) {
             match col {
-                0 => ctx.set_result(&pg_ns.0),
-                1 => ctx.set_result(&pg_ns.1),
-                2 => ctx.set_result(&pg_ns.2),
-                3 => ctx.set_result(&pg_ns.3),
+                0 => ctx.set_result(pg_ns.0),
+                1 => ctx.set_result(pg_ns.1),
+                2 => ctx.set_result(pg_ns.2),
+                3 => ctx.set_result(pg_ns.3),
                 _ => Err(rusqlite::Error::InvalidColumnIndex(col as usize)),
             }
         } else {

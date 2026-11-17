@@ -1,4 +1,4 @@
-use std::{marker::PhantomData, os::raw::c_int, sync::Arc};
+use std::{ffi, marker::PhantomData, os::raw::c_int, sync::Arc};
 
 use rusqlite::vtab::{
     sqlite3_vtab, sqlite3_vtab_cursor, Filters, IndexInfo, VTab, VTabConnection, VTabCursor,
@@ -214,17 +214,20 @@ unsafe impl<'vtab> VTab<'vtab> for InformationSchemaColumnsTable {
 
     fn connect(
         _: &mut VTabConnection,
-        aux: Option<&Arc<Vec<InformationSchemaColumn>>>,
-        args: &[&[u8]],
-    ) -> rusqlite::Result<(String, InformationSchemaColumnsTable)> {
+        aux: Option<&Self::Aux>,
+        _module_name: &[u8],
+        _database_name: &[u8],
+        table_name: &[u8],
+        _args: &[&[u8]],
+    ) -> rusqlite::Result<(std::borrow::Cow<'static, ffi::CStr>, Self)> {
         let vtab = InformationSchemaColumnsTable {
             base: sqlite3_vtab::default(),
             columns: aux.unwrap().clone(),
         };
-        let table_name = std::str::from_utf8(args[0]).map_err(rusqlite::Error::Utf8Error)?;
+        let table_name = std::str::from_utf8(table_name)?;
 
         Ok((
-            format!(
+            ffi::CString::new(format!(
                 "CREATE TABLE {table_name} (
                     table_catalog            TEXT,
                     table_schema             TEXT,
@@ -271,14 +274,16 @@ unsafe impl<'vtab> VTab<'vtab> for InformationSchemaColumnsTable {
                     generation_expression    TEXT,
                     is_updatable             TEXT
                 )"
-            ),
+            ))
+            .unwrap()
+            .into(),
             vtab,
         ))
     }
 
-    fn best_index(&self, info: &mut IndexInfo) -> rusqlite::Result<()> {
+    fn best_index(&self, info: &mut IndexInfo) -> rusqlite::Result<bool> {
         info.set_estimated_cost(1.);
-        Ok(())
+        Ok(true)
     }
 
     fn open(&'vtab mut self) -> rusqlite::Result<InformationSchemaColumnsCursor<'vtab>> {
@@ -322,33 +327,33 @@ unsafe impl VTabCursor for InformationSchemaColumnsCursor<'_> {
     fn column(&self, ctx: &mut rusqlite::vtab::Context, col: c_int) -> rusqlite::Result<()> {
         if let Some(column) = self.columns.get(self.row_id as usize) {
             match col {
-                0 => ctx.set_result(&"state"),
-                1 => ctx.set_result(&"main"),
+                0 => ctx.set_result("state"),
+                1 => ctx.set_result("main"),
                 2 => ctx.set_result(&column.table_name),
                 3 => ctx.set_result(&column.column_name),
-                4 => ctx.set_result(&column.ordinal_position),
+                4 => ctx.set_result(column.ordinal_position),
                 5 => ctx.set_result(&column.column_default),
-                6 => ctx.set_result(&if column.nullable { "YES" } else { "NO" }),
+                6 => ctx.set_result(if column.nullable { "YES" } else { "NO" }),
                 7 => ctx.set_result(&column.data_type),
-                8 => ctx.set_result(&column.character_maximum_length),
-                9 => ctx.set_result(&column.character_octet_length),
-                10 => ctx.set_result(&column.numeric_precision),
-                11 => ctx.set_result(&column.numeric_precision_radix),
-                12 => ctx.set_result(&column.numeric_scale),
-                13 => ctx.set_result(&column.datetime_precision),
+                8 => ctx.set_result(column.character_maximum_length),
+                9 => ctx.set_result(column.character_octet_length),
+                10 => ctx.set_result(column.numeric_precision),
+                11 => ctx.set_result(column.numeric_precision_radix),
+                12 => ctx.set_result(column.numeric_scale),
+                13 => ctx.set_result(column.datetime_precision),
                 14 => ctx.set_result(&Option::<String>::None),
-                15 => ctx.set_result(&Option::<i64>::None),
+                15 => ctx.set_result(Option::<i64>::None),
                 16..=24 | 28..=30 => ctx.set_result(&Option::<String>::None),
-                25 => ctx.set_result(&"state"),
-                26 => ctx.set_result(&"pg_catalog"),
+                25 => ctx.set_result("state"),
+                26 => ctx.set_result("pg_catalog"),
                 27 => ctx.set_result(&column.udt_name),
-                31 => ctx.set_result(&Option::<i64>::None),
+                31 => ctx.set_result(Option::<i64>::None),
                 32 => ctx.set_result(&column.dtd_identifier),
-                33 | 34 => ctx.set_result(&"NO"),
+                33 | 34 => ctx.set_result("NO"),
                 35..=40 => ctx.set_result(&Option::<String>::None),
-                41 => ctx.set_result(&if column.generated { "ALWAYS" } else { "NEVER" }),
+                41 => ctx.set_result(if column.generated { "ALWAYS" } else { "NEVER" }),
                 42 => ctx.set_result(&Option::<String>::None),
-                43 => ctx.set_result(&"YES"),
+                43 => ctx.set_result("YES"),
                 _ => Err(rusqlite::Error::InvalidColumnIndex(col as usize)),
             }
         } else {

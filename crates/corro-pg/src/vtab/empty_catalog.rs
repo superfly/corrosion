@@ -4,8 +4,9 @@ use rusqlite::vtab::{
     sqlite3_vtab, sqlite3_vtab_cursor, Filters, IndexInfo, VTab, VTabConnection, VTabCursor,
 };
 
-/// A virtual table that always returns zero rows.  Used for PostgreSQL system
-/// catalogs that we don't populate yet (e.g. `pg_index`, `pg_am`, `pg_proc`)
+/// A virtual table that always returns zero rows.
+///
+/// Used for PostgreSQL system catalogs that we don't populate yet (e.g. `pg_index`, `pg_am`, `pg_proc`)
 /// but that external tools reference in JOINs.  Returning an empty result set
 /// is safer than erroring because the tool can degrade gracefully.
 #[repr(C)]
@@ -21,24 +22,32 @@ unsafe impl<'vtab> VTab<'vtab> for EmptyCatalogTable {
 
     fn connect(
         _: &mut VTabConnection,
-        aux: Option<&&'static str>,
-        args: &[&[u8]],
-    ) -> rusqlite::Result<(String, EmptyCatalogTable)> {
+        aux: Option<&Self::Aux>,
+        _module_name: &[u8],
+        _database_name: &[u8],
+        table_name: &[u8],
+        _args: &[&[u8]],
+    ) -> rusqlite::Result<(std::borrow::Cow<'static, std::ffi::CStr>, Self)> {
         let ddl = aux.unwrap();
         let vtab = EmptyCatalogTable {
             base: sqlite3_vtab::default(),
             ddl,
         };
-        let table_name = std::str::from_utf8(args[0]).map_err(rusqlite::Error::Utf8Error)?;
-        Ok((format!("CREATE TABLE {table_name} {ddl}"), vtab))
+        let table_name = std::str::from_utf8(table_name)?;
+        Ok((
+            std::ffi::CString::new(format!("CREATE TABLE {table_name} {ddl}"))
+                .unwrap()
+                .into(),
+            vtab,
+        ))
     }
 
-    fn best_index(&self, info: &mut IndexInfo) -> rusqlite::Result<()> {
+    fn best_index(&self, info: &mut IndexInfo) -> rusqlite::Result<bool> {
         info.set_estimated_cost(1.);
-        Ok(())
+        Ok(true)
     }
 
-    fn open(&'vtab mut self) -> rusqlite::Result<EmptyCatalogCursor<'vtab>> {
+    fn open(&'vtab mut self) -> rusqlite::Result<Self::Cursor> {
         Ok(EmptyCatalogCursor {
             base: sqlite3_vtab_cursor::default(),
             _phantom: PhantomData,
