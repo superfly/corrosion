@@ -10,6 +10,13 @@ repository.workspace = true
 [lints]
 workspace = true
 
+[features]
+default = ["config"]
+config = [
+    "dep:consul-client",
+    "dep:serde_with",
+]
+
 [dependencies]
 arc-swap = { workspace = true }
 async-trait = { workspace = true }
@@ -18,7 +25,7 @@ camino = { workspace = true }
 circular-buffer = "0.1.5"
 compact_str = { workspace = true }
 config = { workspace = true }
-consul-client = { version = "0.2.0-alpha.0", path = "../consul-client" }
+consul-client = { version = "0.2.0-alpha.0", path = "../consul-client", optional = true }
 corro-api-types = { version = "0.2.0-alpha.0", path = "../corro-api-types" }
 corro-base-types = { version = "0.1.0-alpha.1", path = "../corro-base-types" }
 corro-utils = { path = "../corro-utils"}
@@ -44,7 +51,7 @@ rusqlite = { workspace = true }
 seahash = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-serde_with = { workspace = true }
+serde_with = { workspace = true, optional = true }
 spawn = { path = "../spawn" }
 speedy = { workspace = true }
 sqlite-functions = { path = "../sqlite-functions" }

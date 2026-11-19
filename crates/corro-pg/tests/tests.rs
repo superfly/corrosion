@@ -1,7 +1,6 @@
 use std::time::{Duration, Instant};
 
 use camino::Utf8PathBuf;
-use chrono::{DateTime, NaiveDateTime, Utc};
 use corro_pg::{start, PgServer};
 use corro_tests::{launch_test_agent, TestAgent};
 use corro_types::{
@@ -14,6 +13,7 @@ use rcgen::Certificate;
 use rustls::pki_types::pem::PemObject;
 use spawn::wait_for_all_pending_handles;
 use tempfile::TempDir;
+use time::PlainDateTime;
 use tokio_postgres::NoTls;
 use tokio_postgres_rustls::MakeRustlsConnect;
 use tripwire::Tripwire;
@@ -720,42 +720,50 @@ async fn test_pg() {
         println!("t.text: {:?}", row.try_get::<_, String>(1));
         println!("t2text: {:?}", row.try_get::<_, String>(2));
 
-        let now: DateTime<Utc> = Utc::now();
+        fn plain_now() -> PlainDateTime {
+            // time wants you to "transmute" this to a PlainDateTime since internally it's already that, but that would
+            // require unsafe and would completely break if the layout changed in the future
+            let n = time::UtcDateTime::now();
+
+            PlainDateTime::new(n.date(), n.time())
+        }
+
+        let now = plain_now();
         println!("NOW: {now:?}");
 
         let row = client
                 .query_one(
                     "INSERT INTO kitchensink (other_ts, id, updated_at) VALUES (?1, ?2, ?1) RETURNING updated_at",
-                    &[&now.naive_utc(), &1i64],
+                    &[&now, &1i64],
                 )
                 .await.unwrap();
 
         println!("ROW: {row:?}");
-        let updated_at = row.try_get::<_, NaiveDateTime>(0).unwrap();
+        let updated_at = row.try_get::<_, PlainDateTime>(0).unwrap();
         println!("updated_at: {updated_at:?}");
 
         assert_eq!(
-            now.timestamp_micros(),
-            updated_at.and_utc().timestamp_micros()
+            now.as_utc().unix_timestamp(),
+            updated_at.as_utc().unix_timestamp()
         );
 
-        let future: DateTime<Utc> = Utc::now() + Duration::from_secs(1);
+        let future = plain_now() + Duration::from_secs(1);
         println!("NOW: {future:?}");
 
         let row = client
                 .query_one(
                     "UPDATE kitchensink SET other_ts = $ts, updated_at = $ts WHERE id = $id AND updated_at > ? RETURNING updated_at",
-                    &[&future.naive_utc(), &1i64, &(now - Duration::from_secs(1)).naive_utc()],
+                    &[&future, &1i64, &(now - Duration::from_secs(1))],
                 )
                 .await.unwrap();
 
         println!("ROW: {row:?}");
-        let updated_at = row.try_get::<_, NaiveDateTime>(0).unwrap();
+        let updated_at = row.try_get::<_, PlainDateTime>(0).unwrap();
         println!("updated_at: {updated_at:?}");
 
         assert_eq!(
-            future.timestamp_micros(),
-            updated_at.and_utc().timestamp_micros()
+            future.as_utc().unix_timestamp(),
+            updated_at.as_utc().unix_timestamp()
         );
 
         let row = client
@@ -1982,7 +1990,7 @@ async fn test_unnest_vtab() {
             let joiner = [1i64, 2];
             let rows = client
                 .query(
-                    "SELECT t.id, t.text, CAST(u.value0 AS int) FROM tests t 
+                    "SELECT t.id, t.text, CAST(u.value0 AS int) FROM tests t
                      JOIN unnest(CAST($1 AS int[])) u ON t.id = u.value0",
                     &[&joiner],
                 )

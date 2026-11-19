@@ -1,6 +1,7 @@
 mod codec;
 pub mod sql_state;
 mod ssl;
+mod time;
 pub mod utils;
 mod vtab;
 
@@ -20,7 +21,6 @@ use std::{
     time::Duration,
 };
 
-use chrono::NaiveDateTime;
 use compact_str::CompactString;
 use corro_types::{
     agent::{Agent, BookieWriteGuard, ChangeError},
@@ -3435,21 +3435,8 @@ pub async fn start(
                                                             }
 
                                                             t @ &Type::TIMESTAMP => {
-                                                                let dt = match format_code {
-                                                                FormatCode::Text => {
-                                                                    let s =
-                                                                        String::from_utf8_lossy(b);
-                                                                    NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S%.f").map_err(ToParamError::Parse)?
-                                                                }
-                                                                FormatCode::Binary => {
-                                                                    NaiveDateTime::from_sql(t, b)
-                                                                        .map_err(
-                                                                            ToParamError::<
-                                                                                chrono::format::ParseError
-                                                                            >::FromSql,
-                                                                        )?
-                                                                }
-                                                            };
+                                                                let dt = time::from_sql(t, &b, format_code)?;
+
                                                                 prepped
                                                                     .raw_bind_parameter(idx, dt)?;
                                                             }
@@ -4323,7 +4310,7 @@ impl<'conn> Session<'conn> {
                         t @ &Type::TIMESTAMP => {
                             encoder
                                 .encode_field_with_type_and_format(
-                                    &row.get::<_, Option<NaiveDateTime>>(idx)?,
+                                    &row.get::<_, Option<time::OurDateTime>>(idx)?,
                                     t,
                                     format,
                                     format_opts,
