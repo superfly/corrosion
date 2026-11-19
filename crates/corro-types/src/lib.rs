@@ -1,4 +1,5 @@
 #![allow(clippy::manual_slice_size_calculation, clippy::collapsible_match)]
+
 pub mod actor;
 pub mod agent;
 pub mod api;
@@ -7,7 +8,6 @@ pub mod broadcast;
 pub mod change;
 pub mod channel;
 pub mod compress;
-#[cfg(feature = "config")]
 pub mod config;
 pub mod gauge;
 pub mod members;
