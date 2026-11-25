@@ -144,6 +144,32 @@ where
     })
 }
 
+/// SQLite failures caused by the caller's statement, as opposed to the node.
+fn is_client_sqlite_error(err: &rusqlite::Error) -> bool {
+    match err {
+        rusqlite::Error::SqliteFailure(sqlite_err, _) => matches!(
+            sqlite_err.code,
+            rusqlite::ErrorCode::ConstraintViolation
+                | rusqlite::ErrorCode::TypeMismatch
+                | rusqlite::ErrorCode::TooBig
+                | rusqlite::ErrorCode::ParameterOutOfRange
+                | rusqlite::ErrorCode::AuthorizationForStatementDenied
+        ),
+        rusqlite::Error::InvalidParameterName(_)
+        | rusqlite::Error::InvalidParameterCount(_, _)
+        | rusqlite::Error::InvalidColumnName(_)
+        | rusqlite::Error::InvalidColumnType(_, _, _)
+        | rusqlite::Error::QueryReturnedMoreThanOneRow
+        | rusqlite::Error::StatementChangedRows(_)
+        | rusqlite::Error::ExecuteReturnedResults
+        | rusqlite::Error::MultipleStatement
+        | rusqlite::Error::NulError(_)
+        | rusqlite::Error::InvalidQuery
+        | rusqlite::Error::SqlInputError { .. } => true,
+        _ => false,
+    }
+}
+
 #[tracing::instrument(skip_all, err)]
 fn execute_statement<T>(
     tx: &InterruptibleTransaction<T>,
@@ -237,13 +263,20 @@ pub async fn api_v1_transactions(
     let (results, version, elapsed) = match res {
         Ok(res) => res,
         Err(e) => {
-            error!("could not execute statement(s): {e}");
+            let (status, message) = match &e {
+                ChangeError::Rusqlite { source, .. } if is_client_sqlite_error(source) => {
+                    debug!("rejected statement(s): {source}");
+                    (StatusCode::BAD_REQUEST, source.to_string())
+                }
+                _ => {
+                    error!("could not execute statement(s): {e}");
+                    (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+                }
+            };
             return (
-                StatusCode::INTERNAL_SERVER_ERROR,
+                status,
                 axum::Json(ExecResponse {
-                    results: vec![ExecResult::Error {
-                        error: e.to_string(),
-                    }],
+                    results: vec![ExecResult::Error { error: message }],
                     time: 0.0,
                     version: None,
                     actor_id: Some(actor_id),
@@ -376,8 +409,15 @@ async fn build_query_rows_response(
             let mut rows = match query {
                 Ok(rows) => rows,
                 Err(e) => {
+                    let status = if is_client_sqlite_error(&e) {
+                        debug!("rejected query: {e}");
+                        StatusCode::BAD_REQUEST
+                    } else {
+                        error!("could not execute query: {e}");
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    };
                     _ = res_tx.send(Err((
-                        StatusCode::INTERNAL_SERVER_ERROR,
+                        status,
                         ExecResult::Error {
                             error: e.to_string(),
                         },
@@ -757,6 +797,41 @@ mod tests {
 
         // no actual changes!
         assert!(matches!(rx_bcast.try_recv(), Err(TryRecvError::Empty)));
+
+        let (status_code, body) = api_v1_transactions(
+            Extension(agent.clone()),
+            axum::extract::Query(TimeoutParams { timeout: None }),
+            axum::Json(vec![Statement::Simple(
+                "INSERT INTO does_not_exist (id) VALUES (1)".into(),
+            )]),
+        )
+        .await;
+
+        assert_eq!(status_code, StatusCode::INTERNAL_SERVER_ERROR);
+        match &body.0.results[..] {
+            [ExecResult::Error { error }] => {
+                assert!(error.to_lowercase().contains("no such table"), "{error}");
+            }
+            other => panic!("expected sqlite error, got {other:?}"),
+        }
+
+        let (status_code, body) = api_v1_transactions(
+            Extension(agent.clone()),
+            axum::extract::Query(TimeoutParams { timeout: None }),
+            axum::Json(vec![Statement::Simple(
+                "INSERT INTO tests (id, text) VALUESS (1, 'a')".into(),
+            )]),
+        )
+        .await;
+
+        assert_eq!(status_code, StatusCode::BAD_REQUEST);
+        match &body.0.results[..] {
+            [ExecResult::Error { error }] => {
+                assert!(error.to_lowercase().contains("syntax error"), "{error}");
+                assert!(error.contains("offset"), "{error}");
+            }
+            other => panic!("expected sql input error, got {other:?}"),
+        }
 
         Ok(())
     }
