@@ -3435,7 +3435,7 @@ pub async fn start(
                                                             }
 
                                                             t @ &Type::TIMESTAMP => {
-                                                                let dt = time::from_sql(t, &b, format_code)?;
+                                                                let dt = time::from_sql(t, b, format_code)?;
 
                                                                 prepped
                                                                     .raw_bind_parameter(idx, dt)?;

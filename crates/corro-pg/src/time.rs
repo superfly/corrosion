@@ -35,7 +35,7 @@ pub(super) fn from_sql(
     match format {
         crate::FormatCode::Text => {
             let s = std::str::from_utf8(val)?;
-            PlainDateTime::parse(&s, fmt_desc())
+            PlainDateTime::parse(s, fmt_desc())
                 .map_err(|err| crate::ToParamError::Parse(err.into()))
         }
         crate::FormatCode::Binary => {
