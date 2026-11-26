@@ -49,10 +49,17 @@ ENV LD_LIBRARY_PATH=/usr/lib/antithesis/lib
 
 ENV RUSTFLAGS="--cfg tokio_unstable -C link-arg=-fuse-ld=mold -C force-frame-pointers -C symbol-mangling-version=v0 -C codegen-units=1 -C passes=sancov-module -C llvm-args=-sanitizer-coverage-level=3 -C llvm-args=-sanitizer-coverage-trace-pc-guard -C link-arg=-Wl,--build-id -C link-arg=-Wl,--build-id -L /usr/lib/antithesis/lib/ -l voidstar"
 
+ENV CARGO_PROFILE_RELEASE_INCREMENTAL=false
+
 # Will build and cache the binary and dependent crates in release mode
 RUN --mount=type=cache,target=/usr/local/cargo,from=rust:bookworm,source=/usr/local/cargo \
     --mount=type=cache,target=target \
-    cargo build --release --features running_in_antithesis && mv target/release/corrosion ./ && mv target/release/rust-load-generator ./
+    rm -rf target/release/incremental && \
+    cargo build --release --features running_in_antithesis && \
+    mv target/release/corrosion ./ && \
+    mv target/release/rust-load-generator ./ && \
+    python3 .antithesis/corrosion/clean-workspace-cache.py && \
+    rm -rf target/release/incremental
 
 # Runtime image
 FROM debian:trixie-slim
@@ -66,9 +73,9 @@ RUN useradd -ms /bin/bash corrosion
 ENV LD_LIBRARY_PATH=/usr/lib/antithesis/lib
 COPY .antithesis/libvoidstar.so /usr/lib/antithesis/lib/libvoidstar.so
 
-RUN mkdir -p /symbols
-COPY --from=builder /usr/src/app/corrosion /symbols/corrosion
-COPY --from=builder /usr/src/app/rust-load-generator /symbols/rust-load-generator
+RUN mkdir -p /symbols && \
+    ln -s /usr/local/bin/corrosion /symbols/corrosion && \
+    ln -s /usr/local/bin/rust-load-generator /symbols/rust-load-generator
 
 COPY .antithesis/corrosion/entrypoint.sh /entrypoint.sh
 COPY .antithesis/corrosion/config.toml.tpl /etc/corrosion/config.toml.tpl
