@@ -1,6 +1,6 @@
 [package]
 name = "sqlite-pool"
-version = "0.1.0-alpha.0"
+version = "0.2.0-alpha.0"
 description = "Async pool for rusqlite connection"
 edition.workspace = true
 license.workspace = true
