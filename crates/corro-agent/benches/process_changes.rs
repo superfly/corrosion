@@ -15,6 +15,7 @@ use corro_types::{
     base::{CrsqlDbVersion, CrsqlSeq},
     broadcast::{ChangeSource, ChangeV1, Changeset, PackedChangesetPerTable},
     change::{row_to_change, row_to_packed_change, Change, PackedChange},
+    updates::{match_changes, match_changes_from_db_version},
 };
 use hyper::StatusCode;
 
@@ -591,6 +592,212 @@ fn bench_partials(c: &mut Criterion) {
     );
 }
 
+/// Exercise the matcher fallback with live handles. The process_changes bench
+/// above has no subscriptions or updates registered, and its remote matching
+/// work is spawned after process_multiple_changes returns.
+fn bench_match_changes_with_live_handles(c: &mut Criterion) {
+    let rt = Runtime::new().unwrap();
+    let config = BenchConfig {
+        rng_seed: 1337,
+        number_of_bench_tables: 8,
+        initial_rows_per_table: 10_000,
+        batch_sizes: vec![100],
+        operations_per_tx: 100,
+        operation_mix: (10, 80, 5, 5),
+        all_partial: false,
+    };
+
+    let ta = rt.block_on(setup_test_agent_with_data(&config)).unwrap();
+    let actor_id = ta.agent.actor_id();
+    let start_version = rt.block_on(async {
+        ta.agent
+            .pool()
+            .read()
+            .await
+            .unwrap()
+            .query_row("SELECT crsql_db_version()", [], |row| {
+                row.get::<_, CrsqlDbVersion>(0)
+            })
+            .unwrap()
+    });
+    let changesets = rt.block_on(generate_changesets(&ta, &config)).unwrap();
+    let changes_by_version = changesets
+        .iter()
+        .map(|(change, _, _)| (change.versions().start(), change.changeset.clone()))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let conn = rt.block_on(async { ta.agent.pool().read().await.unwrap() });
+    let versions = {
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT DISTINCT db_version FROM crsql_changes \
+                 WHERE site_id = ? AND db_version > ? ORDER BY db_version",
+            )
+            .unwrap();
+        stmt.query_map((actor_id, start_version), |row| {
+            row.get::<_, CrsqlDbVersion>(0)
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap()
+    };
+    assert!(
+        !versions.is_empty(),
+        "benchmark workload generated no versions"
+    );
+    assert_eq!(versions.len(), changesets.len());
+    assert_eq!(versions.len(), changes_by_version.len());
+    let (range_start, range_end) = (*versions.first().unwrap(), *versions.last().unwrap());
+
+    let match_query = r#"
+        SELECT DISTINCT "table", pk, cid, cl
+        FROM crsql_changes
+        WHERE db_version = ? AND site_id = ?
+    "#;
+    let need_query = r#"
+        SELECT db_version, MAX(seq) AS last_seq, MAX(ts) AS ts
+        FROM crsql_changes
+        WHERE site_id = ? AND db_version BETWEEN ? AND ?
+        GROUP BY db_version
+        ORDER BY db_version DESC, seq ASC
+    "#;
+    let mut explain = conn
+        .prepare(&format!("EXPLAIN QUERY PLAN {match_query}"))
+        .unwrap();
+    let match_plan = explain
+        .query_map((range_start, actor_id), |row| row.get::<_, String>(3))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    eprintln!("match query plan: {match_plan:?}");
+
+    let mut explain = conn
+        .prepare(&format!("EXPLAIN QUERY PLAN {need_query}"))
+        .unwrap();
+    let need_plan = explain
+        .query_map((actor_id, range_start, range_end), |row| {
+            row.get::<_, String>(3)
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    eprintln!("need-range query plan: {need_plan:?}");
+
+    let (change_rows, max_rows_per_version): (i64, i64) = conn
+        .query_row(
+            "SELECT COALESCE(SUM(rows), 0), COALESCE(MAX(rows), 0) FROM (
+                SELECT COUNT(*) AS rows FROM crsql_changes
+                WHERE site_id = ? AND db_version BETWEEN ? AND ?
+                GROUP BY db_version
+            )",
+            (actor_id, range_start, range_end),
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    eprintln!(
+        "match workload: {} versions, {change_rows} scalar rows, max {max_rows_per_version} rows/version",
+        versions.len()
+    );
+
+    let (matcher_tripwire, matcher_worker, matcher_tx) = Tripwire::new_simple();
+    let mut drain_tasks = Vec::new();
+    rt.block_on(async {
+        let schema = ta.agent.schema().read();
+        let subs_path = ta.agent.config().db.subscriptions_path();
+
+        for table_idx in 0..config.number_of_bench_tables {
+            let table = format!("bench_test_{table_idx}");
+
+            let (_, created) = ta
+                .agent
+                .updates_manager()
+                .get_or_insert(&table, &schema, ta.agent.pool(), matcher_tripwire.clone())
+                .unwrap();
+            if let Some(created) = created {
+                let mut rx = created.evt_rx;
+                drain_tasks.push(tokio::spawn(
+                    async move { while rx.recv().await.is_some() {} },
+                ));
+            }
+
+            let query = format!("SELECT id, value, counter, random FROM {table} WHERE id < 0");
+            let (_, created) = ta
+                .agent
+                .subs_manager()
+                .get_or_insert(
+                    &query,
+                    &subs_path,
+                    &schema,
+                    ta.agent.pool(),
+                    matcher_tripwire.clone(),
+                )
+                .unwrap();
+            if let Some(created) = created {
+                let mut rx = created.evt_rx;
+                drain_tasks.push(tokio::spawn(
+                    async move { while rx.recv().await.is_some() {} },
+                ));
+            }
+        }
+    });
+
+    let subs = ta.agent.subs_manager().clone();
+    let updates = ta.agent.updates_manager().clone();
+    let is_packed = is_v2_mode();
+    let mut group = c.benchmark_group("match_changes_with_live_handles");
+    group.throughput(Throughput::Elements((versions.len() * 2) as u64));
+    group.bench_function(
+        format!(
+            "{}_versions_8_tables_100_ops_{}",
+            versions.len(),
+            if is_packed {
+                "v2_db_fallback"
+            } else {
+                "v1_in_memory"
+            }
+        ),
+        |b| {
+            b.iter(|| {
+                for version in &versions {
+                    if is_packed {
+                        match_changes_from_db_version(&subs, &conn, *version, actor_id).unwrap();
+                        match_changes_from_db_version(&updates, &conn, *version, actor_id).unwrap();
+                    } else {
+                        let changes = &changes_by_version[version];
+                        match_changes(&subs, changes, *version);
+                        match_changes(&updates, changes, *version);
+                    }
+                }
+                black_box(())
+            });
+        },
+    );
+    group.finish();
+
+    let mut need_group = c.benchmark_group("handle_need_metadata_range");
+    need_group.throughput(Throughput::Elements(versions.len() as u64));
+    let mut need_stmt = conn.prepare_cached(need_query).unwrap();
+    need_group.bench_function(format!("{}_versions", versions.len()), |b| {
+        b.iter(|| {
+            let mut rows = need_stmt.query((actor_id, range_start, range_end)).unwrap();
+            let mut count = 0;
+            while let Some(row) = rows.next().unwrap() {
+                let _: CrsqlDbVersion = row.get(0).unwrap();
+                let _: rusqlite::types::Value = row.get(1).unwrap();
+                let _: rusqlite::types::Value = row.get(2).unwrap();
+                count += 1;
+            }
+            black_box(count)
+        });
+    });
+    need_group.finish();
+
+    rt.block_on(async {
+        matcher_tx.send(()).await.ok();
+        matcher_worker.await;
+    });
+    drop(drain_tasks);
+}
+
 criterion_group! {
     name = benches;
     config = Criterion::default()
@@ -603,7 +810,8 @@ criterion_group! {
         bench_fulls_one_large_table_insert_only,
         bench_fulls_one_large_table_update_only,
         bench_fulls_one_large_table_delete_only,
-        bench_partials
+        bench_partials,
+        bench_match_changes_with_live_handles
 }
 
 criterion_main!(benches);
