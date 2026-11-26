@@ -67,11 +67,25 @@ rangemap = { version = "1.5.1", features = ["serde1"] }
 rcgen = { version = "0.11.1", features = ["x509-parser"] }
 reqwest = { version = "0.12", default-features = false, features = ["http2", "rustls-tls", "rustls-tls-webpki-roots"] }
 rhai = { version = "1.15.1", features = ["sync"] }
-rusqlite = { version = "0.41.1", features = ["serde_json", "time", "bundled", "uuid", "array", "load_extension", "column_decltype", "vtab", "functions", "chrono", "series", "trace", "cache", "fallible_uint"] }
+rusqlite = { version = "0.41.1", features = [
+    "serde_json",
+    "time",
+    "bundled",
+    "uuid",
+    "array",
+    "load_extension",
+    "column_decltype",
+    "vtab",
+    "functions",
+    "series",
+    "trace",
+    "cache",
+    "fallible_uint",
+] }
 rustls = { version = "0.23.0", default-features = false, features = ["ring"] }
 seahash = "4.1.0"
 serde = "1.0.159"
-serde_json = { version = "1.0.95", features = ["raw_value"] }
+serde_json = { version = "1.0.151", features = ["raw_value"] }
 serde_with = "2.3.2"
 smallvec = { version = "1.11.0", features = ["serde", "write", "union"] }
 speedy = { version = "0.8.7", features = ["uuid", "smallvec", "indexmap", "indexmap_v2" ], package = "speedy" }
@@ -79,7 +93,7 @@ sqlite3-parser = "0.12.0"
 strum = { version = "0.24.1", features = ["derive"] }
 tempfile = "3.5.0"
 thiserror = "1.0.40"
-time = { version = "0.3.15", features = ["macros", "serde-well-known"] }
+time = { version = "0.3.15", features = ["formatting", "macros", "parsing", "serde-well-known"] }
 tokio = { version = "1.41", features = ["full"] }
 tokio-metrics = "0.3.0"
 tokio-serde = { version = "0.8", features = ["json"] }
