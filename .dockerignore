@@ -1,1 +1,13 @@
 /target
+/.git
+/.buildkite
+/.buildkite-antithesis
+/.github
+/.devin
+/.config
+/benchmark_results
+/book
+/doc
+/examples
+/scripts
+.DS_Store

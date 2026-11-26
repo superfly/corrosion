@@ -4,7 +4,7 @@ FROM rust:bookworm AS builder
 
 ARG TARGETARCH
 
-RUN apt update && apt install -y build-essential gcc-x86-64-linux-gnu clang llvm unzip
+RUN apt-get update && apt-get install -y --no-install-recommends build-essential gcc-x86-64-linux-gnu clang llvm unzip && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
 
 # Install mold
 ENV MOLD_VERSION=1.11.0
@@ -37,6 +37,13 @@ RUN set -eux; \
 WORKDIR /usr/src/app
 COPY . .
 
+ARG CORRO_GIT_SHA=""
+ARG CORRO_GIT_SHORT_SHA=""
+ARG CORRO_GIT_DIRTY=""
+ENV CORRO_GIT_SHA="${CORRO_GIT_SHA}"
+ENV CORRO_GIT_SHORT_SHA="${CORRO_GIT_SHORT_SHA}"
+ENV CORRO_GIT_DIRTY="${CORRO_GIT_DIRTY}"
+
 COPY .antithesis/libvoidstar.so /usr/lib/antithesis/lib/libvoidstar.so
 ENV LD_LIBRARY_PATH=/usr/lib/antithesis/lib
 
@@ -50,7 +57,7 @@ RUN --mount=type=cache,target=/usr/local/cargo,from=rust:bookworm,source=/usr/lo
 # Runtime image
 FROM debian:trixie-slim
 
-RUN apt update && apt install -y sqlite3 sqlite3-tools watch socat iproute2 gettext-base ca-certificates supervisor && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends sqlite3 sqlite3-tools watch socat iproute2 gettext-base ca-certificates supervisor && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
 COPY --from=builder /usr/local/bin/consul /usr/src/app/corrosion /usr/src/app/rust-load-generator /usr/local/bin/
 
 # Create "corrosion" user

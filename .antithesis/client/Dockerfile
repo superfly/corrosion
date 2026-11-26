@@ -1,9 +1,7 @@
 ARG CACHE_BUST_WEEKLY
 FROM corrosion
 
-RUN apt-get update && apt-get install -y curl socat python3
-
-RUN apt install -y python3-pip python3-requests
+RUN apt-get update && apt-get install -y --no-install-recommends curl socat python3 python3-pip python3-requests && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
 
 RUN pip install antithesis cffi pg8000 --break-system-packages
 
