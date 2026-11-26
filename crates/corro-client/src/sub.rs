@@ -592,7 +592,6 @@ impl Decoder for LinesBytesCodec {
                     None
                 } else {
                     let mut line = buf.split_to(buf.len());
-                    line.truncate(line.len() - 1);
                     without_carriage_return(&mut line);
                     self.next_index = 0;
                     Some(line)
@@ -605,5 +604,48 @@ impl Decoder for LinesBytesCodec {
 fn without_carriage_return(s: &mut BytesMut) {
     if let Some(&b'\r') = s.last() {
         s.truncate(s.len() - 1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::StreamExt;
+
+    #[test]
+    fn lines_codec_decode_eof_keeps_unterminated_line() {
+        let mut codec = LinesBytesCodec::default();
+        let mut buf = BytesMut::from(&b"first\nlast"[..]);
+
+        assert_eq!(codec.decode_eof(&mut buf).unwrap().unwrap(), &b"first"[..]);
+        assert_eq!(codec.decode_eof(&mut buf).unwrap().unwrap(), &b"last"[..]);
+        assert!(codec.decode_eof(&mut buf).unwrap().is_none());
+
+        let mut buf = BytesMut::from(&b"last\r"[..]);
+        assert_eq!(codec.decode_eof(&mut buf).unwrap().unwrap(), &b"last"[..]);
+    }
+
+    #[tokio::test]
+    async fn query_stream_reads_last_event_without_trailing_newline() {
+        let body = reqwest::Body::from(
+            r#"{"columns":["id"]}
+{"row":[1,[1]]}
+{"error":"query failed"}"#,
+        );
+        let mut stream = QueryStream::<(i64,)>::new(body);
+
+        assert!(matches!(
+            stream.next().await,
+            Some(Ok(TypedQueryEvent::Columns(_)))
+        ));
+        assert!(matches!(
+            stream.next().await,
+            Some(Ok(TypedQueryEvent::Row(_, (1,))))
+        ));
+        assert!(matches!(
+            stream.next().await,
+            Some(Ok(TypedQueryEvent::Error(e))) if e == "query failed"
+        ));
+        assert!(stream.next().await.is_none());
     }
 }
