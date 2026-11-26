@@ -8,3 +8,6 @@
 .antithesis/config/volumes
 benchmark_results/*
 .DS_Store
+__pycache__/
+.antithesis/scratchbook/
+.antithesis/feature-workloads/

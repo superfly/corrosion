@@ -1,8 +1,17 @@
 #!/usr/bin/env python3
 """Validate V1/V2 metadata compatibility while dual-write is active."""
 
+import fcntl
+import json
+import os
+import re
+import shutil
 import sqlite3
 import sys
+import tarfile
+import tempfile
+import time
+from pathlib import Path
 
 COL_ID_BITS = 12
 COL_ID_MASK = (1 << COL_ID_BITS) - 1
@@ -26,6 +35,71 @@ def pk_info(conn, table):
         return None, []
     mode, columns = row[0].split(":", 1)
     return mode, [part.split(":", 1)[0] for part in columns.split(",")]
+
+
+def check_causal_lengths(conn, table, mode, pk_cols, v2_has_pk_cols):
+    v1_clock = qi(f"{table}__crsql_clock")
+    v1_pks = qi(f"{table}__crsql_pks")
+    v2_pks = qi(f"{table}__crsql_v2_pks")
+    v2_tomb = qi(f"{table}__crsql_v2_tombstones")
+    tomb_pks_name = f"{table}__crsql_v2_tombstone_pks"
+    errors = []
+
+    # V1 and V2 internal keys are unrelated. Unary + removes the V2 column's
+    # affinity so SQLite can use the V1 PK index for integer PKs as well.
+    source = "vp" if v2_has_pk_cols else "b"
+    live_base = "" if v2_has_pk_cols else (
+        f"LEFT JOIN {qi(table)} b ON b.rowid = vp.__crsql_key"
+    )
+    live_join = " AND ".join(f"p.{qi(col)} = +{source}.{qi(col)}" for col in pk_cols)
+    missing_live_pks, live_cl_mismatches = conn.execute(
+        f"""SELECT
+              count(CASE WHEN p.__crsql_key IS NULL THEN 1 END),
+              count(CASE WHEN p.__crsql_key IS NOT NULL
+                         AND vp.cl IS NOT COALESCE(c.col_version, 1) THEN 1 END)
+            FROM {v2_pks} vp
+            {live_base}
+            LEFT JOIN {v1_pks} p ON {live_join}
+            LEFT JOIN {v1_clock} c
+              ON c.key = p.__crsql_key AND c.col_name = '-1'"""
+    ).fetchone()
+    if missing_live_pks:
+        errors.append(f"live V2 PK rows missing V1 PK rows={missing_live_pks}")
+    if live_cl_mismatches:
+        errors.append(f"live CL mismatches={live_cl_mismatches}")
+
+    if mode.endswith("h"):
+        if not exists(conn, tomb_pks_name):
+            # The missing table is reported by the existing structural check.
+            return errors
+        tomb_mapping = (
+            f"LEFT JOIN {qi(tomb_pks_name)} tp ON tp.hashed_pk = t.hashed_pk"
+        )
+        source, has_mapping = "tp", "tp.hashed_pk IS NOT NULL"
+    else:
+        tomb_mapping = ""
+        source, has_mapping = "t", "1"
+    tomb_join = " AND ".join(f"p.{qi(col)} = +{source}.{qi(col)}" for col in pk_cols)
+    missing_tomb_pks, missing_markers, tomb_cl_mismatches = conn.execute(
+        f"""SELECT
+              count(CASE WHEN {has_mapping} AND p.__crsql_key IS NULL THEN 1 END),
+              count(CASE WHEN p.__crsql_key IS NOT NULL
+                         AND (c.key IS NULL OR c.col_version % 2 != 0) THEN 1 END),
+              count(CASE WHEN c.key IS NOT NULL AND c.col_version % 2 = 0
+                         AND t.cl IS NOT c.col_version THEN 1 END)
+            FROM {v2_tomb} t
+            {tomb_mapping}
+            LEFT JOIN {v1_pks} p ON {tomb_join}
+            LEFT JOIN {v1_clock} c
+              ON c.key = p.__crsql_key AND c.col_name = '-1'"""
+    ).fetchone()
+    if missing_tomb_pks:
+        errors.append(f"V2 tombstones missing V1 PK rows={missing_tomb_pks}")
+    if missing_markers:
+        errors.append(f"V2 tombstones missing V1 delete markers={missing_markers}")
+    if tomb_cl_mismatches:
+        errors.append(f"tombstone CL mismatches={tomb_cl_mismatches}")
+    return errors
 
 
 def check_table(conn, table):
@@ -92,6 +166,8 @@ def check_table(conn, table):
             if missing_tomb_pks:
                 errors.append(f"tombstones missing PK rows={missing_tomb_pks}")
 
+    errors.extend(check_causal_lengths(conn, table, mode, pk_cols, v2_has_pk_cols))
+
     v2_clock_count = conn.execute(f"SELECT count(*) FROM {qi(v2_clock)}").fetchone()[0]
     pk_only = not exists(conn, v2_map) or conn.execute(
         f"SELECT count(*) FROM {qi(v2_map)} WHERE col_name != ''"
@@ -146,41 +222,123 @@ def check_table(conn, table):
     return [f"{table}: {error}" for error in errors]
 
 
+def backup_snapshot(conn, destination):
+    target = sqlite3.connect(str(destination), timeout=300)
+    try:
+        # In WAL mode, backing up through this same connection preserves the
+        # read transaction's snapshot rather than newer committed writes.
+        conn.backup(target)
+        checkpoint = target.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        if checkpoint and checkpoint[0]:
+            raise RuntimeError("could not checkpoint evidence snapshot")
+    finally:
+        target.close()
+
+
+def save_evidence(conn, database, errors):
+    root = Path(os.environ.get("V1_V2_INTEGRITY_ARTIFACT_DIR", "/tmp/corrosion-v1v2-integrity"))
+    root.mkdir(parents=True, exist_ok=True)
+    node = re.sub(r"[^A-Za-z0-9_.-]+", "-", Path(database).parent.name or "database")
+    evidence_dir = root / f"evidence-{node}"
+    archive = evidence_dir.with_suffix(".tar")
+
+    with (root / "evidence.lock").open("a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        backup_path = evidence_dir / "state.db"
+        if not backup_path.exists():
+            staging = Path(tempfile.mkdtemp(prefix=f".{node}-", dir=root))
+            try:
+                backup_snapshot(conn, staging / "state.db")
+                manifest = {
+                    "source_database": database,
+                    "created_at_unix": time.time(),
+                    "errors": errors,
+                }
+                (staging / "manifest.json").write_text(
+                    json.dumps(manifest, indent=2, sort_keys=True) + "\n"
+                )
+                os.rename(staging, evidence_dir)
+            except Exception:
+                shutil.rmtree(staging, ignore_errors=True)
+                raise
+        if not archive.exists():
+            with archive.open("wb") as file:
+                with tarfile.open(fileobj=file, mode="w") as tar:
+                    for path in sorted(evidence_dir.iterdir()):
+                        if path.is_file():
+                            tar.add(path, arcname=path.name)
+                file.flush()
+                os.fsync(file.fileno())
+    return evidence_dir, archive
+
+
 def main():
     if len(sys.argv) != 2:
         print(f"usage: {sys.argv[0]} DATABASE", file=sys.stderr)
         return 2
-    conn = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True, timeout=300)
     try:
-        conn.execute("BEGIN")
-        config = dict(
-            conn.execute(
-                "SELECT key, value FROM crsql_master "
-                "WHERE key IN ('config.metadata-write-version', "
-                "'config.metadata-use-version', 'config.sync-log-version')"
-            ).fetchall()
+        conn = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True, timeout=300)
+    except (OSError, sqlite3.Error) as error:
+        print(
+            f"V1/V2 integrity check INCONCLUSIVE ({sys.argv[1]}): "
+            f"could not open database: {error}"
         )
-        write_version = int(config.get("config.metadata-write-version", 1))
-        use_version = int(config.get("config.metadata-use-version", 1))
-        sync_log_version = int(config.get("config.sync-log-version", 1))
-        if write_version != 2:
-            print(
-                "V1/V2 integrity check NOT APPLICABLE "
-                f"(persisted config write={write_version}, use={use_version}, "
-                f"sync={sync_log_version})"
-            )
-            return 0
+        return 2
 
-        clocks = conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE '%__crsql_clock'"
-        ).fetchall()
-        tables = [name.removesuffix('__crsql_clock') for (name,) in clocks]
-        errors = []
-        for table in tables:
-            try:
-                errors.extend(check_table(conn, table))
-            except sqlite3.Error as error:
-                errors.append(f"{table}: checker query failed: {error}")
+    errors = []
+    inconclusive = []
+    evidence = None
+    evidence_error = None
+    try:
+        try:
+            conn.execute("BEGIN")
+            config = dict(
+                conn.execute(
+                    "SELECT key, value FROM crsql_master "
+                    "WHERE key IN ('config.metadata-write-version', "
+                    "'config.metadata-use-version', 'config.sync-log-version')"
+                ).fetchall()
+            )
+            write_version = int(config.get("config.metadata-write-version", 1))
+            use_version = int(config.get("config.metadata-use-version", 1))
+            sync_log_version = int(config.get("config.sync-log-version", 1))
+            if write_version != 2:
+                print(
+                    "V1/V2 integrity check NOT APPLICABLE "
+                    f"(persisted config write={write_version}, use={use_version}, "
+                    f"sync={sync_log_version})"
+                )
+                return 0
+
+            pending = conn.execute(
+                "SELECT count(*) FROM crsql_master "
+                "WHERE key LIKE 'migration_v1_to_v2_migration_%' "
+                "OR key LIKE 'cleanup_v1_tables_%' OR key LIKE 'cleanup_v2_tables_%'"
+            ).fetchone()[0]
+            if pending:
+                print("V1/V2 integrity check NOT APPLICABLE (maintenance pending)")
+                return 0
+
+            clocks = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE '%__crsql_clock'"
+            ).fetchall()
+            tables = [name.removesuffix('__crsql_clock') for (name,) in clocks]
+            for table in tables:
+                try:
+                    errors.extend(check_table(conn, table))
+                except sqlite3.Error as error:
+                    inconclusive.append(f"{table}: checker query failed: {error}")
+            if errors:
+                try:
+                    evidence = save_evidence(conn, sys.argv[1], errors)
+                except (OSError, RuntimeError, sqlite3.Error, tarfile.TarError) as error:
+                    evidence_error = str(error)
+        except (OSError, sqlite3.Error, TypeError, ValueError) as error:
+            print(
+                f"V1/V2 integrity check INCONCLUSIVE ({sys.argv[1]}): "
+                f"checker could not inspect the snapshot: {error}"
+            )
+            return 2
     finally:
         conn.close()
 
@@ -191,7 +349,21 @@ def main():
         print(f"V1/V2 integrity check FAILED ({sys.argv[1]}, {len(tables)} tables)")
         for error in errors:
             print(f"  - {error}")
+        if evidence:
+            print(f"  evidence snapshot: {evidence[0]}")
+            print(f"  evidence archive: {evidence[1]}")
+        elif evidence_error:
+            print(f"  evidence snapshot error: {evidence_error}")
+        if inconclusive:
+            print("Some tables could not be inspected; mismatch evidence above is still valid:")
+            for error in inconclusive:
+                print(f"  - {error}")
         return 1
+    if inconclusive:
+        print(f"V1/V2 integrity check INCONCLUSIVE ({sys.argv[1]}, {len(tables)} tables)")
+        for error in inconclusive:
+            print(f"  - {error}")
+        return 2
     print(f"V1/V2 integrity check OK ({sys.argv[1]}, {len(tables)} tables)")
     return 0
 

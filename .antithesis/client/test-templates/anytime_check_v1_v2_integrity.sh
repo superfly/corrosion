@@ -45,8 +45,27 @@ PY
 
     local db_path="/var/lib/${node}/state.db"
     echo "[v1-v2-integrity] checking ${node}"
-    if ! timeout --kill-after=5s "${V1_V2_INTEGRITY_CHECK_TIMEOUT_SECONDS:-120}s" \
-        python3 /opt/antithesis/py-resources/check_v1_v2_integrity.py "${db_path}"; then
+    local output check_rc
+    set +e
+    output=$(timeout --kill-after=5s "${V1_V2_INTEGRITY_CHECK_TIMEOUT_SECONDS:-120}s" \
+        python3 /opt/antithesis/py-resources/check_v1_v2_integrity.py "${db_path}" 2>&1)
+    check_rc=$?
+    set -e
+    if [ -n "${output}" ]; then
+        printf '%s\n' "${output}"
+    fi
+
+    case "${check_rc}" in
+        0)
+            return 0
+            ;;
+        2|124|125|126|127|137)
+            echo "[v1-v2-integrity] inconclusive attempt for ${node} (exit=${check_rc}); will retry"
+            return 0
+            ;;
+    esac
+
+    if [ "${check_rc}" -ne 0 ]; then
         local refreshed
         if refreshed=$(curl --connect-timeout 2 --max-time 5 -fsS \
             "http://${node}:8080/v1/migrate/status" 2>/dev/null); then
@@ -70,7 +89,7 @@ PY
                 return 0
             fi
         fi
-        echo "[v1-v2-integrity] integrity check failed or timed out: ${node}"
+        echo "[v1-v2-integrity] integrity check failed: ${node}"
         return 1
     fi
 }

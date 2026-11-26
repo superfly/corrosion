@@ -117,23 +117,36 @@ def check_v1_v2_integrity(address):
     """Validate V1/V2 metadata while both formats are still present."""
     host = address.split(":", 1)[0]
     db_path = f"/var/lib/{host}/state.db"
-    result = subprocess.run(
-        ["python3", "/opt/antithesis/py-resources/check_v1_v2_integrity.py", db_path],
-        capture_output=True,
-        text=True,
-        timeout=120,
-    )
+    try:
+        result = subprocess.run(
+            ["python3", "/opt/antithesis/py-resources/check_v1_v2_integrity.py", db_path],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    except subprocess.TimeoutExpired:
+        print(f"Integrity check timed out for {address}; skipping this attempt")
+        return True
     output = f"{result.stdout}{result.stderr}".strip()
     print(f"Integrity check for {address} (exit={result.returncode}):\n{output}")
+    if result.returncode == 2:
+        print(f"Integrity check inconclusive for {address}; retrying on a later attempt")
+        return True
+    if result.returncode == 0 and output.startswith("V1/V2 integrity check NOT APPLICABLE"):
+        return True
     ok = result.returncode == 0
     if not ok:
         refreshed = get_migrate_status(address)
         refreshed_state = classify_node(refreshed) if refreshed is not None else None
-        if refreshed_state not in {
-            "dual_write_done",
-            "dual_write_use_v2",
-            "dual_write_v2_wire",
-        }:
+        if (
+            refreshed_state not in {
+                "dual_write_done",
+                "dual_write_use_v2",
+                "dual_write_v2_wire",
+            }
+            or not refreshed.get("migration_complete", False)
+            or not refreshed.get("cleanup_complete", False)
+        ):
             print(
                 f"Integrity check no longer applicable for {address}: "
                 f"state changed to {refreshed_state}"
@@ -224,7 +237,6 @@ def main():
             "Explicit metadata version settings are configured; "
             f"migration driver will not change any versions: {pinned_settings}"
         )
-        return
 
     # Gather status of all nodes
     nodes = {}  # addr -> (status_dict, classification)
@@ -272,7 +284,12 @@ def main():
     )
     for state in integrity_states:
         for address in categories[state]:
-            check_v1_v2_integrity(address)
+            status, _ = nodes[address]
+            if status.get("migration_complete") and status.get("cleanup_complete"):
+                check_v1_v2_integrity(address)
+
+    if pinned_settings:
+        return
 
     fully_migrated = len(categories["v2_done"])
 

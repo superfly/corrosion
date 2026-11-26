@@ -17,6 +17,13 @@ COPY .antithesis/client/test-templates/anytime_* /opt/antithesis/test/v1/basic_t
 COPY .antithesis/client/config.toml /opt/antithesis/config.toml
 
 COPY .antithesis/client/test-templates/py-resources/helper.py /opt/antithesis/py-resources/helper.py
+COPY .antithesis/client/test-templates/py-resources/snapshot_reconcile.py /opt/antithesis/py-resources/snapshot_reconcile.py
+COPY crates/corro-types/crsqlite-linux-*.so /opt/antithesis/crsqlite/
+
+RUN mkdir -p /opt/antithesis/catalog && \
+    cp /opt/antithesis/test/v1/basic_test/anytime_check_reconciled_db.py /opt/antithesis/catalog/anytime_check_reconciled_db.py && \
+    cp /opt/antithesis/test/v1/basic_test/parallel_driver_migrate.py /opt/antithesis/catalog/parallel_driver_migrate.py && \
+    cp /opt/antithesis/test/v1/basic_test/parallel_driver_resurrections.py /opt/antithesis/catalog/parallel_driver_resurrections.py
 
 COPY .antithesis/client/test-templates/check_bookkeeping.py /opt/antithesis/py-resources/check_bookkeeping.py
 COPY .antithesis/client/test-templates/check_v1_v2_integrity.py /opt/antithesis/py-resources/check_v1_v2_integrity.py
