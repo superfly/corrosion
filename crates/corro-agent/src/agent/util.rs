@@ -795,8 +795,14 @@ pub fn process_single_version<T: Deref<Target = rusqlite::Connection> + Committa
 
     sp.commit()?;
 
-    for (table_name, count) in changes_per_table {
-        counter!("corro.changes.committed", "table" => table_name.to_string(), "source" => "remote").increment(count);
+    for ((table_name, op), count) in changes_per_table {
+        counter!(
+            "corro.changes.committed",
+            "table" => table_name.to_string(),
+            "source" => "remote",
+            "op" => op.as_str()
+        )
+        .increment(count);
     }
 
     Ok((known, changeset))
@@ -1574,6 +1580,41 @@ pub fn process_incomplete_version<T: Deref<Target = rusqlite::Connection> + Comm
     }))
 }
 
+pub type TableOpCounts = BTreeMap<(TableName, ChangeOp), u64>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ChangeOp {
+    Insert,
+    Update,
+    Delete,
+    Resurrection,
+    Unknown,
+}
+
+impl ChangeOp {
+    #[inline]
+    pub fn from_rowid(rowid: i64) -> Self {
+        match (rowid >> 60) & 0x7 {
+            1 => Self::Insert,
+            2 => Self::Update,
+            3 => Self::Delete,
+            4 => Self::Resurrection,
+            _ => Self::Unknown,
+        }
+    }
+
+    #[inline]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Insert => "insert",
+            Self::Update => "update",
+            Self::Delete => "delete",
+            Self::Resurrection => "resurrection",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
 #[tracing::instrument(skip(agent, sp, parts), err)]
 pub fn process_complete_version<T: Deref<Target = rusqlite::Connection> + Committable>(
     agent: Agent,
@@ -1581,7 +1622,7 @@ pub fn process_complete_version<T: Deref<Target = rusqlite::Connection> + Commit
     actor_id: ActorId,
     versions: CrsqlDbVersionRange,
     parts: ChangesetParts,
-) -> rusqlite::Result<(KnownDbVersion, Changeset, BTreeMap<TableName, u64>)> {
+) -> rusqlite::Result<(KnownDbVersion, Changeset, TableOpCounts)> {
     let ChangesetParts {
         version,
         changes,
@@ -1660,10 +1701,11 @@ pub fn process_complete_version<T: Deref<Target = rusqlite::Connection> + Commit
         assert!(db_version == change.db_version);
         assert!(seq == change.seq);
         if rowid != 0 {
+            let op = ChangeOp::from_rowid(rowid);
             let table_name = change.table.clone();
             impactful_changeset.push(change);
             changes_per_table
-                .entry(table_name)
+                .entry((table_name, op))
                 .and_modify(|counter| *counter += 1)
                 .or_insert(1);
         }
@@ -1816,4 +1858,34 @@ fn is_pow_10(i: u64) -> bool {
         i,
         1 | 10 | 100 | 1000 | 10000 | 1000000 | 10000000 | 100000000
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ChangeOp;
+
+    #[test]
+    fn test_change_op_from_rowid() {
+        const SLAB_SAMPLE: i64 = 2 * 10_000_000_000_000 + 42;
+
+        assert_eq!(
+            ChangeOp::from_rowid((1_i64 << 60) | SLAB_SAMPLE),
+            ChangeOp::Insert
+        );
+        assert_eq!(
+            ChangeOp::from_rowid((2_i64 << 60) | SLAB_SAMPLE),
+            ChangeOp::Update
+        );
+        assert_eq!(
+            ChangeOp::from_rowid((3_i64 << 60) | SLAB_SAMPLE),
+            ChangeOp::Delete
+        );
+        assert_eq!(
+            ChangeOp::from_rowid((4_i64 << 60) | SLAB_SAMPLE),
+            ChangeOp::Resurrection
+        );
+        // Legacy unencoded rowids fall back to Unknown without failing
+        assert_eq!(ChangeOp::from_rowid(SLAB_SAMPLE), ChangeOp::Unknown);
+        assert_eq!(ChangeOp::from_rowid(0), ChangeOp::Unknown);
+    }
 }
