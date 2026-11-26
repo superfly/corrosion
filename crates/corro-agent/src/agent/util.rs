@@ -1580,6 +1580,8 @@ pub fn process_incomplete_version<T: Deref<Target = rusqlite::Connection> + Comm
     }))
 }
 
+pub type TableOpCounts = BTreeMap<(TableName, ChangeOp), u64>;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ChangeOp {
     Insert,
@@ -1620,7 +1622,7 @@ pub fn process_complete_version<T: Deref<Target = rusqlite::Connection> + Commit
     actor_id: ActorId,
     versions: CrsqlDbVersionRange,
     parts: ChangesetParts,
-) -> rusqlite::Result<(KnownDbVersion, Changeset, BTreeMap<(TableName, ChangeOp), u64>)> {
+) -> rusqlite::Result<(KnownDbVersion, Changeset, TableOpCounts)> {
     let ChangesetParts {
         version,
         changes,
@@ -1866,9 +1868,18 @@ mod tests {
     fn test_change_op_from_rowid() {
         const SLAB_SAMPLE: i64 = 2 * 10_000_000_000_000 + 42;
 
-        assert_eq!(ChangeOp::from_rowid((1_i64 << 60) | SLAB_SAMPLE), ChangeOp::Insert);
-        assert_eq!(ChangeOp::from_rowid((2_i64 << 60) | SLAB_SAMPLE), ChangeOp::Update);
-        assert_eq!(ChangeOp::from_rowid((3_i64 << 60) | SLAB_SAMPLE), ChangeOp::Delete);
+        assert_eq!(
+            ChangeOp::from_rowid((1_i64 << 60) | SLAB_SAMPLE),
+            ChangeOp::Insert
+        );
+        assert_eq!(
+            ChangeOp::from_rowid((2_i64 << 60) | SLAB_SAMPLE),
+            ChangeOp::Update
+        );
+        assert_eq!(
+            ChangeOp::from_rowid((3_i64 << 60) | SLAB_SAMPLE),
+            ChangeOp::Delete
+        );
         assert_eq!(
             ChangeOp::from_rowid((4_i64 << 60) | SLAB_SAMPLE),
             ChangeOp::Resurrection
