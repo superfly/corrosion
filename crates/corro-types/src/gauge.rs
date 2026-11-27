@@ -46,7 +46,7 @@ impl PersistentGauge {
 impl GaugeRegistry {
     pub fn register(&self, gauge: Gauge, key: u64, persistent: bool) -> PersistentGauge {
         let mut guard = self.gauges.lock().unwrap();
-        let stored_gauge = guard.entry(key).or_insert(StoredGauge {
+        let stored_gauge = guard.entry(key).or_insert_with(|| StoredGauge {
             persistent,
             gauge: Arc::new(gauge),
         });

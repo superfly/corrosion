@@ -466,9 +466,9 @@ impl BookedVersions {
                     if let Some(p) = partial {
                         acc.entry(versions.start())
                             .and_modify(|existing: &mut PartialVersion| {
-                                existing.seqs.extend(p.seqs.clone());
+                                existing.seqs.extend(p.seqs.iter().cloned());
                             })
-                            .or_insert(p.clone());
+                            .or_insert_with(|| p.clone());
                     }
                     acc
                 });
